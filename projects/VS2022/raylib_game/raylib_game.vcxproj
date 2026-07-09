@@ -359,6 +359,7 @@
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="..\..\..\src\app_state\app_state.c" />
     <ClCompile Include="..\..\..\src\main.c" />
     <ClCompile Include="..\..\..\src\screen_state\screen_state.c" />
   </ItemGroup>
@@ -366,6 +367,7 @@
     <ResourceCompile Include="..\..\..\src\base_template.rc" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\..\..\src\app_state\app_state.h" />
     <ClInclude Include="..\..\..\src\screen_state\screen_state.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

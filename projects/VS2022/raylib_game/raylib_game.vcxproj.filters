@@ -5,6 +5,9 @@
     <ClCompile Include="..\..\..\src\screen_state\screen_state.c">
       <Filter>screen_state</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\src\app_state\app_state.c">
+      <Filter>app_state</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\..\..\src\base_template.rc" />
@@ -13,10 +16,16 @@
     <Filter Include="screen_state">
       <UniqueIdentifier>{02c0dfe3-0ce7-4fd6-8c0d-103ee85b663e}</UniqueIdentifier>
     </Filter>
+    <Filter Include="app_state">
+      <UniqueIdentifier>{dee7014e-f783-43fb-af79-3bab26361afb}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\..\src\screen_state\screen_state.h">
       <Filter>screen_state</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\src\app_state\app_state.h">
+      <Filter>app_state</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

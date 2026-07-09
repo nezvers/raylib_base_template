@@ -21,6 +21,7 @@
 #include "box2d/box2d.h"
 
 #include "screen_state/screen_state.h"
+#include "app_state/app_state.h"
 
 //----------------------------------------------------------------------------------
 // Defines and Macros
@@ -119,18 +120,16 @@ void UpdateDrawFrame(void)
     if (IsWindowResized()) {
         ScreenStateResize();
     }
-    // Update
-    //----------------------------------------------------------------------------------
-    // TODO: Update variables / Implement example logic at this point
-   
-    frameCounter++;
-    //----------------------------------------------------------------------------------
+    AppStateUpdate();
+    frameCounter++; // TODO: move to app state
 
     // Draw
     //----------------------------------------------------------------------------------
     ScreenState *screen_state = ScreenStateGet();
     BeginTextureMode(screen_state->target);
-        ClearBackground(RAYWHITE);
+        ClearBackground(screen_state->clear_color);
+        AppStateDraw();
+        // TODO: move to app state
         
         // TODO: Draw your game screen here
         Vector2 target_size = ScreenStateTargetSize();
@@ -149,14 +148,9 @@ void UpdateDrawFrame(void)
     
     // Render to screen (main framebuffer)
     BeginDrawing();
-        ClearBackground(RAYWHITE);
+        ClearBackground(BLACK); // TODO: screen_state
         ScreenStateDrawTarget();
-        
-        // // Draw render texture to screen, scaled if required
-        // DrawTexturePro(screen_state->target.texture, (Rectangle){ 0, 0, (float)screen_state->target.texture.width, -(float)screen_state->target.texture.height }, 
-        //     (Rectangle){ 0, 0, (float)screen_state->target.texture.width, (float)screen_state->target.texture.height }, (Vector2){ 0, 0 }, 0.0f, WHITE);
-
-        // TODO: Draw everything that requires to be drawn at this point, maybe UI?
+        AppStateGui();
 
     EndDrawing();
     //----------------------------------------------------------------------------------  
