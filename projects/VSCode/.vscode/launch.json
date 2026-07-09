@@ -5,7 +5,7 @@
             "name": "Debug",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/../../src/raylib_game",
+            "program": "${workspaceFolder}/../../src/${config:executableName}",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/../../src",
@@ -20,7 +20,7 @@
                 }
             ],
             "windows": {
-                "miDebuggerPath": "C:\\raylib\\w64devkit\\bin\\gdb.exe",
+                "miDebuggerPath": "gdb",
             },
             "linux": {
                 "miDebuggerPath": "/usr/bin/gdb",
@@ -34,7 +34,7 @@
             "name": "Run",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/../../src/raylib_game",
+            "program": "${workspaceFolder}/../../src/${config:executableName}",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/../../src",
@@ -42,7 +42,7 @@
             "externalConsole": false,
             "MIMode": "gdb",
             "windows": {
-                "miDebuggerPath": "C:\\raylib\\w64devkit\\bin\\gdb.exe"
+                "miDebuggerPath": "gdb"
             },
             "linux": {
                 "miDebuggerPath": "/usr/bin/gdb"
