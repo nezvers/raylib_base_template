@@ -84,13 +84,13 @@ b2ShapeId ShapeCreateCapsule(
     unsigned long int categoryBits,       // entity kind
     unsigned long int maskBits,       // collides against
     float density,
-    void *userData,
+    void* userData,
     bool isSensor,
     bool enableSensorEvents,
     bool enablePreSolveEvents,
     bool enableContactEvents,
     bool enableHitEvents
-)
+);
 
 // Utils
 b2Vec2 b2RectanglePosition(b2Vec2 pos, b2Vec2 size);
