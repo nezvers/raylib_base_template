@@ -74,8 +74,7 @@ int main(void)
 #endif
     ScreenState *screen_state = ScreenStateGet();
     // TODO: place to load screen settings
-    screen_state->width = 1280;
-    screen_state->height = 720;
+    ScreenStateReset();
     SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE | FLAG_BORDERLESS_WINDOWED_MODE);
 
     InitWindow(screen_state->width, screen_state->height, "raylib gamejam template");
@@ -129,33 +128,33 @@ void UpdateDrawFrame(void)
 
     // Draw
     //----------------------------------------------------------------------------------
-    // Render game screen to a texture, 
-    // it could be useful for scaling or further shader postprocessing
-    BeginTextureMode(target);
+    ScreenState *screen_state = ScreenStateGet();
+    BeginTextureMode(screen_state->target);
         ClearBackground(RAYWHITE);
         
         // TODO: Draw your game screen here
+        Vector2 target_size = ScreenStateTargetSize();
+        DrawRectangle(0, 0, target_size.x, target_size.y, BLACK);
+        DrawRectangle(10, 10, target_size.x -20, target_size.y -20, RAYWHITE);
+        DrawText("raylib", 30, 30, 40, BLACK);
 
-        DrawRectangle(70, 90, 200, 200, BLACK);
-        DrawRectangle(70 + 16, 90 + 16, 200 - 32, 200 - 32, RAYWHITE);
-        DrawText("raylib", 70 + 200 - MeasureText("raylib", 40) - 32, 90 + 200 - 40 - 24, 40, BLACK);
+        // DrawText("6.x", 290, 90 - 26, 280, BLACK);
+        // DrawText("GAMEJAM", 70, 90 + 210, 120, MAROON);
 
-        DrawText("6.x", 290, 90 - 26, 280, BLACK);
-        DrawText("GAMEJAM", 70, 90 + 210, 120, MAROON);
-
-        if ((frameCounter/20)%2) DrawText("are you ready?", 160, 500, 50, BLACK);
+        // if ((frameCounter/20)%2) DrawText("are you ready?", 160, 500, 50, BLACK);
         
-        DrawRectangleLinesEx((Rectangle){ 0, 0, screenWidth, screenHeight }, 16, BLACK);
+        // DrawRectangleLinesEx((Rectangle){ 0, 0, screen_state->width, screen_state->height }, 16, BLACK);
         
     EndTextureMode();
     
     // Render to screen (main framebuffer)
     BeginDrawing();
         ClearBackground(RAYWHITE);
+        ScreenStateDrawTarget();
         
-        // Draw render texture to screen, scaled if required
-        DrawTexturePro(target.texture, (Rectangle){ 0, 0, (float)target.texture.width, -(float)target.texture.height }, 
-            (Rectangle){ 0, 0, (float)target.texture.width, (float)target.texture.height }, (Vector2){ 0, 0 }, 0.0f, WHITE);
+        // // Draw render texture to screen, scaled if required
+        // DrawTexturePro(screen_state->target.texture, (Rectangle){ 0, 0, (float)screen_state->target.texture.width, -(float)screen_state->target.texture.height }, 
+        //     (Rectangle){ 0, 0, (float)screen_state->target.texture.width, (float)screen_state->target.texture.height }, (Vector2){ 0, 0 }, 0.0f, WHITE);
 
         // TODO: Draw everything that requires to be drawn at this point, maybe UI?
 
