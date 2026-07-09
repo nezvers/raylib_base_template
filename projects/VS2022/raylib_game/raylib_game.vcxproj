@@ -360,9 +360,13 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\..\src\main.c" />
+    <ClCompile Include="..\..\..\src\screen_state\screen_state.c" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\..\..\src\base_template.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\..\src\screen_state\screen_state.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

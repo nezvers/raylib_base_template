@@ -1,0 +1,18 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="..\..\..\src\main.c" />
+    <ClCompile Include="..\..\..\src\screen_state\screen_state.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="..\..\..\src\base_template.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="screen_state">
+      <UniqueIdentifier>{02c0dfe3-0ce7-4fd6-8c0d-103ee85b663e}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\..\src\screen_state\screen_state.h" />
+  </ItemGroup>
+</Project>

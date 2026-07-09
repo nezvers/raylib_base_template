@@ -43,6 +43,7 @@ add_git_dependency(
 # Our Project
 add_executable(${PROJECT_NAME})
 add_subdirectory(src)
+# include_directories(${CMAKE_SOURCE_DIR}/src/screen_state)
 # include_directories(${CMAKE_SOURCE_DIR}/include)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES

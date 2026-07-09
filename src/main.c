@@ -20,6 +20,8 @@
 #include <string.h>                         // Required for:
 #include "box2d/box2d.h"
 
+#include "screen_state/screen_state.h"
+
 //----------------------------------------------------------------------------------
 // Defines and Macros
 //----------------------------------------------------------------------------------
@@ -47,8 +49,10 @@ typedef enum {
 //----------------------------------------------------------------------------------
 // Global Variables Definition (local to this module)
 //----------------------------------------------------------------------------------
-static const int screenWidth = 720;
-static const int screenHeight = 720;
+
+
+static int screenWidth = 720;
+static int screenHeight = 720;
 
 static RenderTexture2D target = { 0 };  // Render texture to render our game
 static int frameCounter = 0;
@@ -68,18 +72,19 @@ int main(void)
 #if !defined(_DEBUG)
     SetTraceLogLevel(LOG_NONE);         // Disable raylib trace log messages
 #endif
-    b2BodyId body;
-    body.generation = 0;
-    // Initialization
-    //--------------------------------------------------------------------------------------
-    InitWindow(screenWidth, screenHeight, "raylib gamejam template");
+    ScreenState *screen_state = ScreenStateGet();
+    // TODO: place to load screen settings
+    screen_state->width = 1280;
+    screen_state->height = 720;
+    SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE | FLAG_BORDERLESS_WINDOWED_MODE);
+
+    InitWindow(screen_state->width, screen_state->height, "raylib gamejam template");
+    ScreenStateResize();
+    InitAudioDevice();
+    SetMasterVolume(100.0);
     
     // TODO: Load resources / Initialize variables at this point
     
-    // Render texture to draw, enables screen scaling
-    // NOTE: If screen is scaled, mouse input should be scaled proportionally
-    target = LoadRenderTexture(screenWidth, screenHeight);
-    SetTextureFilter(target.texture, TEXTURE_FILTER_BILINEAR);
 
 #if defined(PLATFORM_WEB)
     emscripten_set_main_loop(UpdateDrawFrame, 60, 1);
@@ -96,7 +101,7 @@ int main(void)
 
     // De-Initialization
     //--------------------------------------------------------------------------------------
-    UnloadRenderTexture(target);
+    ScreenStateCleanup();
     
     // TODO: Unload all loaded resources at this point
 
@@ -112,6 +117,9 @@ int main(void)
 // Update and draw frame
 void UpdateDrawFrame(void)
 {
+    if (IsWindowResized()) {
+        ScreenStateResize();
+    }
     // Update
     //----------------------------------------------------------------------------------
     // TODO: Update variables / Implement example logic at this point
