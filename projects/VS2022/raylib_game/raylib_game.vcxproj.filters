@@ -2,7 +2,9 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <ClCompile Include="..\..\..\src\main.c" />
-    <ClCompile Include="..\..\..\src\screen_state\screen_state.c" />
+    <ClCompile Include="..\..\..\src\screen_state\screen_state.c">
+      <Filter>screen_state</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\..\..\src\base_template.rc" />
@@ -13,6 +15,8 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\..\src\screen_state\screen_state.h" />
+    <ClInclude Include="..\..\..\src\screen_state\screen_state.h">
+      <Filter>screen_state</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
