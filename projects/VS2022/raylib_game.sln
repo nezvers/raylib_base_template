@@ -1,11 +1,16 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio Version 17
-VisualStudioVersion = 17.0.31912.275
+# Visual Studio Version 18
+VisualStudioVersion = 18.7.11925.98
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "raylib", "raylib\raylib.vcxproj", "{E89D61AC-55DE-4482-AFD4-DF7242EBC859}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "raylib_game", "raylib_game\raylib_game.vcxproj", "{0981CA98-E4A5-4DF1-987F-A41D09131EFC}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "base_template", "raylib_game\raylib_game.vcxproj", "{0981CA98-E4A5-4DF1-987F-A41D09131EFC}"
+	ProjectSection(ProjectDependencies) = postProject
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668} = {EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}
+	EndProjectSection
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "box2d", "..\..\box2d\build\src\box2d.vcxproj", "{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -51,6 +56,22 @@ Global
 		{0981CA98-E4A5-4DF1-987F-A41D09131EFC}.Release|x64.Build.0 = Release|x64
 		{0981CA98-E4A5-4DF1-987F-A41D09131EFC}.Release|x86.ActiveCfg = Release|Win32
 		{0981CA98-E4A5-4DF1-987F-A41D09131EFC}.Release|x86.Build.0 = Release|Win32
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Debug.DLL|x64.ActiveCfg = MinSizeRel|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Debug.DLL|x64.Build.0 = MinSizeRel|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Debug.DLL|x86.ActiveCfg = MinSizeRel|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Debug.DLL|x86.Build.0 = MinSizeRel|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Debug|x64.ActiveCfg = Debug|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Debug|x64.Build.0 = Debug|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Debug|x86.ActiveCfg = Debug|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Debug|x86.Build.0 = Debug|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Release.DLL|x64.ActiveCfg = Release|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Release.DLL|x64.Build.0 = Release|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Release.DLL|x86.ActiveCfg = Release|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Release.DLL|x86.Build.0 = Release|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Release|x64.ActiveCfg = Release|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Release|x64.Build.0 = Release|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Release|x86.ActiveCfg = Release|x64
+		{EA3DF6EC-5003-3DE5-9288-9D5FBFA9F668}.Release|x86.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
