@@ -84,6 +84,8 @@ int main(void)
     SetMasterVolume(100.0);
     
     // TODO: Load resources / Initialize variables at this point
+    extern AppState app_state_placeholder;
+    AppStateTransition(&app_state_placeholder);
     
 
 #if defined(PLATFORM_WEB)
@@ -121,7 +123,6 @@ void UpdateDrawFrame(void)
         ScreenStateResize();
     }
     AppStateUpdate();
-    frameCounter++; // TODO: move to app state
 
     // Draw
     //----------------------------------------------------------------------------------
@@ -129,20 +130,6 @@ void UpdateDrawFrame(void)
     BeginTextureMode(screen_state->target);
         ClearBackground(screen_state->clear_color);
         AppStateDraw();
-        // TODO: move to app state
-        
-        // TODO: Draw your game screen here
-        Vector2 target_size = ScreenStateTargetSize();
-        DrawRectangle(0, 0, target_size.x, target_size.y, BLACK);
-        DrawRectangle(10, 10, target_size.x -20, target_size.y -20, RAYWHITE);
-        DrawText("raylib", 30, 30, 40, BLACK);
-
-        // DrawText("6.x", 290, 90 - 26, 280, BLACK);
-        // DrawText("GAMEJAM", 70, 90 + 210, 120, MAROON);
-
-        // if ((frameCounter/20)%2) DrawText("are you ready?", 160, 500, 50, BLACK);
-        
-        // DrawRectangleLinesEx((Rectangle){ 0, 0, screen_state->width, screen_state->height }, 16, BLACK);
         
     EndTextureMode();
     
