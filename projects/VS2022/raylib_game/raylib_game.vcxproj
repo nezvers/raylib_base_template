@@ -361,6 +361,7 @@
   <ItemGroup>
     <ClCompile Include="..\..\..\src\app_state\app_state.c" />
     <ClCompile Include="..\..\..\src\main.c" />
+    <ClCompile Include="..\..\..\src\placeholder_state\placeholder_state.c" />
     <ClCompile Include="..\..\..\src\screen_state\screen_state.c" />
   </ItemGroup>
   <ItemGroup>

@@ -8,6 +8,9 @@
     <ClCompile Include="..\..\..\src\app_state\app_state.c">
       <Filter>app_state</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\src\placeholder_state\placeholder_state.c">
+      <Filter>placeholder_state</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\..\..\src\base_template.rc" />
@@ -18,6 +21,9 @@
     </Filter>
     <Filter Include="app_state">
       <UniqueIdentifier>{dee7014e-f783-43fb-af79-3bab26361afb}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="placeholder_state">
+      <UniqueIdentifier>{50f20910-aeb0-4f5c-b18e-d13ee7f5ecde}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
