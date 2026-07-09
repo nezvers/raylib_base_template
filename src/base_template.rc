@@ -10,12 +10,12 @@ BEGIN
     BLOCK "040904E4"    // English US
     BEGIN
       VALUE "CompanyName", "raylib technologies"
-      VALUE "FileDescription", "raylib-game | A great game"
+      VALUE "FileDescription", "base_template | A great game"
       VALUE "FileVersion", "1.0"
-      VALUE "InternalName", "raylib-game"
+      VALUE "InternalName", "base_template"
       VALUE "LegalCopyright", "(c) 2025 raylib technologies (@raylibtech)"
       //VALUE "OriginalFilename", "raylib_app.exe"
-      VALUE "ProductName", "raylib-game"
+      VALUE "ProductName", "base_template"
       VALUE "ProductVersion", "1.0"
     END
   END

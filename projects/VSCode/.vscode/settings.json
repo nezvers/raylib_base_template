@@ -1,4 +1,5 @@
 {
+	"executableName": "base_template",
 	"files.exclude": {
 		"**/.git": true,
 		"**/.svn": true,
