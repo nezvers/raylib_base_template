@@ -78,3 +78,8 @@ android.*
 *.js
 !src/minshell.html
 !src/shell.html
+
+*box2d/test/
+*box2d/benchmark/
+*box2d/docs/
+*box2d/samples/
