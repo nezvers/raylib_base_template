@@ -360,6 +360,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\..\src\app_state\app_state.c" />
+    <ClCompile Include="..\..\..\src\box2d_wrap\box2d_body_shape.c" />
     <ClCompile Include="..\..\..\src\box2d_wrap\box2d_world.c" />
     <ClCompile Include="..\..\..\src\main.c" />
     <ClCompile Include="..\..\..\src\placeholder_state\placeholder_state.c" />

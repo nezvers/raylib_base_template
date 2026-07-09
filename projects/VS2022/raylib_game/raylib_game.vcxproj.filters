@@ -14,6 +14,9 @@
     <ClCompile Include="..\..\..\src\box2d_wrap\box2d_world.c">
       <Filter>box2d_wrap</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\src\box2d_wrap\box2d_body_shape.c">
+      <Filter>box2d_wrap</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\..\..\src\base_template.rc" />
