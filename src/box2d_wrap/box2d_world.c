@@ -28,17 +28,19 @@ void WorldContextDestroy(WorldContext *ctx) {
 }
 
 void WorldContextUpdate(WorldContext *ctx, float delta_time) {
-    const float PHYSICS_TIME_STEP = 1.f / 60.f;
-    const unsigned int SUB_STEPS = 12;
-    bool stepped = false;
+    // const float PHYSICS_TIME_STEP = 1.f / 60.f;
+    const unsigned int SUB_STEPS = 4;
+    // bool stepped = false;
 
-    ctx->time += delta_time;
-    while (ctx->time >= PHYSICS_TIME_STEP) {
-        b2World_Step(ctx->world, PHYSICS_TIME_STEP, SUB_STEPS);
-        ctx->time -= PHYSICS_TIME_STEP;
-        stepped = true;
-    }
-    if (!stepped) { return; }
+    // ctx->time += delta_time;
+    // while (ctx->time >= PHYSICS_TIME_STEP) {
+    //     b2World_Step(ctx->world, PHYSICS_TIME_STEP, SUB_STEPS);
+    //     ctx->time -= PHYSICS_TIME_STEP;
+    //     stepped = true;
+    // }
+    // if (!stepped) { return; }
+    
+    b2World_Step(ctx->world, delta_time, SUB_STEPS);
 
     b2SensorEvents sensor_events = b2World_GetSensorEvents(ctx->world);
     if (ctx->sensor_begin_callback != NULL) {
