@@ -14,7 +14,7 @@
                 }
             },
             "linux": {
-                "command": "rm -f ./build/${config:executableName}",
+                "command": "rm -f ./build/${config:executableName}/${config:executableName}",
                 "options": {
                     "shell": {
                         "executable": "/bin/bash",
