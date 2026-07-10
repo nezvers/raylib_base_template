@@ -81,3 +81,16 @@ if (APPLE)
     target_link_libraries(${PROJECT_NAME} "-framework Cocoa")
     target_link_libraries(${PROJECT_NAME} "-framework OpenGL")
 endif()
+
+# Setting RESOURCES_PATH
+if (${PLATFORM} STREQUAL "Web")
+  # Wasm builds have resources directory copied next to it
+    target_compile_definitions(${PROJECT_NAME} PUBLIC RESOURCES_PATH="./resources/")
+elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  SET(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -O0 -DDEBUG")
+  # Set the resources path macro to the absolute path on the dev machine
+  target_compile_definitions(${PROJECT_NAME} PUBLIC RESOURCES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/src/resources/")
+else()
+  # Set the resources path macro in release mode to a relative path that assumes the assets folder is in the same directory as the game executable
+  target_compile_definitions(${PROJECT_NAME} PUBLIC RESOURCES_PATH="./resources/")
+endif()
