@@ -186,14 +186,14 @@ void LevelActorInit(Actor *actor) {
     // TODO: make possible to have different shapes for each actor
     b2ShapeDef torso_def = b2DefaultShapeDef();
     // Belongs to categories
-    torso_def.filter.categoryBits = (actor->type == ACTOR_TYPE_PLAYER) ? ENTITY_KIND_PLAYER : ENTITY_KIND_ENEMY;
+    torso_def.filter.categoryBits = ENTITY_KIND_ACTOR; // | (actor->type == ACTOR_TYPE_PLAYER) ? ENTITY_KIND_PLAYER : ENTITY_KIND_ENEMY;
     // Collides against categories
-    torso_def.filter.maskBits = ENTITY_KIND_SOLID | ENTITY_KIND_PROP;
+    torso_def.filter.maskBits = ENTITY_KIND_SOLID | ENTITY_KIND_PROP; // To collide against actors add ENTITY_KIND_ACTOR
     torso_def.enableSensorEvents = false;
-    torso_def.enablePreSolveEvents = true;
+    torso_def.enablePreSolveEvents = true;   // call LevelPreSolve
     torso_def.userData = &actor->contact;
-    // torso_def.material.friction = 0; // 0 is default
-    // torso_def.density = 1.0f;        // 1 is default
+    torso_def.material.friction = 0;
+    torso_def.density = 1.0f;
 
     const f32 RADIUS = 16.f;
     const f32 HEIGHT = 64.f;
@@ -204,8 +204,8 @@ void LevelActorInit(Actor *actor) {
     actor->shape = b2CreateCapsuleShape(actor->body, &torso_def, &capsule);
 
     b2ShapeDef sensor_def = b2DefaultShapeDef();
-    sensor_def.filter.categoryBits = (actor->type == ACTOR_TYPE_PLAYER) ? ENTITY_KIND_PLAYER : ENTITY_KIND_ENEMY;
-    sensor_def.filter.maskBits = (actor->type == ACTOR_TYPE_PLAYER) ? (ENTITY_KIND_COIN | ENTITY_KIND_JUMPAD) : ENTITY_KIND_JUMPAD;
+    sensor_def.filter.categoryBits = ENTITY_KIND_ACTOR | ENTITY_KIND_PLAYER; //ENTITY_KIND_ACTOR | (actor->type == ACTOR_TYPE_PLAYER) ? ENTITY_KIND_PLAYER : ENTITY_KIND_ENEMY;
+    sensor_def.filter.maskBits = ENTITY_KIND_JUMPAD | ENTITY_KIND_COIN; //(actor->type == ACTOR_TYPE_PLAYER) ? ENTITY_KIND_COIN : ENTITY_KIND_NONE;
     sensor_def.enableSensorEvents = true;
     sensor_def.userData = &actor->sensor_actor;
 
@@ -220,16 +220,16 @@ void LevelPlatformInit(PlatformStatic *platform) {
         *(b2Vec2*)& platform->pos,
         *(b2Vec2*)& platform->size,
         b2_staticBody,
-        true, // fixed_rotation
+        true,            // fixed_rotation
         "Platform"
     );
     platform->shape = ShapeCreateBox(
         platform->body,
         *(b2Vec2*)& platform->size,
         ENTITY_KIND_SOLID,                                         // category
-        (ENTITY_KIND_PLAYER | ENTITY_KIND_ENEMY | ENTITY_KIND_PROP), // mask
+        (ENTITY_KIND_ACTOR | ENTITY_KIND_PLAYER | ENTITY_KIND_ENEMY | ENTITY_KIND_PROP), // mask
         1.f,                   // density
-        &platform->contact, // user_data
+        &platform->contact,    // user_data
         false,                 // is_sensor
         false,                 // enable_sensor_events
         false,                 // enable_presolve_events
@@ -252,8 +252,8 @@ void LevelBoxInit(Box *box) {
     box->prop.shape = ShapeCreateBox(
         box->prop.body,
         *(b2Vec2*)& box->prop.size,
-        ENTITY_KIND_PROP,   // category
-        (ENTITY_KIND_PLAYER | ENTITY_KIND_ENEMY | ENTITY_KIND_PROP | ENTITY_KIND_SOLID), // mask
+        ENTITY_KIND_PROP,      // category
+        (ENTITY_KIND_ACTOR | ENTITY_KIND_PROP | ENTITY_KIND_SOLID), // mask
         1.f,                   // density
         &box->prop.contact,    // user_data
         false,                 // is_sensor
@@ -268,18 +268,18 @@ void LevelBoxInit(Box *box) {
     box->sensor.shape = ShapeCreateBox(
         box->prop.body,
         *(b2Vec2*)& box->prop.size,
-        ENTITY_KIND_PROP,   // category
-        ENTITY_KIND_JUMPAD, // mask
+        ENTITY_KIND_PROP,      // category
+        ENTITY_KIND_JUMPAD,    // mask
         1.f,                   // density
         &box->sensor,          // user_data
         false,                 // is_sensor
-        false,                 // enable_sensor_events
+        true,                  // enable_sensor_events
         false,                 // enable_presolve_events
         false,                 // enable_contact_events
         false                  // enable_hit_events
     );
-    box->sensor.entity = &box->prop;    // MAYBE: reference box
     box->sensor.kind = SENSOR_KIND_PROP;
+    box->sensor.entity = &box->prop;    // MAYBE: reference box
 }
 
 void LevelJumpadInit(Jumpad *jumpad) {
@@ -295,7 +295,7 @@ void LevelJumpadInit(Jumpad *jumpad) {
         jumpad->body,
         *(b2Vec2*)& jumpad->size,
         ENTITY_KIND_JUMPAD,   // category
-        (ENTITY_KIND_PLAYER | ENTITY_KIND_PROP), // mask
+        (ENTITY_KIND_ACTOR | ENTITY_KIND_PROP), // mask
         1.f,                // density
         &jumpad->sensor,    // user_data
         true,               // is_sensor
@@ -305,7 +305,7 @@ void LevelJumpadInit(Jumpad *jumpad) {
         false               // enable_hit_events
     );
     jumpad->sensor.entity = jumpad;
-    jumpad->sensor.kind = SENSOR_KIND_PROP;
+    jumpad->sensor.kind = SENSOR_KIND_JUMPAD;
     jumpad->active = true;
     jumpad->triggered = false;
 }
@@ -322,8 +322,8 @@ void LevelCoinsInit(Coin *coin) {
     coin->sensor.shape = ShapeCreateBox(
         coin->body,
         *(b2Vec2*)& coin->size,
-        ENTITY_KIND_JUMPAD,   // category
-        (ENTITY_KIND_PLAYER | ENTITY_KIND_PROP), // mask
+        ENTITY_KIND_COIN,   // category
+        ENTITY_KIND_PLAYER, // mask
         1.f,                // density
         &coin->sensor,    // user_data
         true,               // is_sensor
@@ -333,7 +333,7 @@ void LevelCoinsInit(Coin *coin) {
         false               // enable_hit_events
     );
     coin->sensor.entity = coin;
-    coin->sensor.kind = SENSOR_KIND_PROP;
+    coin->sensor.kind = SENSOR_KIND_COIN;
     coin->active = true;
     coin->triggered = false;
 }
@@ -359,11 +359,11 @@ void LevelCoinsUpdate(f32 delta_time) {
         ShapeDestroy(coin->sensor.shape);
         BodyDestroy(coin->body);
 
-        // TODO: move to separate function??
+        // TODO: doesn't move underlying ID structs.
         // Replace with last
-        level.coin_count -= 1;
-        if (i == level.coin_count) { continue; }
-        coins[i] = coins[level.coin_count];
+        // level.coin_count -= 1;
+        // if (i == level.coin_count) { continue; }
+        // coins[i] = coins[level.coin_count];
     }
 }
 
@@ -475,6 +475,7 @@ void LevelSensorBegin(b2SensorBeginTouchEvent event) {
 }
 
 void LevelSensorEnd(b2SensorEndTouchEvent event) {
+    if (!b2Shape_IsValid(event.sensorShapeId)) { return; }
     SensorContext *sensor = b2Shape_GetUserData(event.sensorShapeId);
     switch(sensor->kind) {
         case SENSOR_KIND_NONE : break;

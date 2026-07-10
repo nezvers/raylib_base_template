@@ -44,10 +44,10 @@ typedef struct {
 typedef struct {
     Vector2 pos;
     Vector2 size;
-    bool active;
-    bool triggered;
     b2BodyId body;
     SensorContext sensor;
+    bool active;
+    bool triggered;
 } Trigger;
 typedef Trigger Coin;
 typedef Trigger Jumpad;
