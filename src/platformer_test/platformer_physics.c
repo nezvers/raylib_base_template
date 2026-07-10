@@ -1,29 +1,16 @@
-#include "raylib.h"
+#include "platformer_physics.h"
 #include "../box2d_wrap/box2d_wrap.h"
-#include "platformer_types.h"
-#include "platformer_constants.h"
-#include "common_types.h"
 
 
-void PhysicsSensorBegin(b2SensorBeginTouchEvent event_begin);
-void PhysicsSensorEnd(b2SensorEndTouchEvent event_end);
-bool PhysicsPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context );
-
-void PhysicsWorldInit(WorldContext *ctx, void *user_data) {
+void PhysicsWorldInit(WorldContext *ctx, SensorBeginFcn *begin, SensorEndFcn *end, b2PreSolveFcn *pre, void *user_data) {
+    void (*sensor_begin_callback)(b2SensorBeginTouchEvent);
+    void (*sensor_end_callback)(b2SensorEndTouchEvent);
     WorldContextInit(
         ctx,
         32,                 // units per meter
         (b2Vec2){0, 0},     // zero gravity, each object updates their velocity
-        PhysicsSensorBegin,
-        PhysicsSensorEnd
+        begin,
+        end
     );
-    b2World_SetPreSolveCallback(ctx->world, PhysicsPreSolve, user_data);
+    b2World_SetPreSolveCallback(ctx->world, pre, user_data);
 }
-
-void PhysicsPlatformInit(WorldContext *ctx, PlatformStatic *platform) {
-    
-}
-
-void PhysicsSensorBegin(b2SensorBeginTouchEvent event_begin) {}
-void PhysicsSensorEnd(b2SensorEndTouchEvent event_end) {}
-bool PhysicsPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context ) { return false;}

@@ -1,4 +1,5 @@
 #include "raylib.h"
+#include "raymath.h"
 #include "../box2d_wrap/box2d_wrap.h"
 #include "platformer_types.h"
 #include "platformer_constants.h"
@@ -22,6 +23,7 @@ typedef struct {
     // Carry physics info
     WorldContext world_ctx;
     b2DebugDraw debug_draw;
+    Actor *player; // Assigned in LevelActorInit
 } LevelContext;
 
 // Static size buffers for objects
@@ -32,10 +34,37 @@ static Coin coins[20];
 static Jumpad jumpads[20];
 
 static LevelContext level;
+static Actor *player; // Assigned in LevelLoad at initialization
 
+#define SIGN_F(x) ((x) > 0 ? 1 : ((x) < 0) ? -1 : 0)
+
+void LevelActorInit(Actor *actor);
+void LevelPlatformInit(PlatformStatic *platform);
+void LevelBoxInit(Box *box);
+void LevelJumpadInit(Jumpad *jumpad);
+void LevelCoinsInit(Coin *coin);
+
+void LevelActorUpdate(f32 delta_time);
+void LevelBoxesUpdate(f32 delta_time);
+void LevelCoinsUpdate(f32 delta_time);
+
+void LevelSensorBegin(b2SensorBeginTouchEvent event);
+void LevelSensorEnd(b2SensorEndTouchEvent event);
+bool LevelPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context );
 
 void LevelUpdate() {
-    WorldContextUpdate(&level.world_ctx, GetFrameTime());
+    f32 delta_time = GetFrameTime(); // OPTION: turn into bullet time
+    WorldContextUpdate(&level.world_ctx, delta_time);
+    LevelBoxesUpdate(delta_time);
+    LevelCoinsUpdate(delta_time);
+
+    if (player != NULL) {
+        bool right = IsKeyDown(KEY_D);
+        bool left = IsKeyDown(KEY_A);
+        player->input.x = (f32)(i32)right - (f32)(i32)left;
+        player->input.jump = IsKeyDown(KEY_SPACE);
+    }
+    LevelActorUpdate(delta_time);
 }
 
 void LevelDraw() {
@@ -66,19 +95,14 @@ void LevelDestroy() {
         BodyDestroy(actors[i].body);
     }
     WorldContextDestroy(&level.world_ctx);
+    player = NULL;
 }
 
-// Forward declare
-void LevelActorInit(Actor *actor);
-void LevelPlatformInit(PlatformStatic *platform);
-void LevelBoxInit(Box *box);
-void LevelJumpadInit(Jumpad *jumpad);
-void LevelCoinsInit(Coin *coin);
 
 // Load level
 void LevelLoad_1() {
     /* PHYSICS FIRST */
-    PhysicsWorldInit(&level.world_ctx, &level);
+    PhysicsWorldInit(&level.world_ctx, LevelSensorBegin, LevelSensorEnd, LevelPreSolve, &level);
     level.debug_draw = Box2dRaylibDebugDraw();
 
     /* Platforms */
@@ -140,6 +164,9 @@ void LevelLoad_1() {
     };
     for (int i = 0; i < level.actor_count; i += 1) {
         LevelActorInit(&actors[i]);
+        if (actors[i].type == ACTOR_TYPE_PLAYER) {
+            player = &actors[i];
+        }
     }
 }
 
@@ -310,3 +337,171 @@ void LevelCoinsInit(Coin *coin) {
     coin->active = true;
     coin->triggered = false;
 }
+
+void LevelBoxesUpdate(f32 delta_time) {
+    // Reverse order to have option to remove by replacing with last
+    for (int i = level.box_count -1; i > -1; i -= 1) {
+        Box *box = &boxes[i];
+        b2Vec2 velocity = b2Body_GetLinearVelocity(box->prop.body);
+        velocity.y += GRAVITY * delta_time;
+        b2Body_SetLinearVelocity(box->prop.body, velocity);
+    }
+}
+
+void LevelCoinsUpdate(f32 delta_time) {
+    // Reverse order to have option to remove by replacing with last
+    for (int i = level.coin_count -1; i > -1; i -= 1) {
+        Coin *coin = &coins[i];
+        if (!coin->active) { continue; }
+        if (!coin->triggered) { continue; }
+
+        coin->active = false;
+        ShapeDestroy(coin->sensor.shape);
+        BodyDestroy(coin->body);
+
+        // TODO: move to separate function??
+        // Replace with last
+        level.coin_count -= 1;
+        if (i == level.coin_count) { continue; }
+        coins[i] = coins[level.coin_count];
+    }
+}
+
+
+void LevelActorUpdate(f32 delta_time) {
+    // Reverse order to have option to remove by replacing with last
+    for (int i = level.actor_count -1; i > -1; i -= 1) {
+        Actor *actor = &actors[i];
+        b2Vec2 pos_b2 = b2PositionForRectangle( b2Body_GetPosition(actor->body), (b2Vec2){0,0});
+        // TODO: use sprite size
+        actor->state.pos = *(Vector2*)& pos_b2;
+
+        b2Vec2 velocity = b2Body_GetLinearVelocity(actor->body);
+        b2Vec2 target_velocity = velocity;
+
+        // Horizontal speed
+        if (actor->input.x != 0) {
+            target_velocity.x = Clamp(
+                target_velocity.x + actor->input.x * actor->values.acceleration * delta_time,
+                -actor->values.speed_max,
+                actor->values.speed_max
+            );
+        } else {
+            f32 abs_speed = fabsf(target_velocity.x);
+            if (abs_speed > actor->values.deacceleration * delta_time) {
+                f32 sign_speed = SIGN_F(target_velocity.x);
+                target_velocity.x += -sign_speed * delta_time * actor->values.deacceleration;
+            } else {
+                target_velocity.x = 0;
+            }
+        }
+
+        // Vertical speed
+        target_velocity.y += GRAVITY * delta_time;
+
+        // Jumping
+        if (actor->state.grounded) {
+            actor->state.remaining_jumps = actor->values.jump_count;
+            if (actor->input.jump) {
+                if (!actor->state.is_jumping) {
+                    actor->state.grounded = false;
+                    actor->state.is_jumping = true;
+                    actor->state.remaining_jumps -= 1;
+                    target_velocity.y = actor->values.jump_force;
+                }
+            }
+            else if (actor->state.is_jumping) {
+                actor->state.is_jumping = false;
+            }
+        } else {
+            // Not grounded
+            if (actor->input.jump) {
+                if (!actor->state.is_jumping && actor->state.remaining_jumps > 0) {
+                    // Double jump
+                    actor->state.is_jumping = true;
+                    actor->state.remaining_jumps -= 1;
+                    target_velocity.y = actor->values.jump_force;
+                }
+            } else if (actor->state.is_jumping) {
+                actor->state.is_jumping = false;
+                if (target_velocity.y > actor->values.jump_force * 0.5f) {
+                    // Jump release / variable jump height
+                    target_velocity.y = actor->values.jump_force * 0.5f;
+                }
+            }
+        }
+        // NOTE: even with velocity up, next frame collision event sttill happen.
+        // state.velocity used to skip state.grounded
+        actor->state.velocity = *(Vector2*)& target_velocity;
+        b2Body_SetLinearVelocity(actor->body, target_velocity);
+        actor->state.grounded = false;
+    }
+}
+
+void LevelSensorBegin(b2SensorBeginTouchEvent event) {
+    SensorContext *sensor = b2Shape_GetUserData(event.sensorShapeId);
+    SensorContext *visitor = b2Shape_GetUserData(event.visitorShapeId);
+
+    switch(sensor->kind) {
+        case SENSOR_KIND_NONE : break;
+        case SENSOR_KIND_ACTOR: break;
+        case SENSOR_KIND_COIN:
+            Coin *coin = sensor->entity;
+            if (coin->triggered) { return; }
+            if (visitor->kind == SENSOR_KIND_ACTOR && visitor->entity == player) {
+                coin->triggered = true;
+                // TODO: SCORE !!!
+            }
+            break;
+        case SENSOR_KIND_JUMPAD:
+            if (visitor->kind == SENSOR_KIND_ACTOR) {
+                Actor *actor = visitor->entity;
+                b2Vec2 velocity = b2Body_GetLinearVelocity(actor->body);
+                velocity.y = JUMP_FORCE * 1.3;
+                b2Body_SetLinearVelocity(actor->body, velocity);
+            }
+            else if (visitor->kind == SENSOR_KIND_PROP) {
+                // Box
+                Props *prop = visitor->entity;
+                b2Vec2 velocity = b2Body_GetLinearVelocity(prop->body);
+                // TODO: differentiate props
+                velocity.y = JUMP_FORCE * 1.3;
+                b2Body_SetLinearVelocity(prop->body, velocity);
+            }
+            break;
+        case SENSOR_KIND_GROUND:
+            break;
+    }
+}
+
+void LevelSensorEnd(b2SensorEndTouchEvent event) {
+    SensorContext *sensor = b2Shape_GetUserData(event.sensorShapeId);
+    switch(sensor->kind) {
+        case SENSOR_KIND_NONE : break;
+        case SENSOR_KIND_GROUND : break;
+    }
+}
+
+bool LevelPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context ) {
+    ContactContext *contactA = b2Shape_GetUserData(shapeIdA);
+    ContactContext *contactB = b2Shape_GetUserData(shapeIdB);
+
+    if (contactA->kind == ENTITY_KIND_ACTOR) {
+        Actor *actor = contactA->entity;
+        // WORKAROUND: after jumping up, this still triggers frame after
+        if (!(actor->state.velocity.y > 0) && (manifold->normal.y > 0.5f)) {
+            actor->state.grounded = true;
+        }
+    }
+    
+    if (contactB->kind == ENTITY_KIND_ACTOR) {
+        Actor *actor = contactB->entity;
+        // WORKAROUND: after jumping up, this still triggers frame after
+        if (!(actor->state.velocity.y > 0) && (manifold->normal.y > 0.5f)) {
+            actor->state.grounded = true;
+        }
+    }
+
+    return true;
+}
+
