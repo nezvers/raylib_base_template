@@ -5,6 +5,8 @@
 #include "platformer_constants.h"
 #include "common_types.h"
 #include "platformer_physics.h"
+#include "stddef.h"
+
 
 // represents each level
 typedef struct {

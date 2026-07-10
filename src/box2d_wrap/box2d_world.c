@@ -1,4 +1,5 @@
 #include "box2d_wrap.h"
+#include <stddef.h>
 
 void WorldContextInit(
     WorldContext *ctx,
