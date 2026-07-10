@@ -21,7 +21,7 @@ void WorldContextDraw(WorldContext *ctx, b2DebugDraw *debug_draw) {
     b2World_Draw(ctx->world, debug_draw);
 }
 
-void WorldContextCleanup(WorldContext *ctx) {
+void WorldContextDestroy(WorldContext *ctx) {
     if (!b2World_IsValid(ctx->world)) { return; }
     ctx->time = 0;
     b2DestroyWorld(ctx->world);

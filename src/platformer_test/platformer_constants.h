@@ -1,0 +1,13 @@
+#ifndef PLATFORMER_CONSTANTS_H
+#define PLATFORMER_CONSTANTS_H
+
+#include "common_types.h"
+
+#define JUMP_FORCE 550
+#define SPEED_MAX 400
+#define ACCELERATION 600
+#define DEACCELERATION 800
+#define GRAVITY -1000
+#define JUMP_COUNT 2
+
+#endif // PLATFORMER_CONSTANTS_H

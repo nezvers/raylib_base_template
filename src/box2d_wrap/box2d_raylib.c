@@ -24,6 +24,7 @@ static void DrawSolidPolygonFcn( b2Transform transform, const b2Vec2* vertices, 
     for (int i = 0; i < vertexCount; i += 1) {
         b2Vec2 v = b2RotateVector(transform.q, vertices[i]);
         buffer[i] = Vector2Add(*(Vector2*)& v, *(Vector2*)& transform.p);
+        buffer[i].y *= -1.f;
     }
     // TODO: potentially have more than 2x triangles
     DrawTriangle(buffer[0], buffer[1], buffer[2], rl_color);
@@ -51,7 +52,7 @@ static void DrawSolidCapsuleFcn( b2Vec2 p1, b2Vec2 p2, float radius, b2HexColor 
     DrawCircleV((Vector2){p2.x, -p2.y}, radius, rl_color);
     // TODO: Draw with polygon, potentially rotates
     // TODO: check that p1 is on top
-    DrawRectangleRec((Rectangle){p1.x-radius, -p1.y, radius * 2, p1.y - p2.y}, rl_color);
+    DrawRectangleRec((Rectangle){p2.x-radius, -p2.y, radius * 2, p2.y - p1.y}, rl_color);
 }
 
 static void DrawSegmentFcn( b2Vec2 p1, b2Vec2 p2, b2HexColor color, void* context ) {
@@ -88,5 +89,7 @@ b2DebugDraw Box2dRaylibDebugDraw() {
     result.DrawStringFcn = DrawStringFcn;
     result.DrawTransformFcn = DrawTransformFcn;
     result.DrawPointFcn = DrawPointFcn;
+    result.drawShapes = true;
+    result.useDrawingBounds = false;
     return result;
 }

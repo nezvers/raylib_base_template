@@ -34,7 +34,7 @@ void WorldContextInit(
 
 void WorldContextUpdate(WorldContext *ctx, float delta_time);
 void WorldContextDraw(WorldContext *ctx, b2DebugDraw *debug_draw);
-void WorldContextCleanup(WorldContext *ctx);
+void WorldContextDestroy(WorldContext *ctx);
 
 // BODY
 b2BodyId BodyCreate(
@@ -93,6 +93,7 @@ b2ShapeId ShapeCreateCapsule(
 );
 
 // Utils
+b2DebugDraw Box2dRaylibDebugDraw();
 b2Vec2 b2RectanglePosition(b2Vec2 pos, b2Vec2 size);
 b2Vec2 b2PositionForRectangle(b2Vec2 pos, b2Vec2 size);
 void BodyDestroy(b2BodyId body);

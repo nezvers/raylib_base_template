@@ -20,6 +20,15 @@
     <ClCompile Include="..\..\..\src\box2d_wrap\box2d_raylib.c">
       <Filter>box2d_wrap</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\src\platformer_test\platformer_level.c">
+      <Filter>platformer_test</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\src\platformer_test\platformer_physics.c">
+      <Filter>platformer_test</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\src\platformer_test\platformer_test.c">
+      <Filter>platformer_test</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\..\..\src\base_template.rc" />
@@ -37,6 +46,9 @@
     <Filter Include="box2d_wrap">
       <UniqueIdentifier>{45cdfe42-2e31-4cfa-b60f-577385fad4e4}</UniqueIdentifier>
     </Filter>
+    <Filter Include="platformer_test">
+      <UniqueIdentifier>{1c2d75e7-0f4d-4efb-a221-dd60315ff7e4}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\..\src\screen_state\screen_state.h">
@@ -47,6 +59,15 @@
     </ClInclude>
     <ClInclude Include="..\..\..\src\box2d_wrap\box2d_wrap.h">
       <Filter>box2d_wrap</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\src\platformer_test\platformer_constants.h">
+      <Filter>platformer_test</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\src\platformer_test\platformer_physics.h">
+      <Filter>platformer_test</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\src\platformer_test\platformer_types.h">
+      <Filter>platformer_test</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>
