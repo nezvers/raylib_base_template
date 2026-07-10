@@ -4,7 +4,9 @@
     - `projects/VS2022/raylib_game.sln`
 - VS Code:
     - GCC or Mingw available on PATH
-    - `code projects/VSCode` + open workspace
+    - open root directory
+    - Install Microsoft C/C++ extensions
+    - F5 to build
 
 -----------------------------------
 _DISCLAIMER:_
