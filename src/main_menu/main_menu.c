@@ -176,10 +176,9 @@ static void Gui()
                 &fullscreenChecked);
     y += 24.0f + gap;
 
-    // -- ToggleGroup: row of mutually-exclusive buttons; writes selected
-    //    index into &activeTab. "\n" separates the labels.
+    // -- ToggleGroup: row of mutually-exclusive buttons; writes selected index into &activeTab. ";" separates the labels horizontally, "\n" seperates vertically.
     GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h },
-                   "Easy\nNormal\nHard", &activeTab);
+                   "Easy;Normal;Hard", &activeTab);
     y += h + gap;
     GuiLabel((Rectangle){ x, y, w, 20.0f },
              TextFormat("Difficulty index: %i", activeTab));
