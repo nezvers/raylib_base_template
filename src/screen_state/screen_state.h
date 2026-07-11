@@ -12,6 +12,7 @@ typedef struct {
     Rectangle source_rect;
     Rectangle dest_rect;
     RenderTexture2D target;
+    float resize_ratio;
     Color clear_color;
 } ScreenState;
 
@@ -26,5 +27,6 @@ void ScreenStateCleanup();
 
 
 Vector2 ScreenStateTargetSize();
+Vector2 Screen2Target(Vector2 pos);
 
 #endif // SCREEN_STATE_H
