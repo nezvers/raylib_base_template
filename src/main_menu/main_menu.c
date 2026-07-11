@@ -161,12 +161,16 @@ static void Draw()
 static void Gui()
 {
     // Layout anchored to the real window size (not game space).
-    float screenW = (float)GetScreenWidth();
-    float x = screenW - 260.0f;   // right-hand column
-    float y = 120.0f;
+    ScreenState *ss = ScreenStateGet();
+    Rectangle vp = ss->dest_rect;   // game region in REAL screen pixels
+    
+    float screenW = vp.x + vp.width/vp.y;
+    float x = vp.x + vp.width - 260.0f;   // right edge of the GAME region
+    float y = vp.y + 120.0f;              // top of the GAME region + margin
     float w = 220.0f;
     float h = 36.0f;
     float gap = 12.0f;
+    
 
     // -- Label: static text, no interaction ----------------------------------
     GuiLabel((Rectangle){ x, y, w, h }, "--- raygui widgets ---");
