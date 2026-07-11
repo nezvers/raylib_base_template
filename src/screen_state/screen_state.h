@@ -12,6 +12,7 @@ typedef struct {
     Rectangle source_rect;
     Rectangle dest_rect;
     RenderTexture2D target;
+    float resize_ratio;
     Color clear_color;
 } ScreenState;
 
@@ -25,10 +26,8 @@ void ScreenStateDrawTarget();
 void ScreenStateCleanup();
 
 
+Vector2 ScreenStateSize();
 Vector2 ScreenStateTargetSize();
-
-// need to solve screen state pos to game state pos
-Vector2 ScreenStateMouseGame();
-Vector2 ScreenStatePosToGame(Vector2);
+Vector2 Screen2Target(Vector2 pos);
 
 #endif // SCREEN_STATE_H

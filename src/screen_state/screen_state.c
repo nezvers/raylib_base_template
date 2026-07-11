@@ -28,15 +28,15 @@ void ScreenStateResize() {
 
     switch(state.viewport_type){
         case KEEP_ASPECT:{
-            KeepAspectCentered(state.width, state.height, state.game_width, state.game_height, &state.source_rect, &state.dest_rect);
+            state.resize_ratio = KeepAspectCentered(state.width, state.height, state.game_width, state.game_height, &state.source_rect, &state.dest_rect);
             break;
         }
         case KEEP_HEIGHT:{
-            KeepHeightCentered(state.width, state.height, state.game_width, state.game_height, &state.source_rect, &state.dest_rect);
+            state.resize_ratio = KeepHeightCentered(state.width, state.height, state.game_width, state.game_height, &state.source_rect, &state.dest_rect);
             break;
         }
         case KEEP_WIDTH:{
-            KeepWidthCentered(state.width, state.height, state.game_width, state.game_height, &state.source_rect, &state.dest_rect);
+            state.resize_ratio = KeepWidthCentered(state.width, state.height, state.game_width, state.game_height, &state.source_rect, &state.dest_rect);
             break;
         }
     }
@@ -47,10 +47,17 @@ void ScreenStateResize() {
     state.target = LoadRenderTexture(state.source_rect.width, -state.source_rect.height);
     // Nearest Neighbour color interpolation
     SetTextureFilter(state.target.texture, TEXTURE_FILTER_POINT);
+
+    // in case game size has changed
+    SetWindowMinSize(state.game_width, state.game_height);
 }
 
 Vector2 ScreenStateTargetSize() {
     return (Vector2){state.source_rect.width, -state.source_rect.height};
+}
+
+Vector2 ScreenStateSize() {
+    return (Vector2){state.width, state.height};
 }
 
 void ScreenStateCleanup() {
@@ -61,17 +68,8 @@ void ScreenStateDrawTarget(){
         DrawTexturePro(state.target.texture, state.source_rect, state.dest_rect, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
 }
 
-Vector2 ScreenStateMouseGame(){
-    Vector2 pos_mouse = GetMousePosition();
-    return (Vector2){
-        (pos_mouse.x - state.dest_rect.x) / state.dest_rect.width  * state.source_rect.width,
-        (pos_mouse.y - state.dest_rect.y) / state.dest_rect.height * (-state.source_rect.height)
-    };
-}
-
-Vector2 ScreenStatePosToGame(Vector2 _pos_screen){
-    return (Vector2){
-        (_pos_screen.x - state.dest_rect.x) / state.dest_rect.width  * state.source_rect.width,
-        (_pos_screen.y - state.dest_rect.y) / state.dest_rect.height * (-state.source_rect.height)
-    };
+Vector2 Screen2Target(Vector2 pos) {
+    Vector2 relative_pos = {pos.x - state.dest_rect.x, pos.y - state.dest_rect.y};
+    Vector2 scaled_position = {relative_pos.x / state.resize_ratio, relative_pos.y / state.resize_ratio};
+    return scaled_position;
 }
