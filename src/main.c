@@ -7,6 +7,7 @@
 #include <stdio.h>                          // Required for: printf()
 
 #include "screen_state/screen_state.h"
+#include "settings_state/settings_state.h"
 #include "app_state/app_state.h"
 
 
@@ -31,6 +32,7 @@ int main(void)
     ScreenState *screen_state = ScreenStateGet();
     // TODO: place to load screen settings
     ScreenStateReset();
+    SettingsReset();    // global user options (gui_scale, ...) -> SettingsGet()
     SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE | FLAG_BORDERLESS_WINDOWED_MODE);
 
     InitWindow(screen_state->width, screen_state->height, "raylib gamejam template");

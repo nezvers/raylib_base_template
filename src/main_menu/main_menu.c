@@ -11,6 +11,7 @@
 #include "raylib.h"
 #include "../app_state/app_state.h"
 #include "../screen_state/screen_state.h"
+#include "../settings_state/settings_state.h"
 #include <stddef.h>
 #include <math.h>
 
@@ -39,6 +40,7 @@ extern AppState app_state_platformer;
 static float musicVolume = 0.5f;        // driven by a GuiSlider
 static bool fullscreenChecked = false;  // driven by a GuiCheckBox
 static int activeTab = 0;               // driven by a GuiToggleGroup
+static int guiScaleTab = 0;             // GUI Scale toggle: 0=Small(1x) 1=Medium(2x) 2=Large(3x)
 static float animTime = 0.0f;           // accumulates for the animation demo
 
 static void DrawZoomBox(float cx, float cy, Vector2 size, float t)
@@ -164,13 +166,60 @@ static void Gui()
     ScreenState *ss = ScreenStateGet();
     Rectangle vp = ss->dest_rect;   // game region in REAL screen pixels
     
-    float screenW = vp.x + vp.width/vp.y;
-    float x = vp.x + vp.width - 260.0f;   // right edge of the GAME region
-    float y = vp.y + 120.0f;              // top of the GAME region + margin
-    float w = 220.0f;
-    float h = 36.0f;
-    float gap = 12.0f;
-    
+    // -- GUI scale: DESIRED vs EFFECTIVE -------------------------------------
+    // guiScaleTab (set by the toggle below) is what the user WANTS: 0/1/2.
+    // The desired scale is a whole number (1/2/3) so the bitmap font stays
+    // crisp - raygui's default font is a 10px atlas that only renders sharply
+    // at whole multiples of baseSize (10, 20, 30...); fractional sizes blur.
+    Settings *settings = SettingsGet();
+    const float scales[3] = { 1.0f, 2.0f, 3.0f };
+    int desired = (int)scales[guiScaleTab];   // 1, 2 or 3
+
+    // The column is a fixed stack, so its total height is LINEAR in the scale:
+    // total(s) = LAYOUT_UNITS * s. We pick the largest whole scale (<= desired)
+    // that fits (see below) so the last widget is always reachable. If the user
+    // picked Large but only Medium fits now, we render Medium; a taller window
+    // (fullscreen) re-runs this every frame and restores Large automatically.
+    const float game_top_margin = 120.0f;  // clears the game-space title when contained
+    const float screen_margin   = 20.0f;    // margin when expanded to the full window
+    // Height of the whole column at s=1. It's the sum of every "y +=" advance
+    // below plus the final row's own height. If you ADD/REMOVE a widget, update
+    // this: label48 +play48 +options48 +quit60 +vollbl22 +slider32 +check32
+    //        +difftog48 +difflbl32 +scalelbl20 +scaletog36 = 426.
+    const float LAYOUT_UNITS = 426.0f;
+
+    // Prefer to CONTAIN the column in the game region, anchored below the title.
+    // If it's too tall for that, EXPAND to use the whole window height (anchored
+    // near the screen top). Only shrink the scale when it won't fit even that,
+    // so the last widget is always on-screen and clickable.
+    float contained_top = vp.y + game_top_margin;
+    float fit_contained = vp.height - game_top_margin - screen_margin;
+    float fit_expanded  = ss->height - 2.0f*screen_margin;
+    int effective = desired;
+    while (effective > 1 &&
+           LAYOUT_UNITS * effective > fit_contained &&
+           LAYOUT_UNITS * effective > fit_expanded) effective--;
+
+    // Pick the anchor for the chosen scale: stay contained if it fits there,
+    // otherwise expand to the screen top.
+    float col_top = (LAYOUT_UNITS * effective <= fit_contained)
+                        ? contained_top
+                        : screen_margin;
+
+    float s = (float)effective;
+    settings->gui_scale = s;   // publish the ACTUAL rendered scale to the singleton
+
+    int baseSize = GuiGetFont().baseSize;             // 10 for the default font
+    GuiSetStyle(DEFAULT, TEXT_SIZE, baseSize * effective); // crisp glyphs at every preset
+    GuiSetIconScale(effective);                            // icons scale by the same step
+
+    float w = 220.0f * s;                 // widget sizes grow with the scale so
+    float h = 36.0f  * s;                 // the boxes match the bigger font
+    float gap = 12.0f * s;
+    float rh = 20.0f * s;                  // short-row height (labels/slider/checkbox)
+    float x = vp.x + vp.width - w - 40.0f; // anchor by the SCALED width, 40px margin
+    float y = col_top;                     // top of the column (computed above)
+
 
     // -- Label: static text, no interaction ----------------------------------
     GuiLabel((Rectangle){ x, y, w, h }, "--- raygui widgets ---");
@@ -199,21 +248,34 @@ static void Gui()
     y += h + gap*2.0f;
 
     // -- Slider: writes a float into &musicVolume between min and max ---------
-    GuiLabel((Rectangle){ x, y, w, 20.0f }, TextFormat("Volume: %.0f%%", musicVolume*100.0f));
-    y += 22.0f;
+    GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Volume: %.0f%%", musicVolume*100.0f));
+    y += rh + 2.0f*s;
 
-    GuiSlider((Rectangle){ x + 10.0f, y, w - 20.0f, 20.0f }, "0", "100", &musicVolume, 0.0f, 1.0f);
-    y += 20.0f + gap;
+    GuiSlider((Rectangle){ x + 10.0f*s, y, w - 20.0f*s, rh }, "0", "100", &musicVolume, 0.0f, 1.0f);
+    y += rh + gap;
 
     // -- CheckBox: toggles the bool at &fullscreenChecked --------------------
-    GuiCheckBox((Rectangle){ x, y, 24.0f, 24.0f }, "Fullscreen (wip)", &fullscreenChecked);
-    y += 24.0f + gap;
+    GuiCheckBox((Rectangle){ x, y, rh, rh }, "Fullscreen (wip)", &fullscreenChecked);
+    y += rh + gap;
 
     // -- ToggleGroup: row of mutually-exclusive buttons; writes selected index into &activeTab. ";" separates the labels horizontally, "\n" seperates vertically.
     GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h }, "Easy;Normal;Hard", &activeTab);
     y += h + gap;
 
-    GuiLabel((Rectangle){ x, y, w, 20.0f }, TextFormat("Difficulty index: %i", activeTab));
+    GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Difficulty index: %i", activeTab));
+    y += rh + gap;
+
+    // -- GUI Scale: the toggle only records the user's WISH in guiScaleTab.
+    // The top of Gui() reads it, clamps to what fits, and publishes the actual
+    // scale to settings->gui_scale. If the pick doesn't fit, show which size is
+    // actually rendering so the mismatch (e.g. picked Large, showing Medium) is
+    // visible rather than silent.
+    const char *names[3] = { "Small", "Medium", "Large" };
+    GuiLabel((Rectangle){ x, y, w, rh },
+             effective == desired ? "GUI Scale:"
+                                  : TextFormat("GUI Scale: (%s fits)", names[effective - 1]));
+    y += rh;
+    GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h }, "Small;Medium;Large", &guiScaleTab);
 
     // -- Hint (drawn with plain raylib text, also screen space) --------------
     DrawText("Press ENTER or click PLAY to start", 20, 20, 20, RAYWHITE);
