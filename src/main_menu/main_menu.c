@@ -138,9 +138,16 @@ static void Draw()
     DrawCircle((int)cx, (int)(cy + 120.0f + bob), 30.0f, ORANGE);
     DrawCircleLines((int)cx, (int)(cy + 120.0f + bob), 30.0f, RAYWHITE);
 
+    // DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y),20, (int)size.y - 60, 20, GRAY);
+
     // -- Mouse input in GAME space.
     Vector2 pos_mouse = Screen2Target(GetMousePosition());
     DrawCircleLines((int)pos_mouse.x, (int)pos_mouse.y, 12.0f, LIME);
+
+    float screenW = (float)GetScreenWidth();
+    float screenH = (float)GetScreenHeight();
+
+    DrawText(TextFormat("size(screen): %.0f, %.0f; size(game): %.0f, %.0f", size.x, size.y, screenW, screenH),20, (int)size.y - 90, 20, GRAY);
     DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y),20, (int)size.y - 60, 20, GRAY);
 
     // -- FPS + timing readout ------------------------------------------------
