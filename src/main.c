@@ -39,9 +39,7 @@ int main(void)
     SetMasterVolume(100.0);
     
     // TODO: Load resources / Initialize variables at this point
-    // extern AppState app_state_platformer;             // original: launch platformer
-    // AppStateTransition(&app_state_platformer);
-    extern AppState app_state_main_menu;                  // learning demo: main menu
+    // Check app_state.h for "public" AppStates
     AppStateTransition(&app_state_main_menu);
     
 

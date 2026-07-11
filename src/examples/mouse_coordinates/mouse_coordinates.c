@@ -9,7 +9,7 @@ static void Update();
 static void Exit();
 static void Draw();
                                /* Enter, Exit, Update, Draw, Gui, "Name" */
-AppState app_mouse_test = {Enter, Exit, Update, Draw, NULL, "Placeholder"};
+AppState app_mouse_coordinates = {Enter, Exit, Update, Draw, NULL, "Placeholder"};
 
 static void Enter(){
 
