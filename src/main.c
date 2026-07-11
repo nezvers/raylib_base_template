@@ -39,8 +39,10 @@ int main(void)
     SetMasterVolume(100.0);
     
     // TODO: Load resources / Initialize variables at this point
-    extern AppState app_state_platformer;
-    AppStateTransition(&app_state_platformer);
+    // extern AppState app_state_platformer;             // original: launch platformer
+    // AppStateTransition(&app_state_platformer);
+    extern AppState app_state_main_menu;                  // learning demo: main menu
+    AppStateTransition(&app_state_main_menu);
     
 
 #if defined(PLATFORM_WEB)

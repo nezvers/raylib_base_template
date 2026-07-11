@@ -60,3 +60,18 @@ void ScreenStateCleanup() {
 void ScreenStateDrawTarget(){
         DrawTexturePro(state.target.texture, state.source_rect, state.dest_rect, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
 }
+
+Vector2 ScreenStateMouseGame(){
+    Vector2 pos_mouse = GetMousePosition();
+    return (Vector2){
+        (pos_mouse.x - state.dest_rect.x) / state.dest_rect.width  * state.source_rect.width,
+        (pos_mouse.y - state.dest_rect.y) / state.dest_rect.height * (-state.source_rect.height)
+    };
+}
+
+Vector2 ScreenStatePosToGame(Vector2 _pos_screen){
+    return (Vector2){
+        (_pos_screen.x - state.dest_rect.x) / state.dest_rect.width  * state.source_rect.width,
+        (_pos_screen.y - state.dest_rect.y) / state.dest_rect.height * (-state.source_rect.height)
+    };
+}

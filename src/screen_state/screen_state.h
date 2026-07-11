@@ -27,4 +27,8 @@ void ScreenStateCleanup();
 
 Vector2 ScreenStateTargetSize();
 
+// need to solve screen state pos to game state pos
+Vector2 ScreenStateMouseGame();
+Vector2 ScreenStatePosToGame(Vector2);
+
 #endif // SCREEN_STATE_H
