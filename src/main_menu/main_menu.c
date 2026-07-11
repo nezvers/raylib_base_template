@@ -35,11 +35,23 @@ AppState app_state_main_menu = {Enter, Exit, Update, Draw, Gui, "MainMenu"};
 // between states from inside a state.
 extern AppState app_state_platformer;
 
-// --- Demo widget values (persist across frames -> file-scope statics) --------
+// --- widget values (persist across frames -> file-scope statics) --------
 static float musicVolume = 0.5f;        // driven by a GuiSlider
 static bool fullscreenChecked = false;  // driven by a GuiCheckBox
 static int activeTab = 0;               // driven by a GuiToggleGroup
 static float animTime = 0.0f;           // accumulates for the animation demo
+
+static void DrawZoomBox(float cx, float cy, Vector2 size, float t)
+{
+    float t_min = 0.05f;          // matches db_w/db_h = size * 0.05
+    if (t < t_min) return;        // don't draw until it's grown past the distant box
+
+    float W = size.x * t;
+    float H = size.y * t;
+    unsigned char a = (unsigned char)(255.0f * (1.0f - t));
+    Color c = { 130, 150, 180, a };
+    DrawRectangleLines((int)(cx - W*0.5f), (int)(cy - H*0.5f), (int)W, (int)H, c);
+}
 
 // ----------------------------------------------------------------------------
 //  Enter: called once when the state becomes active (via AppStateTransition).
@@ -86,13 +98,13 @@ static void Draw()
     float cx = size.x*0.5f;                   // horizontal center
     float cy = size.y*0.5f;                   // vertical center
 
-    // -- Header Text: DrawText(text, x, y, fontSize, color) -------------------------
+    // -- Header Text: DrawText(text, x, y, fontSize, color) -----------------------
     const char *title = "MAIN MENU";
     int titleSize = 60;
     int titleWidth = MeasureText(title, titleSize);   // width in pixels
     DrawText(title, (int)(cx - titleWidth*0.5f), 80, titleSize, RAYWHITE);
 
-    // -- Sub-Text: DrawText(text, x, y, fontSize, color) -------------------------
+    // -- Sub-Text -----------------------------------------------------------------
     const char *descr = "place of all the buttons";
     int descrSize = 20;
     int descrWidth = MeasureText(descr, descrSize);   // width in pixels
@@ -100,11 +112,26 @@ static void Draw()
 
     // -- Rectangles ----------------------------------------------------------
     DrawRectangle((int)(cx - 200.0f), 170, 400, 4, SKYBLUE);            // filled
-    DrawRectangleLines((int)(cx - 210.0f), 160, 420, 320, DARKGRAY);   // outline
+
+    // a zooming rectangle
+    float db_w = size.x * 0.05f;
+    float db_h = size.y * 0.05f;
+    DrawRectangleLines((int)(cx - (int)(db_w/2)), (int)(cy - (int)(db_h/2)), (int)db_w, (int)db_h, DARKGRAY);
+
+    float period = 5.0f;
+    float base_t = fmodf(animTime, period) / period;   // 0 → 1 loop
+
+    int   N = 3;                                        // how many boxes
+    for (int i = 0; i < N; i++)
+    {
+        float t = fmodf(base_t + (float)i / N, 1.0f);  // stagger by 1/N each
+        DrawZoomBox(cx, cy, size, t);
+    }
 
     // -- Lines ---------------------------------------------------------------
     DrawLine(0, 0, (int)size.x, (int)size.y, (Color){ 60, 70, 90, 255 });
     DrawLine((int)size.x, 0, 0, (int)size.y, (Color){ 60, 70, 90, 255 });
+
 
     // -- Animation: a circle bobbing up/down using sinf + accumulated time ---
     float bob = sinf(animTime*2.0f)*40.0f;    // -40..+40 pixels
@@ -112,14 +139,12 @@ static void Draw()
     DrawCircleLines((int)cx, (int)(cy + 120.0f + bob), 30.0f, RAYWHITE);
 
     // -- Mouse input in GAME space.
-    Vector2 pos_mouse = ScreenStateMouseGame();
+    Vector2 pos_mouse = Screen2Target(GetMousePosition());
     DrawCircleLines((int)pos_mouse.x, (int)pos_mouse.y, 12.0f, LIME);
-    DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y),
-             20, (int)size.y - 60, 20, GRAY);
+    DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y),20, (int)size.y - 60, 20, GRAY);
 
     // -- FPS + timing readout ------------------------------------------------
-    DrawText(TextFormat("GetTime(): %.1fs   FPS: %i", GetTime(), GetFPS()),
-             20, (int)size.y - 30, 20, GRAY);
+    DrawText(TextFormat("GetTime(): %.1fs   FPS: %i", GetTime(), GetFPS()), 20, (int)size.y - 30, 20, GRAY);
 }
 
 // ----------------------------------------------------------------------------
@@ -158,30 +183,26 @@ static void Gui()
     if (GuiButton((Rectangle){ x, y, w, h }, "QUIT"))
     {
         // Requesting exit: closes the window; the main loop's WindowShouldClose()
-        // then returns true and the program shuts down cleanly.
         CloseWindow();
     }
     y += h + gap*2.0f;
 
     // -- Slider: writes a float into &musicVolume between min and max ---------
-    GuiLabel((Rectangle){ x, y, w, 20.0f },
-             TextFormat("Volume: %.0f%%", musicVolume*100.0f));
+    GuiLabel((Rectangle){ x, y, w, 20.0f }, TextFormat("Volume: %.0f%%", musicVolume*100.0f));
     y += 22.0f;
-    GuiSlider((Rectangle){ x + 10.0f, y, w - 20.0f, 20.0f },
-              "0", "100", &musicVolume, 0.0f, 1.0f);
+
+    GuiSlider((Rectangle){ x + 10.0f, y, w - 20.0f, 20.0f }, "0", "100", &musicVolume, 0.0f, 1.0f);
     y += 20.0f + gap;
 
     // -- CheckBox: toggles the bool at &fullscreenChecked --------------------
-    GuiCheckBox((Rectangle){ x, y, 24.0f, 24.0f }, "Fullscreen (demo flag)",
-                &fullscreenChecked);
+    GuiCheckBox((Rectangle){ x, y, 24.0f, 24.0f }, "Fullscreen (wip)", &fullscreenChecked);
     y += 24.0f + gap;
 
     // -- ToggleGroup: row of mutually-exclusive buttons; writes selected index into &activeTab. ";" separates the labels horizontally, "\n" seperates vertically.
-    GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h },
-                   "Easy;Normal;Hard", &activeTab);
+    GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h }, "Easy;Normal;Hard", &activeTab);
     y += h + gap;
-    GuiLabel((Rectangle){ x, y, w, 20.0f },
-             TextFormat("Difficulty index: %i", activeTab));
+
+    GuiLabel((Rectangle){ x, y, w, 20.0f }, TextFormat("Difficulty index: %i", activeTab));
 
     // -- Hint (drawn with plain raylib text, also screen space) --------------
     DrawText("Press ENTER or click PLAY to start", 20, 20, 20, RAYWHITE);
