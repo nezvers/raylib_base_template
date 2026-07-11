@@ -56,6 +56,10 @@ Vector2 ScreenStateTargetSize() {
     return (Vector2){state.source_rect.width, -state.source_rect.height};
 }
 
+Vector2 ScreenStateSize() {
+    return (Vector2){state.width, state.height};
+}
+
 void ScreenStateCleanup() {
     UnloadRenderTexture(state.target);
 }

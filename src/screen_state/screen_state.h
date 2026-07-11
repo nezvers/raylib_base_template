@@ -26,6 +26,7 @@ void ScreenStateDrawTarget();
 void ScreenStateCleanup();
 
 
+Vector2 ScreenStateSize();
 Vector2 ScreenStateTargetSize();
 Vector2 Screen2Target(Vector2 pos);
 
