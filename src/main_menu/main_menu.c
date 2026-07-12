@@ -32,10 +32,10 @@ static void Gui();
                             /* Enter, Exit, Update, Draw, Gui, "Name" */
 AppState app_state_main_menu = {Enter, Exit, Update, Draw, Gui, "MainMenu"};
 
-// The platformer state already exists (platformer_test.c). We reach it by
-// extern so the "Play" button can transition into it - this is how you move
-// between states from inside a state.
-extern AppState app_state_platformer;
+// PLAY now hands off to the transition state (transition_state.c), which plays
+// the fade/zoom/crumble animation and THEN transitions into the platformer.
+// app_state_transition is declared extern in app_state.h, so no local extern is
+// needed here - this is how you move between states from inside a state.
 
 // --- widget values (persist across frames -> file-scope statics) --------
 // Volume, difficulty AND the GUI-scale wish now all live in the Settings singleton
@@ -97,7 +97,7 @@ static void Update()
     // Keyboard input example: ENTER also starts the game.
     if (IsKeyPressed(KEY_ENTER))
     {
-        AppStateTransition(&app_state_platformer);
+        AppStateTransition(&app_state_transition);
     }
 
     // ESC: on the OPTIONS page it returns to MAIN; on MAIN it quits the app.
@@ -162,7 +162,7 @@ static void Draw()
 
     // -- Lines ---------------------------------------------------------------
     DrawLine(0, 0, (int)game_size.x, (int)game_size.y, (Color){ 60, 70, 90, 255 });
-    DrawLine((int)game_size.x, 0, -1, (int)game_size.y, (Color){ 60, 70, 90, 255 });
+    DrawLine((int)game_size.x, 0, -0, (int)game_size.y, (Color){ 60, 70, 90, 255 });
 
 
     // -- Animation: a circle bobbing up/down using sinf + accumulated time ---
@@ -239,7 +239,7 @@ static void Gui()
     float s = (float)effective;
     settings->gui_scale = s;   // publish the ACTUAL rendered scale to the singleton
 
-    int baseSize = GuiGetFont().baseSize;             // 10 for the default font
+    int baseSize = GuiGetFont().baseSize;                  // 10 for the default font
     GuiSetStyle(DEFAULT, TEXT_SIZE, baseSize * effective); // crisp glyphs at every preset
     GuiSetIconScale(effective);                            // icons scale by the same step
 
@@ -266,9 +266,9 @@ static void Gui()
         if (GuiButton((Rectangle){ x, y, w, h }, "PLAY (-> platformer)"))
         {
             AudioPlayButton();
-            // Transition to another state. Exit() of this state runs, then the
-            // platformer's Enter(). This is the core of switching screens.
-            AppStateTransition(&app_state_platformer);
+            // Hand off to the transition state, which plays the animation and then
+            // enters the platformer. Our Exit() runs, then the transition's Enter().
+            AppStateTransition(&app_state_transition);
         }
         y += h + gap;
 
