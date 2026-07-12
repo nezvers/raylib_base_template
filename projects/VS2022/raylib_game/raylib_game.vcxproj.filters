@@ -29,6 +29,18 @@
     <ClCompile Include="..\..\..\src\platformer_test\platformer_test.c">
       <Filter>platformer_test</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\src\audio_state\audio_state.c">
+      <Filter>audio_state</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\src\input\input.c">
+      <Filter>input</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\src\main_menu\main_menu.c">
+      <Filter>main_menu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\src\settings_state\settings_state.c">
+      <Filter>settings_state</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\..\..\src\base_template.rc" />
@@ -49,6 +61,21 @@
     <Filter Include="platformer_test">
       <UniqueIdentifier>{1c2d75e7-0f4d-4efb-a221-dd60315ff7e4}</UniqueIdentifier>
     </Filter>
+    <Filter Include="examples">
+      <UniqueIdentifier>{85a4eed5-daa3-44cb-b3c1-9eb41dc65a01}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="audio_state">
+      <UniqueIdentifier>{883112c5-2a27-4ec9-a7e2-52c0487a0162}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="input">
+      <UniqueIdentifier>{69a0d445-cf1a-40cc-8779-9a3161113127}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="main_menu">
+      <UniqueIdentifier>{c016b78c-bd70-4352-8d95-043b831cd6d7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="settings_state">
+      <UniqueIdentifier>{06ef77a5-8a56-4cc7-89e1-7cc4511f9104}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\..\src\screen_state\screen_state.h">
@@ -68,6 +95,15 @@
     </ClInclude>
     <ClInclude Include="..\..\..\src\platformer_test\platformer_types.h">
       <Filter>platformer_test</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\src\audio_state\audio_state.h">
+      <Filter>audio_state</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\src\input\input.h">
+      <Filter>input</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\src\settings_state\settings_state.h">
+      <Filter>settings_state</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>
