@@ -33,10 +33,12 @@ int main(void)
     // TODO: place to load screen settings
     ScreenStateReset();
     SettingsReset();    // global user options (gui_scale, ...) -> SettingsGet()
-    SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE | FLAG_BORDERLESS_WINDOWED_MODE);
+    SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE);
 
     InitWindow(screen_state->width, screen_state->height, "raylib gamejam template");
     ScreenStateResize();
+    SettingsLoad();     // override defaults from settings.cfg if it exists
+    SettingsApplyWindowMode(SettingsGet()->window_mode);   // apply saved/default mode
     InitAudioDevice();
     SetMasterVolume(100.0);
     
@@ -52,10 +54,13 @@ int main(void)
 
     // Main game loop
     // Detect window close button
-    while (!WindowShouldClose()) {
+    // Exit on the window close button OR a state's quit request (see app_state.h).
+    while (!WindowShouldClose() && !AppStateShouldQuit()) {
         UpdateDrawFrame();
     }
 #endif
+
+    if (SettingsGet()->persist) SettingsSave();   // remember options for next launch
 
     ScreenStateCleanup();
     // TODO: Unload all loaded resources at this point

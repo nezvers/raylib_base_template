@@ -4,6 +4,11 @@
 static AppState APP_STATE_EMPTY;
 AppState* current_app_state = &APP_STATE_EMPTY;
 
+static bool quit_requested = false;
+
+void AppStateRequestQuit() { quit_requested = true; }
+bool AppStateShouldQuit()  { return quit_requested; }
+
 void AppStateTransition(AppState* value){
     if (value == NULL) {
         current_app_state = &APP_STATE_EMPTY;

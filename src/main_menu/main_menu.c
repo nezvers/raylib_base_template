@@ -15,9 +15,9 @@
 #include <stddef.h>
 #include <math.h>
 
-// raygui lives in src/include/ (on the include path). Its implementation must
-// be compiled EXACTLY ONCE in the whole project - we do it here. If you add
-// this same #define to another .c you will get duplicate-symbol link errors.
+// raygui lives in src/include/ (on the include path). 
+// Its implementation must be compiled EXACTLY ONCE in the whole project - we do it here. 
+// If you add this same #define to another .c you will get duplicate-symbol link errors.
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
 
@@ -37,9 +37,10 @@ AppState app_state_main_menu = {Enter, Exit, Update, Draw, Gui, "MainMenu"};
 extern AppState app_state_platformer;
 
 // --- widget values (persist across frames -> file-scope statics) --------
-static float musicVolume = 0.5f;        // driven by a GuiSlider
-static bool fullscreenChecked = false;  // driven by a GuiCheckBox
-static int activeTab = 0;               // driven by a GuiToggleGroup
+// Volume and difficulty now live in the Settings singleton (settings->music_volume,
+// settings->difficulty) so they're global and persist on quit; the widgets below
+// bind straight to them. guiScaleTab stays local: it's a "wish" that Gui() clamps
+// to what fits before publishing the effective scale to settings->gui_scale.
 static int guiScaleTab = 0;             // GUI Scale toggle: 0=Small(1x) 1=Medium(2x) 2=Large(3x)
 static float animTime = 0.0f;           // accumulates for the animation demo
 
@@ -64,6 +65,14 @@ static void Enter()
     ScreenState *screenState = ScreenStateGet();
     screenState->clear_color = (Color){ 25, 30, 40, 255 };  // dark blue-gray
     animTime = 0.0f;
+
+    // Seed the GUI-scale toggle from the (possibly loaded) singleton. gui_scale is
+    // the effective scale 1/2/3; the toggle wants an index 0/1/2. Without this the
+    // toggle defaults to Small and Gui() would overwrite a persisted gui_scale.
+    int idx = (int)SettingsGet()->gui_scale - 1;   // 1.0->0, 2.0->1, 3.0->2
+    if (idx < 0) idx = 0;
+    if (idx > 2) idx = 2;
+    guiScaleTab = idx;
 }
 
 // ----------------------------------------------------------------------------
@@ -168,30 +177,26 @@ static void Gui()
     
     // -- GUI scale: DESIRED vs EFFECTIVE -------------------------------------
     // guiScaleTab (set by the toggle below) is what the user WANTS: 0/1/2.
-    // The desired scale is a whole number (1/2/3) so the bitmap font stays
-    // crisp - raygui's default font is a 10px atlas that only renders sharply
-    // at whole multiples of baseSize (10, 20, 30...); fractional sizes blur.
+    // The desired scale is a whole number (1/2/3) so the bitmap font stays crisp
+    // raygui's default font is a 10px atlas that only renders sharply at whole multiples of baseSize (10, 20, 30...); fractional sizes blur.
     Settings *settings = SettingsGet();
     const float scales[3] = { 1.0f, 2.0f, 3.0f };
     int desired = (int)scales[guiScaleTab];   // 1, 2 or 3
 
     // The column is a fixed stack, so its total height is LINEAR in the scale:
-    // total(s) = LAYOUT_UNITS * s. We pick the largest whole scale (<= desired)
-    // that fits (see below) so the last widget is always reachable. If the user
-    // picked Large but only Medium fits now, we render Medium; a taller window
-    // (fullscreen) re-runs this every frame and restores Large automatically.
+    // total(s) = LAYOUT_UNITS * s. 
+    // We pick the largest whole scale (<= desired) that fits (see below) so the last widget is always reachable. 
+    // If the user picked Large but only Medium fits now, we render Medium; a taller window (fullscreen) re-runs this every frame and restores Large automatically.
     const float game_top_margin = 120.0f;  // clears the game-space title when contained
     const float screen_margin   = 20.0f;    // margin when expanded to the full window
-    // Height of the whole column at s=1. It's the sum of every "y +=" advance
-    // below plus the final row's own height. If you ADD/REMOVE a widget, update
-    // this: label48 +play48 +options48 +quit60 +vollbl22 +slider32 +check32
-    //        +difftog48 +difflbl32 +scalelbl20 +scaletog36 = 426.
-    const float LAYOUT_UNITS = 426.0f;
+    // Height of the whole column at s=1. It's the sum of every "y +=" advance below plus the final row's own height. 
+    // If you ADD/REMOVE a widget, update this manual calc of gui height:
+    // label48 +play48 +options48 +quit60 +vollbl22 +slider32 +modelbl20 +modetog48 +persist32 +difftog48 +difflbl32 +scalelbl20 +scaletog36 = 494.
+    const float LAYOUT_UNITS = 494.0f;
 
     // Prefer to CONTAIN the column in the game region, anchored below the title.
-    // If it's too tall for that, EXPAND to use the whole window height (anchored
-    // near the screen top). Only shrink the scale when it won't fit even that,
-    // so the last widget is always on-screen and clickable.
+    // If it's too tall for that, EXPAND to use the whole window height (anchored near the screen top). 
+    // Only shrink the scale when it won't fit even that, so the last widget is always on-screen and clickable.
     float contained_top = vp.y + game_top_margin;
     float fit_contained = vp.height - game_top_margin - screen_margin;
     float fit_expanded  = ss->height - 2.0f*screen_margin;
@@ -200,11 +205,11 @@ static void Gui()
            LAYOUT_UNITS * effective > fit_contained &&
            LAYOUT_UNITS * effective > fit_expanded) effective--;
 
-    // Pick the anchor for the chosen scale: stay contained if it fits there,
-    // otherwise expand to the screen top.
-    float col_top = (LAYOUT_UNITS * effective <= fit_contained)
+    // Pick the anchor for the chosen scale: stay below the title when it fits the game region; otherwise vertically CENTER it in the full window.
+    float col_h = LAYOUT_UNITS * effective;
+    float col_top = (col_h <= fit_contained)
                         ? contained_top
-                        : screen_margin;
+                        : (ss->height - col_h) * 0.5f;
 
     float s = (float)effective;
     settings->gui_scale = s;   // publish the ACTUAL rendered scale to the singleton
@@ -242,34 +247,47 @@ static void Gui()
 
     if (GuiButton((Rectangle){ x, y, w, h }, "QUIT"))
     {
-        // Requesting exit: closes the window; the main loop's WindowShouldClose()
-        CloseWindow();
+        // Ask to exit. Do NOT call CloseWindow() here: we're mid-frame inside Gui()
+        // and that would destroy the GL context under us (segfault). main.c sees
+        // the request at the top of the next loop and shuts down cleanly.
+        AppStateRequestQuit();
     }
     y += h + gap*2.0f;
 
     // -- Slider: writes a float into &musicVolume between min and max ---------
-    GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Volume: %.0f%%", musicVolume*100.0f));
+    GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Volume: %.0f%%", settings->music_volume*100.0f));
     y += rh + 2.0f*s;
 
-    GuiSlider((Rectangle){ x + 10.0f*s, y, w - 20.0f*s, rh }, "0", "100", &musicVolume, 0.0f, 1.0f);
+    GuiSlider((Rectangle){ x + 10.0f*s, y, w - 20.0f*s, rh }, "0", "100", &settings->music_volume, 0.0f, 1.0f);
     y += rh + gap;
 
-    // -- CheckBox: toggles the bool at &fullscreenChecked --------------------
-    GuiCheckBox((Rectangle){ x, y, rh, rh }, "Fullscreen (wip)", &fullscreenChecked);
+    // -- Window mode: 3-way selector, applied to the real window on change ----
+    // Bound directly to the singleton (window state is global, unlike gui_scale's
+    // wish-vs-effective dance). SettingsApplyWindowMode reconfigures the window
+    // and rebuilds the letterbox only when the selection actually changes.
+    GuiLabel((Rectangle){ x, y, w, rh }, "Window Mode:");
+    y += rh;
+    int prevMode = settings->window_mode;
+    int mode = prevMode;
+    GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h },
+                   "Windowed;Fullscreen;Borderless", &mode);
+    if (mode != prevMode) SettingsApplyWindowMode(mode);
+    y += h + gap;
+
+    // -- CheckBox: save settings to disk on quit (writes bool at &settings->persist)
+    GuiCheckBox((Rectangle){ x, y, rh, rh }, "Persist settings on quit", &settings->persist);
     y += rh + gap;
 
     // -- ToggleGroup: row of mutually-exclusive buttons; writes selected index into &activeTab. ";" separates the labels horizontally, "\n" seperates vertically.
-    GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h }, "Easy;Normal;Hard", &activeTab);
+    GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h }, "Easy;Normal;Hard", &settings->difficulty);
     y += h + gap;
 
-    GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Difficulty index: %i", activeTab));
+    GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Difficulty index: %i", settings->difficulty));
     y += rh + gap;
 
     // -- GUI Scale: the toggle only records the user's WISH in guiScaleTab.
-    // The top of Gui() reads it, clamps to what fits, and publishes the actual
-    // scale to settings->gui_scale. If the pick doesn't fit, show which size is
-    // actually rendering so the mismatch (e.g. picked Large, showing Medium) is
-    // visible rather than silent.
+    // The top of Gui() reads it, clamps to what fits, and publishes the actual scale to settings->gui_scale. 
+    // If the pick doesn't fit, show which size is actually rendering so the mismatch (e.g. picked Large, showing Medium) is visible rather than silent.
     const char *names[3] = { "Small", "Medium", "Large" };
     GuiLabel((Rectangle){ x, y, w, rh },
              effective == desired ? "GUI Scale:"

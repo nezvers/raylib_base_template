@@ -83,3 +83,5 @@ android.*
 *box2d/benchmark/
 *box2d/docs/
 *box2d/samples/
+
+settings.cfg
