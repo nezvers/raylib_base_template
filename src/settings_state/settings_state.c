@@ -1,6 +1,7 @@
 #include "settings_state.h"
 #include "raylib.h"
 #include "../screen_state/screen_state.h"
+#include "../audio_state/audio_state.h"
 #include <stdio.h>
 
 #define SETTINGS_FILE "settings.cfg"
@@ -18,6 +19,10 @@ void SettingsReset() {
     state.music_volume = 0.5f;
     state.difficulty = 0;
     state.persist = false;
+
+    // Settings orchestrates the layer below it: reset its subsystems to defaults too.
+    ScreenStateReset();
+    AudioStateReset();
 }
 
 void SettingsSave() {
@@ -59,6 +64,8 @@ bool SettingsLoad() {
     if (state.gui_scale_wish < 0 || state.gui_scale_wish > 2) state.gui_scale_wish = 0;
     if (state.music_volume < 0.0f) state.music_volume = 0.0f;
     if (state.music_volume > 1.0f) state.music_volume = 1.0f;
+
+    ScreenStateLoad();   // load any persisted screen state (no-op today)
     return true;
 }
 
@@ -72,7 +79,7 @@ void SettingsApplyWindowMode(int mode) {
     switch (mode) {
         case WINDOW_MODE_WINDOWED: {
             ScreenState *ss = ScreenStateGet();
-            SetWindowSize(ss->game_width, ss->game_height);  // back to 1280x720
+            SetWindowSize(ss->width, ss->height);  // back to 1280x720
             break;
         }
         case WINDOW_MODE_FULLSCREEN: {
@@ -91,4 +98,27 @@ void SettingsApplyWindowMode(int mode) {
 
     state.window_mode = mode;
     ScreenStateResize();  // rebuild letterbox/render-texture for the new size
+}
+
+// What window mode the ACTUAL window is currently in, so SettingsApply can
+// reapply the stored mode only when reality disagrees (avoids re-toggling
+// fullscreen/borderless -> visible flicker on every settings change).
+static int CurrentActualWindowMode() {
+    if (IsWindowFullscreen()) return WINDOW_MODE_FULLSCREEN;
+    if (IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE)) return WINDOW_MODE_BORDERLESS;
+    return WINDOW_MODE_WINDOWED;
+}
+
+void SettingsApplyVolume() {
+    SetMasterVolume(state.music_volume);   // single owner of the volume push
+}
+
+void SettingsApply() {
+    SettingsApplyVolume();   // always cheap, no flicker
+
+    if (state.window_mode != CurrentActualWindowMode()) {
+        SettingsApplyWindowMode(state.window_mode);   // also rebuilds letterbox
+    } else {
+        ScreenStateResize();   // mode already correct; still rebuild for boot / gui_scale
+    }
 }

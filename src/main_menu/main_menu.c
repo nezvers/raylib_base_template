@@ -310,7 +310,7 @@ static void Gui()
         GuiSlider((Rectangle){ x + 10.0f*s, y, w - 20.0f*s, rh }, "0", "100", &settings->music_volume, 0.0f, 1.0f);
         // Slider writes straight into the singleton; push it to the audio engine every frame so the change is immediately audible.
         // Play the "huh" preview when the level actually changed (already at the new volume, so the user hears it).
-        SetMasterVolume(settings->music_volume);
+        SettingsApplyVolume();
         if (settings->music_volume != prevVol) AudioPlayVolumePreview();
         y += rh + gap;
 

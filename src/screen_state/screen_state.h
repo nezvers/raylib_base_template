@@ -21,6 +21,7 @@ enum ViewportType {KEEP_ASPECT, KEEP_HEIGHT, KEEP_WIDTH};
 ScreenState *ScreenStateGet();
 void ScreenStateSet(ScreenState *value);
 void ScreenStateReset();
+void ScreenStateLoad();     // override defaults from disk (no-op today; part of Reset->Load->Apply lifecycle)
 void ScreenStateResize();
 void ScreenStateDrawTarget();
 void ScreenStateCleanup();
