@@ -12,6 +12,7 @@
 #include "../app_state/app_state.h"
 #include "../screen_state/screen_state.h"
 #include "../settings_state/settings_state.h"
+#include "../audio_state/audio_state.h"
 #include <stddef.h>
 #include <math.h>
 
@@ -233,6 +234,7 @@ static void Gui()
     // -- Button: returns non-zero (true) on click ----------------------------
     if (GuiButton((Rectangle){ x, y, w, h }, "PLAY (-> platformer)"))
     {
+        AudioPlayButton();
         // Transition to another state. Exit() of this state runs, then the
         // platformer's Enter(). This is the core of switching screens.
         AppStateTransition(&app_state_platformer);
@@ -241,15 +243,17 @@ static void Gui()
 
     if (GuiButton((Rectangle){ x, y, w, h }, "OPTIONS (no-op)"))
     {
+        AudioPlayButton();
         // Placeholder: a real menu would transition to an options state.
     }
     y += h + gap;
 
     if (GuiButton((Rectangle){ x, y, w, h }, "QUIT"))
     {
+        AudioPlayButton();
         // Ask to exit. Do NOT call CloseWindow() here: we're mid-frame inside Gui()
-        // and that would destroy the GL context under us (segfault). main.c sees
-        // the request at the top of the next loop and shuts down cleanly.
+        // and that would destroy the GL context under us (segfault). 
+        // main.c sees the request at the top of the next loop and shuts down cleanly.
         AppStateRequestQuit();
     }
     y += h + gap*2.0f;
@@ -258,28 +262,38 @@ static void Gui()
     GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Volume: %.0f%%", settings->music_volume*100.0f));
     y += rh + 2.0f*s;
 
+    float prevVol = settings->music_volume;   // snapshot to detect a drag this frame
     GuiSlider((Rectangle){ x + 10.0f*s, y, w - 20.0f*s, rh }, "0", "100", &settings->music_volume, 0.0f, 1.0f);
+    // Slider writes straight into the singleton; push it to the audio engine every frame so the change is immediately audible. 
+    // Play the "huh" preview when the level actually changed (already at the new volume, so the user hears it).
+    SetMasterVolume(settings->music_volume);
+    if (settings->music_volume != prevVol) AudioPlayVolumePreview();
     y += rh + gap;
 
     // -- Window mode: 3-way selector, applied to the real window on change ----
-    // Bound directly to the singleton (window state is global, unlike gui_scale's
-    // wish-vs-effective dance). SettingsApplyWindowMode reconfigures the window
-    // and rebuilds the letterbox only when the selection actually changes.
+    // Bound directly to the singleton (window state is global, unlike gui_scale's wish-vs-effective dance). 
+    // SettingsApplyWindowMode reconfigures the window and rebuilds the letterbox only when the selection actually changes.
     GuiLabel((Rectangle){ x, y, w, rh }, "Window Mode:");
     y += rh;
     int prevMode = settings->window_mode;
     int mode = prevMode;
     GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h },
                    "Windowed;Fullscreen;Borderless", &mode);
-    if (mode != prevMode) SettingsApplyWindowMode(mode);
+    if (mode != prevMode) {
+        AudioPlayButton();
+        SettingsApplyWindowMode(mode);
+    }
     y += h + gap;
 
     // -- CheckBox: save settings to disk on quit (writes bool at &settings->persist)
-    GuiCheckBox((Rectangle){ x, y, rh, rh }, "Persist settings on quit", &settings->persist);
+    if (GuiCheckBox((Rectangle){ x, y, rh, rh }, "Persist settings on quit", &settings->persist))
+        AudioPlayButton();
     y += rh + gap;
 
     // -- ToggleGroup: row of mutually-exclusive buttons; writes selected index into &activeTab. ";" separates the labels horizontally, "\n" seperates vertically.
+    int prevDiff = settings->difficulty;
     GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h }, "Easy;Normal;Hard", &settings->difficulty);
+    if (settings->difficulty != prevDiff) AudioPlayButton();
     y += h + gap;
 
     GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Difficulty index: %i", settings->difficulty));
@@ -293,7 +307,9 @@ static void Gui()
              effective == desired ? "GUI Scale:"
                                   : TextFormat("GUI Scale: (%s fits)", names[effective - 1]));
     y += rh;
+    int prevScaleTab = guiScaleTab;
     GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h }, "Small;Medium;Large", &guiScaleTab);
+    if (guiScaleTab != prevScaleTab) AudioPlayButton();
 
     // -- Hint (drawn with plain raylib text, also screen space) --------------
     DrawText("Press ENTER or click PLAY to start", 20, 20, 20, RAYWHITE);
