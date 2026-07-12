@@ -19,7 +19,8 @@ typedef enum {
 } WindowMode;
 
 typedef struct {
-    float gui_scale;      // 1.0 = default; multiplies raygui font/icon/widget sizes
+    int gui_scale_wish;   // user's GUI-scale pick: 0=Small 1=Medium 2=Large (persisted)
+    float gui_scale;      // runtime EFFECTIVE scale 1/2/3 (clamped to fit; recomputed, not persisted)
     int window_mode;      // one of WindowMode; default WINDOW_MODE_WINDOWED
     float music_volume;   // 0.0..1.0; drives master volume (SetMasterVolume)
     int difficulty;       // 0=Easy 1=Normal 2=Hard

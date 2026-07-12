@@ -12,7 +12,8 @@ Settings *SettingsGet() {
 }
 
 void SettingsReset() {
-    state.gui_scale = 1.0f;
+    state.gui_scale_wish = 0;   // Small
+    state.gui_scale = 1.0f;     // effective; recomputed each frame
     state.window_mode = WINDOW_MODE_WINDOWED;
     state.music_volume = 0.5f;
     state.difficulty = 0;
@@ -22,7 +23,7 @@ void SettingsReset() {
 void SettingsSave() {
     FILE *f = fopen(SETTINGS_FILE, "w");
     if (f == NULL) return;
-    fprintf(f, "gui_scale %f\n",    state.gui_scale);
+    fprintf(f, "gui_scale_wish %d\n", state.gui_scale_wish);  // persist the WISH, not effective
     fprintf(f, "window_mode %d\n",  state.window_mode);
     fprintf(f, "music_volume %f\n", state.music_volume);
     fprintf(f, "difficulty %d\n",   state.difficulty);
@@ -37,7 +38,7 @@ bool SettingsLoad() {
     // Read known keys; anything missing/malformed just keeps its default value.
     char key[64];
     while (fscanf(f, "%63s", key) == 1) {
-        if      (TextIsEqual(key, "gui_scale"))    fscanf(f, "%f", &state.gui_scale);
+        if      (TextIsEqual(key, "gui_scale_wish")) fscanf(f, "%d", &state.gui_scale_wish);
         else if (TextIsEqual(key, "window_mode"))  fscanf(f, "%d", &state.window_mode);
         else if (TextIsEqual(key, "music_volume")) fscanf(f, "%f", &state.music_volume);
         else if (TextIsEqual(key, "difficulty"))   fscanf(f, "%d", &state.difficulty);
@@ -55,6 +56,7 @@ bool SettingsLoad() {
         state.window_mode = WINDOW_MODE_WINDOWED;
     }
     if (state.difficulty < 0 || state.difficulty > 2) state.difficulty = 0;
+    if (state.gui_scale_wish < 0 || state.gui_scale_wish > 2) state.gui_scale_wish = 0;
     if (state.music_volume < 0.0f) state.music_volume = 0.0f;
     if (state.music_volume > 1.0f) state.music_volume = 1.0f;
     return true;

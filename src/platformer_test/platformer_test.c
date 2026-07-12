@@ -33,6 +33,10 @@ static void Exit(){
 
 static void Update(){
     LevelUpdate();
+
+    // ESC quits. main.c disabled raylib's default ESC=quit (SetExitKey(KEY_NULL))
+    // so each state owns ESC; request a clean shutdown via the app-state flag.
+    if (IsKeyPressed(KEY_ESCAPE)) AppStateRequestQuit();
 }
 
 static void Draw(){

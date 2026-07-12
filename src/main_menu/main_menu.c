@@ -38,12 +38,16 @@ AppState app_state_main_menu = {Enter, Exit, Update, Draw, Gui, "MainMenu"};
 extern AppState app_state_platformer;
 
 // --- widget values (persist across frames -> file-scope statics) --------
-// Volume and difficulty now live in the Settings singleton (settings->music_volume,
-// settings->difficulty) so they're global and persist on quit; the widgets below
-// bind straight to them. guiScaleTab stays local: it's a "wish" that Gui() clamps
-// to what fits before publishing the effective scale to settings->gui_scale.
-static int guiScaleTab = 0;             // GUI Scale toggle: 0=Small(1x) 1=Medium(2x) 2=Large(3x)
+// Volume, difficulty AND the GUI-scale wish now all live in the Settings singleton
+// (settings->music_volume / ->difficulty / ->gui_scale_wish), so they're global and
+// persist on quit; the widgets below bind straight to them.
 static float animTime = 0.0f;           // accumulates for the animation demo
+
+// The menu shows one of two pages (contexts) at a time. MAIN has the top-level
+// buttons; OPTIONS has BACK + all the settings widgets. The OPTIONS button switches
+// to OPTIONS; BACK or ESC returns to MAIN (ESC handled in Update()).
+typedef enum { MENU_PAGE_MAIN = 0, MENU_PAGE_OPTIONS } MenuPage;
+static MenuPage menuPage = MENU_PAGE_MAIN;
 
 static void DrawZoomBox(float cx, float cy, Vector2 size, float t)
 {
@@ -66,14 +70,10 @@ static void Enter()
     ScreenState *screenState = ScreenStateGet();
     screenState->clear_color = (Color){ 25, 30, 40, 255 };  // dark blue-gray
     animTime = 0.0f;
+    menuPage = MENU_PAGE_MAIN;   // always open on the main page
 
-    // Seed the GUI-scale toggle from the (possibly loaded) singleton. gui_scale is
-    // the effective scale 1/2/3; the toggle wants an index 0/1/2. Without this the
-    // toggle defaults to Small and Gui() would overwrite a persisted gui_scale.
-    int idx = (int)SettingsGet()->gui_scale - 1;   // 1.0->0, 2.0->1, 3.0->2
-    if (idx < 0) idx = 0;
-    if (idx > 2) idx = 2;
-    guiScaleTab = idx;
+    // No GUI-scale seeding needed: the wish lives in settings->gui_scale_wish, loaded
+    // at startup and bound directly to the toggle below.
 }
 
 // ----------------------------------------------------------------------------
@@ -98,6 +98,22 @@ static void Update()
     if (IsKeyPressed(KEY_ENTER))
     {
         AppStateTransition(&app_state_platformer);
+    }
+
+    // ESC: on the OPTIONS page it returns to MAIN; on MAIN it quits the app.
+    // main.c disabled raylib's default ESC=quit (SetExitKey(KEY_NULL)) so we can own
+    // it here - otherwise WindowShouldClose() would latch ESC and exit before Update().
+    if (IsKeyPressed(KEY_ESCAPE))
+    {
+        if (menuPage == MENU_PAGE_OPTIONS)
+        {
+            AudioPlayButton();
+            menuPage = MENU_PAGE_MAIN;
+        }
+        else
+        {
+            AppStateRequestQuit();
+        }
     }
 }
 
@@ -177,12 +193,12 @@ static void Gui()
     Rectangle vp = ss->dest_rect;   // game region in REAL screen pixels
     
     // -- GUI scale: DESIRED vs EFFECTIVE -------------------------------------
-    // guiScaleTab (set by the toggle below) is what the user WANTS: 0/1/2.
+    // settings->gui_scale_wish is what the user WANTS: 0/1/2 (persisted).
     // The desired scale is a whole number (1/2/3) so the bitmap font stays crisp
     // raygui's default font is a 10px atlas that only renders sharply at whole multiples of baseSize (10, 20, 30...); fractional sizes blur.
     Settings *settings = SettingsGet();
     const float scales[3] = { 1.0f, 2.0f, 3.0f };
-    int desired = (int)scales[guiScaleTab];   // 1, 2 or 3
+    int desired = (int)scales[settings->gui_scale_wish];   // 1, 2 or 3
 
     // The column is a fixed stack, so its total height is LINEAR in the scale:
     // total(s) = LAYOUT_UNITS * s. 
@@ -190,10 +206,13 @@ static void Gui()
     // If the user picked Large but only Medium fits now, we render Medium; a taller window (fullscreen) re-runs this every frame and restores Large automatically.
     const float game_top_margin = 120.0f;  // clears the game-space title when contained
     const float screen_margin   = 20.0f;    // margin when expanded to the full window
-    // Height of the whole column at s=1. It's the sum of every "y +=" advance below plus the final row's own height. 
-    // If you ADD/REMOVE a widget, update this manual calc of gui height:
-    // label48 +play48 +options48 +quit60 +vollbl22 +slider32 +modelbl20 +modetog48 +persist32 +difftog48 +difflbl32 +scalelbl20 +scaletog36 = 494.
-    const float LAYOUT_UNITS = 494.0f;
+    // Height of the active page's column at s=1: the sum of every "y +=" advance below
+    // (for that page) plus the final row's own height. Each page fits/scales on its own.
+    // If you ADD/REMOVE a widget on a page, update its manual calc of gui height here:
+    //   MAIN:    label48 +play48 +options48 +quit36 = 180.
+    //   OPTIONS: back48 +vollbl22 +slider32 +modelbl20 +modetog48 +persist32
+    //            +difftog48 +difflbl32 +scalelbl20 +scaletog36 = 338.
+    const float LAYOUT_UNITS = (menuPage == MENU_PAGE_MAIN) ? 180.0f : 338.0f;
 
     // Prefer to CONTAIN the column in the game region, anchored below the title.
     // If it's too tall for that, EXPAND to use the whole window height (anchored near the screen top). 
@@ -227,90 +246,111 @@ static void Gui()
     float y = col_top;                     // top of the column (computed above)
 
 
-    // -- Label: static text, no interaction ----------------------------------
-    GuiLabel((Rectangle){ x, y, w, h }, "--- raygui widgets ---");
-    y += h + gap;
-
-    // -- Button: returns non-zero (true) on click ----------------------------
-    if (GuiButton((Rectangle){ x, y, w, h }, "PLAY (-> platformer)"))
+    // ========================================================================
+    //  The menu has two PAGES (contexts). Same anchored column, different body.
+    //  MAIN = top-level buttons; OPTIONS = BACK + all settings widgets. Clicking
+    //  OPTIONS switches to the OPTIONS page; BACK / ESC returns to MAIN.
+    // ========================================================================
+    if (menuPage == MENU_PAGE_MAIN)
     {
-        AudioPlayButton();
-        // Transition to another state. Exit() of this state runs, then the
-        // platformer's Enter(). This is the core of switching screens.
-        AppStateTransition(&app_state_platformer);
-    }
-    y += h + gap;
+        // -- Label: static text, no interaction ------------------------------
+        GuiLabel((Rectangle){ x, y, w, h }, "--- raygui widgets ---");
+        y += h + gap;
 
-    if (GuiButton((Rectangle){ x, y, w, h }, "OPTIONS (no-op)"))
+        // -- Button: returns non-zero (true) on click ------------------------
+        if (GuiButton((Rectangle){ x, y, w, h }, "PLAY (-> platformer)"))
+        {
+            AudioPlayButton();
+            // Transition to another state. Exit() of this state runs, then the
+            // platformer's Enter(). This is the core of switching screens.
+            AppStateTransition(&app_state_platformer);
+        }
+        y += h + gap;
+
+        // -- OPTIONS: switch this state to its OPTIONS page (no state change) -
+        if (GuiButton((Rectangle){ x, y, w, h }, "OPTIONS"))
+        {
+            AudioPlayButton();
+            menuPage = MENU_PAGE_OPTIONS;
+        }
+        y += h + gap;
+
+        if (GuiButton((Rectangle){ x, y, w, h }, "QUIT"))
+        {
+            AudioPlayButton();
+            // Ask to exit. Do NOT call CloseWindow() here: we're mid-frame inside Gui()
+            // and that would destroy the GL context under us (segfault).
+            // main.c sees the request at the top of the next loop and shuts down cleanly.
+            AppStateRequestQuit();
+        }
+
+        // -- Hint (drawn with plain raylib text, also screen space) ----------
+        DrawText("Press ENTER or click PLAY to start", 20, 20, 20, RAYWHITE);
+    }
+    else // MENU_PAGE_OPTIONS
     {
-        AudioPlayButton();
-        // Placeholder: a real menu would transition to an options state.
+        // -- BACK: return to the MAIN page (same as ESC, see Update) ----------
+        if (GuiButton((Rectangle){ x, y, w, h }, "< BACK"))
+        {
+            AudioPlayButton();
+            menuPage = MENU_PAGE_MAIN;
+        }
+        y += h + gap;
+
+        // -- Slider: writes a float into &music_volume between min and max ----
+        GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Volume: %.0f%%", settings->music_volume*100.0f));
+        y += rh + 2.0f*s;
+
+        float prevVol = settings->music_volume;   // snapshot to detect a drag this frame
+        GuiSlider((Rectangle){ x + 10.0f*s, y, w - 20.0f*s, rh }, "0", "100", &settings->music_volume, 0.0f, 1.0f);
+        // Slider writes straight into the singleton; push it to the audio engine every frame so the change is immediately audible.
+        // Play the "huh" preview when the level actually changed (already at the new volume, so the user hears it).
+        SetMasterVolume(settings->music_volume);
+        if (settings->music_volume != prevVol) AudioPlayVolumePreview();
+        y += rh + gap;
+
+        // -- Window mode: 3-way selector, applied to the real window on change -
+        // Bound directly to the singleton (window state is global, unlike gui_scale's wish-vs-effective dance).
+        // SettingsApplyWindowMode reconfigures the window and rebuilds the letterbox only when the selection actually changes.
+        GuiLabel((Rectangle){ x, y, w, rh }, "Window Mode:");
+        y += rh;
+        int prevMode = settings->window_mode;
+        int mode = prevMode;
+        GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h },
+                       "Windowed;Fullscreen;Borderless", &mode);
+        if (mode != prevMode) {
+            AudioPlayButton();
+            SettingsApplyWindowMode(mode);
+        }
+        y += h + gap;
+
+        // -- CheckBox: save settings to disk on quit (writes bool at &settings->persist)
+        if (GuiCheckBox((Rectangle){ x, y, rh, rh }, "Persist settings on quit", &settings->persist))
+            AudioPlayButton();
+        y += rh + gap;
+
+        // -- ToggleGroup: row of mutually-exclusive buttons; writes selected index into &activeTab. ";" separates the labels horizontally, "\n" seperates vertically.
+        int prevDiff = settings->difficulty;
+        GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h }, "Easy;Normal;Hard", &settings->difficulty);
+        if (settings->difficulty != prevDiff) AudioPlayButton();
+        y += h + gap;
+
+        GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Difficulty index: %i", settings->difficulty));
+        y += rh + gap;
+
+        // -- GUI Scale: the toggle records the user's WISH in settings->gui_scale_wish.
+        // The top of Gui() reads it, clamps to what fits, and publishes the actual scale to settings->gui_scale.
+        // If the pick doesn't fit, show which size is actually rendering so the mismatch (e.g. picked Large, showing Medium) is visible rather than silent.
+        const char *names[3] = { "Small", "Medium", "Large" };
+        GuiLabel((Rectangle){ x, y, w, rh },
+                 effective == desired ? "GUI Scale:"
+                                      : TextFormat("GUI Scale: (%s fits)", names[effective - 1]));
+        y += rh;
+        int prevScaleWish = settings->gui_scale_wish;
+        GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h }, "Small;Medium;Large", &settings->gui_scale_wish);
+        if (settings->gui_scale_wish != prevScaleWish) AudioPlayButton();
+
+        // -- Hint: how to leave this page ------------------------------------
+        DrawText("Press ESC or click BACK to return", 20, 20, 20, RAYWHITE);
     }
-    y += h + gap;
-
-    if (GuiButton((Rectangle){ x, y, w, h }, "QUIT"))
-    {
-        AudioPlayButton();
-        // Ask to exit. Do NOT call CloseWindow() here: we're mid-frame inside Gui()
-        // and that would destroy the GL context under us (segfault). 
-        // main.c sees the request at the top of the next loop and shuts down cleanly.
-        AppStateRequestQuit();
-    }
-    y += h + gap*2.0f;
-
-    // -- Slider: writes a float into &musicVolume between min and max ---------
-    GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Volume: %.0f%%", settings->music_volume*100.0f));
-    y += rh + 2.0f*s;
-
-    float prevVol = settings->music_volume;   // snapshot to detect a drag this frame
-    GuiSlider((Rectangle){ x + 10.0f*s, y, w - 20.0f*s, rh }, "0", "100", &settings->music_volume, 0.0f, 1.0f);
-    // Slider writes straight into the singleton; push it to the audio engine every frame so the change is immediately audible. 
-    // Play the "huh" preview when the level actually changed (already at the new volume, so the user hears it).
-    SetMasterVolume(settings->music_volume);
-    if (settings->music_volume != prevVol) AudioPlayVolumePreview();
-    y += rh + gap;
-
-    // -- Window mode: 3-way selector, applied to the real window on change ----
-    // Bound directly to the singleton (window state is global, unlike gui_scale's wish-vs-effective dance). 
-    // SettingsApplyWindowMode reconfigures the window and rebuilds the letterbox only when the selection actually changes.
-    GuiLabel((Rectangle){ x, y, w, rh }, "Window Mode:");
-    y += rh;
-    int prevMode = settings->window_mode;
-    int mode = prevMode;
-    GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h },
-                   "Windowed;Fullscreen;Borderless", &mode);
-    if (mode != prevMode) {
-        AudioPlayButton();
-        SettingsApplyWindowMode(mode);
-    }
-    y += h + gap;
-
-    // -- CheckBox: save settings to disk on quit (writes bool at &settings->persist)
-    if (GuiCheckBox((Rectangle){ x, y, rh, rh }, "Persist settings on quit", &settings->persist))
-        AudioPlayButton();
-    y += rh + gap;
-
-    // -- ToggleGroup: row of mutually-exclusive buttons; writes selected index into &activeTab. ";" separates the labels horizontally, "\n" seperates vertically.
-    int prevDiff = settings->difficulty;
-    GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h }, "Easy;Normal;Hard", &settings->difficulty);
-    if (settings->difficulty != prevDiff) AudioPlayButton();
-    y += h + gap;
-
-    GuiLabel((Rectangle){ x, y, w, rh }, TextFormat("Difficulty index: %i", settings->difficulty));
-    y += rh + gap;
-
-    // -- GUI Scale: the toggle only records the user's WISH in guiScaleTab.
-    // The top of Gui() reads it, clamps to what fits, and publishes the actual scale to settings->gui_scale. 
-    // If the pick doesn't fit, show which size is actually rendering so the mismatch (e.g. picked Large, showing Medium) is visible rather than silent.
-    const char *names[3] = { "Small", "Medium", "Large" };
-    GuiLabel((Rectangle){ x, y, w, rh },
-             effective == desired ? "GUI Scale:"
-                                  : TextFormat("GUI Scale: (%s fits)", names[effective - 1]));
-    y += rh;
-    int prevScaleTab = guiScaleTab;
-    GuiToggleGroup((Rectangle){ x, y, (w - gap*2.0f)/3.0f, h }, "Small;Medium;Large", &guiScaleTab);
-    if (guiScaleTab != prevScaleTab) AudioPlayButton();
-
-    // -- Hint (drawn with plain raylib text, also screen space) --------------
-    DrawText("Press ENTER or click PLAY to start", 20, 20, 20, RAYWHITE);
 }

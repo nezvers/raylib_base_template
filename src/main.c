@@ -37,6 +37,7 @@ int main(void)
     SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE);
 
     InitWindow(screen_state->width, screen_state->height, "raylib gamejam template");
+    SetExitKey(KEY_NULL);   // disable ESC=quit; states own ESC (main menu: Options->Main, else quit)
     ScreenStateResize();
     SettingsLoad();     // override defaults from settings.cfg if it exists
     SettingsApplyWindowMode(SettingsGet()->window_mode);   // apply saved/default mode
