@@ -42,6 +42,7 @@ add_git_dependency(
 
 # Our Project
 add_executable(${PROJECT_NAME})
+set_property(TARGET ${PROJECT_NAME} PROPERTY C_STANDARD 99)
 add_subdirectory(src)
 include_directories(${CMAKE_SOURCE_DIR}/src/include)
 
