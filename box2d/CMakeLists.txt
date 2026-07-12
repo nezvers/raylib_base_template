@@ -100,35 +100,35 @@ if(PROJECT_IS_TOP_LEVEL)
 	# Tests need static linkage because they test internal Box2D functions
 	if(NOT BUILD_SHARED_LIBS AND BOX2D_UNIT_TESTS)
 		message(STATUS "Adding Box2D unit tests")
-		add_subdirectory(test)
-		set_target_properties(test PROPERTIES XCODE_GENERATE_SCHEME TRUE)
+		# add_subdirectory(test)
+		# set_target_properties(test PROPERTIES XCODE_GENERATE_SCHEME TRUE)
 	else()
 		message(STATUS "Skipping Box2D unit tests")
 	endif()
 
 	if(BOX2D_SAMPLES)
-		add_subdirectory(samples)
+		# add_subdirectory(samples)
 
 		# default startup project for Visual Studio
-		if(MSVC)
-			set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT samples)
-			set_property(TARGET samples PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-		endif()
+		# if(MSVC)
+		# 	set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT samples)
+		# 	set_property(TARGET samples PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+		# endif()
 
-		if(APPLE)
-			set_target_properties(samples PROPERTIES
-				XCODE_GENERATE_SCHEME TRUE
-				XCODE_SCHEME_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-		endif()
+		# if(APPLE)
+		# 	set_target_properties(samples PROPERTIES
+		# 		XCODE_GENERATE_SCHEME TRUE
+		# 		XCODE_SCHEME_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+		# endif()
 	endif()
 
 	if(BOX2D_BENCHMARKS)
-		add_subdirectory(benchmark)
-		set_target_properties(benchmark PROPERTIES XCODE_GENERATE_SCHEME TRUE)
+		# add_subdirectory(benchmark)
+		# set_target_properties(benchmark PROPERTIES XCODE_GENERATE_SCHEME TRUE)
 	endif()
 
 	if(BOX2D_DOCS)
-		add_subdirectory(docs)
+		# add_subdirectory(docs)
 	endif()
 endif()
 
