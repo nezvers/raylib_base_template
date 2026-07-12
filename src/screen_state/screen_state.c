@@ -16,8 +16,8 @@ void ScreenStateSet(ScreenState *value) {
 void ScreenStateReset() {
     state.width = 1280;
     state.height = 720;
-    state.game_width = 1280;
-    state.game_height = 720;
+    state.game_width = 1920/6;
+    state.game_height = 1080/6;
     state.viewport_type = KEEP_HEIGHT;
     state.clear_color = RAYWHITE;
 }
