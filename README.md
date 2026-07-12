@@ -1,6 +1,6 @@
 - Clone raylib next to this repository
 - Windows Visual Studio:
-    - `box2d/create_sln.bat`
+    - `vs_setup.bat`
     - `projects/VS2022/raylib_game.sln`
 - VS Code:
     - GCC or Mingw available on PATH
