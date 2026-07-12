@@ -27,10 +27,10 @@ enum PLAYER_STATE {
 
 const vec2 SPRITE_SIZE = {16, 16};
 vec2 tex_pos[] = {{0.f,0.f}, {16.f,0.f}, {32.f,0.f}, {48.f,0.f}, {64.f,0.f}, {80.f,0.f}, {96.f,0.f}, {112.f,0.f}};
-Frames anim_idle = {.data = &tex_pos[0], .count = 2, .size = (const vec2)SPRITE_SIZE};
-Frames anim_walk = {.data = &tex_pos[2], .count = 6, .size = (const vec2)SPRITE_SIZE};
-Frames anim_up =   {.data = &tex_pos[5], .count = 1, .size = (const vec2)SPRITE_SIZE};
-Frames anim_down = {.data = &tex_pos[4], .count = 1, .size = (const vec2)SPRITE_SIZE};
+Frames anim_idle = {.data = &tex_pos[0], .count = 2, .size = SPRITE_SIZE};
+Frames anim_walk = {.data = &tex_pos[2], .count = 6, .size = SPRITE_SIZE};
+Frames anim_up =   {.data = &tex_pos[5], .count = 1, .size = SPRITE_SIZE};
+Frames anim_down = {.data = &tex_pos[4], .count = 1, .size = SPRITE_SIZE};
 Frames *player_anim_list[] = {&anim_idle, &anim_walk, &anim_up, &anim_down};
 
 const AnimationSet player_animations = {
