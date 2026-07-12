@@ -22,6 +22,10 @@ void ScreenStateReset() {
     state.clear_color = RAYWHITE;
 }
 
+void ScreenStateLoad() {
+    // No persisted screen state yet; defaults from ScreenStateReset stand.
+}
+
 void ScreenStateResize() {
     state.width = GetScreenWidth();
     state.height = GetScreenHeight();

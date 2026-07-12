@@ -30,20 +30,19 @@ int main(void)
 #if !defined(_DEBUG)
     SetTraceLogLevel(LOG_NONE);         // Disable raylib trace log messages
 #endif
-    ScreenState *screen_state = ScreenStateGet();
-    // TODO: place to load screen settings
-    ScreenStateReset();
-    SettingsReset();    // global user options (gui_scale, ...) -> SettingsGet()
     SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE);
+    SettingsReset();    // defaults for Settings + Screen + Audio -> SettingsGet()
+    SettingsLoad();     // override defaults from settings.cfg (+ future screen load)
 
+    ScreenState *screen_state = ScreenStateGet();
     InitWindow(screen_state->width, screen_state->height, "raylib gamejam template");
     SetExitKey(KEY_NULL);   // disable ESC=quit; states own ESC (main menu: Options->Main, else quit)
     ScreenStateResize();
-    SettingsLoad();     // override defaults from settings.cfg if it exists
-    SettingsApplyWindowMode(SettingsGet()->window_mode);   // apply saved/default mode
+
     InitAudioDevice();
-    SetMasterVolume(SettingsGet()->music_volume);   // apply saved/default volume (0.0..1.0)
-    AudioStateLoad();   // load UI sounds once (button click, volume preview)
+    AudioStateLoad();   // load UI sounds once (needs audio device)
+
+    SettingsApply();    // apply saved/default window mode + volume + letterbox resize
     
     // TODO: Load resources / Initialize variables at this point
     // Check app_state.h for "public" AppStates

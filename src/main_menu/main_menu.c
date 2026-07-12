@@ -32,10 +32,10 @@ static void Gui();
                             /* Enter, Exit, Update, Draw, Gui, "Name" */
 AppState app_state_main_menu = {Enter, Exit, Update, Draw, Gui, "MainMenu"};
 
-// The platformer state already exists (platformer_test.c). We reach it by
-// extern so the "Play" button can transition into it - this is how you move
-// between states from inside a state.
-extern AppState app_state_platformer;
+// PLAY now hands off to the transition state (transition_state.c), which plays
+// the fade/zoom/crumble animation and THEN transitions into the platformer.
+// app_state_transition is declared extern in app_state.h, so no local extern is
+// needed here - this is how you move between states from inside a state.
 
 // --- widget values (persist across frames -> file-scope statics) --------
 // Volume, difficulty AND the GUI-scale wish now all live in the Settings singleton
@@ -97,7 +97,7 @@ static void Update()
     // Keyboard input example: ENTER also starts the game.
     if (IsKeyPressed(KEY_ENTER))
     {
-        AppStateTransition(&app_state_platformer);
+        AppStateTransition(&app_state_transition);
     }
 
     // ESC: on the OPTIONS page it returns to MAIN; on MAIN it quits the app.
@@ -118,7 +118,9 @@ static void Update()
 }
 
 // ----------------------------------------------------------------------------
-//  Draw: GAME SPACE (1280x720, scaled to the window). Raylib primitives here.
+//  Draw: GAME SPACE (canvas = ScreenStateTargetSize(), scaled to the window).
+//  Resolution-independent: all sizes/positions are fractions of game_size,
+//  so the pixelart holds at any render resolution. Raylib primitives here.
 // ----------------------------------------------------------------------------
 static void Draw()
 {
@@ -128,18 +130,20 @@ static void Draw()
 
     // -- Header Text: DrawText(text, x, y, fontSize, color) -----------------------
     const char *title = "MAIN MENU";
-    int titleSize = 60;
+    int titleSize = (int)fmaxf(1.0f, game_size.y*0.083f);
     int titleWidth = MeasureText(title, titleSize);   // width in pixels
-    DrawText(title, (int)(cx - titleWidth*0.5f), 80, titleSize, RAYWHITE);
+    DrawText(title, (int)(cx - titleWidth*0.5f), (int)(game_size.y*0.11f), titleSize, RAYWHITE);
 
     // -- Sub-Text -----------------------------------------------------------------
     const char *descr = "place of all the buttons";
-    int descrSize = 20;
+    int descrSize = (int)fmaxf(1.0f, game_size.y*0.028f);
     int descrWidth = MeasureText(descr, descrSize);   // width in pixels
-    DrawText(descr, (int)(cx - descrWidth*0.5f), 135, descrSize, RAYWHITE);
+    DrawText(descr, (int)(cx - descrWidth*0.5f), (int)(game_size.y*0.19f), descrSize, RAYWHITE);
 
     // -- Rectangles ----------------------------------------------------------
-    DrawRectangle((int)(cx - 200.0f), 170, 400, 4, SKYBLUE);            // filled
+    float bar_w = game_size.x*0.31f;
+    int   bar_h = (int)fmaxf(1.0f, game_size.y*0.006f);
+    DrawRectangle((int)(cx - bar_w*0.5f), (int)(game_size.y*0.24f), (int)bar_w, bar_h, SKYBLUE); // filled
 
     // a zooming rectangle
     float db_w = game_size.x * 0.05f;
@@ -158,27 +162,29 @@ static void Draw()
 
     // -- Lines ---------------------------------------------------------------
     DrawLine(0, 0, (int)game_size.x, (int)game_size.y, (Color){ 60, 70, 90, 255 });
-    DrawLine((int)game_size.x, 0, 0, (int)game_size.y, (Color){ 60, 70, 90, 255 });
+    DrawLine((int)game_size.x, 0, -0, (int)game_size.y, (Color){ 60, 70, 90, 255 });
 
 
     // -- Animation: a circle bobbing up/down using sinf + accumulated time ---
-    float bob = sinf(animTime*2.0f)*40.0f;    // -40..+40 pixels
-    DrawCircle((int)cx, (int)(cy + 120.0f + bob), 30.0f, ORANGE);
-    DrawCircleLines((int)cx, (int)(cy + 120.0f + bob), 30.0f, RAYWHITE);
-
-    // DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y),20, (int)size.y - 60, 20, GRAY);
+    float bob = sinf(animTime*2.0f)*(game_size.y*0.056f);   // proportional bob
+    float bob_off = game_size.y*0.17f;                       // below center
+    float bob_r   = game_size.y*0.042f;
+    DrawCircle((int)cx, (int)(cy + bob_off + bob), bob_r, ORANGE);
+    DrawCircleLines((int)cx, (int)(cy + bob_off + bob), bob_r, RAYWHITE);
 
     // -- Mouse input in GAME space.
     Vector2 pos_mouse = Screen2Target(GetMousePosition());
-    DrawCircleLines((int)pos_mouse.x, (int)pos_mouse.y, 12.0f, LIME);
+    DrawCircleLines((int)pos_mouse.x, (int)pos_mouse.y, game_size.y*0.017f, LIME);
 
     Vector2 screen_size = ScreenStateSize();
 
-    DrawText(TextFormat("size(screen): %.0f, %.0f; size(game): %.0f, %.0f", screen_size.x, screen_size.y, game_size.x, game_size.y),20, (int)game_size.y - 90, 20, GRAY);
-    DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y),20, (int)game_size.y - 60, 20, GRAY);
-
-    // -- FPS + timing readout ------------------------------------------------
-    DrawText(TextFormat("GetTime(): %.1fs   FPS: %i", GetTime(), GetFPS()), 20, (int)game_size.y - 30, 20, GRAY);
+    // -- Debug readout (bottom-left), stacked upward ------------------------
+    int   dbgSize = (int)fmaxf(1.0f, game_size.y*0.052f);
+    int   dbgPad  = (int)fmaxf(1.0f, game_size.y*0.005f);
+    float dbgX    = game_size.x*0.02f;
+    DrawText(TextFormat("size(screen): %.0f, %.0f; size(game): %.0f, %.0f", screen_size.x, screen_size.y, game_size.x, game_size.y), (int)dbgX, (int)game_size.y - (3*(dbgPad+dbgSize)), dbgSize, GRAY);
+    DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y), (int)dbgX, (int)game_size.y - (2*(dbgSize+dbgPad)), dbgSize, GRAY);
+    DrawText(TextFormat("GetTime(): %.1fs   FPS: %i", GetTime(), GetFPS()), (int)dbgX, (int)game_size.y - (dbgSize+dbgPad), dbgSize, GRAY);
 }
 
 // ----------------------------------------------------------------------------
@@ -233,7 +239,7 @@ static void Gui()
     float s = (float)effective;
     settings->gui_scale = s;   // publish the ACTUAL rendered scale to the singleton
 
-    int baseSize = GuiGetFont().baseSize;             // 10 for the default font
+    int baseSize = GuiGetFont().baseSize;                  // 10 for the default font
     GuiSetStyle(DEFAULT, TEXT_SIZE, baseSize * effective); // crisp glyphs at every preset
     GuiSetIconScale(effective);                            // icons scale by the same step
 
@@ -260,9 +266,9 @@ static void Gui()
         if (GuiButton((Rectangle){ x, y, w, h }, "PLAY (-> platformer)"))
         {
             AudioPlayButton();
-            // Transition to another state. Exit() of this state runs, then the
-            // platformer's Enter(). This is the core of switching screens.
-            AppStateTransition(&app_state_platformer);
+            // Hand off to the transition state, which plays the animation and then
+            // enters the platformer. Our Exit() runs, then the transition's Enter().
+            AppStateTransition(&app_state_transition);
         }
         y += h + gap;
 
@@ -304,7 +310,7 @@ static void Gui()
         GuiSlider((Rectangle){ x + 10.0f*s, y, w - 20.0f*s, rh }, "0", "100", &settings->music_volume, 0.0f, 1.0f);
         // Slider writes straight into the singleton; push it to the audio engine every frame so the change is immediately audible.
         // Play the "huh" preview when the level actually changed (already at the new volume, so the user hears it).
-        SetMasterVolume(settings->music_volume);
+        SettingsApplyVolume();
         if (settings->music_volume != prevVol) AudioPlayVolumePreview();
         y += rh + gap;
 

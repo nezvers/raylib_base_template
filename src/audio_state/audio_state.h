@@ -20,6 +20,7 @@ typedef struct {
 
 AudioState *AudioStateGet();   // pointer to the singleton
 
+void AudioStateReset();    // restore defaults (nothing loaded); part of the Reset->Load->Apply lifecycle
 void AudioStateLoad();     // LoadSound the wavs; call once after InitAudioDevice()
 void AudioStateUnload();   // UnloadSound; call before CloseAudioDevice()
 

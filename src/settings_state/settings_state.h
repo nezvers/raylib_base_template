@@ -35,6 +35,15 @@ void SettingsReset();      // restore defaults (gui_scale = 1.0f, windowed, no p
 // raylib's ToggleFullscreen/ToggleBorderlessWindowed are relative toggles.
 void SettingsApplyWindowMode(int mode);
 
+// Push the stored master volume (music_volume) to the audio engine.
+// Single owner of SetMasterVolume; needs InitAudioDevice() first.
+void SettingsApplyVolume();
+
+// Apply ALL stored settings to the live engine: volume (always) + window mode
+// (only when it differs from the actual window, to avoid flicker) + letterbox
+// resize. Call at boot (after window + audio init) and after any GUI change.
+void SettingsApply();
+
 // Disk persistence (plain-text file, one "key value" per line).
 void SettingsSave();   // write the singleton to disk
 bool SettingsLoad();   // read into the singleton; false if no/invalid file (defaults kept)

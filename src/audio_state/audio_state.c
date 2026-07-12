@@ -6,6 +6,10 @@ AudioState *AudioStateGet() {
     return &state;
 }
 
+void AudioStateReset() {
+    state.loaded = false;   // volume lives in Settings; nothing to reset here yet
+}
+
 void AudioStateLoad() {
     // RESOURCES_PATH is a compiler macro (see CMakeLists.txt) and 
     // it already ends in '/'; existing code uses the leading-slash form (sprite_example.c).
