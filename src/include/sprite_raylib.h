@@ -41,7 +41,7 @@ void DrawSprite(Sprite *sprite, Texture2D *texture, Color tint) {
     target_rect.x += sprite->offset.x;
     target_rect.y += sprite->offset.y;
 
-    vec2 origin = {sprite->origin.x * abs(sprite->scale.x), sprite->origin.y * abs(sprite->scale.y)};
+    vec2 origin = {sprite->origin.x * fabsf(sprite->scale.x), sprite->origin.y * fabsf(sprite->scale.y)};
 
     if (sprite->scale.x < 0.f) {
         source_rect.w *= -1;

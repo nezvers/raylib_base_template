@@ -22,6 +22,12 @@ void AppStateUpdate();
 void AppStateDraw();
 void AppStateGui();
 
+// Quit request: a state asks to exit by calling AppStateRequestQuit() instead of CloseWindow() directly. 
+// Calling CloseWindow() mid-frame (from Gui()) destroys the GL context while the frame is still rendering -> segfault. 
+// main.c polls AppStateShouldQuit() at the top of the loop and tears down once, cleanly.
+void AppStateRequestQuit();
+bool AppStateShouldQuit();
+
 /* List of "public" app states */
 extern AppState app_state_main_menu;    // learning demo: main menu
 extern AppState app_state_platformer;   // original: launch platformer
