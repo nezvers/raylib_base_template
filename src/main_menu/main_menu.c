@@ -118,7 +118,9 @@ static void Update()
 }
 
 // ----------------------------------------------------------------------------
-//  Draw: GAME SPACE (1280x720, scaled to the window). Raylib primitives here.
+//  Draw: GAME SPACE (canvas = ScreenStateTargetSize(), scaled to the window).
+//  Resolution-independent: all sizes/positions are fractions of game_size,
+//  so the pixelart holds at any render resolution. Raylib primitives here.
 // ----------------------------------------------------------------------------
 static void Draw()
 {
@@ -128,18 +130,20 @@ static void Draw()
 
     // -- Header Text: DrawText(text, x, y, fontSize, color) -----------------------
     const char *title = "MAIN MENU";
-    int titleSize = 60;
+    int titleSize = (int)fmaxf(1.0f, game_size.y*0.083f);
     int titleWidth = MeasureText(title, titleSize);   // width in pixels
-    DrawText(title, (int)(cx - titleWidth*0.5f), 80, titleSize, RAYWHITE);
+    DrawText(title, (int)(cx - titleWidth*0.5f), (int)(game_size.y*0.11f), titleSize, RAYWHITE);
 
     // -- Sub-Text -----------------------------------------------------------------
     const char *descr = "place of all the buttons";
-    int descrSize = 20;
+    int descrSize = (int)fmaxf(1.0f, game_size.y*0.028f);
     int descrWidth = MeasureText(descr, descrSize);   // width in pixels
-    DrawText(descr, (int)(cx - descrWidth*0.5f), 135, descrSize, RAYWHITE);
+    DrawText(descr, (int)(cx - descrWidth*0.5f), (int)(game_size.y*0.19f), descrSize, RAYWHITE);
 
     // -- Rectangles ----------------------------------------------------------
-    DrawRectangle((int)(cx - 200.0f), 170, 400, 4, SKYBLUE);            // filled
+    float bar_w = game_size.x*0.31f;
+    int   bar_h = (int)fmaxf(1.0f, game_size.y*0.006f);
+    DrawRectangle((int)(cx - bar_w*0.5f), (int)(game_size.y*0.24f), (int)bar_w, bar_h, SKYBLUE); // filled
 
     // a zooming rectangle
     float db_w = game_size.x * 0.05f;
@@ -158,27 +162,29 @@ static void Draw()
 
     // -- Lines ---------------------------------------------------------------
     DrawLine(0, 0, (int)game_size.x, (int)game_size.y, (Color){ 60, 70, 90, 255 });
-    DrawLine((int)game_size.x, 0, 0, (int)game_size.y, (Color){ 60, 70, 90, 255 });
+    DrawLine((int)game_size.x, 0, -1, (int)game_size.y, (Color){ 60, 70, 90, 255 });
 
 
     // -- Animation: a circle bobbing up/down using sinf + accumulated time ---
-    float bob = sinf(animTime*2.0f)*40.0f;    // -40..+40 pixels
-    DrawCircle((int)cx, (int)(cy + 120.0f + bob), 30.0f, ORANGE);
-    DrawCircleLines((int)cx, (int)(cy + 120.0f + bob), 30.0f, RAYWHITE);
-
-    // DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y),20, (int)size.y - 60, 20, GRAY);
+    float bob = sinf(animTime*2.0f)*(game_size.y*0.056f);   // proportional bob
+    float bob_off = game_size.y*0.17f;                       // below center
+    float bob_r   = game_size.y*0.042f;
+    DrawCircle((int)cx, (int)(cy + bob_off + bob), bob_r, ORANGE);
+    DrawCircleLines((int)cx, (int)(cy + bob_off + bob), bob_r, RAYWHITE);
 
     // -- Mouse input in GAME space.
     Vector2 pos_mouse = Screen2Target(GetMousePosition());
-    DrawCircleLines((int)pos_mouse.x, (int)pos_mouse.y, 12.0f, LIME);
+    DrawCircleLines((int)pos_mouse.x, (int)pos_mouse.y, game_size.y*0.017f, LIME);
 
     Vector2 screen_size = ScreenStateSize();
 
-    DrawText(TextFormat("size(screen): %.0f, %.0f; size(game): %.0f, %.0f", screen_size.x, screen_size.y, game_size.x, game_size.y),20, (int)game_size.y - 90, 20, GRAY);
-    DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y),20, (int)game_size.y - 60, 20, GRAY);
-
-    // -- FPS + timing readout ------------------------------------------------
-    DrawText(TextFormat("GetTime(): %.1fs   FPS: %i", GetTime(), GetFPS()), 20, (int)game_size.y - 30, 20, GRAY);
+    // -- Debug readout (bottom-left), stacked upward ------------------------
+    int   dbgSize = (int)fmaxf(1.0f, game_size.y*0.052f);
+    int   dbgPad  = (int)fmaxf(1.0f, game_size.y*0.005f);
+    float dbgX    = game_size.x*0.02f;
+    DrawText(TextFormat("size(screen): %.0f, %.0f; size(game): %.0f, %.0f", screen_size.x, screen_size.y, game_size.x, game_size.y), (int)dbgX, (int)game_size.y - (3*(dbgPad+dbgSize)), dbgSize, GRAY);
+    DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y), (int)dbgX, (int)game_size.y - (2*(dbgSize+dbgPad)), dbgSize, GRAY);
+    DrawText(TextFormat("GetTime(): %.1fs   FPS: %i", GetTime(), GetFPS()), (int)dbgX, (int)game_size.y - (dbgSize+dbgPad), dbgSize, GRAY);
 }
 
 // ----------------------------------------------------------------------------
