@@ -38,6 +38,13 @@ static Jumpad jumpads[20];
 static LevelContext level;
 static Actor *player; // Assigned in LevelLoad at initialization
 
+typedef void RestartFcn(void);
+static RestartFcn *restart_callback;
+void LevelSetRestartCallback(RestartFcn *callback) {
+    restart_callback = callback;
+}
+#define RESTART_FALL 200
+
 #define SIGN_F(x) ((x) > 0 ? 1 : ((x) < 0) ? -1 : 0)
 
 void LevelActorInit(Actor *actor);
@@ -67,6 +74,11 @@ void LevelUpdate() {
         player->input.jump = IsKeyDown(KEY_SPACE);
     }
     LevelActorUpdate(delta_time);
+
+    if (player->state.pos.y > RESTART_FALL) {
+        // Fell below floor
+        if (restart_callback != NULL) { restart_callback();}
+    }
 }
 
 void LevelDraw() {

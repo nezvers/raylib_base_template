@@ -83,6 +83,8 @@ static bool  paused   = false;
 static float pauseDim = 0.0f;   // 0..1 dark-overlay strength (eased toward paused)
 
 // TODO: temporary declarations
+typedef void RestartFcn(void);
+void LevelSetRestartCallback(RestartFcn *callback);
 void LevelLoad_1();
 void LevelDestroy();
 void LevelUpdate();
@@ -104,6 +106,7 @@ static void Enter(){
     screen_state->clear_color = DARKGRAY;
 
     LevelLoad_1();
+    LevelSetRestartCallback(Enter);
 
     // Kick off the "GAME ON" intro (appears, then fades out).
     SceneAnimStart(&introPlayer, &introAnim, ANIM_INTRO);
