@@ -110,10 +110,10 @@ void LevelLoad_1() {
     /* Platforms */
     level.platforms = platforms;
     level.platform_count = 4;
-    platforms[0] = (PlatformStatic){.pos = (Vector2){10, 500}, .size = (Vector2){1260, 32}}; // bottom floor
-    platforms[1] = (PlatformStatic){.pos = (Vector2){200, 500 - 128}, .size = (Vector2){128, 32}};
-    platforms[2] = (PlatformStatic){.pos = (Vector2){500, 500 - 128}, .size = (Vector2){128, 32}};
-    platforms[3] = (PlatformStatic){.pos = (Vector2){800, 500 - 128}, .size = (Vector2){128, 32}};
+    platforms[0] = (PlatformStatic){.pos = (Vector2){0, 170}, .size = (Vector2){320, 8}}; // bottom floor
+    platforms[1] = (PlatformStatic){.pos = (Vector2){50, 170 - 32}, .size = (Vector2){48, 8}};
+    platforms[2] = (PlatformStatic){.pos = (Vector2){150, 170 - 32}, .size = (Vector2){48, 8}};
+    platforms[3] = (PlatformStatic){.pos = (Vector2){250, 170 - 32}, .size = (Vector2){48, 8}};
     for (int i = 0; i < level.platform_count; i += 1) {
         LevelPlatformInit(&platforms[i]);
     }
@@ -121,9 +121,9 @@ void LevelLoad_1() {
     /* Boxes */
     level.boxes = boxes;
     level.box_count = 3;
-    boxes[0] = (Box){.prop = (Props){.pos = (Vector2){290, 310}, .size = (Vector2){32, 32}}};
-    boxes[1] = (Box){.prop = (Props){.pos = (Vector2){590, 310}, .size = (Vector2){32, 32}}};
-    boxes[2] = (Box){.prop = (Props){.pos = (Vector2){890, 310}, .size = (Vector2){32, 32}}};
+    boxes[0] = (Box){.prop = (Props){.pos = (Vector2){80, 130}, .size = (Vector2){8, 8}}};
+    boxes[1] = (Box){.prop = (Props){.pos = (Vector2){180, 130}, .size = (Vector2){8, 8}}};
+    boxes[2] = (Box){.prop = (Props){.pos = (Vector2){280, 130}, .size = (Vector2){8, 8}}};
     for (int i = 0; i < level.box_count; i += 1) {
         LevelBoxInit(&boxes[i]);
     }
@@ -131,7 +131,7 @@ void LevelLoad_1() {
     /* Jumpads */
     level.jumpads = jumpads;
     level.jumpad_count = 1;
-    jumpads[0] = (Jumpad){.pos = (Vector2){380, 496}, .size = (Vector2){32, 4}};
+    jumpads[0] = (Jumpad){.pos = (Vector2){110, 170 -1}, .size = (Vector2){8, 2}};
     for (int i = 0; i < level.jumpad_count; i += 1) {
         LevelJumpadInit(&jumpads[i]);
     }
@@ -139,9 +139,9 @@ void LevelLoad_1() {
     /* Coins */
     level.coins = coins;
     level.coin_count = 3;
-    coins[0] = (Coin){.pos = (Vector2){264, 330}, .size = (Vector2){8, 8}};
-    coins[1] = (Coin){.pos = (Vector2){564, 330}, .size = (Vector2){8, 8}};
-    coins[2] = (Coin){.pos = (Vector2){864, 330}, .size = (Vector2){8, 8}};
+    coins[0] = (Coin){.pos = (Vector2){65, 125}, .size = (Vector2){2, 2}};
+    coins[1] = (Coin){.pos = (Vector2){165, 125}, .size = (Vector2){2, 2}};
+    coins[2] = (Coin){.pos = (Vector2){265, 125}, .size = (Vector2){2, 2}};
     for (int i = 0; i < level.coin_count; i += 1) {
         LevelCoinsInit(&coins[i]);
     }
@@ -160,7 +160,7 @@ void LevelLoad_1() {
         },
         .state = (ActorState){
             .grounded = false,
-            .pos = (Vector2){50, 100},
+            .pos = (Vector2){10, 30},
         },
         .contact = (ContactContext){.entity = &actors[0], .kind = ENTITY_KIND_ACTOR},
     };
@@ -197,8 +197,8 @@ void LevelActorInit(Actor *actor) {
     torso_def.material.friction = 0;
     torso_def.density = 1.0f;
 
-    const f32 RADIUS = 16.f;
-    const f32 HEIGHT = 64.f;
+    const f32 RADIUS = 3.f;
+    const f32 HEIGHT = 16.f;
     // Capsule above position
     b2Vec2 p1 = b2Add(pos, (b2Vec2){0.f, -HEIGHT + RADIUS});
     b2Vec2 p2 = b2Add(pos, (b2Vec2){0.f, -RADIUS});
