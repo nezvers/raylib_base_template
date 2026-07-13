@@ -78,7 +78,7 @@ static const AnimPhase descrOutro[] = {
 // Every DrawText the menu owns: text, size (fraction of game height), anchor
 // (x = text center, y = top edge; fractions of game size), color, phases.
 static AnimText menuTexts[] = {
-    { "MAIN MENU",                0.083f, {0.5f, 0.11f}, RAYWHITE, titleIntro, 1,  titleOutro, 3 },
+    { "MAIN MENU",                0.125f, {0.5f, 0.06f}, RAYWHITE, titleIntro, 1,  titleOutro, 3 },
     { "place of all the buttons", 0.062f, {0.5f, 0.18f}, RAYWHITE, descrIntro, 1,  descrOutro, 1 },
 };
 
