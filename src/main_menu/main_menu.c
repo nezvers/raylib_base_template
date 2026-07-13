@@ -196,11 +196,6 @@ static void Draw()
 {
     Vector2 game_size = ScreenStateTargetSize();   // {width, height} of game space
 
-    // -- Scene decor (bar, lines, bobbing circle) -----------------------------
-    // Shared with the outro: the transition state calls this same function
-    // with a fading alpha, so the art can never drift from what the menu drew.
-    DrawMenuArt(1.0f, 0.0f);
-
     // -- Zoom boxes: staggered ambient loop off the shared clock --------------
     ZoomBoxesDrawLoop(&zoomBoxes);
 
@@ -211,6 +206,11 @@ static void Draw()
     // -- Mouse input in GAME space.
     Vector2 pos_mouse = Screen2Target(GetMousePosition());
     DrawCircleLines((int)pos_mouse.x, (int)pos_mouse.y, game_size.y*0.017f, LIME);
+
+    // -- Scene decor (bar, lines, bobbing circle) -----------------------------
+    // Shared with the outro: the transition state calls this same function
+    // with a fading alpha, so the art can never drift from what the menu drew.
+    DrawMenuArt(1.0f, 0.0f);
 
     Vector2 screen_size = ScreenStateSize();
 
