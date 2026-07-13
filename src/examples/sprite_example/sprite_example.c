@@ -33,31 +33,33 @@ Frames anim_up =   {.data = &tex_pos[5], .count = 1, .size = SPRITE_SIZE};
 Frames anim_down = {.data = &tex_pos[4], .count = 1, .size = SPRITE_SIZE};
 Frames *player_anim_list[] = {&anim_idle, &anim_walk, &anim_up, &anim_down};
 
-const AnimationSet player_animations = {
+AnimationSet player_animations = {
     .frames = player_anim_list,
     .count = 4, 
     .animation_index = PlayerStateIdle, 
     .image_index = 0, 
     .frame_rate = 12, 
-    .time = 0,
+    .time = 0
 };
-
 
 Texture2D player_texture;
-SpriteRaylib player_sprite = {
-    .sprite = {
-        .animation_set = player_animations,
-        .position = {10, 60},
-        .origin = {8, 16},
-        .offset = {0, 0},
-        .scale = {1, 1},
-        .rotation = 0,
-    },
-    .texture = &player_texture,
-    .tint = WHITE,
-};
+SpriteRaylib player_sprite;
 
 static void Enter(){
+    // MSVC compiler doesn't like to have this inicialization like rest structs
+    player_sprite = (SpriteRaylib){
+        .sprite = {
+            .animation_set = player_animations,
+            .position = {10, 60},
+            .origin = {8, 16},
+            .offset = {0, 0},
+            .scale = {1, 1},
+            .rotation = 0
+        },
+        .texture = &player_texture,
+        .tint = WHITE
+    };
+
     ChangeAnimation(&player_sprite.sprite.animation_set, PlayerStateWalk);
     // RESOURCES_PATH is a macro definition from compiler
     player_texture = LoadTexture(RESOURCES_PATH"/textures/player_sheet.png");
