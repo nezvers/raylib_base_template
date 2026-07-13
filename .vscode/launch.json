@@ -57,7 +57,7 @@
             "preLaunchTask": "build all release",
         },
         {
-            "name": "(gdb) TEMPLATE Build",
+            "name": "(gdb) just Build",
             "type": "cppdbg",
             "request": "launch",
             "windows": {
