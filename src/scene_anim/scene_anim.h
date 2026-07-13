@@ -44,6 +44,7 @@ typedef enum {                  // GLOBAL - whole-screen beats
 typedef enum {                  // TEXT - per AnimText beats
     TP_SLIDE_IN = 100,          // off-screen edge -> rest pose (no motion if the
                                 //   text is already on-screen when an OUTRO starts)
+    TP_SLIDE_OUT,               // rest pose -> off the nearest screen edge (outro)
     TP_CENTER_X,                // rest -> horizontally centered on screen
     TP_CENTER_Y,                // rest -> vertically centered on screen
     TP_FADE_IN,                 // alpha 0 -> 1 (intro)

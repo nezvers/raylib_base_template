@@ -91,6 +91,7 @@ static void TextTable(const SceneAnimPlayer *p, const AnimText *at,
 // ---------------------------------------------------------------------------
 typedef struct {
     float startLeft;            // slide start (== restLeft when already on-screen)
+    float exitLeft;             // TP_SLIDE_OUT target: nearest off-screen edge
     float restLeft, restTop;    // rest pose top-left
     float width, height;        // measured text box
 } AnimTextPose;
@@ -114,12 +115,14 @@ static AnimTextPose TextPose(const SceneAnimPlayer *p, int i, Vector2 game)
     // Otherwise (off-screen, or an intro where the text has not been shown
     // yet) slide in from the nearest screen edge.
     bool onScreen = (ps.restLeft + ps.width > 0.0f) && (ps.restLeft < game.x);
+    float nearEdge = (ps.restLeft + ps.width*0.5f <= game.x*0.5f)
+                         ? -ps.width         // nearest edge is the left one
+                         : game.x;           // nearest edge is the right one
     if (onScreen && p->dir == ANIM_OUTRO)
         ps.startLeft = ps.restLeft;
     else
-        ps.startLeft = (ps.restLeft + ps.width*0.5f <= game.x*0.5f)
-                           ? -ps.width       // enter from the left edge
-                           : game.x;         // enter from the right edge
+        ps.startLeft = nearEdge;
+    ps.exitLeft = nearEdge;   // TP_SLIDE_OUT always leaves via the nearest edge
     return ps;
 }
 
@@ -136,12 +139,14 @@ static Vector2 RigidOffset(const SceneAnimPlayer *p, int i,
     const AnimPhase *tab; int n;
     TextTable(p, &p->spec->texts[i], &tab, &n);
 
-    float slide = AnimPhaseAmount(tab, n, TP_SLIDE_IN, p->t, 1.0f);
-    float cxA   = AnimPhaseAmount(tab, n, TP_CENTER_X, p->t, 0.0f);
-    float cyA   = AnimPhaseAmount(tab, n, TP_CENTER_Y, p->t, 0.0f);
+    float slide    = AnimPhaseAmount(tab, n, TP_SLIDE_IN,  p->t, 1.0f);
+    float slideOut = AnimPhaseAmount(tab, n, TP_SLIDE_OUT, p->t, 0.0f);
+    float cxA      = AnimPhaseAmount(tab, n, TP_CENTER_X,  p->t, 0.0f);
+    float cyA      = AnimPhaseAmount(tab, n, TP_CENTER_Y,  p->t, 0.0f);
 
     Vector2 off;
     off.x = (1.0f - slide) * (ps->startLeft - ps->restLeft)
+          + slideOut * (ps->exitLeft - ps->restLeft)
           + cxA * (game.x*0.5f - (ps->restLeft + ps->width*0.5f));
     off.y = cyA * (game.y*0.5f - (ps->restTop + ps->height*0.5f));
     return off;
