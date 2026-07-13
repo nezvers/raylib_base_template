@@ -44,6 +44,12 @@
     <ClCompile Include="..\..\..\src\transition\transition_state.c">
       <Filter>transition</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\src\scene_anim\scene_anim.c">
+      <Filter>scene_anim</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\..\src\include\easing.c">
+      <Filter>include</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\..\..\src\base_template.rc" />
@@ -82,6 +88,12 @@
     <Filter Include="transition">
       <UniqueIdentifier>{7f3a1c02-4b8e-4d21-9a6c-2e5f8b0d1a34}</UniqueIdentifier>
     </Filter>
+    <Filter Include="scene_anim">
+      <UniqueIdentifier>{9b4e6d13-5c7a-4f80-b2e9-6d1a3c8e5f27}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="include">
+      <UniqueIdentifier>{4a2f8c61-9e3d-47b5-a8c4-1f6b2d9e0c53}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\..\src\screen_state\screen_state.h">
@@ -110,6 +122,12 @@
     </ClInclude>
     <ClInclude Include="..\..\..\src\settings_state\settings_state.h">
       <Filter>settings_state</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\src\scene_anim\scene_anim.h">
+      <Filter>scene_anim</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\..\src\transition\transition_state.h">
+      <Filter>transition</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

@@ -13,6 +13,8 @@
 #include "../screen_state/screen_state.h"
 #include "../settings_state/settings_state.h"
 #include "../audio_state/audio_state.h"
+#include "../scene_anim/scene_anim.h"        // AnimText / AnimPhase / SceneAnim data model
+#include "../transition/transition_state.h"  // TransitionStateStart (generic outro player)
 #include <stddef.h>
 #include <math.h>
 
@@ -32,11 +34,6 @@ static void Gui();
                             /* Enter, Exit, Update, Draw, Gui, "Name" */
 AppState app_state_main_menu = {Enter, Exit, Update, Draw, Gui, "MainMenu"};
 
-// PLAY now hands off to the transition state (transition_state.c), which plays
-// the fade/zoom/crumble animation and THEN transitions into the platformer.
-// app_state_transition is declared extern in app_state.h, so no local extern is
-// needed here - this is how you move between states from inside a state.
-
 // --- widget values (persist across frames -> file-scope statics) --------
 // Volume, difficulty AND the GUI-scale wish now all live in the Settings singleton
 // (settings->music_volume / ->difficulty / ->gui_scale_wish), so they're global and
@@ -49,16 +46,81 @@ static float animTime = 0.0f;           // accumulates for the animation demo
 typedef enum { MENU_PAGE_MAIN = 0, MENU_PAGE_OPTIONS } MenuPage;
 static MenuPage menuPage = MENU_PAGE_MAIN;
 
-static void DrawZoomBox(float cx, float cy, Vector2 size, float t)
-{
-    float t_min = 0.05f;          // matches db_w/db_h = size * 0.05
-    if (t < t_min) return;        // don't draw until it's grown past the distant box
+// ============================================================================
+//  SCENE ANIMATION DATA (see scene_anim.h) - the demonstration integration.
+//
+//  This block is the SINGLE source of truth for every animated text the menu
+//  shows and for how the menu animates in (intro, played by this state) and
+//  out (outro, played by the generic transition state). There is no second
+//  DrawText for the title/sub-text anywhere - the same AnimText rows drive
+//  the idle menu, the intro and the outro, so nothing can drift apart.
+//
+//  Phase rows: { kind, start s, end s, easing } - ANY order, found by kind.
+//  A gap between rows = the old "hold" (nothing needs a row to stand still).
+// ============================================================================
 
-    float W = size.x * t;
-    float H = size.y * t;
-    unsigned char a = (unsigned char)(255.0f * (1.0f - t));
-    Color c = { 130, 150, 180, a };
-    DrawRectangleLines((int)(cx - W*0.5f), (int)(cy - H*0.5f), (int)W, (int)H, c);
+static const AnimPhase titleIntro[] = {
+    { TP_SLIDE_IN, 0.00f, 0.60f, sineEaseOutf },     // slides in from off-screen
+};
+static const AnimPhase titleOutro[] = {
+    { TP_CENTER_X, 0.00f, 0.55f, sineEaseOutf },     // already centered -> no motion,
+                                                     //   but would center any rest pose
+    { TP_CENTER_Y, 0.10f, 0.75f, sineEaseInOutf },   // drop to the vertical center
+    { TP_CRUMBLE,  1.05f, 2.15f, cubicEaseInf  },    // then break apart and fall
+};
+static const AnimPhase descrIntro[] = {
+    { TP_FADE_IN,  0.20f, 0.70f, NULL },             // NULL ease = linear
+};
+static const AnimPhase descrOutro[] = {
+    { TP_CRUMBLE,  1.15f, 2.25f, cubicEaseInf },     // sub-text crumbles a beat later
+};
+
+// Every DrawText the menu owns: text, size (fraction of game height), anchor
+// (x = text center, y = top edge; fractions of game size), color, phases.
+static AnimText menuTexts[] = {
+    { "MAIN MENU",                0.083f, {0.5f, 0.11f}, RAYWHITE, titleIntro, 1,  titleOutro, 3 },
+    { "place of all the buttons", 0.062f, {0.5f, 0.18f}, RAYWHITE, descrIntro, 1,  descrOutro, 1 },
+};
+
+// Global (whole-screen) outro beats. GP_FADE_BLACK's end is the hand-off time.
+static const AnimPhase menuOutroGlobal[] = {
+    { GP_ART_FADE,   0.15f, 1.10f, NULL },
+    { GP_FADE_BLACK, 1.90f, 2.55f, NULL },
+};
+// Shape (zoom box) outro beats: keep zooming while the gaps shrink to zero
+// (they group up mid-zoom), then the grouped stack reverses inward together.
+static const AnimPhase menuOutroShape[] = {
+    { SP_ZOOM_SETTLE_GAP1,  0.00f, 1.35f, sineEaseOutf },
+    { SP_ZOOM_REVERSE, 1.35f, 2.45f, cubicEaseInf },
+};
+
+// The zoom boxes' clock lives HERE (in the scene) and the spec points at it,
+// so the outro captures the boxes exactly where the menu just drew them.
+static ZoomBoxes zoomBoxes = { .count = 3, .period = 5.0f };
+
+static void DrawMenuArt(float alpha, float time);   // defined below Draw()
+
+// The bundle handed to both players: our texts, global/shape outro tables,
+// the shared zoom boxes and the decor callback. (introGlobal is NULL: this
+// menu has no whole-screen intro beat; GP_UNFADE_BLACK would go there.)
+static const SceneAnim menuAnim = {
+    .texts = menuTexts,             .textCount = 2,
+    .introGlobal = NULL,            .introGlobalCount = 0,
+    .outroGlobal = menuOutroGlobal, .outroGlobalCount = 2,
+    .outroShape  = menuOutroShape,  .outroShapeCount  = 2,
+    .boxes = &zoomBoxes,
+    .drawArt = DrawMenuArt,
+};
+
+// Plays the INTRO when the menu is entered; after it finishes, the same
+// SceneAnimDrawTexts call keeps drawing the texts at their rest pose forever.
+static SceneAnimPlayer introPlayer;
+
+// Leave the menu through the generic outro player (PLAY button and ENTER).
+static void StartGameTransition()
+{
+    TransitionStateStart(&menuAnim, &app_state_platformer);
+    AppStateTransition(&app_state_transition);
 }
 
 // ----------------------------------------------------------------------------
@@ -71,6 +133,10 @@ static void Enter()
     screenState->clear_color = (Color){ 25, 30, 40, 255 };  // dark blue-gray
     animTime = 0.0f;
     menuPage = MENU_PAGE_MAIN;   // always open on the main page
+
+    // Kick off the intro: texts slide/fade IN to their rest pose. When it is
+    // done the same player simply keeps drawing the rest pose (see Draw()).
+    SceneAnimStart(&introPlayer, &menuAnim, ANIM_INTRO);
 
     // No GUI-scale seeding needed: the wish lives in settings->gui_scale_wish, loaded
     // at startup and bound directly to the toggle below.
@@ -92,12 +158,16 @@ static void Update()
 {
     // GetFrameTime() = seconds since last frame. Multiply movement by it so
     // speed is frame-rate independent. (GetTime() = seconds since start.)
-    animTime += GetFrameTime();
+    float dt = GetFrameTime();
+    animTime += dt;
+
+    SceneAnimUpdate(&introPlayer, dt);   // advance the intro (no-op once done)
+    ZoomBoxesUpdate(&zoomBoxes, dt);     // the boxes' shared loop clock
 
     // Keyboard input example: ENTER also starts the game.
     if (IsKeyPressed(KEY_ENTER))
     {
-        AppStateTransition(&app_state_transition);
+        StartGameTransition();
     }
 
     // ESC: on the OPTIONS page it returns to MAIN; on MAIN it quits the app.
@@ -125,52 +195,18 @@ static void Update()
 static void Draw()
 {
     Vector2 game_size = ScreenStateTargetSize();   // {width, height} of game space
-    float cx = game_size.x*0.5f;                   // horizontal center
-    float cy = game_size.y*0.5f;                   // vertical center
 
-    // -- Header Text: DrawText(text, x, y, fontSize, color) -----------------------
-    const char *title = "MAIN MENU";
-    int titleSize = (int)fmaxf(1.0f, game_size.y*0.083f);
-    int titleWidth = MeasureText(title, titleSize);   // width in pixels
-    DrawText(title, (int)(cx - titleWidth*0.5f), (int)(game_size.y*0.11f), titleSize, RAYWHITE);
+    // -- Scene decor (bar, lines, bobbing circle) -----------------------------
+    // Shared with the outro: the transition state calls this same function
+    // with a fading alpha, so the art can never drift from what the menu drew.
+    DrawMenuArt(1.0f, 0.0f);
 
-    // -- Sub-Text -----------------------------------------------------------------
-    const char *descr = "place of all the buttons";
-    int descrSize = (int)fmaxf(1.0f, game_size.y*0.028f);
-    int descrWidth = MeasureText(descr, descrSize);   // width in pixels
-    DrawText(descr, (int)(cx - descrWidth*0.5f), (int)(game_size.y*0.19f), descrSize, RAYWHITE);
+    // -- Zoom boxes: staggered ambient loop off the shared clock --------------
+    ZoomBoxesDrawLoop(&zoomBoxes);
 
-    // -- Rectangles ----------------------------------------------------------
-    float bar_w = game_size.x*0.31f;
-    int   bar_h = (int)fmaxf(1.0f, game_size.y*0.006f);
-    DrawRectangle((int)(cx - bar_w*0.5f), (int)(game_size.y*0.24f), (int)bar_w, bar_h, SKYBLUE); // filled
-
-    // a zooming rectangle
-    float db_w = game_size.x * 0.05f;
-    float db_h = game_size.y * 0.05f;
-    DrawRectangleLines((int)(cx - (int)(db_w/2)), (int)(cy - (int)(db_h/2)), (int)db_w, (int)db_h, DARKGRAY);
-
-    float period = 5.0f;
-    float base_t = fmodf(animTime, period) / period;   // 0 → 1 loop
-
-    int   N = 3;                                        // how many boxes
-    for (int i = 0; i < N; i++)
-    {
-        float t = fmodf(base_t + (float)i / N, 1.0f);  // stagger by 1/N each
-        DrawZoomBox(cx, cy, game_size, t);
-    }
-
-    // -- Lines ---------------------------------------------------------------
-    DrawLine(0, 0, (int)game_size.x, (int)game_size.y, (Color){ 60, 70, 90, 255 });
-    DrawLine((int)game_size.x, 0, -0, (int)game_size.y, (Color){ 60, 70, 90, 255 });
-
-
-    // -- Animation: a circle bobbing up/down using sinf + accumulated time ---
-    float bob = sinf(animTime*2.0f)*(game_size.y*0.056f);   // proportional bob
-    float bob_off = game_size.y*0.17f;                       // below center
-    float bob_r   = game_size.y*0.042f;
-    DrawCircle((int)cx, (int)(cy + bob_off + bob), bob_r, ORANGE);
-    DrawCircleLines((int)cx, (int)(cy + bob_off + bob), bob_r, RAYWHITE);
+    // -- Texts: title + sub-text from the menuTexts table ---------------------
+    // During the intro they animate in; afterwards this draws the rest pose.
+    SceneAnimDrawTexts(&introPlayer);
 
     // -- Mouse input in GAME space.
     Vector2 pos_mouse = Screen2Target(GetMousePosition());
@@ -185,6 +221,44 @@ static void Draw()
     DrawText(TextFormat("size(screen): %.0f, %.0f; size(game): %.0f, %.0f", screen_size.x, screen_size.y, game_size.x, game_size.y), (int)dbgX, (int)game_size.y - (3*(dbgPad+dbgSize)), dbgSize, GRAY);
     DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y), (int)dbgX, (int)game_size.y - (2*(dbgSize+dbgPad)), dbgSize, GRAY);
     DrawText(TextFormat("GetTime(): %.1fs   FPS: %i", GetTime(), GetFPS()), (int)dbgX, (int)game_size.y - (dbgSize+dbgPad), dbgSize, GRAY);
+}
+
+// ----------------------------------------------------------------------------
+//  DrawMenuArt: the menu's non-text, non-box decor. ONE definition used by
+//  both the live menu (alpha=1) and the outro player (alpha=1-GP_ART_FADE),
+//  so the transition never has to copy these draws.
+//  `time` is ADDED to the menu's own clock: the menu passes 0, the outro
+//  passes its play clock - animTime froze when the menu exited, so the sum
+//  keeps the bobbing motion continuous across the hand-off.
+// ----------------------------------------------------------------------------
+static void DrawMenuArt(float alpha, float time)
+{
+    Vector2 game_size = ScreenStateTargetSize();
+    float cx = game_size.x*0.5f;
+    float cy = game_size.y*0.5f;
+    float t  = animTime + time;
+
+    // -- Rectangles: the header underline bar + the boxes' tiny seed outline --
+    float bar_w = game_size.x*0.31f;
+    int   bar_h = (int)fmaxf(1.0f, game_size.y*0.006f);
+    DrawRectangle((int)(cx - bar_w*0.5f), (int)(game_size.y*0.24f), (int)bar_w, bar_h,
+                  Fade(SKYBLUE, alpha));
+
+    float db_w = game_size.x * 0.05f;
+    float db_h = game_size.y * 0.05f;
+    DrawRectangleLines((int)(cx - (int)(db_w/2)), (int)(cy - (int)(db_h/2)),
+                       (int)db_w, (int)db_h, Fade(DARKGRAY, alpha));
+
+    // -- Lines ----------------------------------------------------------------
+    DrawLine(0, 0, (int)game_size.x, (int)game_size.y, Fade((Color){ 60, 70, 90, 255 }, alpha));
+    DrawLine((int)game_size.x, 0, 0, (int)game_size.y, Fade((Color){ 60, 70, 90, 255 }, alpha));
+
+    // -- Animation: a circle bobbing up/down using sinf + accumulated time ----
+    float bob = sinf(t*2.0f)*(game_size.y*0.056f);   // proportional bob
+    float bob_off = game_size.y*0.17f;               // below center
+    float bob_r   = game_size.y*0.042f;
+    DrawCircle((int)cx, (int)(cy + bob_off + bob), bob_r, Fade(ORANGE, alpha));
+    DrawCircleLines((int)cx, (int)(cy + bob_off + bob), bob_r, Fade(RAYWHITE, alpha));
 }
 
 // ----------------------------------------------------------------------------
@@ -266,9 +340,9 @@ static void Gui()
         if (GuiButton((Rectangle){ x, y, w, h }, "PLAY (-> platformer)"))
         {
             AudioPlayButton();
-            // Hand off to the transition state, which plays the animation and then
-            // enters the platformer. Our Exit() runs, then the transition's Enter().
-            AppStateTransition(&app_state_transition);
+            // Arm the generic outro player with OUR spec + destination, then
+            // enter it. Our Exit() runs, then the transition's Enter().
+            StartGameTransition();
         }
         y += h + gap;
 

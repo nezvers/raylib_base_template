@@ -364,6 +364,7 @@
     <ClCompile Include="..\..\..\src\box2d_wrap\box2d_body_shape.c" />
     <ClCompile Include="..\..\..\src\box2d_wrap\box2d_raylib.c" />
     <ClCompile Include="..\..\..\src\box2d_wrap\box2d_world.c" />
+    <ClCompile Include="..\..\..\src\include\easing.c" />
     <ClCompile Include="..\..\..\src\input\input.c" />
     <ClCompile Include="..\..\..\src\main.c" />
     <ClCompile Include="..\..\..\src\main_menu\main_menu.c" />
@@ -371,6 +372,7 @@
     <ClCompile Include="..\..\..\src\platformer_test\platformer_level.c" />
     <ClCompile Include="..\..\..\src\platformer_test\platformer_physics.c" />
     <ClCompile Include="..\..\..\src\platformer_test\platformer_test.c" />
+    <ClCompile Include="..\..\..\src\scene_anim\scene_anim.c" />
     <ClCompile Include="..\..\..\src\screen_state\screen_state.c" />
     <ClCompile Include="..\..\..\src\settings_state\settings_state.c" />
     <ClCompile Include="..\..\..\src\transition\transition_state.c" />
@@ -386,8 +388,10 @@
     <ClInclude Include="..\..\..\src\platformer_test\platformer_constants.h" />
     <ClInclude Include="..\..\..\src\platformer_test\platformer_physics.h" />
     <ClInclude Include="..\..\..\src\platformer_test\platformer_types.h" />
+    <ClInclude Include="..\..\..\src\scene_anim\scene_anim.h" />
     <ClInclude Include="..\..\..\src\screen_state\screen_state.h" />
     <ClInclude Include="..\..\..\src\settings_state\settings_state.h" />
+    <ClInclude Include="..\..\..\src\transition\transition_state.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
