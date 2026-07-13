@@ -31,7 +31,7 @@ Frames anim_idle = {.data = &tex_pos[0], .count = 2, .size = SPRITE_SIZE};
 Frames anim_walk = {.data = &tex_pos[2], .count = 6, .size = SPRITE_SIZE};
 Frames anim_up =   {.data = &tex_pos[5], .count = 1, .size = SPRITE_SIZE};
 Frames anim_down = {.data = &tex_pos[4], .count = 1, .size = SPRITE_SIZE};
-const Frames *player_anim_list[] = {&anim_idle, &anim_walk, &anim_up, &anim_down};
+Frames *player_anim_list[] = {&anim_idle, &anim_walk, &anim_up, &anim_down};
 
 const AnimationSet player_animations = {
     .frames = player_anim_list,
