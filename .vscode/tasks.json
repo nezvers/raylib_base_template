@@ -58,6 +58,37 @@
             "detail": "Update new source files"
         },
         {
+            "label": "Cmake configure release",
+            "type": "shell",
+            "windows": {
+                "command": "cmake",
+                "args": [
+                    "-S",
+                    ".",
+                    "-B",
+                    "./build",
+                    "-G",
+                    "MinGW Makefiles",
+                    "-DCMAKE_BUILD_TYPE=Release"
+                ]
+            },
+            "linux": {
+                "command": "cmake",
+                "args": [
+                    "-S",
+                    ".",
+                    "-B",
+                    "./build",
+                    "-G",
+                    "Unix Makefiles",
+                    "-DCMAKE_BUILD_TYPE=Release"
+                ]
+            },
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "Update new source files"
+        },
+        {
             "label": "build",
             "type": "shell",
             "windows": {
@@ -79,8 +110,18 @@
             "detail": "Build with MinGW on Windows or gcc on Linux"
         },
         {
-            "label": "build all",
+            "label": "build all debug",
             "dependsOn": ["delete build", "Cmake configure", "build"],
+            "dependsOrder": "sequence",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "build all release",
+            "dependsOn": ["delete build", "Cmake configure release", "build"],
             "dependsOrder": "sequence",
             "group": {
                 "kind": "build",

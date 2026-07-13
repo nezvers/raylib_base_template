@@ -89,9 +89,17 @@ if (${PLATFORM} STREQUAL "Web")
     target_compile_definitions(${PROJECT_NAME} PUBLIC RESOURCES_PATH="./resources/")
 elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
   SET(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -O0 -DDEBUG")
+  SET(CMAKE_C_FLAGS  "${CMAKE_C_FLAGS} -O0 -DDEBUG")
   # Set the resources path macro to the absolute path on the dev machine
   target_compile_definitions(${PROJECT_NAME} PUBLIC RESOURCES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/src/resources/")
 else()
   # Set the resources path macro in release mode to a relative path that assumes the assets folder is in the same directory as the game executable
-  target_compile_definitions(${PROJECT_NAME} PUBLIC RESOURCES_PATH="./resources/")
+  target_compile_definitions(${PROJECT_NAME} PUBLIC RESOURCES_PATH="resources/")
+  # TODO: Copy "src/resources" directory next to output
+
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_SOURCE_DIR}/src/resources
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/resources
+    )
 endif()
