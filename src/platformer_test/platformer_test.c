@@ -32,6 +32,10 @@ static void Exit(){
 }
 
 static void Update(){
+    if (IsKeyPressed(KEY_R)){
+        // Restart
+        Enter();
+    }
     LevelUpdate();
 
     // ESC quits. main.c disabled raylib's default ESC=quit (SetExitKey(KEY_NULL))

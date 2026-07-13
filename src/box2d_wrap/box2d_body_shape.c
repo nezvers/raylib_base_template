@@ -59,7 +59,7 @@ b2ShapeId ShapeCreateBox(
     shape_def.enableContactEvents = enableContactEvents;
     shape_def.enableHitEvents = enableHitEvents;
 
-    b2Polygon box = b2MakeBox(size.x * 0.5f - 1, size.y * 0.5f - 1);
+    b2Polygon box = b2MakeBox(size.x * 0.5f, size.y * 0.5f);
     b2ShapeId result = b2CreatePolygonShape(body, &shape_def, &box);
     return result;
 }
