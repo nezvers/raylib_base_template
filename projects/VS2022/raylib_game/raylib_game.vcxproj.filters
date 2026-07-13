@@ -41,6 +41,9 @@
     <ClCompile Include="..\..\..\src\settings_state\settings_state.c">
       <Filter>settings_state</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\src\transition\transition_state.c">
+      <Filter>transition</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\..\..\src\base_template.rc" />
@@ -75,6 +78,9 @@
     </Filter>
     <Filter Include="settings_state">
       <UniqueIdentifier>{06ef77a5-8a56-4cc7-89e1-7cc4511f9104}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="transition">
+      <UniqueIdentifier>{7f3a1c02-4b8e-4d21-9a6c-2e5f8b0d1a34}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>
