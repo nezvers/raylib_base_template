@@ -119,13 +119,17 @@ static void Update()
 {
     StrategyWorld *world = StrategyWorldGet();
 
-    // ESC priority: cancel a building ghost first, then back out of the
-    // options page, then toggle the pause menu itself.
+    // ESC priority: cancel a building ghost first, then close the build
+    // menu, then back out of the options page, then toggle the pause menu.
     if (IsKeyPressed(KEY_ESCAPE))
     {
         if (!paused && world->placing >= 0)
         {
             world->placing = -1;
+        }
+        else if (!paused && world->buildMenuOpen)
+        {
+            world->buildMenuOpen = false;
         }
         else if (paused && pausePage == PAUSE_PAGE_OPTIONS)
         {
@@ -182,11 +186,16 @@ static void Draw()
 }
 
 // ----------------------------------------------------------------------------
-//  Build bar: three build buttons with costs, bottom-left of the game region.
+//  Command panel: ONE bottom strip whose content depends on what is selected
+//  (derived fresh every frame - only buildMenuOpen is stored state):
+//    build menu open   -> all building buttons with costs + CLOSE
+//    building selected -> that building's actions (train/progress/info)
+//    units selected    -> counts + STOP + GATHER NEAREST
+//    nothing           -> a single BUILD button
 //  Publishes its rectangle to world->guiBlock so the world ignores mouse
-//  presses that land on the buttons (no click-through selecting units).
+//  presses that land on the panel (no click-through selecting units).
 // ----------------------------------------------------------------------------
-static void GuiBuildBar(StrategyWorld *world)
+static void GuiCommandPanel(StrategyWorld *world)
 {
     ScreenState *ss = ScreenStateGet();
     Rectangle vp = ss->dest_rect;
@@ -199,27 +208,150 @@ static void GuiBuildBar(StrategyWorld *world)
     GuiSetStyle(DEFAULT, TEXT_SIZE, baseSize*s);
     GuiSetIconScale(s);
 
-    float w   = 150.0f*(float)s;
     float h   = 32.0f*(float)s;
     float gap = 8.0f*(float)s;
     float x   = vp.x + 20.0f;
     float y   = vp.y + vp.height - h - 20.0f;
 
-    world->guiBlock = (Rectangle){ x - 6.0f, y - 6.0f,
-                                   3.0f*w + 2.0f*gap + 12.0f, h + 12.0f };
-
-    const char *labels[BLD_COUNT] = { "HOUSE", "LOGGING CAMP", "QUARRY" };
-    for (int kind = 0; kind < BLD_COUNT; kind++)
+    // Selection census (drives which panel shows).
+    int workers = 0;
+    int soldiers = 0;
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
     {
-        const char *text = TextFormat("%s %dw %ds", labels[kind],
-                                      strategyBuildingCost[kind][RES_WOOD],
-                                      strategyBuildingCost[kind][RES_STONE]);
-        if (GuiButton((Rectangle){ x, y, w, h }, text))
+        Unit *u = &world->units[i];
+        if (!u->active || u->faction != 0 || !u->selected) continue;
+        if (u->kind == KIND_WORKER) workers++;
+        else                        soldiers++;
+    }
+
+    // Reserve the whole strip up front; individual widgets draw inside it.
+    world->guiBlock = (Rectangle){ vp.x, y - 6.0f, vp.width, h + 12.0f };
+
+    if (world->buildMenuOpen)
+    {
+        static const char *names[BLD_COUNT] = {
+            "HOUSE", "LOGGING", "QUARRY", "BARRACKS", "FARM",
+        };
+        float w = 120.0f*(float)s;
+        for (int kind = 0; kind < BLD_COUNT; kind++)
+        {
+            const char *text = TextFormat("%s %dw %ds", names[kind],
+                                          strategyBuildingCost[kind][RES_WOOD],
+                                          strategyBuildingCost[kind][RES_STONE]);
+            if (GuiButton((Rectangle){ x, y, w, h }, text))
+            {
+                AudioPlayButton();
+                world->placing = kind;
+                world->buildMenuOpen = false;
+            }
+            x += w + gap;
+        }
+        if (GuiButton((Rectangle){ x, y, 80.0f*(float)s, h }, "CLOSE"))
         {
             AudioPlayButton();
-            world->placing = kind;
+            world->buildMenuOpen = false;
         }
-        x += w + gap;
+    }
+    else if (world->selectedBuilding >= 0)
+    {
+        Building *b = &world->buildings[world->selectedBuilding];
+        float w = 200.0f*(float)s;
+
+        if (b->trainKind >= 0)
+        {
+            // Progress bar for the current trainee.
+            float frac = b->trainProgress /
+                         ((b->trainKind == KIND_WORKER) ? STRAT_TRAIN_TIME_WORKER
+                                                        : STRAT_TRAIN_TIME_SOLDIER);
+            GuiLabel((Rectangle){ x, y, w, h },
+                     (b->trainKind == KIND_WORKER) ? "training worker..."
+                                                   : "training soldier...");
+            DrawRectangle((int)(x + w + gap), (int)(y + h*0.35f),
+                          (int)w, (int)(h*0.3f), Fade(DARKGRAY, 0.8f));
+            DrawRectangle((int)(x + w + gap), (int)(y + h*0.35f),
+                          (int)(w*frac), (int)(h*0.3f), GREEN);
+        }
+        else if (b->kind == BLD_HOUSE)
+        {
+            if (GuiButton((Rectangle){ x, y, w, h }, TextFormat("TRAIN WORKER %df",
+                          strategyTrainCost[KIND_WORKER][RES_FOOD])))
+            {
+                AudioPlayButton();
+                StrategyTrainStart(world->selectedBuilding, KIND_WORKER);
+            }
+        }
+        else if (b->kind == BLD_BARRACKS)
+        {
+            if (GuiButton((Rectangle){ x, y, w, h }, TextFormat("TRAIN SOLDIER %dw %df",
+                          strategyTrainCost[KIND_SOLDIER][RES_WOOD],
+                          strategyTrainCost[KIND_SOLDIER][RES_FOOD])))
+            {
+                AudioPlayButton();
+                StrategyTrainStart(world->selectedBuilding, KIND_SOLDIER);
+            }
+        }
+        else if (b->kind == BLD_FARM)
+        {
+            int hands = 0;
+            for (int i = 0; i < STRAT_MAX_UNITS; i++)
+            {
+                Unit *u = &world->units[i];
+                if (u->active && u->state == UNIT_FARM &&
+                    u->targetBuilding == world->selectedBuilding) hands++;
+            }
+            GuiLabel((Rectangle){ x, y, w, h },
+                     TextFormat("FARM - workers: %d (RMB workers here)", hands));
+        }
+        else
+        {
+            GuiLabel((Rectangle){ x, y, w, h },
+                     (b->kind == BLD_LOGGING) ? "LOGGING CAMP (wood dropoff)"
+                                              : "QUARRY (stone dropoff)");
+        }
+    }
+    else if (workers + soldiers > 0)
+    {
+        GuiLabel((Rectangle){ x, y, 180.0f*(float)s, h },
+                 TextFormat("%d WORKER  %d SOLDIER", workers, soldiers));
+        x += 180.0f*(float)s + gap;
+
+        if (GuiButton((Rectangle){ x, y, 80.0f*(float)s, h }, "STOP"))
+        {
+            AudioPlayButton();
+            for (int i = 0; i < STRAT_MAX_UNITS; i++)
+            {
+                Unit *u = &world->units[i];
+                if (!u->active || u->faction != 0 || !u->selected) continue;
+                u->state          = UNIT_IDLE;
+                u->targetUnit     = -1;
+                u->targetNode     = -1;
+                u->targetBuilding = -1;
+            }
+        }
+        x += 80.0f*(float)s + gap;
+
+        if (workers > 0 &&
+            GuiButton((Rectangle){ x, y, 160.0f*(float)s, h }, "GATHER NEAREST"))
+        {
+            AudioPlayButton();
+            for (int i = 0; i < STRAT_MAX_UNITS; i++)
+            {
+                Unit *u = &world->units[i];
+                if (!u->active || u->faction != 0 || !u->selected) continue;
+                if (u->kind != KIND_WORKER) continue;
+
+                int node = StrategyNearestNodeOfKind(u->pos, -1, STRAT_RETARGET_RADIUS);
+                if (node >= 0) StrategyOrderGather(u, node);
+            }
+        }
+    }
+    else
+    {
+        if (GuiButton((Rectangle){ x, y, 120.0f*(float)s, h }, "BUILD"))
+        {
+            AudioPlayButton();
+            world->buildMenuOpen = true;
+        }
     }
 }
 
@@ -235,7 +367,7 @@ static void Gui()
 
     if (!paused)
     {
-        GuiBuildBar(world);
+        GuiCommandPanel(world);
         return;
     }
 

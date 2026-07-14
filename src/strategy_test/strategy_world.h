@@ -17,8 +17,33 @@ void StrategyWorldUpdate(float dt);     // units, gathering, combat, AI, effects
 void StrategyWorldDraw3D(void);         // Begin/EndMode3D + all world geometry
 void StrategyWorldDraw2DOverlay(void);  // drag rect, HP bars, resource HUD (game space)
 
-// Cost table for the build buttons (defined in strategy_world.c).
+// Population: cap comes from standing houses, used counts own units.
+int StrategyPopCap(int faction);
+int StrategyPopUsed(int faction);
+
+// Orders: the ONLY way anything (mouse, GUI or AI) makes a unit act.
+void StrategyOrderMove(Unit *u, Vector3 dest);
+void StrategyOrderGather(Unit *u, int nodeIndex);
+void StrategyOrderAttack(Unit *u, int unitIndex);
+void StrategyOrderAttackBuilding(Unit *u, int bldIndex);
+void StrategyOrderFarm(Unit *u, int bldIndex);
+
+// Nearest active node of a kind (-1 = any kind) within radius, else -1.
+int StrategyNearestNodeOfKind(Vector3 pos, int nodeKind, float radius);
+
+// Start training at a building: validates cost + pop cap, deducts, returns
+// success. Shared by the GUI buttons and the enemy AI.
+bool StrategyTrainStart(int bldIndex, UnitKind kind);
+
+// Validate + pay + place a building; false when unaffordable or blocked.
+bool StrategyTryBuild(int faction, BuildingKind kind, Vector3 pos);
+
+// Enemy + animal think tick (strategy_ai.c), called on the world's aiTimer.
+void StrategyAiTick(void);
+
+// Cost tables for the GUI (defined in strategy_world.c).
 extern const int strategyBuildingCost[BLD_COUNT][RES_COUNT];
+extern const int strategyTrainCost[2][RES_COUNT];   // [KIND_WORKER/KIND_SOLDIER]
 extern const Color strategyFactionColor[STRAT_FACTIONS];
 
 // -- Effects (strategy_effects.c) ---------------------------------------------
