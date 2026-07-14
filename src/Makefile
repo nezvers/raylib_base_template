@@ -32,12 +32,19 @@ PLATFORM              ?= PLATFORM_DESKTOP
 PROJECT_NAME          ?= base_template
 PROJECT_VERSION       ?= 1.0
 PROJECT_BUILD_PATH    ?= .
-PROJECT_SOURCE_FILES  ?= main.c
+# All app module .c files (recursive), excluding examples/ which define alternate
+# AppState entry points not wired into the app. Mirrors CMake's GLOB_RECURSE.
+PROJECT_SOURCE_FILES  ?= $(shell find . -name '*.c' -not -path './examples/*' -not -path './external/*')
 
 # raylib library variables
 RAYLIB_PATH           ?= ../../raylib
 RAYLIB_INCLUDE_PATH   ?= $(RAYLIB_PATH)/src
 RAYLIB_LIB_PATH       ?= $(RAYLIB_PATH)/src
+
+# box2d library variables (used by platformer_test via box2d_wrap)
+BOX2D_PATH            ?= ../../box2d
+BOX2D_INCLUDE_PATH    ?= $(BOX2D_PATH)/include
+BOX2D_LIB_PATH        ?= $(BOX2D_PATH)/build/src
 
 # Library type used for raylib: STATIC (.a) or SHARED (.so/.dll)
 RAYLIB_LIBTYPE        ?= STATIC
@@ -188,7 +195,7 @@ endif
 
 # Define include paths for required headers: INCLUDE_PATHS
 #------------------------------------------------------------------------------------------------
-INCLUDE_PATHS += -I. -Iexternal -I$(RAYLIB_INCLUDE_PATH)
+INCLUDE_PATHS += -I. -Iexternal -I$(RAYLIB_INCLUDE_PATH) -I$(BOX2D_INCLUDE_PATH)
 
 # Define additional directories containing required header files
 ifeq ($(PLATFORM),PLATFORM_DRM)
@@ -308,7 +315,7 @@ ifeq ($(PLATFORM),PLATFORM_DESKTOP)
 endif
 ifeq ($(PLATFORM),PLATFORM_WEB)
     # Libraries for web (HTML5) compiling
-    LDLIBS = $(RAYLIB_LIB_PATH)/libraylib.web.a
+    LDLIBS = $(RAYLIB_LIB_PATH)/libraylib.web.a $(BOX2D_LIB_PATH)/libbox2d.a
 endif
 ifeq ($(PLATFORM),PLATFORM_DRM)
     # Libraries for DRM compiling
