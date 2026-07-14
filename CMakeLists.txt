@@ -39,6 +39,9 @@ FetchContent_MakeAvailable(raylib)
 set(BOX2D_UNIT_TESTS OFF CACHE BOOL "" FORCE)
 set(BOX2D_SAMPLES OFF CACHE BOOL "" FORCE)
 set(BOX2D_VALIDATE OFF CACHE BOOL "" FORCE)
+# Disable box2d SIMD: avoids -msimd128 flag mismatch with raylib/app objects on Web,
+# and keeps the static lib portable across desktop archs.
+set(BOX2D_DISABLE_SIMD ON CACHE BOOL "" FORCE)
 add_git_dependency(
     box2d
     https://github.com/erincatto/box2d.git
@@ -76,9 +79,16 @@ target_link_libraries(${PROJECT_NAME} box2d)
 
 # Web Configurations
 if ("${PLATFORM}" STREQUAL "Web")
-    # Tell Emscripten to build an example.html file.
+    # Tell Emscripten to build an <project>.html file.
     set_target_properties(${PROJECT_NAME} PROPERTIES SUFFIX ".html")
-    target_link_options(${PROJECT_NAME} PUBLIC -sUSE_GLFW=3 PUBLIC --preload-file resources)
+    target_link_options(${PROJECT_NAME} PUBLIC
+        -sUSE_GLFW=3
+        -sTOTAL_MEMORY=134217728       # 128MB heap
+        -sSTACK_SIZE=1048576           # 1MB stack
+        -sFORCE_FILESYSTEM=1
+        -sASSERTIONS=1
+        --preload-file ${CMAKE_SOURCE_DIR}/src/resources@resources
+        --shell-file ${CMAKE_SOURCE_DIR}/src/minshell.html)
 endif()
 
 # Checks if OSX and links appropriate frameworks (Only required on MacOS)
