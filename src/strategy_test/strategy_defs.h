@@ -30,6 +30,7 @@ typedef struct {
     int      cost[RES_COUNT];       // wood, stone, food, providence
     float    refundRate;            // base sell refund fraction of cost
     float    maxHp;
+    float    buildTime;             // worker-seconds to raise the scaffold to full
     bool     critical;              // losing ALL critical buildings (and all
                                     //   workers) defeats the faction
     int      popCap;                // population added while standing
@@ -38,6 +39,11 @@ typedef struct {
     float    trainCooldown;         // anti-spam pause after each trainee
     bool     accepts[RES_COUNT];    // dropoff: which carried resources land here
     int      produces[RES_COUNT];   // reserved (planks/bricks later), all 0
+
+    // Node-tending buildings: an assigned worker plants this node kind nearby.
+    // tendNode < 0 means the building does not tend (not a farm/forestry).
+    int      tendNode;              // NodeKind to plant, or -1
+    int      tendAmount;           // resource units in each planted node
     float    trainCostMul;          // cost reduction hook, 1.0 default
     float    buffHpMul, buffDmgMul; // applied to units trained here
 } BuildingDef;

@@ -149,7 +149,9 @@ static Unit *UnitSpawn(int faction, UnitKind kind, Vector3 pos)
     return NULL;
 }
 
-static Building *BuildingSpawn(BuildingKind kind, int faction, Vector3 pos)
+// scaffold=true spawns an under-construction site: near-zero HP, non-functional
+// until a worker builds it up. Pre-placed and AI buildings pass false (finished).
+static Building *BuildingSpawn(BuildingKind kind, int faction, Vector3 pos, bool scaffold)
 {
     for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
     {
@@ -157,14 +159,16 @@ static Building *BuildingSpawn(BuildingKind kind, int faction, Vector3 pos)
         if (b->active) continue;
 
         *b = (Building){ 0 };
-        b->active        = true;
-        b->kind          = kind;
-        b->faction       = faction;
-        b->pos           = pos;
-        b->maxHp         = StrategyBuildingDef(kind)->maxHp;
-        b->hp            = b->maxHp;
-        b->trainKind     = -1;
-        b->trainProgress = 0.0f;
+        b->active            = true;
+        b->kind              = kind;
+        b->faction           = faction;
+        b->pos               = pos;
+        b->maxHp             = StrategyBuildingDef(kind)->maxHp;
+        b->underConstruction = scaffold;
+        b->hp                = scaffold ? 1.0f : b->maxHp;
+        b->buildProgress     = 0.0f;
+        b->trainKind         = -1;
+        b->trainProgress     = 0.0f;
         return b;
     }
     return NULL;
@@ -237,14 +241,14 @@ void StrategyWorldInit(void)
     // Two rival bases in opposite corners: town hall FIRST (critical, trains
     // workers, and the AI's EnemyHome anchors to the first building), two
     // houses + barracks; 4 workers + 2 soldiers each.
-    BuildingSpawn(BLD_TOWN_HALL, 0, (Vector3){ -14.0f, 0.0f, -14.0f });
-    BuildingSpawn(BLD_HOUSE,     0, (Vector3){ -17.0f, 0.0f, -14.0f });
-    BuildingSpawn(BLD_HOUSE,     0, (Vector3){ -17.0f, 0.0f, -11.0f });
-    BuildingSpawn(BLD_BARRACKS,  0, (Vector3){ -11.0f, 0.0f, -14.0f });
-    BuildingSpawn(BLD_TOWN_HALL, 1, (Vector3){  14.0f, 0.0f,  14.0f });
-    BuildingSpawn(BLD_HOUSE,     1, (Vector3){  17.0f, 0.0f,  14.0f });
-    BuildingSpawn(BLD_HOUSE,     1, (Vector3){  17.0f, 0.0f,  11.0f });
-    BuildingSpawn(BLD_BARRACKS,  1, (Vector3){  11.0f, 0.0f,  14.0f });
+    BuildingSpawn(BLD_TOWN_HALL, 0, (Vector3){ -14.0f, 0.0f, -14.0f }, false);
+    BuildingSpawn(BLD_HOUSE,     0, (Vector3){ -17.0f, 0.0f, -14.0f }, false);
+    BuildingSpawn(BLD_HOUSE,     0, (Vector3){ -17.0f, 0.0f, -11.0f }, false);
+    BuildingSpawn(BLD_BARRACKS,  0, (Vector3){ -11.0f, 0.0f, -14.0f }, false);
+    BuildingSpawn(BLD_TOWN_HALL, 1, (Vector3){  14.0f, 0.0f,  14.0f }, false);
+    BuildingSpawn(BLD_HOUSE,     1, (Vector3){  17.0f, 0.0f,  14.0f }, false);
+    BuildingSpawn(BLD_HOUSE,     1, (Vector3){  17.0f, 0.0f,  11.0f }, false);
+    BuildingSpawn(BLD_BARRACKS,  1, (Vector3){  11.0f, 0.0f,  14.0f }, false);
     for (int i = 0; i < 6; i++)
     {
         UnitKind kind = (i < 4) ? KIND_WORKER : KIND_SOLDIER;
@@ -256,8 +260,8 @@ void StrategyWorldInit(void)
     // factions can feed their training queue.
     NodeCluster(NODE_TREE,  (Vector3){ -7.0f, 0.0f,  -3.0f }, 6, 2.5f, 12);
     NodeCluster(NODE_TREE,  (Vector3){  6.0f, 0.0f,   9.0f }, 6, 2.5f, 12);
-    NodeCluster(NODE_ROCK,  (Vector3){ -3.0f, 0.0f,   8.0f }, 5, 2.0f, 10);
-    NodeCluster(NODE_ROCK,  (Vector3){  9.0f, 0.0f,  -7.0f }, 5, 2.0f, 10);
+    NodeCluster(NODE_ROCK,  (Vector3){ -3.0f, 0.0f,   8.0f }, 5, 2.0f, 100);
+    NodeCluster(NODE_ROCK,  (Vector3){  9.0f, 0.0f,  -7.0f }, 5, 2.0f, 100);
     NodeCluster(NODE_WHEAT, (Vector3){ -10.0f, 0.0f, -7.0f }, 5, 2.0f, 8);
     NodeCluster(NODE_WHEAT, (Vector3){  10.0f, 0.0f,  7.0f }, 5, 2.0f, 8);
 
@@ -278,12 +282,17 @@ void StrategyWorldInit(void)
         UnitSpawn(FACTION_NEUTRAL, KIND_ANIMAL_STRONG, pos);
     }
 
-    // Starting stockpiles so building/training is possible right away.
+    // Starting stockpiles so building/training is possible right away. The
+    // human player (faction 0) gets an easier-difficulty head start: Easy x3,
+    // Normal x2, Hard x1. The enemy always starts on the base amounts.
+    int playerMul = (SettingsGet()->difficulty == 0) ? 3
+                  : (SettingsGet()->difficulty == 1) ? 2 : 1;
     for (int f = 0; f < STRAT_FACTIONS; f++)
     {
-        world.stockpile[f][RES_WOOD]  = 10;
-        world.stockpile[f][RES_STONE] = 10;
-        world.stockpile[f][RES_FOOD]  = 5;
+        int mul = (f == 0) ? playerMul : 1;
+        world.stockpile[f][RES_WOOD]  = 10*mul;
+        world.stockpile[f][RES_STONE] = 10*mul;
+        world.stockpile[f][RES_FOOD]  = 5*mul;
     }
 }
 
@@ -327,13 +336,33 @@ void StrategyOrderAttackBuilding(Unit *u, int bldIndex)
     u->attackCooldown = 0.0f;
 }
 
+// Assign a worker to tend a node-spawning building (farm/forestry). target is
+// seeded to the building position, the "pick a new plant spot" sentinel.
 void StrategyOrderFarm(Unit *u, int bldIndex)
 {
     u->state          = UNIT_FARM;
     u->targetBuilding = bldIndex;
+    u->target         = world.buildings[bldIndex].pos;
     u->targetUnit     = -1;
     u->targetNode     = -1;
+    u->carryAmount    = 0;
     u->gatherTimer    = 0.0f;
+}
+
+void StrategyOrderBuild(Unit *u, int bldIndex)
+{
+    u->state          = UNIT_BUILD;
+    u->targetBuilding = bldIndex;
+    u->targetUnit     = -1;
+    u->targetNode     = -1;
+}
+
+void StrategyOrderRepair(Unit *u, int bldIndex)
+{
+    u->state          = UNIT_REPAIR;
+    u->targetBuilding = bldIndex;
+    u->targetUnit     = -1;
+    u->targetNode     = -1;
 }
 
 // ----------------------------------------------------------------------------
@@ -429,7 +458,7 @@ int StrategyPopCap(int faction)
     for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
     {
         Building *b = &world.buildings[i];
-        if (b->active && b->faction == faction)
+        if (b->active && !b->underConstruction && b->faction == faction)
         {
             cap += StrategyBuildingDef(b->kind)->popCap;
         }
@@ -447,10 +476,55 @@ int StrategyPopUsed(int faction)
     return used;
 }
 
+// Refund a to-be-cancelled trainee's paid cost back to the faction stockpile.
+static void TrainRefund(Building *b, UnitKind kind)
+{
+    const BuildingDef *bd = StrategyBuildingDef(b->kind);
+    const UnitDef *ud = StrategyUnitDef(kind);
+    for (int r = 0; r < RES_COUNT; r++)
+        world.stockpile[b->faction][r] += (int)ceilf((float)ud->cost[r]*bd->trainCostMul);
+}
+
+// Cancel one trainee: the last queued one if any, else the active trainee.
+// Refunds its cost. Returns false when there was nothing to cancel.
+bool StrategyTrainCancel(int bldIndex)
+{
+    Building *b = &world.buildings[bldIndex];
+    if (!b->active) return false;
+
+    if (b->trainQueueCount > 0)
+    {
+        TrainRefund(b, b->trainQueue[--b->trainQueueCount]);
+        return true;
+    }
+    if (b->trainKind >= 0)
+    {
+        TrainRefund(b, (UnitKind)b->trainKind);
+        b->trainKind     = -1;
+        b->trainProgress = 0.0f;
+        return true;
+    }
+    return false;
+}
+
+// Pop the next queued kind into the active trainee slot (queue shifts down).
+// Assumes the building is idle and off cooldown; cost was paid on enqueue.
+static void TrainDequeue(Building *b)
+{
+    if (b->trainQueueCount <= 0) return;
+    b->trainKind     = (int)b->trainQueue[0];
+    b->trainProgress = 0.0f;
+    for (int i = 1; i < b->trainQueueCount; i++) b->trainQueue[i - 1] = b->trainQueue[i];
+    b->trainQueueCount--;
+}
+
+// Enqueue a trainee: validate kind/pop/cost, pay up front, then either start
+// immediately (idle + off cooldown) or append to the queue. The pop check
+// counts already-queued trainees so a full queue can't overshoot the cap.
 bool StrategyTrainStart(int bldIndex, UnitKind kind)
 {
     Building *b = &world.buildings[bldIndex];
-    if (!b->active || b->trainKind >= 0 || b->trainCooldown > 0.0f) return false;
+    if (!b->active || b->underConstruction) return false;
 
     const BuildingDef *bd = StrategyBuildingDef(b->kind);
     bool allowed = false;
@@ -459,7 +533,12 @@ bool StrategyTrainStart(int bldIndex, UnitKind kind)
         if (bd->trainable[i] == kind) allowed = true;
     }
     if (!allowed) return false;
-    if (StrategyPopUsed(b->faction) + 1 > StrategyPopCap(b->faction)) return false;
+
+    // Everything already committed to this building: the active trainee plus
+    // whatever is queued behind it. Keeps the pop cap honest for the queue.
+    int committed = (b->trainKind >= 0 ? 1 : 0) + b->trainQueueCount;
+    if (b->trainQueueCount >= BLD_MAX_QUEUE) return false;
+    if (StrategyPopUsed(b->faction) + committed + 1 > StrategyPopCap(b->faction)) return false;
 
     const UnitDef *ud = StrategyUnitDef(kind);
     int cost[RES_COUNT];
@@ -472,8 +551,16 @@ bool StrategyTrainStart(int bldIndex, UnitKind kind)
     {
         world.stockpile[b->faction][r] -= cost[r];
     }
-    b->trainKind     = (int)kind;
-    b->trainProgress = 0.0f;
+
+    if (b->trainKind < 0 && b->trainCooldown <= 0.0f)
+    {
+        b->trainKind     = (int)kind;
+        b->trainProgress = 0.0f;
+    }
+    else
+    {
+        b->trainQueue[b->trainQueueCount++] = kind;
+    }
     return true;
 }
 
@@ -555,15 +642,81 @@ bool StrategySellBuilding(int index)
     return true;
 }
 
+// Count active nodes of a kind within radius of a point (node-tend cap).
+static int NodesNear(NodeKind kind, Vector3 pos, float radius)
+{
+    int n = 0;
+    for (int i = 0; i < STRAT_MAX_NODES; i++)
+    {
+        ResourceNode *nd = &world.nodes[i];
+        if (nd->active && nd->kind == kind && DistXZ(nd->pos, pos) <= radius) n++;
+    }
+    return n;
+}
+
+// A ground spot is free to plant on when it is clear of every node, building
+// and off the map edge. Used to scatter tended nodes without overlap.
+static bool PlantSpotClear(Vector3 pos)
+{
+    float margin = STRAT_GROUND_HALF - 1.0f;
+    if (fabsf(pos.x) > margin || fabsf(pos.z) > margin) return false;
+    for (int i = 0; i < STRAT_MAX_NODES; i++)
+        if (world.nodes[i].active &&
+            DistXZ(world.nodes[i].pos, pos) < STRAT_TEND_SPACING) return false;
+    for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
+        if (world.buildings[i].active &&
+            DistXZ(world.buildings[i].pos, pos) < STRAT_TEND_SPACING) return false;
+    return true;
+}
+
+// Pick a free plant spot near a building's tend area, or fall back to the
+// building itself when the area is packed. A few random tries is plenty.
+static Vector3 PlantSpotNear(Vector3 center)
+{
+    for (int tries = 0; tries < 12; tries++)
+    {
+        Vector3 p = center;
+        p.x += (float)GetRandomValue(-100, 100)*0.01f*STRAT_TEND_RANGE;
+        p.z += (float)GetRandomValue(-100, 100)*0.01f*STRAT_TEND_RANGE;
+        if (PlantSpotClear(p)) return p;
+    }
+    return center;
+}
+
+// Quarry: spend providence to conjure a fresh stone node beside the quarry.
+// Returns false when the building isn't a finished quarry or providence is short.
+bool StrategyQuarrySpawnStone(int bldIndex)
+{
+    Building *b = &world.buildings[bldIndex];
+    if (!b->active || b->underConstruction || b->kind != BLD_QUARRY) return false;
+    if (world.stockpile[b->faction][RES_PROVIDENCE] < STRAT_QUARRY_STONE_PROV)
+        return false;
+
+    world.stockpile[b->faction][RES_PROVIDENCE] -= STRAT_QUARRY_STONE_PROV;
+    Vector3 p = b->pos;
+    p.x += (float)GetRandomValue(-100, 100)*0.01f*STRAT_QUARRY_STONE_SPREAD;
+    p.z += (float)GetRandomValue(-100, 100)*0.01f*STRAT_QUARRY_STONE_SPREAD;
+    NodeSpawn(NODE_ROCK, p, STRAT_QUARRY_STONE_AMOUNT);
+    EffectSpawn(FX_RING, p, GRAY);
+    EffectSpawn(FX_FLASH, (Vector3){ p.x, 0.6f, p.z }, RAYWHITE);
+    return true;
+}
+
 // Advance every in-progress trainee; on completion spawn the unit beside the
 // building (separation shoves crowds apart) and start the anti-spam cooldown.
+// Scaffolds do nothing here; the forestry auto-plants trees on its own timer.
 static void BuildingsUpdate(float dt)
 {
     for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
     {
         Building *b = &world.buildings[i];
-        if (!b->active) continue;
+        if (!b->active || b->underConstruction) continue;
+
         if (b->trainCooldown > 0.0f) b->trainCooldown -= dt;
+
+        // Idle and off cooldown with a queue waiting: start the next trainee.
+        if (b->trainKind < 0 && b->trainCooldown <= 0.0f && b->trainQueueCount > 0)
+            TrainDequeue(b);
         if (b->trainKind < 0) continue;
 
         b->trainProgress += dt;
@@ -578,6 +731,8 @@ static void BuildingsUpdate(float dt)
                 u->maxHp  *= bd->buffHpMul;
                 u->hp      = u->maxHp;
                 u->damage *= bd->buffDmgMul;
+                // Rally point: walk the fresh unit to the flag if one is set.
+                if (b->hasRally) StrategyOrderMove(u, b->rally);
             }
             EffectSpawn(FX_RING, spawn, strategyFactionColor[b->faction]);
             EffectSpawn(FX_FLASH, (Vector3){ spawn.x, 0.6f, spawn.z }, RAYWHITE);
@@ -613,12 +768,17 @@ static void CameraPanZoom(void)
 }
 
 // Placement validity: affordable, on the ground, and clear of everything.
-static bool PlacementValid(int faction, BuildingKind kind, Vector3 pos)
+// Can the faction currently pay for this building?
+static bool Affordable(int faction, BuildingKind kind)
 {
     for (int r = 0; r < RES_COUNT; r++)
-    {
         if (world.stockpile[faction][r] < StrategyBuildingDef(kind)->cost[r]) return false;
-    }
+    return true;
+}
+
+static bool PlacementValid(int faction, BuildingKind kind, Vector3 pos)
+{
+    if (!Affordable(faction, kind)) return false;
     float margin = STRAT_GROUND_HALF - 1.5f;
     if (fabsf(pos.x) > margin || fabsf(pos.z) > margin) return false;
 
@@ -647,7 +807,9 @@ bool StrategyTryBuild(int faction, BuildingKind kind, Vector3 pos)
     {
         world.stockpile[faction][r] -= StrategyBuildingDef(kind)->cost[r];
     }
-    BuildingSpawn(kind, faction, pos);
+    // Player buildings go up as scaffolds a worker must finish; the AI has no
+    // build behavior, so its buildings spawn complete.
+    BuildingSpawn(kind, faction, pos, faction == 0);
     EffectSpawn(FX_RING, pos, RAYWHITE);
     for (int i = 0; i < 3; i++) EffectSpawn(FX_PUFF, (Vector3){ pos.x, 0.8f, pos.z }, LIGHTGRAY);
     return true;
@@ -677,7 +839,32 @@ static void PlacementInput(void)
     BuildingKind kind = (BuildingKind)world.placing;
     if (!PlacementGhost(&pos)) return;
     if (!StrategyTryBuild(0, kind, pos)) return;
-    world.placing = -1;
+
+    // Hold Shift to keep placing more of the same building; a plain click
+    // (or running out of resources) exits placement mode.
+    bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    if (!shift || !Affordable(0, kind)) world.placing = -1;
+}
+
+// Select every own unit of `kind` whose projection lands within the visible
+// game canvas (double-click "select all of type"). shift extends the current
+// selection instead of replacing it.
+static void SelectOnScreenOfKind(UnitKind kind, bool shift)
+{
+    Vector2 gameSize = ScreenStateTargetSize();
+    Rectangle screen = { 0.0f, 0.0f, gameSize.x, gameSize.y };
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    {
+        Unit *u = &world.units[i];
+        if (!u->active || u->faction != 0) continue;
+        if (u->kind != kind)
+        {
+            if (!shift) u->selected = false;
+            continue;
+        }
+        if (CheckCollisionPointRec(WorldToGame(u->pos), screen)) u->selected = true;
+        else if (!shift) u->selected = false;
+    }
 }
 
 static void SelectionInput(void)
@@ -750,6 +937,26 @@ static void SelectionInput(void)
     }
     else world.selectedBuilding = -1;
 
+    // Double-click a unit -> select all on-screen units of that kind. Detected
+    // by a second hit on the same-kind unit within the click window.
+    static double lastClickTime = -1.0;
+    static int    lastClickKind = -1;
+    if (hit >= 0)
+    {
+        double now = GetTime();
+        UnitKind kind = world.units[hit].kind;
+        bool dbl = (now - lastClickTime < 0.3) && (lastClickKind == (int)kind);
+        lastClickTime = now;
+        lastClickKind = (int)kind;
+        if (dbl)
+        {
+            SelectOnScreenOfKind(kind, shift);
+            EffectSpawn(FX_RING, world.units[hit].pos, GREEN);
+            return;
+        }
+    }
+    else lastClickKind = -1;
+
     for (int i = 0; i < STRAT_MAX_UNITS; i++)
     {
         Unit *u = &world.units[i];
@@ -761,17 +968,20 @@ static void SelectionInput(void)
 }
 
 // One selected unit's right-click routing. `hostile` covers enemy units AND
-// animals (hunting); soldiers can't gather/farm, so those fall back to move.
-static void OrderUnitAt(Unit *u, int hostile, int enemyBld, int node, int ownFarm,
-                        Vector3 ground)
+// animals (hunting); soldiers can't gather/farm/build, so those fall back to
+// move. ownScaffold/ownRepair/ownFarm are worker-only own-building jobs.
+static void OrderUnitAt(Unit *u, int hostile, int enemyBld, int node,
+                        int ownFarm, int ownScaffold, int ownRepair, Vector3 ground)
 {
     bool worker = (u->kind == KIND_WORKER);
 
-    if (hostile >= 0)                 StrategyOrderAttack(u, hostile);
-    else if (enemyBld >= 0)           StrategyOrderAttackBuilding(u, enemyBld);
-    else if (node >= 0 && worker)     StrategyOrderGather(u, node);
-    else if (ownFarm >= 0 && worker)  StrategyOrderFarm(u, ownFarm);
-    else                              StrategyOrderMove(u, ground);
+    if (hostile >= 0)                     StrategyOrderAttack(u, hostile);
+    else if (enemyBld >= 0)               StrategyOrderAttackBuilding(u, enemyBld);
+    else if (node >= 0 && worker)         StrategyOrderGather(u, node);
+    else if (ownScaffold >= 0 && worker)  StrategyOrderBuild(u, ownScaffold);
+    else if (ownRepair >= 0 && worker)    StrategyOrderRepair(u, ownRepair);
+    else if (ownFarm >= 0 && worker)      StrategyOrderFarm(u, ownFarm);
+    else                                  StrategyOrderMove(u, ground);
 }
 
 // Right click: hostile unit/animal > enemy building > resource node >
@@ -784,6 +994,20 @@ static void OrderInput(void)
     Vector3 ground;
     if (!MouseGroundPoint(&ground)) return;
 
+    // A selected training building takes the right-click as a rally order:
+    // new trainees will walk to this spot instead of standing at the door.
+    if (world.selectedBuilding >= 0)
+    {
+        Building *b = &world.buildings[world.selectedBuilding];
+        if (StrategyBuildingDef(b->kind)->trainableCount > 0)
+        {
+            b->rally    = ground;
+            b->hasRally = true;
+            EffectSpawn(FX_RING, ground, GREEN);
+            return;
+        }
+    }
+
     // Any non-player unit is a valid attack/hunt target.
     int hostile = PickUnit(ground, 1, 0.8f);
     if (hostile < 0) hostile = PickUnit(ground, FACTION_NEUTRAL, 0.8f);
@@ -791,11 +1015,19 @@ static void OrderInput(void)
     int enemyBld = (hostile < 0) ? PickBuilding(ground, 1, 1.4f) : -1;
     int node     = (hostile < 0 && enemyBld < 0) ? PickNode(ground, 0.9f) : -1;
 
-    int ownFarm = -1;
+    // Own building under the cursor -> build (scaffold), repair (damaged), or
+    // farm work, in that priority. Worker-only; OrderUnitAt gates by kind.
+    int ownFarm = -1, ownScaffold = -1, ownRepair = -1;
     if (hostile < 0 && enemyBld < 0 && node < 0)
     {
         int own = PickBuilding(ground, 0, 1.4f);
-        if (own >= 0 && world.buildings[own].kind == BLD_FARM) ownFarm = own;
+        if (own >= 0)
+        {
+            Building *b = &world.buildings[own];
+            if (b->underConstruction)      ownScaffold = own;
+            else if (b->hp < b->maxHp)      ownRepair   = own;
+            else if (StrategyBuildingDef(b->kind)->tendNode >= 0) ownFarm = own;
+        }
     }
 
     bool any = false;
@@ -804,18 +1036,20 @@ static void OrderInput(void)
         Unit *u = &world.units[i];
         if (!u->active || u->faction != 0 || !u->selected) continue;
 
-        OrderUnitAt(u, hostile, enemyBld, node, ownFarm, ground);
+        OrderUnitAt(u, hostile, enemyBld, node, ownFarm, ownScaffold, ownRepair, ground);
         any = true;
     }
     if (!any) return;
 
     // Order feedback: red ring on an attack target, yellow on a resource,
-    // green on a farm, lime ripple on plain ground.
-    if (hostile >= 0)       EffectSpawn(FX_RING, world.units[hostile].pos, RED);
-    else if (enemyBld >= 0) EffectSpawn(FX_RING, world.buildings[enemyBld].pos, RED);
-    else if (node >= 0)     EffectSpawn(FX_RING, world.nodes[node].pos, YELLOW);
-    else if (ownFarm >= 0)  EffectSpawn(FX_RING, world.buildings[ownFarm].pos, GREEN);
-    else                    EffectSpawn(FX_RING, ground, LIME);
+    // green on a build/repair/farm target, lime ripple on plain ground.
+    if (hostile >= 0)         EffectSpawn(FX_RING, world.units[hostile].pos, RED);
+    else if (enemyBld >= 0)   EffectSpawn(FX_RING, world.buildings[enemyBld].pos, RED);
+    else if (node >= 0)       EffectSpawn(FX_RING, world.nodes[node].pos, YELLOW);
+    else if (ownScaffold >= 0)EffectSpawn(FX_RING, world.buildings[ownScaffold].pos, GREEN);
+    else if (ownRepair >= 0)  EffectSpawn(FX_RING, world.buildings[ownRepair].pos, GREEN);
+    else if (ownFarm >= 0)    EffectSpawn(FX_RING, world.buildings[ownFarm].pos, GREEN);
+    else                      EffectSpawn(FX_RING, ground, LIME);
 }
 
 // Control groups: ctrl+1..3 stamps the current selection as that group
@@ -882,7 +1116,7 @@ static int NearestDropoff(const Unit *u)
     for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
     {
         Building *b = &world.buildings[i];
-        if (!b->active || b->faction != u->faction) continue;
+        if (!b->active || b->underConstruction || b->faction != u->faction) continue;
         if (!StrategyBuildingDef(b->kind)->accepts[u->carryKind]) continue;
 
         float d = DistXZ(b->pos, u->pos);
@@ -1175,27 +1409,148 @@ static void UnitUpdate(int index, float dt)
 
         case UNIT_FARM:
         {
-            Building *farm = (u->targetBuilding >= 0)
+            // Node-tending: a worker assigned to a farm/forestry plants its
+            // node kind in free ground nearby. Once TEND_MAX of them stand
+            // around the building it harvests the nearest one to depletion
+            // (carrying to a dropoff like any gather) then resumes planting.
+            Building *tb = (u->targetBuilding >= 0)
                 ? &world.buildings[u->targetBuilding] : NULL;
-            if ((farm == NULL) || !farm->active || farm->kind != BLD_FARM)
+            const BuildingDef *bd = (tb && tb->active)
+                ? StrategyBuildingDef(tb->kind) : NULL;
+            if ((tb == NULL) || !tb->active || bd == NULL || bd->tendNode < 0)
             {
                 u->state = UNIT_IDLE;
                 u->targetBuilding = -1;
                 break;
             }
-            if (DistXZ(u->pos, farm->pos) > 1.4f)
+            NodeKind nk = (NodeKind)bd->tendNode;
+
+            // 1) Carrying a full load: walk it to the nearest accepting building.
+            if (u->carryAmount >= STRAT_CARRY_MAX)
             {
-                MoveToward(u, farm->pos, dt);
+                int home = NearestDropoff(u);
+                if (home < 0) { u->carryAmount = 0; }   // nothing accepts it: dump
+                else
+                {
+                    Building *h = &world.buildings[home];
+                    if (DistXZ(u->pos, h->pos) > 1.6f) { MoveToward(u, h->pos, dt); break; }
+                    world.stockpile[u->faction][u->carryKind] += u->carryAmount;
+                    u->carryAmount = 0;
+                    EffectSpawn(FX_FLASH, (Vector3){ h->pos.x, 1.2f, h->pos.z },
+                                strategyFactionColor[u->faction]);
+                }
                 break;
             }
-            // Renewable: food goes straight to the stockpile, forever.
-            u->gatherTimer += dt;
-            if (u->gatherTimer >= u->farmPeriod)
+
+            // 2) Harvesting an existing tended node.
+            if (u->targetNode >= 0)
             {
-                u->gatherTimer -= u->farmPeriod;
-                world.stockpile[u->faction][RES_FOOD]++;
-                EffectSpawn(FX_PUFF, (Vector3){ farm->pos.x, 0.8f, farm->pos.z },
-                            (Color){ 130, 200, 80, 255 });
+                ResourceNode *n = &world.nodes[u->targetNode];
+                if (!n->active) { u->targetNode = -1; break; }
+                if (DistXZ(u->pos, n->pos) > 1.0f) { MoveToward(u, n->pos, dt); break; }
+                u->gatherTimer += dt;
+                if (u->gatherTimer >= u->gatherTime)
+                {
+                    u->gatherTimer -= u->gatherTime;
+                    u->carryKind = NodeResource(n->kind);
+                    u->carryAmount++;
+                    n->remaining--;
+                    EffectSpawn(FX_PUFF, (Vector3){ n->pos.x, 1.0f, n->pos.z },
+                                (nk == NODE_TREE) ? BROWN : (Color){ 220, 190, 90, 255 });
+                    if (n->remaining <= 0)
+                    {
+                        n->active = false;
+                        u->targetNode = -1;
+                        EffectSpawn(FX_RING, n->pos, GRAY);
+                    }
+                }
+                break;
+            }
+
+            // 3) Area full of nodes: switch to harvesting the nearest one.
+            if (NodesNear(nk, tb->pos, STRAT_TEND_RANGE + 2.0f) >= STRAT_TEND_MAX)
+            {
+                int near = StrategyNearestNodeOfKind(tb->pos, nk, STRAT_TEND_RANGE + 2.0f);
+                if (near >= 0) { u->targetNode = near; u->gatherTimer = 0.0f; break; }
+                // (fallthrough to planting if none found somehow)
+            }
+
+            // 4) Plant: walk to a chosen free spot, then drop a fresh node.
+            //    target == building pos is the "no spot yet" sentinel.
+            if (DistXZ(u->target, tb->pos) < 0.001f)
+            {
+                u->target = PlantSpotNear(tb->pos);
+                u->gatherTimer = 0.0f;
+            }
+            if (DistXZ(u->pos, u->target) > 0.6f) { MoveToward(u, u->target, dt); break; }
+            u->gatherTimer += dt;
+            if (u->gatherTimer >= STRAT_TEND_PERIOD)
+            {
+                u->gatherTimer = 0.0f;
+                if (PlantSpotClear(u->target))
+                    NodeSpawn(nk, u->target, bd->tendAmount);
+                EffectSpawn(FX_PUFF, (Vector3){ u->target.x, 0.6f, u->target.z },
+                            (nk == NODE_TREE) ? (Color){ 60, 140, 60, 255 }
+                                              : (Color){ 220, 190, 90, 255 });
+                u->target = tb->pos;    // reset sentinel -> pick a new spot next
+            }
+        } break;
+
+        case UNIT_BUILD:
+        {
+            // Walk to the scaffold, then pour build-time into it; HP tracks
+            // progress so the site visibly rises. Done -> functional, worker idle.
+            Building *b = (u->targetBuilding >= 0)
+                ? &world.buildings[u->targetBuilding] : NULL;
+            if ((b == NULL) || !b->active || !b->underConstruction)
+            {
+                u->state = UNIT_IDLE;
+                u->targetBuilding = -1;
+                break;
+            }
+            if (DistXZ(u->pos, b->pos) > STRAT_BUILD_RANGE)
+            {
+                MoveToward(u, b->pos, dt);
+                break;
+            }
+            float buildTime = StrategyBuildingDef(b->kind)->buildTime;
+            b->buildProgress += dt;
+            b->hp = fminf(b->maxHp, 1.0f + (b->maxHp - 1.0f)*(b->buildProgress/buildTime));
+            EffectSpawn(FX_PUFF, (Vector3){ b->pos.x, 0.9f, b->pos.z }, LIGHTGRAY);
+            if (b->buildProgress >= buildTime)
+            {
+                b->underConstruction = false;
+                b->hp = b->maxHp;
+                EffectSpawn(FX_RING, b->pos, strategyFactionColor[b->faction]);
+                u->state = UNIT_IDLE;
+                u->targetBuilding = -1;
+            }
+        } break;
+
+        case UNIT_REPAIR:
+        {
+            // Restore a damaged own building over time, free. Full HP -> idle.
+            Building *b = (u->targetBuilding >= 0)
+                ? &world.buildings[u->targetBuilding] : NULL;
+            if ((b == NULL) || !b->active || b->underConstruction ||
+                b->hp >= b->maxHp)
+            {
+                u->state = UNIT_IDLE;
+                u->targetBuilding = -1;
+                break;
+            }
+            if (DistXZ(u->pos, b->pos) > STRAT_BUILD_RANGE)
+            {
+                MoveToward(u, b->pos, dt);
+                break;
+            }
+            b->hp = fminf(b->maxHp, b->hp + STRAT_REPAIR_RATE*dt);
+            EffectSpawn(FX_PUFF, (Vector3){ b->pos.x, 0.9f, b->pos.z },
+                        (Color){ 200, 200, 120, 255 });
+            if (b->hp >= b->maxHp)
+            {
+                u->state = UNIT_IDLE;
+                u->targetBuilding = -1;
             }
         } break;
 
@@ -1519,6 +1874,19 @@ static void DrawBuilding(BuildingKind kind, int faction, Vector3 pos, Color tint
             DrawCylinder(spire, 0.0f, 0.5f, 1.0f, 6, Fade(GOLD, tint.a/255.0f));
         } break;
 
+        case BLD_FORESTRY:
+        {
+            // Low hut with a couple of little saplings sprouting on top.
+            Vector3 body = (Vector3){ pos.x, 0.35f, pos.z };
+            DrawCube(body, 1.4f, 0.7f, 1.4f, tint);
+            Color leaf = Fade((Color){ 60, 140, 60, 255 }, tint.a/255.0f);
+            for (int i = 0; i < 2; i++)
+            {
+                Vector3 sap = (Vector3){ pos.x + (i ? 0.4f : -0.4f), 0.75f, pos.z };
+                DrawCylinder(sap, 0.0f, 0.28f, 0.7f, 6, leaf);
+            }
+        } break;
+
         default: break;
     }
 
@@ -1546,6 +1914,21 @@ static void DrawUnit(const Unit *u)
             DrawCylinder(u->pos, 0.28f, STRAT_UNIT_RADIUS, 0.8f, 8, color);
             Vector3 head = (Vector3){ u->pos.x, 0.95f, u->pos.z };
             DrawSphere(head, 0.18f, ColorBrightness(color, 0.3f));
+
+            // Tending workers wear a "hat" shaped like the resource they plant:
+            // a green cone (forestry -> wood) or a golden cone (farm -> wheat).
+            if (u->state == UNIT_FARM && u->targetBuilding >= 0)
+            {
+                const BuildingDef *tb =
+                    StrategyBuildingDef(world.buildings[u->targetBuilding].kind);
+                if (tb->tendNode >= 0)
+                {
+                    Color hat = (tb->tendNode == NODE_TREE)
+                        ? (Color){ 60, 140, 60, 255 } : (Color){ 220, 190, 90, 255 };
+                    Vector3 cap = (Vector3){ u->pos.x, 1.12f, u->pos.z };
+                    DrawCylinder(cap, 0.0f, 0.16f, 0.28f, 6, hat);
+                }
+            }
         } break;
 
         case KIND_SOLDIER:
@@ -1627,11 +2010,32 @@ void StrategyWorldDraw3D(void)
     {
         Building *b = &world.buildings[i];
         if (!b->active) continue;
-        DrawBuilding(b->kind, b->faction, b->pos, BEIGE);
+
+        // A scaffold reads as a faint, translucent version of the finished
+        // building wrapped in a wireframe frame so it's clearly "not done".
+        Color tint = b->underConstruction ? Fade(BEIGE, 0.35f) : BEIGE;
+        DrawBuilding(b->kind, b->faction, b->pos, tint);
+        if (b->underConstruction)
+        {
+            Vector3 frame = (Vector3){ b->pos.x, 0.9f, b->pos.z };
+            DrawCubeWires(frame, 2.0f, 1.8f, 2.0f, Fade(BROWN, 0.8f));
+        }
         if (i == world.selectedBuilding)
         {
             Vector3 ring = (Vector3){ b->pos.x, 0.02f, b->pos.z };
             DrawCircle3D(ring, 1.5f, (Vector3){ 1.0f, 0.0f, 0.0f }, 90.0f, GREEN);
+
+            // Rally flag for the selected training building.
+            if (b->hasRally)
+            {
+                Vector3 top = (Vector3){ b->rally.x, 1.4f, b->rally.z };
+                Vector3 bot = (Vector3){ b->rally.x, 0.0f, b->rally.z };
+                DrawLine3D(bot, top, GREEN);
+                DrawCube((Vector3){ b->rally.x + 0.2f, 1.25f, b->rally.z },
+                         0.4f, 0.25f, 0.05f, GREEN);
+                DrawCircle3D((Vector3){ b->rally.x, 0.02f, b->rally.z }, 0.5f,
+                             (Vector3){ 1.0f, 0.0f, 0.0f }, 90.0f, Fade(GREEN, 0.6f));
+            }
         }
     }
     for (int i = 0; i < STRAT_MAX_UNITS; i++)
@@ -1714,7 +2118,7 @@ void StrategyWorldDraw2DOverlay(void)
 
     if (world.placing >= 0)
     {
-        const char *hint = "LMB place - RMB/ESC cancel";
+        const char *hint = "LMB place - Shift+LMB place more - RMB/ESC cancel";
         DrawText(hint, (int)(gameSize.x*0.5f - (float)MeasureText(hint, size/2)*0.5f),
                  (int)(gameSize.y*0.9f), size/2, RAYWHITE);
     }

@@ -46,6 +46,24 @@
 #define STRAT_HEAL_AMOUNT    8.0f   // hp restored by one healer blessing
 #define STRAT_HEAL_COST      1     // providence consumed by one healing
 
+// Construction / repair (worker-driven).
+#define STRAT_BUILD_RANGE    1.8f   // worker must be this close to build/repair
+#define STRAT_REPAIR_RATE    12.0f  // building hp restored per second per worker
+
+// Node-tending buildings (farm -> wheat, forestry -> wood): an assigned worker
+// walks to a free spot nearby and plants a node. Once TEND_MAX nodes stand
+// near the building the worker instead harvests the nearest one to depletion,
+// then resumes planting. Amounts come from the building def (tendAmount).
+#define STRAT_TEND_RANGE   6.0f   // how far from the building a worker plants
+#define STRAT_TEND_SPACING 1.4f   // min gap to any node/building at a plant spot
+#define STRAT_TEND_PERIOD  1.5f   // seconds to plant one node once in position
+#define STRAT_TEND_MAX     8       // planted nodes near the building before gathering
+
+// Quarry: spend providence to conjure a fresh stone node beside it.
+#define STRAT_QUARRY_STONE_PROV   2     // providence spent per spawn
+#define STRAT_QUARRY_STONE_AMOUNT 100   // stone in the spawned node
+#define STRAT_QUARRY_STONE_SPREAD 3.0f  // jitter radius around the quarry
+
 typedef enum {
     RES_WOOD = 0,
     RES_STONE,
@@ -71,6 +89,7 @@ typedef enum {
     BLD_TOWN_HALL,      // CRITICAL initial building: trains workers, accepts
                         //   wood + stone + food
     BLD_CHANTRY,        // trains templars (providence economy)
+    BLD_FORESTRY,       // auto-plants fresh tree nodes nearby over time
     BLD_COUNT
 } BuildingKind;
 
@@ -97,6 +116,8 @@ typedef enum {
     UNIT_FLEE,          // animal running away from an attacker (to .target)
     UNIT_FOLLOW,        // templar shadowing .targetUnit
     UNIT_BLESS,         // templar performing the sparkly blessing on .targetUnit
+    UNIT_BUILD,         // worker raising a scaffold (.targetBuilding) to full
+    UNIT_REPAIR,        // worker restoring a damaged building (.targetBuilding)
 } UnitState;
 
 typedef struct {
@@ -141,6 +162,21 @@ typedef struct {
     int          trainKind;         // UnitKind in production, -1 = idle
     float        trainProgress;     // seconds spent on the current trainee
     float        trainCooldown;     // anti-spam: seconds until training may restart
+
+    // Production queue: kinds waiting behind the current trainee (paid for on
+    // enqueue). The active trainee is trainKind; these are the ones after it.
+#define BLD_MAX_QUEUE 8
+    UnitKind     trainQueue[BLD_MAX_QUEUE];
+    int          trainQueueCount;   // 0..BLD_MAX_QUEUE
+
+    // Construction: a freshly placed building starts as a scaffold that a
+    // worker must build up before it functions (no train / dropoff / popcap).
+    bool         underConstruction;
+    float        buildProgress;     // seconds accrued by workers, toward buildTime
+
+    // Rally: trained units walk here on completion instead of going idle.
+    Vector3      rally;
+    bool         hasRally;
 
     // Timed buffs (reserved: filled by future upgrades / templar blessings
     // on buildings; property indices to be defined with the upgrade system).

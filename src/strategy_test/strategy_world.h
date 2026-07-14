@@ -28,6 +28,8 @@ void StrategyOrderGather(Unit *u, int nodeIndex);
 void StrategyOrderAttack(Unit *u, int unitIndex);
 void StrategyOrderAttackBuilding(Unit *u, int bldIndex);
 void StrategyOrderFarm(Unit *u, int bldIndex);
+void StrategyOrderBuild(Unit *u, int bldIndex);     // raise a scaffold to full
+void StrategyOrderRepair(Unit *u, int bldIndex);    // restore a damaged building
 
 // Nearest active node of a kind (-1 = any kind) within radius, else -1.
 int StrategyNearestNodeOfKind(Vector3 pos, int nodeKind, float radius);
@@ -36,11 +38,17 @@ int StrategyNearestNodeOfKind(Vector3 pos, int nodeKind, float radius);
 // success. Shared by the GUI buttons and the enemy AI.
 bool StrategyTrainStart(int bldIndex, UnitKind kind);
 
+// Cancel one trainee (last queued, else the active one) and refund its cost.
+bool StrategyTrainCancel(int bldIndex);
+
 // Validate + pay + place a building; false when unaffordable or blocked.
 bool StrategyTryBuild(int faction, BuildingKind kind, Vector3 pos);
 
 // Sell a building: refund refundRate (+ difficulty bonus) of its cost.
 bool StrategySellBuilding(int index);
+
+// Quarry: spend providence to spawn a fresh stone node beside it.
+bool StrategyQuarrySpawnStone(int bldIndex);
 
 // Enemy + animal think tick (strategy_ai.c), called on the world's aiTimer.
 void StrategyAiTick(void);

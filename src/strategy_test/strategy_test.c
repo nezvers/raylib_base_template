@@ -195,6 +195,28 @@ static void Draw()
 //  Publishes its rectangle to world->guiBlock so the world ignores mouse
 //  presses that land on the panel (no click-through selecting units).
 // ----------------------------------------------------------------------------
+// Readable info drawn on its own row ABOVE the button strip, with an opaque
+// backing so it stays legible over the battlefield. `sub` (may be NULL) is a
+// second, dimmer line below `text` - used for what a building is doing.
+static void GuiInfoRow(Rectangle row, const char *text, const char *sub)
+{
+    DrawRectangleRec(row, Fade(BLACK, 0.7f));
+    DrawRectangleLinesEx(row, 1.0f, Fade(RAYWHITE, 0.3f));
+    int fs = (int)(row.height*(sub ? 0.34f : 0.6f));
+    if (sub)
+    {
+        DrawText(text, (int)(row.x + 10.0f),
+                 (int)(row.y + row.height*0.14f), fs, RAYWHITE);
+        DrawText(sub, (int)(row.x + 10.0f),
+                 (int)(row.y + row.height*0.54f), fs, Fade(RAYWHITE, 0.75f));
+    }
+    else
+    {
+        DrawText(text, (int)(row.x + 10.0f),
+                 (int)(row.y + (row.height - (float)fs)*0.5f), fs, RAYWHITE);
+    }
+}
+
 static void GuiCommandPanel(StrategyWorld *world)
 {
     ScreenState *ss = ScreenStateGet();
@@ -213,10 +235,18 @@ static void GuiCommandPanel(StrategyWorld *world)
     float x   = vp.x + 20.0f;
     float y   = vp.y + vp.height - h - 20.0f;
 
+    // Info row sits one row above the buttons. A selected building shows two
+    // lines (name+HP, then what it's doing), so the row is taller then.
+    bool bldSelected = (world->selectedBuilding >= 0);
+    float infoH = (bldSelected ? 42.0f : 26.0f)*(float)s;
+    Rectangle infoRow = { vp.x + 20.0f, y - infoH - 6.0f,
+                          vp.width - 40.0f, infoH };
+
     // Selection census (drives which panel shows).
     int workers = 0;
     int soldiers = 0;   // fighters: melee + ranged
     int templars = 0;
+    int lastSel = -1;   // index of the single selected unit (for detailed info)
     for (int i = 0; i < STRAT_MAX_UNITS; i++)
     {
         Unit *u = &world->units[i];
@@ -225,15 +255,106 @@ static void GuiCommandPanel(StrategyWorld *world)
         else if (u->kind == KIND_TEMPLAR ||
                  u->kind == KIND_TEMPLAR_HEALER) templars++;
         else soldiers++;
+        lastSel = i;
     }
+    int selCount = workers + soldiers + templars;
 
-    // Reserve the whole strip up front; individual widgets draw inside it.
-    world->guiBlock = (Rectangle){ vp.x, y - 6.0f, vp.width, h + 12.0f };
+    // Reserve BOTH rows so world clicks under the info row are also blocked.
+    world->guiBlock = (Rectangle){ vp.x, infoRow.y - 6.0f, vp.width,
+                                   (y + h + 12.0f) - (infoRow.y - 6.0f) };
+
+    // --- Info row content: single-unit stats, group census, or building. ---
+    if (bldSelected)
+    {
+        Building *b = &world->buildings[world->selectedBuilding];
+        const BuildingDef *bd = StrategyBuildingDef(b->kind);
+
+        // Top line: name + HP. Bottom line: what the building is DOING (build
+        // progress / training + queue / resting / farm hands / idle).
+        const char *head = b->underConstruction
+            ? TextFormat("%s (scaffold)   build %.0f%%", bd->name,
+                         100.0f*b->buildProgress/bd->buildTime)
+            : TextFormat("%s   HP %.0f/%.0f", bd->name, b->hp, b->maxHp);
+
+        const char *sub;
+        if (b->underConstruction)
+        {
+            sub = "RMB a worker onto it to build";
+        }
+        else if (b->trainKind >= 0)
+        {
+            const UnitDef *ud = StrategyUnitDef((UnitKind)b->trainKind);
+            const char *base = TextFormat("training %s  %.0f%%", ud->name,
+                                          100.0f*b->trainProgress/ud->trainTime);
+            sub = (b->trainQueueCount > 0)
+                ? TextFormat("%s   (+%d queued)", base, b->trainQueueCount)
+                : base;
+        }
+        else if (b->trainCooldown > 0.0f && bd->trainableCount > 0)
+        {
+            sub = (b->trainQueueCount > 0)
+                ? TextFormat("resting %.1fs   (+%d queued)", b->trainCooldown,
+                             b->trainQueueCount)
+                : TextFormat("resting %.1fs", b->trainCooldown);
+        }
+        else if (bd->tendNode >= 0)
+        {
+            int hands = 0;
+            for (int i = 0; i < STRAT_MAX_UNITS; i++)
+            {
+                Unit *u = &world->units[i];
+                if (u->active && u->state == UNIT_FARM &&
+                    u->targetBuilding == world->selectedBuilding) hands++;
+            }
+            const char *what = (bd->tendNode == NODE_TREE) ? "planting wood" : "planting wheat";
+            sub = TextFormat("%s - workers: %d  (RMB a worker here)", what, hands);
+        }
+        else sub = "idle";
+
+        GuiInfoRow(infoRow, head, sub);
+    }
+    else if (selCount == 1)
+    {
+        Unit *u = &world->units[lastSel];
+        const char *name = StrategyUnitDef(u->kind)->name;
+        GuiInfoRow(infoRow, TextFormat("%s   HP %.0f/%.0f   DMG %.0f",
+                   name, u->hp, u->maxHp, u->damage), NULL);
+    }
+    else if (selCount > 1)
+    {
+        GuiInfoRow(infoRow, TextFormat("%d WORKER   %d ARMY   %d TEMPLAR",
+                   workers, soldiers, templars), NULL);
+    }
 
     if (world->buildMenuOpen)
     {
+        // Paginate the building buttons so they always fit the screen width.
+        static int buildPage = 0;
         float w = 110.0f*(float)s;
-        for (int kind = 0; kind < BLD_COUNT; kind++)
+        float navW = 44.0f*(float)s;
+        float closeW = 80.0f*(float)s;
+        // Width available for building buttons after nav + close reserve.
+        float avail = vp.width - 40.0f - (2.0f*(navW + gap)) - (closeW + gap);
+        int perPage = (int)(avail/(w + gap));
+        if (perPage < 1) perPage = 1;
+        int pages = (BLD_COUNT + perPage - 1)/perPage;
+        if (buildPage >= pages) buildPage = pages - 1;
+        if (buildPage < 0) buildPage = 0;
+
+        if (pages > 1)
+        {
+            if (GuiButton((Rectangle){ x, y, navW, h }, "<") && buildPage > 0)
+            {
+                AudioPlayButton();
+                buildPage--;
+            }
+            x += navW + gap;
+        }
+
+        int first = buildPage*perPage;
+        int last  = first + perPage;
+        if (last > BLD_COUNT) last = BLD_COUNT;
+        for (int kind = first; kind < last; kind++)
         {
             const BuildingDef *bd = StrategyBuildingDef((BuildingKind)kind);
             const char *text = TextFormat("%s %dw %ds", bd->name,
@@ -246,7 +367,18 @@ static void GuiCommandPanel(StrategyWorld *world)
             }
             x += w + gap;
         }
-        if (GuiButton((Rectangle){ x, y, 80.0f*(float)s, h }, "CLOSE"))
+
+        if (pages > 1)
+        {
+            if (GuiButton((Rectangle){ x, y, navW, h }, ">") && buildPage < pages - 1)
+            {
+                AudioPlayButton();
+                buildPage++;
+            }
+            x += navW + gap;
+        }
+
+        if (GuiButton((Rectangle){ x, y, closeW, h }, "CLOSE"))
         {
             AudioPlayButton();
             world->buildMenuOpen = false;
@@ -258,28 +390,12 @@ static void GuiCommandPanel(StrategyWorld *world)
         const BuildingDef *bd = StrategyBuildingDef(b->kind);
         float w = 190.0f*(float)s;
 
-        if (b->trainKind >= 0)
+        // Status text (scaffold / training / resting / farm) now lives in the
+        // info row above; the button strip is actions only. TRAIN buttons stay
+        // available while training so you can queue more (StrategyTrainStart
+        // enqueues when busy). Scaffolds can't train.
+        if (!b->underConstruction && bd->trainableCount > 0)
         {
-            // Progress bar for the current trainee.
-            const UnitDef *ud = StrategyUnitDef((UnitKind)b->trainKind);
-            float frac = b->trainProgress/ud->trainTime;
-            GuiLabel((Rectangle){ x, y, w, h }, TextFormat("training %s...", ud->name));
-            x += w + gap;
-            DrawRectangle((int)x, (int)(y + h*0.35f),
-                          (int)w, (int)(h*0.3f), Fade(DARKGRAY, 0.8f));
-            DrawRectangle((int)x, (int)(y + h*0.35f),
-                          (int)(w*frac), (int)(h*0.3f), GREEN);
-            x += w + gap;
-        }
-        else if (b->trainCooldown > 0.0f && bd->trainableCount > 0)
-        {
-            GuiLabel((Rectangle){ x, y, w, h },
-                     TextFormat("%s resting %.1fs", bd->name, b->trainCooldown));
-            x += w + gap;
-        }
-        else if (bd->trainableCount > 0)
-        {
-            // One TRAIN button per kind this building can produce.
             for (int t = 0; t < bd->trainableCount; t++)
             {
                 const UnitDef *ud = StrategyUnitDef(bd->trainable[t]);
@@ -293,23 +409,28 @@ static void GuiCommandPanel(StrategyWorld *world)
                 x += w + gap;
             }
         }
-        else if (b->kind == BLD_FARM)
+
+        // QUARRY: spend providence to conjure a fresh stone node nearby.
+        if (!b->underConstruction && b->kind == BLD_QUARRY)
         {
-            int hands = 0;
-            for (int i = 0; i < STRAT_MAX_UNITS; i++)
+            const char *stone = TextFormat("SPAWN STONE (%dprov)", STRAT_QUARRY_STONE_PROV);
+            if (GuiButton((Rectangle){ x, y, 200.0f*(float)s, h }, stone))
             {
-                Unit *u = &world->units[i];
-                if (u->active && u->state == UNIT_FARM &&
-                    u->targetBuilding == world->selectedBuilding) hands++;
+                AudioPlayButton();
+                StrategyQuarrySpawnStone(world->selectedBuilding);
             }
-            GuiLabel((Rectangle){ x, y, w, h },
-                     TextFormat("FARM - workers: %d (RMB workers here)", hands));
-            x += w + gap;
+            x += 200.0f*(float)s + gap;
         }
-        else
+
+        // CANCEL: drop the last queued trainee (or the active one), refunded.
+        if (b->trainKind >= 0 || b->trainQueueCount > 0)
         {
-            GuiLabel((Rectangle){ x, y, w, h }, bd->name);
-            x += w + gap;
+            if (GuiButton((Rectangle){ x, y, 90.0f*(float)s, h }, "CANCEL"))
+            {
+                AudioPlayButton();
+                StrategyTrainCancel(world->selectedBuilding);
+            }
+            x += 90.0f*(float)s + gap;
         }
 
         // SELL: refund scales with the difficulty bonus (Easy sells best).
@@ -323,13 +444,9 @@ static void GuiCommandPanel(StrategyWorld *world)
             StrategySellBuilding(world->selectedBuilding);
         }
     }
-    else if (workers + soldiers + templars > 0)
+    else if (selCount > 0)
     {
-        GuiLabel((Rectangle){ x, y, 220.0f*(float)s, h },
-                 TextFormat("%d WORKER  %d ARMY  %d TEMPLAR",
-                            workers, soldiers, templars));
-        x += 220.0f*(float)s + gap;
-
+        // Census now lives in the info row above; this row is just actions.
         if (GuiButton((Rectangle){ x, y, 80.0f*(float)s, h }, "STOP"))
         {
             AudioPlayButton();
