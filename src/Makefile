@@ -195,7 +195,7 @@ endif
 
 # Define include paths for required headers: INCLUDE_PATHS
 #------------------------------------------------------------------------------------------------
-INCLUDE_PATHS += -I. -Iexternal -I$(RAYLIB_INCLUDE_PATH) -I$(BOX2D_INCLUDE_PATH)
+INCLUDE_PATHS += -I. -Iinclude -Iexternal -I$(RAYLIB_INCLUDE_PATH) -I$(BOX2D_INCLUDE_PATH)
 
 # Define additional directories containing required header files
 ifeq ($(PLATFORM),PLATFORM_DRM)
@@ -312,6 +312,8 @@ ifeq ($(PLATFORM),PLATFORM_DESKTOP)
         # On XWindow requires also below libraries
         LDLIBS += -lX11 -lXrandr -lXinerama -lXi -lXxf86vm -lXcursor
     endif
+    # box2d static lib (used by platformer_test via box2d_wrap)
+    LDLIBS += $(BOX2D_LIB_PATH)/libbox2d.a
 endif
 ifeq ($(PLATFORM),PLATFORM_WEB)
     # Libraries for web (HTML5) compiling
@@ -363,7 +365,8 @@ ifeq ($(PLATFORM),PLATFORM_DESKTOP)
 	rm -fv *.o
     endif
     ifeq ($(PLATFORM_OS),OSX)
-	rm -f *.o external/*.o $(PROJECT_NAME)
+	find . -name '*.o' -delete
+	rm -f $(PROJECT_NAME)
     endif
 endif
 ifeq ($(PLATFORM),PLATFORM_RPI)
