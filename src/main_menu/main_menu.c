@@ -116,10 +116,10 @@ static const SceneAnim menuAnim = {
 // SceneAnimDrawTexts call keeps drawing the texts at their rest pose forever.
 static SceneAnimPlayer introPlayer;
 
-// Leave the menu through the generic outro player (PLAY button and ENTER).
-static void StartGameTransition()
+// Leave the menu through the generic outro player (PLAY/STRATEGY and ENTER).
+static void StartGameTransition(AppState *destination)
 {
-    TransitionStateStart(&menuAnim, &app_state_platformer);
+    TransitionStateStart(&menuAnim, destination);
     AppStateTransition(&app_state_transition);
 }
 
@@ -167,7 +167,7 @@ static void Update()
     // Keyboard input example: ENTER also starts the game.
     if (IsKeyPressed(KEY_ENTER))
     {
-        StartGameTransition();
+        StartGameTransition(&app_state_platformer);
     }
 
     // ESC: on the OPTIONS page it returns to MAIN; on MAIN it quits the app.
@@ -288,10 +288,10 @@ static void Gui()
     // Height of the active page's column at s=1: the sum of every "y +=" advance below
     // (for that page) plus the final row's own height. Each page fits/scales on its own.
     // If you ADD/REMOVE a widget on a page, update its manual calc of gui height here:
-    //   MAIN:    label48 +play48 +options48 +quit36 = 180.
+    //   MAIN:    label48 +play48 +strategy48 +options48 +quit36 = 228.
     //   OPTIONS: back48 +vollbl22 +slider32 +modelbl20 +modetog48 +persist32
     //            +difftog48 +difflbl32 +scalelbl20 +scaletog36 = 338.
-    const float LAYOUT_UNITS = (menuPage == MENU_PAGE_MAIN) ? 180.0f : 338.0f;
+    const float LAYOUT_UNITS = (menuPage == MENU_PAGE_MAIN) ? 228.0f : 338.0f;
 
     // Prefer to CONTAIN the column in the game region, anchored below the title.
     // If it's too tall for that, EXPAND to use the whole window height (anchored near the screen top). 
@@ -342,7 +342,14 @@ static void Gui()
             AudioPlayButton();
             // Arm the generic outro player with OUR spec + destination, then
             // enter it. Our Exit() runs, then the transition's Enter().
-            StartGameTransition();
+            StartGameTransition(&app_state_platformer);
+        }
+        y += h + gap;
+
+        if (GuiButton((Rectangle){ x, y, w, h }, "STRATEGY (-> RTS test)"))
+        {
+            AudioPlayButton();
+            StartGameTransition(&app_state_strategy);
         }
         y += h + gap;
 
