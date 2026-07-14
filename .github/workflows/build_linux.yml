@@ -52,7 +52,7 @@ jobs:
     - name: Build Product
       run: |
         cd ${{ env.PROJECT_REPO_NAME }}
-        cmake -S . -B "/build" -G "Unix Makefiles" "-DPROJECT_NAME=${{ env.PROJECT_NAME }}" "-DCMAKE_BUILD_TYPE=Release"
+        cmake -S . -B "build" -G "Unix Makefiles" "-DPROJECT_NAME=${{ env.PROJECT_NAME }}" "-DCMAKE_BUILD_TYPE=Release"
         make -C "./build"
 
     - name: Generate Artifacts
