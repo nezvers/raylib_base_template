@@ -52,13 +52,13 @@ jobs:
     - name: Build Product
       run: |
         cd ${{ env.PROJECT_REPO_NAME }}
-        cmake -S . -B "/build" -G "Unix Makefiles" "-DCMAKE_BUILD_TYPE=Release"
+        cmake -S . -B "/build" -G "Unix Makefiles" "-DPROJECT_NAME=${{ env.PROJECT_NAME }}" "-DCMAKE_BUILD_TYPE=Release"
         make -C "./build"
 
     - name: Generate Artifacts
       run: |
-        ls ${{ env.PROJECT_BUILD_PATH }}
-        cp ${{ env.PROJECT_BUILD_PATH }}/${{ env.PROJECT_NAME }} ${{ env.PROJECT_RELEASE_PATH }}
+        ls ${{ env.PROJECT_BUILD_PATH }}/${{ env.PROJECT_NAME }}
+        cp ${{ env.PROJECT_BUILD_PATH }}/${{ env.PROJECT_NAME }}/${{ env.PROJECT_NAME }} ${{ env.PROJECT_RELEASE_PATH }}
         cp -r ${{ env.PROJECT_REPO_NAME }}/${{ env.PROJECT_RESOURCES_SRC_PATH }} ${{ env.PROJECT_RELEASE_PATH }}/${{ env.PROJECT_RESOURCES_DST_PATH }}
         cp ${{ env.PROJECT_REPO_NAME }}/README.md ${{ env.PROJECT_RELEASE_PATH }}
         cp ${{ env.PROJECT_REPO_NAME }}/LICENSE ${{ env.PROJECT_RELEASE_PATH }}

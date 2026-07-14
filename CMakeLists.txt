@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.24...3.30)
-project(raylib-game-template)
+IF (DEFINED PROJECT_NAME)
+    project(${PROJECT_NAME})
+    MESSAGE(STATUS " - - - Project name is defined")
+ELSE( DEFINED PROJECT_NAME )
+    project(raylib-game-template)
+ENDIF (DEFINED PROJECT_NAME)
 
 include(FetchContent)
 
