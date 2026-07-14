@@ -32,19 +32,6 @@ jobs:
       with:
         path: ${{ env.PROJECT_REPO_NAME }}
 
-    - name: Checkout raylib repo
-      uses: actions/checkout@master
-      with:
-        repository: raysan5/raylib
-        path: raylib
-
-    - name: Checkout box2d repo
-      uses: actions/checkout@master
-      with:
-        repository: erincatto/box2d
-        ref: v3.1.1
-        path: box2d
-
     - name: Setup emsdk
       uses: emscripten-core/setup-emsdk@v15
       with:
@@ -63,16 +50,11 @@ jobs:
         ls
       shell: bash
 
-    - name: Build box2d Library
-      run: |
-        cd box2d
-        emcmake cmake -B build -DCMAKE_BUILD_TYPE=Release -DBOX2D_UNIT_TESTS=OFF -DBOX2D_SAMPLES=OFF -DBOX2D_VALIDATE=OFF -DBOX2D_DISABLE_SIMD=ON
-        cmake --build build --config Release --target box2d
-
     - name: Build Product
       run: |
-        cd ${{ env.PROJECT_REPO_NAME }}/src
-        make PLATFORM=PLATFORM_WEB BUILD_MODE=RELEASE EMSDK_PATH="D:/a/${{ env.PROJECT_REPO_NAME }}/${{ env.PROJECT_REPO_NAME }}/emsdk-cache/emsdk-main" PROJECT_BUILD_PATH=. RAYLIB_PATH=../../raylib BOX2D_PATH=../../box2d -B
+        cd ${{ env.PROJECT_REPO_NAME }}
+        emcmake cmake -S . -B "build" -G "Unix Makefiles" "-DPROJECT_NAME=${{ env.PROJECT_NAME }}" "-DCMAKE_BUILD_TYPE=Release" "-DPLATFORM=Web"
+        cmake --build "build"
 
     - name: Generate Artifacts
       run: |
