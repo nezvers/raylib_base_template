@@ -40,6 +40,13 @@ jobs:
         repository: raysan5/raylib
         path: raylib
 
+    - name: Checkout box2d repo
+      uses: actions/checkout@master
+      with:
+        repository: erincatto/box2d
+        ref: v3.1.1
+        path: box2d
+
     - name: Setup Release Paths
       run: |
         echo "PROJECT_RELEASE_PATH=${{ env.PROJECT_NAME }}_v${{ github.event.release.tag_name }}_macos" >> $GITHUB_ENV
@@ -87,19 +94,37 @@ jobs:
         lipo libraylib.a -detailed_info
         cd ../..
 
+    - name: Build box2d Library
+      run: |
+        cd box2d
+
+        # Build box2d x86_64 static
+        cmake -B build_x86_64 -DCMAKE_BUILD_TYPE=Release -DBOX2D_UNIT_TESTS=OFF -DBOX2D_SAMPLES=OFF -DBOX2D_VALIDATE=OFF -DBOX2D_DISABLE_SIMD=ON -DCMAKE_OSX_ARCHITECTURES=x86_64
+        cmake --build build_x86_64 --config Release --target box2d
+
+        # Build box2d arm64 static
+        cmake -B build_arm64 -DCMAKE_BUILD_TYPE=Release -DBOX2D_UNIT_TESTS=OFF -DBOX2D_SAMPLES=OFF -DBOX2D_VALIDATE=OFF -DBOX2D_DISABLE_SIMD=ON -DCMAKE_OSX_ARCHITECTURES=arm64
+        cmake --build build_arm64 --config Release --target box2d
+
+        # Join x86_64 and arm64 into universal lib at the path the Makefile expects
+        mkdir -p build/src
+        lipo -create -output build/src/libbox2d.a build_x86_64/src/libbox2d.a build_arm64/src/libbox2d.a
+        lipo build/src/libbox2d.a -detailed_info
+        cd ..
+
     - name: Build Product
       run: |
         cd ${{ env.PROJECT_REPO_NAME }}/src
 
         # Build project x86_64 binary
         # TODO: Link with x86_64 raylib library: libraylib_x86_64.a
-        make PLATFORM=PLATFORM_DESKTOP BUILD_MODE=RELEASE PROJECT_CUSTOM_FLAGS=${{ env.PROJECT_CUSTOM_FLAGS }} PROJECT_BUILD_PATH=. RAYLIB_PATH=../../raylib PROJECT_CUSTOM_FLAGS="-target x86_64-apple-macos10.12"
+        make PLATFORM=PLATFORM_DESKTOP BUILD_MODE=RELEASE PROJECT_CUSTOM_FLAGS=${{ env.PROJECT_CUSTOM_FLAGS }} PROJECT_BUILD_PATH=. RAYLIB_PATH=../../raylib BOX2D_PATH=../../box2d PROJECT_CUSTOM_FLAGS="-target x86_64-apple-macos10.12"
         mv -v -f ${{ env.PROJECT_NAME }} ${{ env.PROJECT_NAME }}_x86_64
         make clean
 
         # Build project arm64 binary
         # TODO: Link with arm64 raylib library: libraylib_arm.a
-        make PLATFORM=PLATFORM_DESKTOP BUILD_MODE=RELEASE PROJECT_CUSTOM_FLAGS=${{ env.PROJECT_CUSTOM_FLAGS }} PROJECT_BUILD_PATH=. RAYLIB_PATH=../../raylib PROJECT_CUSTOM_FLAGS="-target arm64-apple-macos11"
+        make PLATFORM=PLATFORM_DESKTOP BUILD_MODE=RELEASE PROJECT_CUSTOM_FLAGS=${{ env.PROJECT_CUSTOM_FLAGS }} PROJECT_BUILD_PATH=. RAYLIB_PATH=../../raylib BOX2D_PATH=../../box2d PROJECT_CUSTOM_FLAGS="-target arm64-apple-macos11"
         mv -v -f ${{ env.PROJECT_NAME }} ${{ env.PROJECT_NAME }}_arm64
         make clean
 
