@@ -22,7 +22,7 @@ jobs:
     env:
       PROJECT_NAME: ${{ github.event.repository.name }}
       PROJECT_REPO_NAME: ${{ github.event.repository.name }}
-      PROJECT_BUILD_PATH: ${{ github.event.repository.name }}/src
+      PROJECT_BUILD_PATH: ${{ github.event.repository.name }}/build
       PROJECT_RELEASE_PATH: ${{ github.event.repository.name }}_dev_linux_x64
       PROJECT_RESOURCES_SRC_PATH: src/resources
       PROJECT_RESOURCES_DST_PATH: resources
@@ -33,12 +33,6 @@ jobs:
       uses: actions/checkout@master
       with:
         path: ${{ env.PROJECT_REPO_NAME }}
-      
-    - name: Checkout raylib repo
-      uses: actions/checkout@master
-      with:
-        repository: raysan5/raylib
-        path: raylib
         
     - name: Setup Release Paths
       run: |
@@ -50,21 +44,16 @@ jobs:
     - name: Setup Environment
       run: | 
         sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends libglfw3 libglfw3-dev libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libxext-dev libxfixes-dev libwayland-dev libxkbcommon-dev
+        sudo apt-get install -y --no-install-recommends cmake libglfw3 libglfw3-dev libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libxext-dev libxfixes-dev libwayland-dev libxkbcommon-dev
         mkdir ${{ env.PROJECT_RELEASE_PATH }}
         ls
       shell: bash
-        
-    - name: Build raylib Library
-      run: |
-        cd raylib/src
-        gcc --version
-        make PLATFORM=PLATFORM_DESKTOP BUILD_MODE=RELEASE RAYLIB_LIBTYPE=STATIC RAYLIB_RELEASE_PATH=. -B
 
     - name: Build Product
       run: |
-        cd ${{ env.PROJECT_REPO_NAME }}/src
-        make PLATFORM=PLATFORM_DESKTOP BUILD_MODE=RELEASE PROJECT_CUSTOM_FLAGS=${{ env.PROJECT_CUSTOM_FLAGS }} PROJECT_BUILD_PATH=. RAYLIB_PATH=../../raylib
+        cd ${{ env.PROJECT_REPO_NAME }}
+        cmake -S . -B "/build" -G "Unix Makefiles" "-DCMAKE_BUILD_TYPE=Release"
+        make -C "./build"
 
     - name: Generate Artifacts
       run: |
