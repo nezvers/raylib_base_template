@@ -14,30 +14,10 @@
 
 #include "strategy_world.h"
 #include "../screen_state/screen_state.h"
+#include "../settings_state/settings_state.h"
 #include "raymath.h"
 #include <math.h>
 #include <stddef.h>
-
-// Build costs, indexed [BuildingKind][ResourceKind] (wood, stone, food).
-const int strategyBuildingCost[BLD_COUNT][RES_COUNT] = {
-    { 5, 3, 0 },   // BLD_HOUSE
-    { 3, 0, 0 },   // BLD_LOGGING
-    { 2, 2, 0 },   // BLD_QUARRY
-    { 6, 4, 0 },   // BLD_BARRACKS
-    { 4, 1, 0 },   // BLD_FARM
-};
-
-// Training costs, indexed [KIND_WORKER/KIND_SOLDIER][ResourceKind].
-const int strategyTrainCost[2][RES_COUNT] = {
-    { 0, 0, 2 },   // worker: 2 food
-    { 2, 0, 2 },   // soldier: 2 wood + 2 food
-};
-
-// Per-kind stats. Workers can defend themselves (weakly); animals never fight.
-static const float unitMaxHp[UNIT_KIND_COUNT]     = { 30.0f, 60.0f, 15.0f };
-static const float unitDamage[UNIT_KIND_COUNT]    = {  4.0f, 12.0f,  0.0f };
-static const float unitTrainTime[2]               = { STRAT_TRAIN_TIME_WORKER,
-                                                      STRAT_TRAIN_TIME_SOLDIER };
 
 const Color strategyFactionColor[STRAT_FACTIONS] = {
     {  80, 140, 255, 255 },     // faction 0: player, blue
@@ -139,6 +119,11 @@ static Unit *UnitSpawn(int faction, UnitKind kind, Vector3 pos)
         Unit *u = &world.units[i];
         if (u->active) continue;
 
+        // Resolve stats ONCE: base def x this faction's difficulty mods.
+        // (Training-building buffs multiply on top in BuildingsUpdate.)
+        const UnitDef *def = StrategyUnitDef(kind);
+        const FactionMods *m = &world.mods[faction];
+
         *u = (Unit){ 0 };
         u->active         = true;
         u->faction        = faction;
@@ -146,8 +131,16 @@ static Unit *UnitSpawn(int faction, UnitKind kind, Vector3 pos)
         u->pos            = pos;
         u->target         = pos;
         u->state          = UNIT_IDLE;
-        u->maxHp          = unitMaxHp[kind];
-        u->hp             = unitMaxHp[kind];
+        u->maxHp          = def->maxHp*m->hpMul;
+        u->hp             = u->maxHp;
+        u->damage         = def->damage*m->dmgMul;
+        u->attackRange    = def->attackRange;
+        u->attackPeriod   = def->attackPeriod;
+        u->preferredRange = def->preferredRange;
+        u->moveSpeed      = def->moveSpeed;
+        u->sightRange     = def->sightRange*m->sightMul;
+        u->gatherTime     = def->gatherTime*m->gatherMul;
+        u->farmPeriod     = def->farmPeriod*m->gatherMul;
         u->targetUnit     = -1;
         u->targetNode     = -1;
         u->targetBuilding = -1;
@@ -168,8 +161,8 @@ static Building *BuildingSpawn(BuildingKind kind, int faction, Vector3 pos)
         b->kind          = kind;
         b->faction       = faction;
         b->pos           = pos;
-        b->maxHp         = 100.0f;
-        b->hp            = 100.0f;
+        b->maxHp         = StrategyBuildingDef(kind)->maxHp;
+        b->hp            = b->maxHp;
         b->trainKind     = -1;
         b->trainProgress = 0.0f;
         return b;
@@ -210,8 +203,28 @@ void StrategyWorldInit(void)
     world.placing          = -1;
     world.selectedBuilding = -1;
     world.gameOver         = -1;
-    world.aiTimer          = STRAT_AI_PERIOD;
     EffectsReset();
+
+    // Difficulty mods BEFORE any spawn (UnitSpawn reads them). The player and
+    // neutral rows stay identity; only the AI faction is scaled. Hard is the
+    // baseline; Normal/Easy weaken the AI and give the player a sell bonus.
+    FactionMods identity = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f };
+    world.mods[0] = world.mods[1] = world.mods[FACTION_NEUTRAL] = identity;
+    switch (SettingsGet()->difficulty)
+    {
+        case 0:     // Easy
+            world.mods[1] = (FactionMods){ 0.8f, 0.8f, 1.10f, 0.9f, 1.6f, 0.0f };
+            world.mods[0].refundBonus = 0.2f;
+            break;
+        case 1:     // Normal
+            world.mods[1] = (FactionMods){ 0.9f, 1.0f, 1.05f, 1.0f, 1.25f, 0.0f };
+            world.mods[0].refundBonus = 0.1f;
+            break;
+        default:    // Hard: identity
+            break;
+    }
+    world.aiPeriod = STRAT_AI_PERIOD*world.mods[1].aiPeriodMul;
+    world.aiTimer  = world.aiPeriod;
 
     // Camera: perspective, fixed pitch; focus starts over the player base.
     world.camera.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
@@ -221,14 +234,17 @@ void StrategyWorldInit(void)
     world.camZoom  = 1.0f;
     CameraRefresh();
 
-    // Two rival bases in opposite corners: two houses (pop cap 8 for the
-    // starting 6 units) + barracks, 4 workers + 2 soldiers each.
-    BuildingSpawn(BLD_HOUSE,    0, (Vector3){ -14.0f, 0.0f, -14.0f });
-    BuildingSpawn(BLD_HOUSE,    0, (Vector3){ -17.0f, 0.0f, -14.0f });
-    BuildingSpawn(BLD_BARRACKS, 0, (Vector3){ -11.0f, 0.0f, -14.0f });
-    BuildingSpawn(BLD_HOUSE,    1, (Vector3){  14.0f, 0.0f,  14.0f });
-    BuildingSpawn(BLD_HOUSE,    1, (Vector3){  17.0f, 0.0f,  14.0f });
-    BuildingSpawn(BLD_BARRACKS, 1, (Vector3){  11.0f, 0.0f,  14.0f });
+    // Two rival bases in opposite corners: town hall FIRST (critical, trains
+    // workers, and the AI's EnemyHome anchors to the first building), two
+    // houses + barracks; 4 workers + 2 soldiers each.
+    BuildingSpawn(BLD_TOWN_HALL, 0, (Vector3){ -14.0f, 0.0f, -14.0f });
+    BuildingSpawn(BLD_HOUSE,     0, (Vector3){ -17.0f, 0.0f, -14.0f });
+    BuildingSpawn(BLD_HOUSE,     0, (Vector3){ -17.0f, 0.0f, -11.0f });
+    BuildingSpawn(BLD_BARRACKS,  0, (Vector3){ -11.0f, 0.0f, -14.0f });
+    BuildingSpawn(BLD_TOWN_HALL, 1, (Vector3){  14.0f, 0.0f,  14.0f });
+    BuildingSpawn(BLD_HOUSE,     1, (Vector3){  17.0f, 0.0f,  14.0f });
+    BuildingSpawn(BLD_HOUSE,     1, (Vector3){  17.0f, 0.0f,  11.0f });
+    BuildingSpawn(BLD_BARRACKS,  1, (Vector3){  11.0f, 0.0f,  14.0f });
     for (int i = 0; i < 6; i++)
     {
         UnitKind kind = (i < 4) ? KIND_WORKER : KIND_SOLDIER;
@@ -245,13 +261,21 @@ void StrategyWorldInit(void)
     NodeCluster(NODE_WHEAT, (Vector3){ -10.0f, 0.0f, -7.0f }, 5, 2.0f, 8);
     NodeCluster(NODE_WHEAT, (Vector3){  10.0f, 0.0f,  7.0f }, 5, 2.0f, 8);
 
-    // Neutral animals wandering mid-map, huntable for food.
+    // Neutral animals wandering mid-map, huntable for food. Weak ones flee
+    // when hit, strong ones fight back as a pack.
     for (int i = 0; i < STRAT_ANIMAL_COUNT; i++)
     {
         Vector3 pos = (Vector3){
             (float)GetRandomValue(-10, 10), 0.0f, (float)GetRandomValue(-10, 10),
         };
-        UnitSpawn(FACTION_NEUTRAL, KIND_ANIMAL, pos);
+        UnitSpawn(FACTION_NEUTRAL, KIND_ANIMAL_WEAK, pos);
+    }
+    for (int i = 0; i < STRAT_ANIMAL_STRONG_COUNT; i++)
+    {
+        Vector3 pos = (Vector3){
+            (float)GetRandomValue(-8, 8), 0.0f, (float)GetRandomValue(-8, 8),
+        };
+        UnitSpawn(FACTION_NEUTRAL, KIND_ANIMAL_STRONG, pos);
     }
 
     // Starting stockpiles so building/training is possible right away.
@@ -405,9 +429,9 @@ int StrategyPopCap(int faction)
     for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
     {
         Building *b = &world.buildings[i];
-        if (b->active && b->faction == faction && b->kind == BLD_HOUSE)
+        if (b->active && b->faction == faction)
         {
-            cap += STRAT_POP_PER_HOUSE;
+            cap += StrategyBuildingDef(b->kind)->popCap;
         }
     }
     return cap;
@@ -426,39 +450,64 @@ int StrategyPopUsed(int faction)
 bool StrategyTrainStart(int bldIndex, UnitKind kind)
 {
     Building *b = &world.buildings[bldIndex];
-    if (!b->active || b->trainKind >= 0) return false;
-    if (kind != KIND_WORKER && kind != KIND_SOLDIER) return false;
+    if (!b->active || b->trainKind >= 0 || b->trainCooldown > 0.0f) return false;
+
+    const BuildingDef *bd = StrategyBuildingDef(b->kind);
+    bool allowed = false;
+    for (int i = 0; i < bd->trainableCount; i++)
+    {
+        if (bd->trainable[i] == kind) allowed = true;
+    }
+    if (!allowed) return false;
     if (StrategyPopUsed(b->faction) + 1 > StrategyPopCap(b->faction)) return false;
 
+    const UnitDef *ud = StrategyUnitDef(kind);
+    int cost[RES_COUNT];
     for (int r = 0; r < RES_COUNT; r++)
     {
-        if (world.stockpile[b->faction][r] < strategyTrainCost[kind][r]) return false;
+        cost[r] = (int)ceilf((float)ud->cost[r]*bd->trainCostMul);
+        if (world.stockpile[b->faction][r] < cost[r]) return false;
     }
     for (int r = 0; r < RES_COUNT; r++)
     {
-        world.stockpile[b->faction][r] -= strategyTrainCost[kind][r];
+        world.stockpile[b->faction][r] -= cost[r];
     }
     b->trainKind     = (int)kind;
     b->trainProgress = 0.0f;
     return true;
 }
 
-// The loser is the faction with no buildings left. Called after a destroy.
+// A faction is defeated when it has NO critical building AND no workers left
+// (houses alone can't rebuild an economy). Called after every building
+// destroy/sell and every unit kill.
 static void CheckGameOver(void)
 {
+    if (world.gameOver >= 0) return;
+
     for (int f = 0; f < STRAT_FACTIONS; f++)
     {
-        bool alive = false;
+        bool critical = false;
+        bool workers  = false;
         for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
         {
             Building *b = &world.buildings[i];
-            if (b->active && b->faction == f)
+            if (b->active && b->faction == f &&
+                StrategyBuildingDef(b->kind)->critical)
             {
-                alive = true;
+                critical = true;
                 break;
             }
         }
-        if (!alive)
+        for (int i = 0; i < STRAT_MAX_UNITS; i++)
+        {
+            Unit *u = &world.units[i];
+            if (u->active && u->faction == f && u->kind == KIND_WORKER)
+            {
+                workers = true;
+                break;
+            }
+        }
+        if (!critical && !workers)
         {
             world.gameOver = 1 - f;     // the OTHER faction wins
             return;
@@ -481,24 +530,60 @@ static void BuildingDestroy(int index)
     CheckGameOver();
 }
 
+// Sell a building back: refund refundRate (+ the player-facing difficulty
+// bonus) of every cost component, floored. The slot just deactivates.
+bool StrategySellBuilding(int index)
+{
+    Building *b = &world.buildings[index];
+    if (!b->active) return false;
+
+    const BuildingDef *bd = StrategyBuildingDef(b->kind);
+    float rate = bd->refundRate + world.mods[b->faction].refundBonus;
+    for (int r = 0; r < RES_COUNT; r++)
+    {
+        world.stockpile[b->faction][r] += (int)floorf((float)bd->cost[r]*rate);
+    }
+    b->active = false;
+    if (world.selectedBuilding == index) world.selectedBuilding = -1;
+
+    EffectSpawn(FX_RING, b->pos, GOLD);
+    for (int i = 0; i < 3; i++)
+    {
+        EffectSpawn(FX_PUFF, (Vector3){ b->pos.x, 0.8f, b->pos.z }, LIGHTGRAY);
+    }
+    CheckGameOver();    // selling your last town hall can lose the game
+    return true;
+}
+
 // Advance every in-progress trainee; on completion spawn the unit beside the
-// building (separation shoves crowds apart).
+// building (separation shoves crowds apart) and start the anti-spam cooldown.
 static void BuildingsUpdate(float dt)
 {
     for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
     {
         Building *b = &world.buildings[i];
-        if (!b->active || b->trainKind < 0) continue;
+        if (!b->active) continue;
+        if (b->trainCooldown > 0.0f) b->trainCooldown -= dt;
+        if (b->trainKind < 0) continue;
 
         b->trainProgress += dt;
-        if (b->trainProgress >= unitTrainTime[b->trainKind])
+        if (b->trainProgress >= StrategyUnitDef((UnitKind)b->trainKind)->trainTime)
         {
+            const BuildingDef *bd = StrategyBuildingDef(b->kind);
             Vector3 spawn = (Vector3){ b->pos.x + 1.6f, 0.0f, b->pos.z + 1.2f };
-            UnitSpawn(b->faction, (UnitKind)b->trainKind, spawn);
+            Unit *u = UnitSpawn(b->faction, (UnitKind)b->trainKind, spawn);
+            if (u != NULL)
+            {
+                // Training-building buffs (identity today: upgrade hook).
+                u->maxHp  *= bd->buffHpMul;
+                u->hp      = u->maxHp;
+                u->damage *= bd->buffDmgMul;
+            }
             EffectSpawn(FX_RING, spawn, strategyFactionColor[b->faction]);
             EffectSpawn(FX_FLASH, (Vector3){ spawn.x, 0.6f, spawn.z }, RAYWHITE);
             b->trainKind     = -1;
             b->trainProgress = 0.0f;
+            b->trainCooldown = bd->trainCooldown;
         }
     }
 }
@@ -532,7 +617,7 @@ static bool PlacementValid(int faction, BuildingKind kind, Vector3 pos)
 {
     for (int r = 0; r < RES_COUNT; r++)
     {
-        if (world.stockpile[faction][r] < strategyBuildingCost[kind][r]) return false;
+        if (world.stockpile[faction][r] < StrategyBuildingDef(kind)->cost[r]) return false;
     }
     float margin = STRAT_GROUND_HALF - 1.5f;
     if (fabsf(pos.x) > margin || fabsf(pos.z) > margin) return false;
@@ -560,7 +645,7 @@ bool StrategyTryBuild(int faction, BuildingKind kind, Vector3 pos)
 
     for (int r = 0; r < RES_COUNT; r++)
     {
-        world.stockpile[faction][r] -= strategyBuildingCost[kind][r];
+        world.stockpile[faction][r] -= StrategyBuildingDef(kind)->cost[r];
     }
     BuildingSpawn(kind, faction, pos);
     EffectSpawn(FX_RING, pos, RAYWHITE);
@@ -602,15 +687,26 @@ static void SelectionInput(void)
 
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
     {
-        if (MouseOnGui()) return;   // the build bar owns this click
-        world.dragStart = mouse;
-        world.dragging  = false;
+        if (MouseOnGui())
+        {
+            // The build bar owns this click: without this flag the stale
+            // dragStart would fake a drag and the release (the same one
+            // that fires GuiButton) would box-select behind the panel.
+            world.pressInWorld = false;
+            world.dragging     = false;
+            return;
+        }
+        world.pressInWorld = true;
+        world.dragStart    = mouse;
+        world.dragging     = false;
     }
-    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && !world.dragging)
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && world.pressInWorld && !world.dragging)
     {
         if (Vector2Distance(mouse, world.dragStart) > 6.0f) world.dragging = true;
     }
     if (!IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) return;
+    if (!world.pressInWorld) return;    // this click belongs to the GUI
+    world.pressInWorld = false;
 
     if (world.dragging)
     {
@@ -772,12 +868,14 @@ static void MoveToward(Unit *u, Vector3 dest, float dt)
     float dist = Vector3Length(delta);
     if (dist < 0.001f) return;
 
-    float step = STRAT_UNIT_SPEED*dt;
+    float step = u->moveSpeed*dt;
     if (step > dist) step = dist;
     u->pos = Vector3Add(u->pos, Vector3Scale(delta, step/dist));
 }
 
-static int NearestOwnBuilding(const Unit *u)
+// Nearest own building that ACCEPTS what the unit is carrying - wood only
+// lands at logging camps / town halls, and so on.
+static int NearestDropoff(const Unit *u)
 {
     int best = -1;
     float bestDist = 1000000.0f;
@@ -785,6 +883,7 @@ static int NearestOwnBuilding(const Unit *u)
     {
         Building *b = &world.buildings[i];
         if (!b->active || b->faction != u->faction) continue;
+        if (!StrategyBuildingDef(b->kind)->accepts[u->carryKind]) continue;
 
         float d = DistXZ(b->pos, u->pos);
         if (d < bestDist)
@@ -830,23 +929,91 @@ static void UnitKill(int index, Unit *killer)
         EffectSpawn(FX_PUFF, (Vector3){ u->pos.x, 0.5f, u->pos.z }, GRAY);
     }
 
-    if (u->kind == KIND_ANIMAL)
+    int corpseFood = StrategyUnitDef(u->kind)->corpseFood;
+    if (corpseFood > 0)
     {
-        NodeSpawn(NODE_CORPSE, u->pos, STRAT_CORPSE_FOOD);
+        NodeSpawn(NODE_CORPSE, u->pos, corpseFood);
         if (killer != NULL && killer->kind == KIND_WORKER)
         {
             int corpse = StrategyNearestNodeOfKind(u->pos, NODE_CORPSE, 2.0f);
             if (corpse >= 0) StrategyOrderGather(killer, corpse);
         }
     }
+    CheckGameOver();    // losing the last worker can decide the game
+}
+
+// Weak-animal panic reflex: the victim AND every weak animal near it bolt
+// away from the attacker together (the herd scatters as one).
+static void AnimalPanic(int victimIndex, Vector3 threat)
+{
+    Vector3 origin = world.units[victimIndex].pos;
+
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    {
+        Unit *u = &world.units[i];
+        if (!u->active || u->kind != KIND_ANIMAL_WEAK) continue;
+        if (DistXZ(u->pos, origin) > STRAT_FLEE_PACK_RADIUS) continue;
+
+        Vector3 away = Vector3Subtract(u->pos, threat);
+        away.y = 0.0f;
+        if (Vector3Length(away) < 0.001f) away = (Vector3){ 1.0f, 0.0f, 0.0f };
+
+        Vector3 dest = Vector3Add(u->pos,
+                                  Vector3Scale(Vector3Normalize(away), STRAT_FLEE_DIST));
+        dest.x = Clamp(dest.x, -STRAT_GROUND_HALF + 1.0f, STRAT_GROUND_HALF - 1.0f);
+        dest.z = Clamp(dest.z, -STRAT_GROUND_HALF + 1.0f, STRAT_GROUND_HALF - 1.0f);
+
+        u->state          = UNIT_FLEE;
+        u->target         = dest;
+        u->targetUnit     = -1;
+        u->targetNode     = -1;
+        u->targetBuilding = -1;
+    }
+}
+
+// Strong-animal pack reflex: the victim and its packmates all turn on the
+// attacker (regular attack orders - the shared state machine does the rest).
+static void AnimalRetaliate(int victimIndex, Unit *attacker)
+{
+    int attackerIndex = (int)(attacker - world.units);
+    if (attackerIndex < 0 || attackerIndex >= STRAT_MAX_UNITS) return;
+
+    Vector3 origin = world.units[victimIndex].pos;
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    {
+        Unit *u = &world.units[i];
+        if (!u->active || u->kind != KIND_ANIMAL_STRONG) continue;
+        if (DistXZ(u->pos, origin) > STRAT_FLEE_PACK_RADIUS) continue;
+
+        StrategyOrderAttack(u, attackerIndex);
+    }
+}
+
+// ALL unit-vs-unit damage funnels through here so the animal reflexes fire
+// even on a killing blow. Returns true when the victim died.
+static bool UnitDamage(int victimIndex, Unit *attacker, float damage)
+{
+    Unit *v = &world.units[victimIndex];
+    v->hp -= damage;
+
+    if (v->kind == KIND_ANIMAL_WEAK)        AnimalPanic(victimIndex, attacker->pos);
+    else if (v->kind == KIND_ANIMAL_STRONG) AnimalRetaliate(victimIndex, attacker);
+
+    if (v->hp <= 0.0f)
+    {
+        UnitKill(victimIndex, attacker);
+        return true;
+    }
+    return false;
 }
 
 // Auto-aggro: idle units of BOTH factions engage hostiles on sight; enemy
 // units also break off moving/working (the player keeps manual control).
-// Animals never fight back.
+// Animals only react when hit; templars never fight.
 static void UnitAggroScan(Unit *u)
 {
-    if (u->kind == KIND_ANIMAL) return;
+    if (u->kind == KIND_ANIMAL_WEAK || u->kind == KIND_ANIMAL_STRONG) return;
+    if (u->kind == KIND_TEMPLAR || u->kind == KIND_TEMPLAR_HEALER) return;
 
     bool scan = (u->state == UNIT_IDLE) ||
                 (u->faction == 1 && (u->state == UNIT_MOVE ||
@@ -855,8 +1022,59 @@ static void UnitAggroScan(Unit *u)
                                      u->state == UNIT_FARM));
     if (!scan) return;
 
-    int hostile = NearestHostile(u, STRAT_SIGHT_RANGE);
+    int hostile = NearestHostile(u, u->sightRange);
     if (hostile >= 0) StrategyOrderAttack(u, hostile);
+}
+
+// Templar target search. The blessing templar shadows own units that are
+// WORKING (gather/farm/return); the healer shadows own WOUNDED units. Both
+// fall back to any own non-templar unit so they never stand alone mid-map.
+static int TemplarFindTarget(const Unit *u)
+{
+    bool healer = (u->kind == KIND_TEMPLAR_HEALER);
+    int best = -1;
+    float bestDist = healer ? 15.0f : 1000000.0f;
+
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    {
+        Unit *other = &world.units[i];
+        if (!other->active || other->faction != u->faction || other == u) continue;
+        if (other->kind == KIND_TEMPLAR || other->kind == KIND_TEMPLAR_HEALER) continue;
+
+        if (healer)
+        {
+            if (other->hp >= other->maxHp) continue;
+        }
+        else
+        {
+            if (other->state != UNIT_GATHER && other->state != UNIT_FARM &&
+                other->state != UNIT_RETURN) continue;
+        }
+        float d = DistXZ(other->pos, u->pos);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            best = i;
+        }
+    }
+    if (best >= 0) return best;
+
+    // Fallback: any own non-templar unit, unlimited range.
+    bestDist = 1000000.0f;
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    {
+        Unit *other = &world.units[i];
+        if (!other->active || other->faction != u->faction || other == u) continue;
+        if (other->kind == KIND_TEMPLAR || other->kind == KIND_TEMPLAR_HEALER) continue;
+
+        float d = DistXZ(other->pos, u->pos);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            best = i;
+        }
+    }
+    return best;
 }
 
 static void UnitUpdate(int index, float dt)
@@ -896,11 +1114,11 @@ static void UnitUpdate(int index, float dt)
                 MoveToward(u, n->pos, dt);
                 break;
             }
-            // In working range: one resource unit per GATHER_TIME tick.
+            // In working range: one resource unit per gatherTime tick.
             u->gatherTimer += dt;
-            if (u->gatherTimer >= STRAT_GATHER_TIME)
+            if (u->gatherTimer >= u->gatherTime)
             {
-                u->gatherTimer -= STRAT_GATHER_TIME;
+                u->gatherTimer -= u->gatherTime;
                 u->carryKind = NodeResource(n->kind);
                 u->carryAmount++;
                 n->remaining--;
@@ -923,10 +1141,10 @@ static void UnitUpdate(int index, float dt)
 
         case UNIT_RETURN:
         {
-            int home = NearestOwnBuilding(u);
+            int home = NearestDropoff(u);
             if (home < 0)
             {
-                u->carryAmount = 0;     // nowhere to drop off
+                u->carryAmount = 0;     // nothing accepts this - dump it
                 u->state = UNIT_IDLE;
                 break;
             }
@@ -972,9 +1190,9 @@ static void UnitUpdate(int index, float dt)
             }
             // Renewable: food goes straight to the stockpile, forever.
             u->gatherTimer += dt;
-            if (u->gatherTimer >= STRAT_FARM_PERIOD)
+            if (u->gatherTimer >= u->farmPeriod)
             {
-                u->gatherTimer -= STRAT_FARM_PERIOD;
+                u->gatherTimer -= u->farmPeriod;
                 world.stockpile[u->faction][RES_FOOD]++;
                 EffectSpawn(FX_PUFF, (Vector3){ farm->pos.x, 0.8f, farm->pos.z },
                             (Color){ 130, 200, 80, 255 });
@@ -986,7 +1204,7 @@ static void UnitUpdate(int index, float dt)
             // Two target flavors share the chase/cooldown skeleton: a unit
             // (or animal) via targetUnit, or a building via targetBuilding.
             Vector3 targetPos = u->pos;
-            float   range     = STRAT_ATTACK_RANGE;
+            float   range     = u->attackRange;
             bool    valid     = false;
 
             if (u->targetBuilding >= 0)
@@ -1009,16 +1227,29 @@ static void UnitUpdate(int index, float dt)
                 u->targetBuilding = -1;
                 break;
             }
-            if (DistXZ(u->pos, targetPos) > range)
+            float dist = DistXZ(u->pos, targetPos);
+            if (dist > range)
             {
                 MoveToward(u, targetPos, dt);
                 break;
             }
+            // Kiting: a ranged unit keeps FIRING but backs off toward its
+            // stand-off distance when the target crowds in.
+            if (u->preferredRange > 0.0f && dist < u->preferredRange*0.6f)
+            {
+                Vector3 away = Vector3Subtract(u->pos, targetPos);
+                away.y = 0.0f;
+                if (Vector3Length(away) > 0.001f)
+                {
+                    Vector3 dest = Vector3Add(u->pos,
+                                              Vector3Scale(Vector3Normalize(away), 2.0f));
+                    MoveToward(u, dest, dt);
+                }
+            }
             u->attackCooldown -= dt;
             if (u->attackCooldown <= 0.0f)
             {
-                u->attackCooldown = STRAT_ATTACK_PERIOD;
-                float damage = unitDamage[u->kind];
+                u->attackCooldown = u->attackPeriod;
 
                 Vector3 from = (Vector3){ u->pos.x, 0.8f, u->pos.z };
                 Vector3 to   = (Vector3){ targetPos.x, 0.6f, targetPos.z };
@@ -1028,7 +1259,7 @@ static void UnitUpdate(int index, float dt)
                 if (u->targetBuilding >= 0)
                 {
                     Building *b = &world.buildings[u->targetBuilding];
-                    b->hp -= damage;
+                    b->hp -= u->damage;
                     if (b->hp <= 0.0f)
                     {
                         BuildingDestroy(u->targetBuilding);
@@ -1036,24 +1267,79 @@ static void UnitUpdate(int index, float dt)
                         u->targetBuilding = -1;
                     }
                 }
-                else
+                else if (UnitDamage(u->targetUnit, u, u->damage))
                 {
-                    Unit *victim = &world.units[u->targetUnit];
-                    victim->hp -= damage;
-                    if (victim->hp <= 0.0f)
+                    // The kill handler may have re-ordered u (corpse
+                    // harvest); only idle it if it is still attacking.
+                    if (u->state == UNIT_ATTACK)
                     {
-                        UnitKill(u->targetUnit, u);
-                        // The kill handler may have re-ordered u (corpse
-                        // harvest); only idle it if it is still attacking.
-                        if (u->state == UNIT_ATTACK)
-                        {
-                            u->state      = UNIT_IDLE;
-                            u->targetUnit = -1;
-                        }
+                        u->state      = UNIT_IDLE;
+                        u->targetUnit = -1;
                     }
                 }
             }
         } break;
+
+        case UNIT_FLEE:
+        {
+            MoveToward(u, u->target, dt);
+            if (DistXZ(u->pos, u->target) < 0.2f) u->state = UNIT_IDLE;
+        } break;
+
+        case UNIT_FOLLOW:
+        {
+            // Templar/healer shadowing its target; gatherTimer paces the
+            // bless cadence. The heal/providence effect lands when the
+            // blessing STARTS - UNIT_BLESS is just the sparkle pause.
+            Unit *t = (u->targetUnit >= 0) ? &world.units[u->targetUnit] : NULL;
+            bool healer = (u->kind == KIND_TEMPLAR_HEALER);
+            if ((t == NULL) || !t->active || (healer && t->hp >= t->maxHp))
+            {
+                u->state      = UNIT_IDLE;  // retarget next frame
+                u->targetUnit = -1;
+                break;
+            }
+            if (DistXZ(u->pos, t->pos) > 1.5f)
+            {
+                MoveToward(u, t->pos, dt);
+                break;
+            }
+            u->gatherTimer += dt;
+            if (u->gatherTimer >= STRAT_BLESS_PERIOD)
+            {
+                u->gatherTimer = 0.0f;
+                if (healer)
+                {
+                    if (world.stockpile[u->faction][RES_PROVIDENCE] < STRAT_HEAL_COST)
+                        break;      // broke: keep following, try again later
+                    world.stockpile[u->faction][RES_PROVIDENCE] -= STRAT_HEAL_COST;
+                    t->hp = fminf(t->maxHp, t->hp + STRAT_HEAL_AMOUNT);
+                }
+                else world.stockpile[u->faction][RES_PROVIDENCE] += 1;
+
+                u->state          = UNIT_BLESS;
+                u->attackCooldown = STRAT_BLESS_TIME;
+                EffectSpawnBless(t->pos);
+            }
+        } break;
+
+        case UNIT_BLESS:
+        {
+            u->attackCooldown -= dt;
+            if (u->attackCooldown <= 0.0f) u->state = UNIT_FOLLOW;
+        } break;
+    }
+
+    // Idle templars pick someone to shadow (their version of auto-aggro).
+    if (u->state == UNIT_IDLE &&
+        (u->kind == KIND_TEMPLAR || u->kind == KIND_TEMPLAR_HEALER))
+    {
+        int t = TemplarFindTarget(u);
+        if (t >= 0)
+        {
+            u->state      = UNIT_FOLLOW;
+            u->targetUnit = t;
+        }
     }
 
     // Never leave the ground plane.
@@ -1110,7 +1396,7 @@ void StrategyWorldUpdate(float dt)
     world.aiTimer -= dt;
     if (world.aiTimer <= 0.0f)
     {
-        world.aiTimer += STRAT_AI_PERIOD;
+        world.aiTimer += world.aiPeriod;
         StrategyAiTick();
     }
 
@@ -1214,6 +1500,25 @@ static void DrawBuilding(BuildingKind kind, int faction, Vector3 pos, Color tint
             }
         } break;
 
+        case BLD_TOWN_HALL:
+        {
+            // The biggest footprint on the map, with a faction-colored keep.
+            Vector3 body = (Vector3){ pos.x, 0.7f, pos.z };
+            DrawCube(body, 2.4f, 1.4f, 2.4f, tint);
+            Vector3 keep = (Vector3){ pos.x, 1.7f, pos.z };
+            DrawCube(keep, 1.2f, 0.6f, 1.2f,
+                     Fade(strategyFactionColor[faction], tint.a/255.0f));
+        } break;
+
+        case BLD_CHANTRY:
+        {
+            // Pale tower with a gold spire.
+            Vector3 body = (Vector3){ pos.x, 0.8f, pos.z };
+            DrawCube(body, 1.2f, 1.6f, 1.2f, tint);
+            Vector3 spire = (Vector3){ pos.x, 1.6f, pos.z };
+            DrawCylinder(spire, 0.0f, 0.5f, 1.0f, 6, Fade(GOLD, tint.a/255.0f));
+        } break;
+
         default: break;
     }
 
@@ -1252,11 +1557,42 @@ static void DrawUnit(const Unit *u)
             DrawSphere(head, 0.2f, color);
         } break;
 
-        case KIND_ANIMAL:
+        case KIND_RANGED:
+        {
+            // Slighter than the soldier, with a "bow" post at the side.
+            Color light = ColorBrightness(color, 0.15f);
+            DrawCylinder(u->pos, 0.30f, 0.40f, 1.0f, 8, light);
+            Vector3 head = (Vector3){ u->pos.x, 1.18f, u->pos.z };
+            DrawSphere(head, 0.18f, color);
+            DrawLine3D((Vector3){ u->pos.x + 0.35f, 0.25f, u->pos.z },
+                       (Vector3){ u->pos.x + 0.35f, 1.05f, u->pos.z }, DARKBROWN);
+        } break;
+
+        case KIND_TEMPLAR:
+        case KIND_TEMPLAR_HEALER:
+        {
+            // White robe, gold (templar) or lime (healer) head, faction band.
+            Color halo = (u->kind == KIND_TEMPLAR) ? GOLD : LIME;
+            DrawCylinder(u->pos, 0.26f, 0.42f, 1.0f, 8, RAYWHITE);
+            Vector3 band = (Vector3){ u->pos.x, 0.55f, u->pos.z };
+            DrawCube(band, 0.5f, 0.12f, 0.5f, color);
+            Vector3 head = (Vector3){ u->pos.x, 1.16f, u->pos.z };
+            DrawSphere(head, 0.17f, halo);
+        } break;
+
+        case KIND_ANIMAL_WEAK:
         {
             // Small low critter, no head sphere.
             Vector3 body = (Vector3){ u->pos.x, 0.22f, u->pos.z };
             DrawCube(body, 0.55f, 0.4f, 0.35f, color);
+        } break;
+
+        case KIND_ANIMAL_STRONG:
+        {
+            // Bigger, darker beast - reads as "don't poke it".
+            Vector3 body = (Vector3){ u->pos.x, 0.34f, u->pos.z };
+            DrawCube(body, 0.9f, 0.65f, 0.55f, ColorBrightness(color, -0.35f));
+            DrawCubeWires(body, 0.9f, 0.65f, 0.55f, DARKBROWN);
         } break;
 
         default: break;
@@ -1364,14 +1700,14 @@ void StrategyWorldDraw2DOverlay(void)
 
     // Resource HUD: player big, enemy small below (visible AI progress).
     int size = (int)fmaxf(10.0f, gameSize.y*0.045f);
-    DrawText(TextFormat("WOOD %d   STONE %d   FOOD %d   POP %d/%d",
+    DrawText(TextFormat("WOOD %d   STONE %d   FOOD %d   PROV %d   POP %d/%d",
                         world.stockpile[0][RES_WOOD], world.stockpile[0][RES_STONE],
-                        world.stockpile[0][RES_FOOD],
+                        world.stockpile[0][RES_FOOD], world.stockpile[0][RES_PROVIDENCE],
                         StrategyPopUsed(0), StrategyPopCap(0)),
              (int)(gameSize.x*0.02f), (int)(gameSize.y*0.02f), size, RAYWHITE);
-    DrawText(TextFormat("enemy: wood %d stone %d food %d pop %d/%d",
+    DrawText(TextFormat("enemy: wood %d stone %d food %d prov %d pop %d/%d",
                         world.stockpile[1][RES_WOOD], world.stockpile[1][RES_STONE],
-                        world.stockpile[1][RES_FOOD],
+                        world.stockpile[1][RES_FOOD], world.stockpile[1][RES_PROVIDENCE],
                         StrategyPopUsed(1), StrategyPopCap(1)),
              (int)(gameSize.x*0.02f), (int)(gameSize.y*0.02f) + size + 4, size/2,
              Fade(strategyFactionColor[1], 0.8f));
@@ -1391,8 +1727,13 @@ void StrategyWorldDraw2DOverlay(void)
         int bigSize = (int)(gameSize.y*0.14f);
         DrawText(msg, (int)(gameSize.x*0.5f - (float)MeasureText(msg, bigSize)*0.5f),
                  (int)(gameSize.y*0.36f), bigSize, tint);
+        const char *why = (world.gameOver == 0)
+            ? "the enemy lost every critical building and worker"
+            : "you lost every critical building and worker";
+        DrawText(why, (int)(gameSize.x*0.5f - (float)MeasureText(why, size/2)*0.5f),
+                 (int)(gameSize.y*0.36f) + bigSize + 8, size/2, LIGHTGRAY);
         const char *sub = "press R to restart";
         DrawText(sub, (int)(gameSize.x*0.5f - (float)MeasureText(sub, size)*0.5f),
-                 (int)(gameSize.y*0.36f) + bigSize + 8, size, RAYWHITE);
+                 (int)(gameSize.y*0.36f) + bigSize + size/2 + 16, size, RAYWHITE);
     }
 }

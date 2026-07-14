@@ -91,6 +91,17 @@ void EffectSpawnBeam(Vector3 from, Vector3 to, Color color)
     e->color   = color;
 }
 
+// Composite templar blessing: a gold ring plus a gentle burst of gold puffs
+// (each puff already gets its own random upward drift in EffectSpawn).
+void EffectSpawnBless(Vector3 pos)
+{
+    EffectSpawn(FX_RING, pos, GOLD);
+    for (int i = 0; i < 5; i++)
+    {
+        EffectSpawn(FX_PUFF, (Vector3){ pos.x, 0.9f, pos.z }, GOLD);
+    }
+}
+
 void EffectsUpdate(float dt)
 {
     for (int i = 0; i < STRAT_MAX_EFFECTS; i++)

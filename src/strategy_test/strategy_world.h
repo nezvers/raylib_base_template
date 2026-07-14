@@ -8,6 +8,7 @@
 #define STRATEGY_WORLD_H
 
 #include "strategy_types.h"
+#include "strategy_defs.h"
 
 // -- World (strategy_world.c) ------------------------------------------------
 StrategyWorld *StrategyWorldGet(void);
@@ -38,12 +39,14 @@ bool StrategyTrainStart(int bldIndex, UnitKind kind);
 // Validate + pay + place a building; false when unaffordable or blocked.
 bool StrategyTryBuild(int faction, BuildingKind kind, Vector3 pos);
 
+// Sell a building: refund refundRate (+ difficulty bonus) of its cost.
+bool StrategySellBuilding(int index);
+
 // Enemy + animal think tick (strategy_ai.c), called on the world's aiTimer.
 void StrategyAiTick(void);
 
-// Cost tables for the GUI (defined in strategy_world.c).
-extern const int strategyBuildingCost[BLD_COUNT][RES_COUNT];
-extern const int strategyTrainCost[2][RES_COUNT];   // [KIND_WORKER/KIND_SOLDIER]
+// Faction colors for the GUI (defined in strategy_world.c). Costs/stats/names
+// come from the def tables in strategy_defs.h.
 extern const Color strategyFactionColor[STRAT_FACTIONS];
 
 // -- Effects (strategy_effects.c) ---------------------------------------------
@@ -55,11 +58,12 @@ typedef enum {
     FX_BEAM,        // short-lived attack line between two points
 } EffectKind;
 
-#define STRAT_MAX_EFFECTS 64
+#define STRAT_MAX_EFFECTS 96
 
 void EffectsReset(void);
 void EffectSpawn(EffectKind kind, Vector3 pos, Color color);
 void EffectSpawnBeam(Vector3 from, Vector3 to, Color color);
+void EffectSpawnBless(Vector3 pos);     // gold ring + puff burst (templars)
 void EffectsUpdate(float dt);
 void EffectsDraw3D(void);   // call between BeginMode3D/EndMode3D
 

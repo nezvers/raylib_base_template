@@ -87,15 +87,16 @@ static void AnimalsTick(StrategyWorld *world)
     }
 }
 
-// Enemy production: houses keep the worker count at 6, barracks always
-// train soldiers when affordable (StrategyTrainStart validates everything).
+// Enemy production: the town hall keeps the worker count at 6, barracks keep
+// melee and ranged roughly even, the chantry maintains one templar + one
+// healer (StrategyTrainStart validates cost/pop/cooldown/trainable).
 static void EnemyTrainTick(StrategyWorld *world)
 {
-    int workers = 0;
+    int count[UNIT_KIND_COUNT] = { 0 };
     for (int i = 0; i < STRAT_MAX_UNITS; i++)
     {
         Unit *u = &world->units[i];
-        if (u->active && u->faction == 1 && u->kind == KIND_WORKER) workers++;
+        if (u->active && u->faction == 1) count[u->kind]++;
     }
 
     for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
@@ -103,13 +104,26 @@ static void EnemyTrainTick(StrategyWorld *world)
         Building *b = &world->buildings[i];
         if (!b->active || b->faction != 1 || b->trainKind >= 0) continue;
 
-        if (b->kind == BLD_HOUSE && workers < 6)
+        if (b->kind == BLD_TOWN_HALL && count[KIND_WORKER] < 6)
         {
-            if (StrategyTrainStart(i, KIND_WORKER)) workers++;
+            if (StrategyTrainStart(i, KIND_WORKER)) count[KIND_WORKER]++;
         }
         else if (b->kind == BLD_BARRACKS)
         {
-            StrategyTrainStart(i, KIND_SOLDIER);
+            UnitKind want = (count[KIND_RANGED] < count[KIND_SOLDIER])
+                                ? KIND_RANGED : KIND_SOLDIER;
+            if (StrategyTrainStart(i, want)) count[want]++;
+        }
+        else if (b->kind == BLD_CHANTRY)
+        {
+            if (count[KIND_TEMPLAR] < 1)
+            {
+                if (StrategyTrainStart(i, KIND_TEMPLAR)) count[KIND_TEMPLAR]++;
+            }
+            else if (count[KIND_TEMPLAR_HEALER] < 1)
+            {
+                if (StrategyTrainStart(i, KIND_TEMPLAR_HEALER)) count[KIND_TEMPLAR_HEALER]++;
+            }
         }
     }
 }
@@ -143,7 +157,7 @@ static void EnemyWorkersTick(StrategyWorld *world)
             if (GetRandomValue(0, 99) < 40)
             {
                 int animal = NearestUnitOfKind(world, u->pos, FACTION_NEUTRAL,
-                                               KIND_ANIMAL);
+                                               KIND_ANIMAL_WEAK);
                 if (animal >= 0)
                 {
                     StrategyOrderAttack(u, animal);   // hunt: corpse follows
@@ -167,12 +181,35 @@ static void EnemyWorkersTick(StrategyWorld *world)
     }
 }
 
-// Enemy construction: the only thing the AI builds is HOUSES, and only when
-// pop-capped - otherwise training stalls forever. A few random spots near
-// home are tried; StrategyTryBuild rejects blocked/unaffordable ones.
+// Enemy construction: a HOUSE when pop-capped (else training stalls forever),
+// or ONE chantry once the economy is up. A few random spots near home are
+// tried; StrategyTryBuild rejects blocked/unaffordable ones.
 static void EnemyBuildTick(StrategyWorld *world)
 {
-    if (StrategyPopUsed(1) + 1 <= StrategyPopCap(1)) return;
+    BuildingKind want;
+    if (StrategyPopUsed(1) + 1 > StrategyPopCap(1))
+    {
+        want = BLD_HOUSE;
+    }
+    else
+    {
+        bool hasChantry = false;
+        int workers = 0;
+        for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
+        {
+            Building *b = &world->buildings[i];
+            if (b->active && b->faction == 1 && b->kind == BLD_CHANTRY) hasChantry = true;
+        }
+        for (int i = 0; i < STRAT_MAX_UNITS; i++)
+        {
+            Unit *u = &world->units[i];
+            if (u->active && u->faction == 1 && u->kind == KIND_WORKER) workers++;
+        }
+        // Economy up = full worker crew and a resource buffer beyond the cost.
+        if (hasChantry || workers < 5 ||
+            world->stockpile[1][RES_WOOD] < 8 || world->stockpile[1][RES_STONE] < 5) return;
+        want = BLD_CHANTRY;
+    }
 
     Vector3 home = EnemyHome(world);
     for (int attempt = 0; attempt < 5; attempt++)
@@ -182,22 +219,27 @@ static void EnemyBuildTick(StrategyWorld *world)
         pos.z += (float)GetRandomValue(-700, 700)*0.01f;
         pos.x  = roundf(pos.x);
         pos.z  = roundf(pos.z);
-        if (StrategyTryBuild(1, BLD_HOUSE, pos)) return;
+        if (StrategyTryBuild(1, want, pos)) return;
     }
 }
 
-// Attack wave: once enough soldiers idle at home, send them all at the
-// player building closest to the enemy base.
+// Attack wave: once enough fighters (melee + ranged) idle at home, send them
+// all at the player building closest to the enemy base.
+static bool AiIsFighter(const Unit *u)
+{
+    return u->kind == KIND_SOLDIER || u->kind == KIND_RANGED;
+}
+
 static void EnemyAttackTick(StrategyWorld *world)
 {
-    int idleSoldiers = 0;
+    int idleFighters = 0;
     for (int i = 0; i < STRAT_MAX_UNITS; i++)
     {
         Unit *u = &world->units[i];
-        if (u->active && u->faction == 1 && u->kind == KIND_SOLDIER &&
-            u->state == UNIT_IDLE) idleSoldiers++;
+        if (u->active && u->faction == 1 && AiIsFighter(u) &&
+            u->state == UNIT_IDLE) idleFighters++;
     }
-    if (idleSoldiers < STRAT_AI_ATTACK_SQUAD) return;
+    if (idleFighters < STRAT_AI_ATTACK_SQUAD) return;
 
     int target = NearestPlayerBuilding(world, EnemyHome(world));
     if (target < 0) return;
@@ -205,7 +247,7 @@ static void EnemyAttackTick(StrategyWorld *world)
     for (int i = 0; i < STRAT_MAX_UNITS; i++)
     {
         Unit *u = &world->units[i];
-        if (u->active && u->faction == 1 && u->kind == KIND_SOLDIER &&
+        if (u->active && u->faction == 1 && AiIsFighter(u) &&
             u->state == UNIT_IDLE)
         {
             StrategyOrderAttackBuilding(u, target);

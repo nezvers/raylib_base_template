@@ -215,13 +215,16 @@ static void GuiCommandPanel(StrategyWorld *world)
 
     // Selection census (drives which panel shows).
     int workers = 0;
-    int soldiers = 0;
+    int soldiers = 0;   // fighters: melee + ranged
+    int templars = 0;
     for (int i = 0; i < STRAT_MAX_UNITS; i++)
     {
         Unit *u = &world->units[i];
         if (!u->active || u->faction != 0 || !u->selected) continue;
         if (u->kind == KIND_WORKER) workers++;
-        else                        soldiers++;
+        else if (u->kind == KIND_TEMPLAR ||
+                 u->kind == KIND_TEMPLAR_HEALER) templars++;
+        else soldiers++;
     }
 
     // Reserve the whole strip up front; individual widgets draw inside it.
@@ -229,15 +232,12 @@ static void GuiCommandPanel(StrategyWorld *world)
 
     if (world->buildMenuOpen)
     {
-        static const char *names[BLD_COUNT] = {
-            "HOUSE", "LOGGING", "QUARRY", "BARRACKS", "FARM",
-        };
-        float w = 120.0f*(float)s;
+        float w = 110.0f*(float)s;
         for (int kind = 0; kind < BLD_COUNT; kind++)
         {
-            const char *text = TextFormat("%s %dw %ds", names[kind],
-                                          strategyBuildingCost[kind][RES_WOOD],
-                                          strategyBuildingCost[kind][RES_STONE]);
+            const BuildingDef *bd = StrategyBuildingDef((BuildingKind)kind);
+            const char *text = TextFormat("%s %dw %ds", bd->name,
+                                          bd->cost[RES_WOOD], bd->cost[RES_STONE]);
             if (GuiButton((Rectangle){ x, y, w, h }, text))
             {
                 AudioPlayButton();
@@ -255,39 +255,42 @@ static void GuiCommandPanel(StrategyWorld *world)
     else if (world->selectedBuilding >= 0)
     {
         Building *b = &world->buildings[world->selectedBuilding];
-        float w = 200.0f*(float)s;
+        const BuildingDef *bd = StrategyBuildingDef(b->kind);
+        float w = 190.0f*(float)s;
 
         if (b->trainKind >= 0)
         {
             // Progress bar for the current trainee.
-            float frac = b->trainProgress /
-                         ((b->trainKind == KIND_WORKER) ? STRAT_TRAIN_TIME_WORKER
-                                                        : STRAT_TRAIN_TIME_SOLDIER);
-            GuiLabel((Rectangle){ x, y, w, h },
-                     (b->trainKind == KIND_WORKER) ? "training worker..."
-                                                   : "training soldier...");
-            DrawRectangle((int)(x + w + gap), (int)(y + h*0.35f),
+            const UnitDef *ud = StrategyUnitDef((UnitKind)b->trainKind);
+            float frac = b->trainProgress/ud->trainTime;
+            GuiLabel((Rectangle){ x, y, w, h }, TextFormat("training %s...", ud->name));
+            x += w + gap;
+            DrawRectangle((int)x, (int)(y + h*0.35f),
                           (int)w, (int)(h*0.3f), Fade(DARKGRAY, 0.8f));
-            DrawRectangle((int)(x + w + gap), (int)(y + h*0.35f),
+            DrawRectangle((int)x, (int)(y + h*0.35f),
                           (int)(w*frac), (int)(h*0.3f), GREEN);
+            x += w + gap;
         }
-        else if (b->kind == BLD_HOUSE)
+        else if (b->trainCooldown > 0.0f && bd->trainableCount > 0)
         {
-            if (GuiButton((Rectangle){ x, y, w, h }, TextFormat("TRAIN WORKER %df",
-                          strategyTrainCost[KIND_WORKER][RES_FOOD])))
-            {
-                AudioPlayButton();
-                StrategyTrainStart(world->selectedBuilding, KIND_WORKER);
-            }
+            GuiLabel((Rectangle){ x, y, w, h },
+                     TextFormat("%s resting %.1fs", bd->name, b->trainCooldown));
+            x += w + gap;
         }
-        else if (b->kind == BLD_BARRACKS)
+        else if (bd->trainableCount > 0)
         {
-            if (GuiButton((Rectangle){ x, y, w, h }, TextFormat("TRAIN SOLDIER %dw %df",
-                          strategyTrainCost[KIND_SOLDIER][RES_WOOD],
-                          strategyTrainCost[KIND_SOLDIER][RES_FOOD])))
+            // One TRAIN button per kind this building can produce.
+            for (int t = 0; t < bd->trainableCount; t++)
             {
-                AudioPlayButton();
-                StrategyTrainStart(world->selectedBuilding, KIND_SOLDIER);
+                const UnitDef *ud = StrategyUnitDef(bd->trainable[t]);
+                const char *text = TextFormat("TRAIN %s %dw %df", ud->name,
+                                              ud->cost[RES_WOOD], ud->cost[RES_FOOD]);
+                if (GuiButton((Rectangle){ x, y, w, h }, text))
+                {
+                    AudioPlayButton();
+                    StrategyTrainStart(world->selectedBuilding, bd->trainable[t]);
+                }
+                x += w + gap;
             }
         }
         else if (b->kind == BLD_FARM)
@@ -301,19 +304,31 @@ static void GuiCommandPanel(StrategyWorld *world)
             }
             GuiLabel((Rectangle){ x, y, w, h },
                      TextFormat("FARM - workers: %d (RMB workers here)", hands));
+            x += w + gap;
         }
         else
         {
-            GuiLabel((Rectangle){ x, y, w, h },
-                     (b->kind == BLD_LOGGING) ? "LOGGING CAMP (wood dropoff)"
-                                              : "QUARRY (stone dropoff)");
+            GuiLabel((Rectangle){ x, y, w, h }, bd->name);
+            x += w + gap;
+        }
+
+        // SELL: refund scales with the difficulty bonus (Easy sells best).
+        float rate = bd->refundRate + world->mods[0].refundBonus;
+        const char *sell = TextFormat("SELL +%dw +%ds",
+                                      (int)floorf((float)bd->cost[RES_WOOD]*rate),
+                                      (int)floorf((float)bd->cost[RES_STONE]*rate));
+        if (GuiButton((Rectangle){ x, y, 140.0f*(float)s, h }, sell))
+        {
+            AudioPlayButton();
+            StrategySellBuilding(world->selectedBuilding);
         }
     }
-    else if (workers + soldiers > 0)
+    else if (workers + soldiers + templars > 0)
     {
-        GuiLabel((Rectangle){ x, y, 180.0f*(float)s, h },
-                 TextFormat("%d WORKER  %d SOLDIER", workers, soldiers));
-        x += 180.0f*(float)s + gap;
+        GuiLabel((Rectangle){ x, y, 220.0f*(float)s, h },
+                 TextFormat("%d WORKER  %d ARMY  %d TEMPLAR",
+                            workers, soldiers, templars));
+        x += 220.0f*(float)s + gap;
 
         if (GuiButton((Rectangle){ x, y, 80.0f*(float)s, h }, "STOP"))
         {
