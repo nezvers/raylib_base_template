@@ -59,40 +59,18 @@ static MenuPage menuPage = MENU_PAGE_MAIN;
 //  A gap between rows = the old "hold" (nothing needs a row to stand still).
 // ============================================================================
 
-static const AnimPhase titleIntro[] = {
-    { TP_SLIDE_IN, 0.00f, 0.60f, sineEaseOutf },     // slides in from off-screen
-};
-static const AnimPhase titleOutro[] = {
-    { TP_CENTER_X, 0.00f, 0.55f, sineEaseOutf },     // already centered -> no motion,
-                                                     //   but would center any rest pose
-    { TP_CENTER_Y, 0.10f, 0.75f, sineEaseInOutf },   // drop to the vertical center
-    { TP_CRUMBLE,  1.05f, 2.15f, cubicEaseInf  },    // then break apart and fall
-};
-static const AnimPhase descrIntro[] = {
-    { TP_FADE_IN,  0.20f, 0.70f, NULL },             // NULL ease = linear
-};
-static const AnimPhase descrOutro[] = {
-    { TP_CRUMBLE,  1.15f, 2.25f, cubicEaseInf },     // sub-text crumbles a beat later
-};
-
-// Every DrawText the menu owns: text, size (fraction of game height), anchor
-// (x = text center, y = top edge; fractions of game size), color, phases.
-static AnimText menuTexts[] = {
-    { "MAIN MENU",                0.125f, {0.5f, 0.06f}, RAYWHITE, titleIntro, 1,  titleOutro, 3 },
-    { "place of all the buttons", 0.062f, {0.5f, 0.18f}, RAYWHITE, descrIntro, 1,  descrOutro, 1 },
-};
-
-// Global (whole-screen) outro beats. GP_FADE_BLACK's end is the hand-off time.
-static const AnimPhase menuOutroGlobal[] = {
-    { GP_ART_FADE,   0.15f, 1.10f, NULL },
-    { GP_FADE_BLACK, 1.90f, 2.55f, NULL },
-};
-// Shape (zoom box) outro beats: keep zooming while the gaps shrink to zero
-// (they group up mid-zoom), then the grouped stack reverses inward together.
-static const AnimPhase menuOutroShape[] = {
-    { SP_ZOOM_SETTLE_GAP1,  0.00f, 1.35f, sineEaseOutf },
-    { SP_ZOOM_REVERSE, 1.35f, 2.45f, cubicEaseInf },
-};
+typedef struct {
+    AnimPhase titleIntro[1];
+    AnimPhase titleOutro[3];
+    AnimPhase descrIntro[1];
+    AnimPhase descrOutro[1];
+    AnimText menuTexts[2];
+    AnimPhase menuOutroGlobal[2];
+    AnimPhase menuOutroShape[2];
+    SceneAnim menuAnim;
+    SceneAnimPlayer player;
+} MainMenUAnimations_t;
+static MainMenUAnimations_t menu_animations;
 
 // The zoom boxes' clock lives HERE (in the scene) and the spec points at it,
 // so the outro captures the boxes exactly where the menu just drew them.
@@ -100,26 +78,64 @@ static ZoomBoxes zoomBoxes = { .count = 3, .period = 5.0f };
 
 static void DrawMenuArt(float alpha, float time);   // defined below Draw()
 
-// The bundle handed to both players: our texts, global/shape outro tables,
-// the shared zoom boxes and the decor callback. (introGlobal is NULL: this
-// menu has no whole-screen intro beat; GP_UNFADE_BLACK would go there.)
-static const SceneAnim menuAnim = {
-    .texts = menuTexts,             .textCount = 2,
-    .introGlobal = NULL,            .introGlobalCount = 0,
-    .outroGlobal = menuOutroGlobal, .outroGlobalCount = 2,
-    .outroShape  = menuOutroShape,  .outroShapeCount  = 2,
-    .boxes = &zoomBoxes,
-    .drawArt = DrawMenuArt,
-};
-
 // Plays the INTRO when the menu is entered; after it finishes, the same
 // SceneAnimDrawTexts call keeps drawing the texts at their rest pose forever.
-static SceneAnimPlayer introPlayer;
+
+static void AnimationsInit() {
+    // slides in from off-screen
+    menu_animations.titleIntro[0] = (AnimPhase){ TP_SLIDE_IN, 0.00f, 0.60f, sineEaseOutf };
+
+    // already centered -> no motion, but would center any rest pose
+    menu_animations.titleOutro[0] = (AnimPhase){ TP_CENTER_X, 0.00f, 0.55f, sineEaseOutf };
+    // drop to the vertical center
+    menu_animations.titleOutro[1] = (AnimPhase){ TP_CENTER_Y, 0.10f, 0.75f, sineEaseInOutf };
+    // then break apart and fall
+    menu_animations.titleOutro[2] = (AnimPhase){ TP_CRUMBLE,  1.05f, 2.15f, cubicEaseInf };
+
+    // NULL ease = linear
+    menu_animations.descrIntro[0] = (AnimPhase){ TP_FADE_IN,  0.20f, 0.70f, NULL };
+    // sub-text crumbles a beat later
+    menu_animations.descrOutro[0] = (AnimPhase){ TP_CRUMBLE,  1.15f, 2.25f, cubicEaseInf };
+    
+    // Every DrawText the menu owns: text, size (fraction of game height), anchor
+    // (x = text center, y = top edge; fractions of game size), color, phases.
+    menu_animations.menuTexts[0] = (AnimText){ "MAIN MENU",                0.125f, {0.5f, 0.06f}, RAYWHITE, menu_animations.titleIntro, 1,  menu_animations.titleOutro, 3 };
+    menu_animations.menuTexts[1] = (AnimText){ "place of all the buttons", 0.062f, {0.5f, 0.18f}, RAYWHITE, menu_animations.descrIntro, 1,  menu_animations.descrOutro, 1 };
+
+    // Global (whole-screen) outro beats. GP_FADE_BLACK's end is the hand-off time.
+    menu_animations.menuOutroGlobal[0] = (AnimPhase){ GP_ART_FADE,   0.15f, 1.10f, NULL };
+    menu_animations.menuOutroGlobal[1] = (AnimPhase){ GP_FADE_BLACK, 1.90f, 2.55f, NULL };
+
+    // Shape (zoom box) outro beats: keep zooming while the gaps shrink to zero
+    // (they group up mid-zoom), then the grouped stack reverses inward together.
+    menu_animations.menuOutroShape[0] = (AnimPhase){ SP_ZOOM_SETTLE_GAP1,  0.00f, 1.35f, sineEaseOutf };
+    menu_animations.menuOutroShape[1] = (AnimPhase){ SP_ZOOM_REVERSE, 1.35f, 2.45f, cubicEaseInf };
+
+    // The bundle handed to both players: our texts, global/shape outro tables,
+    // the shared zoom boxes and the decor callback. (introGlobal is NULL: this
+    // menu has no whole-screen intro beat; GP_UNFADE_BLACK would go there.)
+    menu_animations.menuAnim = (SceneAnim){
+        .texts = menu_animations.menuTexts,
+        .textCount = 2,
+
+        .introGlobal = NULL,
+        .introGlobalCount = 0,
+
+        .outroGlobal = menu_animations.menuOutroGlobal,
+        .outroGlobalCount = 2,
+
+        .outroShape = menu_animations.menuOutroShape,
+        .outroShapeCount = 2,
+
+        .boxes = &zoomBoxes,
+        .drawArt = DrawMenuArt,
+        };
+}
 
 // Leave the menu through the generic outro player (PLAY/STRATEGY and ENTER).
 static void StartGameTransition(AppState *destination)
 {
-    TransitionStateStart(&menuAnim, destination);
+    TransitionStateStart(&menu_animations.menuAnim, destination);
     AppStateTransition(&app_state_transition);
 }
 
@@ -136,7 +152,8 @@ static void Enter()
 
     // Kick off the intro: texts slide/fade IN to their rest pose. When it is
     // done the same player simply keeps drawing the rest pose (see Draw()).
-    SceneAnimStart(&introPlayer, &menuAnim, ANIM_INTRO);
+    AnimationsInit();
+    SceneAnimStart(&menu_animations.player, &menu_animations.menuAnim, ANIM_INTRO);
 
     // No GUI-scale seeding needed: the wish lives in settings->gui_scale_wish, loaded
     // at startup and bound directly to the toggle below.
@@ -161,7 +178,7 @@ static void Update()
     float dt = GetFrameTime();
     animTime += dt;
 
-    SceneAnimUpdate(&introPlayer, dt);   // advance the intro (no-op once done)
+    SceneAnimUpdate(&menu_animations.player, dt);   // advance the intro (no-op once done)
     ZoomBoxesUpdate(&zoomBoxes, dt);     // the boxes' shared loop clock
 
     // Keyboard input example: ENTER also starts the game.
@@ -201,7 +218,7 @@ static void Draw()
 
     // -- Texts: title + sub-text from the menuTexts table ---------------------
     // During the intro they animate in; afterwards this draws the rest pose.
-    SceneAnimDrawTexts(&introPlayer);
+    SceneAnimDrawTexts(&menu_animations.player);
 
     // -- Mouse input in GAME space.
     Vector2 pos_mouse = Screen2Target(GetMousePosition());

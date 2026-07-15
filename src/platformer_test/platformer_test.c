@@ -29,22 +29,14 @@ static unsigned int score;
 //  text shows and then vanishes on the same intro clock (TextAlpha multiplies
 //  in * (1-out), see scene_anim.c). No boxes/art/global beats needed.
 // ============================================================================
-static const AnimPhase introTextPhases[] = {
-    { TP_FADE_IN,  0.30f, 1.10f, sineEaseOutf },   // fade up
-    { TP_FADE_OUT, 2.00f, 2.80f, sineEaseInf  },   // then fade away
-};
-static const AnimPhase introGlobalPhases[] = {
-    { GP_UNFADE_BLACK, 0.00f, 0.60f, sineEaseOutf },  // black -> level reveal
-};
-static AnimText introTexts[] = {
-    { "GAME ON", 0.15f, {0.5f, 0.42f}, RAYWHITE, introTextPhases, 2,  NULL, 0 },
-};
-static const SceneAnim introAnim = {
-    .texts = introTexts, .textCount = 1,
-    .introGlobal = introGlobalPhases, .introGlobalCount = 1,
-    // no shape beats, no zoom boxes, no decor art
-};
-static SceneAnimPlayer introPlayer;
+typedef struct {
+    AnimPhase introTextPhases[2];
+    AnimPhase introGlobalPhases[1];
+    AnimText introTexts[1];
+    SceneAnim introAnim;
+    SceneAnimPlayer player;
+} IntroAnim_t;
+static IntroAnim_t intro_animation;
 
 // ============================================================================
 //  PAUSE MENU. ESC toggles it (the state machine has no stacking, so pause is
@@ -53,28 +45,49 @@ static SceneAnimPlayer introPlayer;
 //  dimming overlay; the same pausePlayer plays the texts IN on pause and OUT
 //  on resume (gameplay resumes immediately, the outro runs over live play).
 // ============================================================================
-static const AnimPhase pauseTitleIntro[] = {
-    { TP_SLIDE_IN, 0.00f, 0.50f, sineEaseOutf },   // title first
-};
-static const AnimPhase pauseSubIntro[] = {
-    { TP_SLIDE_IN, 0.20f, 0.70f, sineEaseOutf },   // subtitle trails behind
-};
-static const AnimPhase pauseTitleOutro[] = {
-    { TP_SLIDE_OUT, 0.10f, 0.55f, sineEaseInf },   // reverse stagger: sub leaves
-};
-static const AnimPhase pauseSubOutro[] = {
-    { TP_SLIDE_OUT, 0.00f, 0.45f, sineEaseInf },   //   first, title follows
-};
-static AnimText pauseTexts[] = {
-    { "PAUSE MENU",              0.11f, {0.5f, 0.08f}, RAYWHITE,
-      pauseTitleIntro, 1, pauseTitleOutro, 1 },
-    { "still, all the buttons!", 0.056f, {0.5f, 0.21f}, LIGHTGRAY,
-      pauseSubIntro,   1, pauseSubOutro,   1 },
-};
-static const SceneAnim pauseAnim = {
-    .texts = pauseTexts, .textCount = 2,
-};
-static SceneAnimPlayer pausePlayer;
+typedef struct {
+    AnimPhase pauseTitleIntro[1];
+    AnimPhase pauseSubIntro[1];
+    AnimPhase pauseTitleOutro[1];
+    AnimPhase pauseSubOutro[1];
+    AnimText pauseTexts[2];
+    SceneAnim pauseAnim;
+    SceneAnimPlayer player;
+} PauseAnim_t;
+static PauseAnim_t pause_animation;
+
+static void InitAnimations() {
+    // Intro
+    {
+        intro_animation.introTextPhases[0] = (AnimPhase){ TP_FADE_IN,  0.30f, 1.10f, sineEaseOutf };   // fade up
+        intro_animation.introTextPhases[1] = (AnimPhase){ TP_FADE_OUT, 2.00f, 2.80f, sineEaseInf };    // then fade away
+
+        intro_animation.introGlobalPhases[0] = (AnimPhase){ GP_UNFADE_BLACK, 0.00f, 0.60f, sineEaseOutf };  // black -> level reveal
+        intro_animation.introTexts[0] = (AnimText){ "GAME ON", 0.15f, {0.5f, 0.42f}, RAYWHITE, intro_animation.introTextPhases, 2,  NULL, 0 };
+
+        intro_animation.introAnim = (SceneAnim){
+            .texts = intro_animation.introTexts,
+            .textCount = 1,
+            .introGlobal = intro_animation.introGlobalPhases,
+            .introGlobalCount = 1,
+            // no shape beats, no zoom boxes, no decor art
+        };
+    }
+
+    // Pause
+    {
+        pause_animation.pauseTitleIntro[0] = (AnimPhase){ TP_SLIDE_IN, 0.00f, 0.50f, sineEaseOutf };   // title first
+        pause_animation.pauseSubIntro[0] = (AnimPhase){ TP_SLIDE_IN, 0.20f, 0.70f, sineEaseOutf };     // subtitle trails behind
+        pause_animation.pauseTitleOutro[0] = (AnimPhase){ TP_SLIDE_OUT, 0.10f, 0.55f, sineEaseInf };   // reverse stagger: sub leaves
+        pause_animation.pauseSubOutro[0] = (AnimPhase){ TP_SLIDE_OUT, 0.00f, 0.45f, sineEaseInf };     //   first, title follows
+
+        pause_animation.pauseTexts[0] = (AnimText){ "PAUSE MENU",              0.11f, {0.5f, 0.08f}, RAYWHITE,
+                                                    pause_animation.pauseTitleIntro, 1, pause_animation.pauseTitleOutro, 1 };
+        pause_animation.pauseTexts[1] = (AnimText){ "still, all the buttons!", 0.056f, {0.5f, 0.21f}, LIGHTGRAY,
+                                                    pause_animation.pauseSubIntro,   1, pause_animation.pauseSubOutro,   1 };
+        pause_animation.pauseAnim = (SceneAnim){.texts = pause_animation.pauseTexts, .textCount = 2};
+    }
+}
 
 // Pause GUI shows one of two pages, mirroring main_menu's MenuPage.
 typedef enum { PAUSE_PAGE_MAIN = 0, PAUSE_PAGE_OPTIONS } PausePage;
@@ -93,12 +106,12 @@ void LevelDraw();
 static void PauseOpen(){
     paused    = true;
     pausePage = PAUSE_PAGE_MAIN;
-    SceneAnimStart(&pausePlayer, &pauseAnim, ANIM_INTRO);
+    SceneAnimStart(&pause_animation.player, &pause_animation.pauseAnim, ANIM_INTRO);
 }
 
 static void PauseClose(){
     paused = false;
-    SceneAnimStart(&pausePlayer, &pauseAnim, ANIM_OUTRO);   // texts slide back out
+    SceneAnimStart(&pause_animation.player, &pause_animation.pauseAnim, ANIM_OUTRO);   // texts slide back out
 }
 
 static void Enter(){
@@ -109,13 +122,14 @@ static void Enter(){
     LevelSetRestartCallback(Enter);
 
     // Kick off the "GAME ON" intro (appears, then fades out).
-    SceneAnimStart(&introPlayer, &introAnim, ANIM_INTRO);
+    InitAnimations();
+    SceneAnimStart(&intro_animation.player, &intro_animation.introAnim, ANIM_INTRO);
 
     // Fresh pause state (Enter is also the KEY_R restart).
     paused    = false;
     pausePage = PAUSE_PAGE_MAIN;
     pauseDim  = 0.0f;
-    pausePlayer.spec = NULL;   // nothing to play/draw until the first ESC
+    pause_animation.player.spec = NULL;   // nothing to play/draw until the first ESC
 }
 
 static void Exit(){
@@ -141,12 +155,12 @@ static void Update(){
             Enter();
         }
         LevelUpdate();
-        SceneAnimUpdate(&introPlayer, GetFrameTime());   // advance intro text (no-op once done)
+        SceneAnimUpdate(&intro_animation.player, GetFrameTime());   // advance intro text (no-op once done)
     }
 
     // Pause texts animate on their own clock: intro while paused, outro over
     // live gameplay right after resume (no-op once finished / never started).
-    if (pausePlayer.spec) SceneAnimUpdate(&pausePlayer, GetFrameTime());
+    if (pause_animation.player.spec) SceneAnimUpdate(&pause_animation.player, GetFrameTime());
 
     // Ease the dim overlay toward its target (1 when paused, 0 when playing).
     float dimTarget = paused ? 1.0f : 0.0f;
@@ -158,17 +172,17 @@ static void Draw(){
     LevelDraw();
 
     // "GAME ON" intro text, drawn on top of the level (game space).
-    SceneAnimDrawTexts(&introPlayer);
+    SceneAnimDrawTexts(&intro_animation.player);
 
     // Pause overlay: dim the frozen game, then the animated pause texts.
     if (pauseDim > 0.01f)
         DrawRectangle(0, 0, (int)game_size.x, (int)game_size.y,
                       Fade(BLACK, 0.55f*pauseDim));
-    if (pausePlayer.spec) SceneAnimDrawTexts(&pausePlayer);
+    if (pause_animation.player.spec) SceneAnimDrawTexts(&pause_animation.player);
 
     // Entry fade-in: GP_UNFADE_BLACK eases 0->1, so the remaining blackness is
     // 1-amount (missing row would read 1 = no overlay). Drawn last, over all.
-    float black = 1.0f - SceneAnimGlobalAmount(&introPlayer, GP_UNFADE_BLACK);
+    float black = 1.0f - SceneAnimGlobalAmount(&intro_animation.player, GP_UNFADE_BLACK);
     if (black > 0.001f)
         DrawRectangle(0, 0, (int)game_size.x, (int)game_size.y,
                       Fade(BLACK, black));
