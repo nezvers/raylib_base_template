@@ -31,8 +31,20 @@ void StrategyOrderFarm(Unit *u, int bldIndex);
 void StrategyOrderBuild(Unit *u, int bldIndex);     // raise a scaffold to full
 void StrategyOrderRepair(Unit *u, int bldIndex);    // restore a damaged building
 
+// Queue a worker job (build / repair / gather-assign). append=false replaces
+// the current job and clears the queue; append=true chains after it (Shift-RMB).
+void StrategyOrderJob(Unit *u, WorkerJobKind kind, int bldIndex, bool append);
+
 // Nearest active node of a kind (-1 = any kind) within radius, else -1.
 int StrategyNearestNodeOfKind(Vector3 pos, int nodeKind, float radius);
+
+// Composition census (player-facing pop panel). kind < 0 counts every kind.
+int StrategyCountUnits(int faction, int kind);
+int StrategyCountIdleWorkers(int faction);
+
+// Select the idle worker nearest the camera focus and pan the camera to it.
+// No-op when the player has no idle worker.
+void StrategySelectNearestIdleWorker(void);
 
 // Start training at a building: validates cost + pop cap, deducts, returns
 // success. Shared by the GUI buttons and the enemy AI.

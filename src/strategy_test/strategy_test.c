@@ -32,48 +32,61 @@ AppState app_state_strategy = {Enter, Exit, Update, Draw, Gui, "Strategy"};
 //  INTRO: "STRATEGY" fades in over the fresh battlefield then disappears,
 //  while GP_UNFADE_BLACK reveals the scene from black (platformer pattern).
 // ============================================================================
-static const AnimPhase introTextPhases[] = {
-    { TP_FADE_IN,  0.30f, 1.10f, sineEaseOutf },   // fade up
-    { TP_FADE_OUT, 2.00f, 2.80f, sineEaseInf  },   // then fade away
-};
-static const AnimPhase introGlobalPhases[] = {
-    { GP_UNFADE_BLACK, 0.00f, 0.60f, sineEaseOutf },  // black -> battlefield
-};
-static AnimText introTexts[] = {
-    { "STRATEGY", 0.15f, {0.5f, 0.42f}, RAYWHITE, introTextPhases, 2, NULL, 0 },
-};
-static const SceneAnim introAnim = {
-    .texts = introTexts, .textCount = 1,
-    .introGlobal = introGlobalPhases, .introGlobalCount = 1,
-};
-static SceneAnimPlayer introPlayer;
+typedef struct {
+    AnimPhase introTextPhases[2];
+    AnimPhase introGlobalPhases[1];
+    AnimText  introTexts[1];
+    SceneAnim introAnim;
+    SceneAnimPlayer player;
+} IntroAnim_t;
+static IntroAnim_t intro_animation;
 
 // ============================================================================
 //  PAUSE MENU: same in-state flag + dim + slide-in/out texts as the
 //  platformer (see the long comments there).
 // ============================================================================
-static const AnimPhase pauseTitleIntro[] = {
-    { TP_SLIDE_IN, 0.00f, 0.50f, sineEaseOutf },
-};
-static const AnimPhase pauseSubIntro[] = {
-    { TP_SLIDE_IN, 0.20f, 0.70f, sineEaseOutf },
-};
-static const AnimPhase pauseTitleOutro[] = {
-    { TP_SLIDE_OUT, 0.10f, 0.55f, sineEaseInf },
-};
-static const AnimPhase pauseSubOutro[] = {
-    { TP_SLIDE_OUT, 0.00f, 0.45f, sineEaseInf },
-};
-static AnimText pauseTexts[] = {
-    { "PAUSE MENU",                  0.11f,  {0.5f, 0.08f}, RAYWHITE,
-      pauseTitleIntro, 1, pauseTitleOutro, 1 },
-    { "the armies hold their ground", 0.056f, {0.5f, 0.21f}, LIGHTGRAY,
-      pauseSubIntro,   1, pauseSubOutro,   1 },
-};
-static const SceneAnim pauseAnim = {
-    .texts = pauseTexts, .textCount = 2,
-};
-static SceneAnimPlayer pausePlayer;
+typedef struct {
+    AnimPhase pauseTitleIntro[1];
+    AnimPhase pauseSubIntro[1];
+    AnimPhase pauseTitleOutro[1];
+    AnimPhase pauseSubOutro[1];
+    AnimText  pauseTexts[2];
+    SceneAnim pauseAnim;
+    SceneAnimPlayer player;
+} PauseAnim_t;
+static PauseAnim_t pause_animation;
+
+static void InitAnimations() {
+    // Intro
+    {
+        intro_animation.introTextPhases[0] = (AnimPhase){ TP_FADE_IN,  0.30f, 1.10f, sineEaseOutf };   // fade up
+        intro_animation.introTextPhases[1] = (AnimPhase){ TP_FADE_OUT, 2.00f, 2.80f, sineEaseInf };    // then fade away
+
+        intro_animation.introGlobalPhases[0] = (AnimPhase){ GP_UNFADE_BLACK, 0.00f, 0.60f, sineEaseOutf };  // black -> battlefield
+        intro_animation.introTexts[0] = (AnimText){ "STRATEGY", 0.15f, {0.5f, 0.42f}, RAYWHITE, intro_animation.introTextPhases, 2, NULL, 0 };
+
+        intro_animation.introAnim = (SceneAnim){
+            .texts = intro_animation.introTexts,
+            .textCount = 1,
+            .introGlobal = intro_animation.introGlobalPhases,
+            .introGlobalCount = 1,
+        };
+    }
+
+    // Pause
+    {
+        pause_animation.pauseTitleIntro[0] = (AnimPhase){ TP_SLIDE_IN, 0.00f, 0.50f, sineEaseOutf };
+        pause_animation.pauseSubIntro[0]   = (AnimPhase){ TP_SLIDE_IN, 0.20f, 0.70f, sineEaseOutf };
+        pause_animation.pauseTitleOutro[0] = (AnimPhase){ TP_SLIDE_OUT, 0.10f, 0.55f, sineEaseInf };
+        pause_animation.pauseSubOutro[0]   = (AnimPhase){ TP_SLIDE_OUT, 0.00f, 0.45f, sineEaseInf };
+
+        pause_animation.pauseTexts[0] = (AnimText){ "PAUSE MENU",                  0.11f,  {0.5f, 0.08f}, RAYWHITE,
+                                                    pause_animation.pauseTitleIntro, 1, pause_animation.pauseTitleOutro, 1 };
+        pause_animation.pauseTexts[1] = (AnimText){ "the armies hold their ground", 0.056f, {0.5f, 0.21f}, LIGHTGRAY,
+                                                    pause_animation.pauseSubIntro,   1, pause_animation.pauseSubOutro,   1 };
+        pause_animation.pauseAnim = (SceneAnim){ .texts = pause_animation.pauseTexts, .textCount = 2 };
+    }
+}
 
 typedef enum { PAUSE_PAGE_MAIN = 0, PAUSE_PAGE_OPTIONS } PausePage;
 static PausePage pausePage = PAUSE_PAGE_MAIN;
@@ -84,13 +97,13 @@ static void PauseOpen()
 {
     paused    = true;
     pausePage = PAUSE_PAGE_MAIN;
-    SceneAnimStart(&pausePlayer, &pauseAnim, ANIM_INTRO);
+    SceneAnimStart(&pause_animation.player, &pause_animation.pauseAnim, ANIM_INTRO);
 }
 
 static void PauseClose()
 {
     paused = false;
-    SceneAnimStart(&pausePlayer, &pauseAnim, ANIM_OUTRO);   // texts slide back out
+    SceneAnimStart(&pause_animation.player, &pause_animation.pauseAnim, ANIM_OUTRO);   // texts slide back out
 }
 
 static void Enter()
@@ -101,13 +114,14 @@ static void Enter()
     StrategyWorldInit();
 
     // Kick off the "STRATEGY" intro (appears, then fades out).
-    SceneAnimStart(&introPlayer, &introAnim, ANIM_INTRO);
+    InitAnimations();
+    SceneAnimStart(&intro_animation.player, &intro_animation.introAnim, ANIM_INTRO);
 
     // Fresh pause state (Enter is also the KEY_R restart).
     paused    = false;
     pausePage = PAUSE_PAGE_MAIN;
     pauseDim  = 0.0f;
-    pausePlayer.spec = NULL;   // nothing to play/draw until the first ESC
+    pause_animation.player.spec = NULL;   // nothing to play/draw until the first ESC
 }
 
 static void Exit()
@@ -149,12 +163,12 @@ static void Update()
         }
         StrategyWorldHandleInput();
         StrategyWorldUpdate(GetFrameTime());
-        SceneAnimUpdate(&introPlayer, GetFrameTime());   // advance intro text (no-op once done)
+        SceneAnimUpdate(&intro_animation.player, GetFrameTime());   // advance intro text (no-op once done)
     }
 
     // Pause texts animate on their own clock: intro while paused, outro over
     // live gameplay right after resume (no-op once finished / never started).
-    if (pausePlayer.spec) SceneAnimUpdate(&pausePlayer, GetFrameTime());
+    if (pause_animation.player.spec) SceneAnimUpdate(&pause_animation.player, GetFrameTime());
 
     // Ease the dim overlay toward its target (1 when paused, 0 when playing).
     float dimTarget = paused ? 1.0f : 0.0f;
@@ -169,17 +183,17 @@ static void Draw()
     StrategyWorldDraw2DOverlay();   // drag rect, HP bars, resource HUD
 
     // "STRATEGY" intro text, drawn on top of the world (game space).
-    SceneAnimDrawTexts(&introPlayer);
+    SceneAnimDrawTexts(&intro_animation.player);
 
     // Pause overlay: dim the frozen game, then the animated pause texts.
     if (pauseDim > 0.01f)
         DrawRectangle(0, 0, (int)game_size.x, (int)game_size.y,
                       Fade(BLACK, 0.55f*pauseDim));
-    if (pausePlayer.spec) SceneAnimDrawTexts(&pausePlayer);
+    if (pause_animation.player.spec) SceneAnimDrawTexts(&pause_animation.player);
 
     // Entry fade-in: GP_UNFADE_BLACK eases 0->1, so the remaining blackness is
     // 1-amount (missing row would read 1 = no overlay). Drawn last, over all.
-    float black = 1.0f - SceneAnimGlobalAmount(&introPlayer, GP_UNFADE_BLACK);
+    float black = 1.0f - SceneAnimGlobalAmount(&intro_animation.player, GP_UNFADE_BLACK);
     if (black > 0.001f)
         DrawRectangle(0, 0, (int)game_size.x, (int)game_size.y,
                       Fade(BLACK, black));
@@ -214,6 +228,66 @@ static void GuiInfoRow(Rectangle row, const char *text, const char *sub)
     {
         DrawText(text, (int)(row.x + 10.0f),
                  (int)(row.y + (row.height - (float)fs)*0.5f), fs, RAYWHITE);
+    }
+}
+
+// ----------------------------------------------------------------------------
+//  Population panel: a small left-middle column listing the player's unit
+//  composition and a SELECT IDLE button that grabs the nearest idle worker and
+//  pans the camera to it. Reserves world->guiBlock2 so clicks don't fall
+//  through to the battlefield (see MouseOnGui).
+// ----------------------------------------------------------------------------
+static void GuiPopPanel(StrategyWorld *world)
+{
+    ScreenState *ss = ScreenStateGet();
+    Rectangle vp = ss->dest_rect;
+    Settings *settings = SettingsGet();
+
+    const float scales[3] = { 1.0f, 2.0f, 3.0f };
+    int s = (int)scales[settings->gui_scale_wish];
+
+    int baseSize = GuiGetFont().baseSize;
+    GuiSetStyle(DEFAULT, TEXT_SIZE, baseSize*s);
+    GuiSetIconScale(s);
+
+    int workers  = StrategyCountUnits(0, KIND_WORKER);
+    int soldiers = StrategyCountUnits(0, KIND_SOLDIER) +
+                   StrategyCountUnits(0, KIND_RANGED);
+    int templars = StrategyCountUnits(0, KIND_TEMPLAR) +
+                   StrategyCountUnits(0, KIND_TEMPLAR_HEALER);
+    int idle     = StrategyCountIdleWorkers(0);
+
+    // Panel geometry: one header row + four census rows + a button, stacked.
+    float rowH = 22.0f*(float)s;
+    float w    = 150.0f*(float)s;
+    float btnH = 30.0f*(float)s;
+    float pad  = 8.0f*(float)s;
+    int   rows = 5;         // header + 4 census lines
+    float panelH = pad*2.0f + (float)rows*rowH + 6.0f*(float)s + btnH;
+    float x = vp.x + 16.0f;
+    float y = vp.y + (vp.height - panelH)*0.5f;
+
+    Rectangle panel = { x, y, w, panelH };
+    world->guiBlock2 = panel;   // block world clicks under the panel
+
+    DrawRectangleRec(panel, Fade(BLACK, 0.7f));
+    DrawRectangleLinesEx(panel, 1.0f, Fade(RAYWHITE, 0.3f));
+
+    int fs = (int)(rowH*0.62f);
+    float tx = x + pad;
+    float ty = y + pad;
+    DrawText("POPULATION", (int)tx, (int)ty, fs, RAYWHITE);            ty += rowH;
+    DrawText(TextFormat("WORKERS  %d", workers),  (int)tx, (int)ty, fs, RAYWHITE); ty += rowH;
+    DrawText(TextFormat("ARMY     %d", soldiers), (int)tx, (int)ty, fs, RAYWHITE); ty += rowH;
+    DrawText(TextFormat("TEMPLARS %d", templars), (int)tx, (int)ty, fs, RAYWHITE); ty += rowH;
+    Color idleColor = (idle > 0) ? (Color){ 240, 210, 90, 255 } : Fade(RAYWHITE, 0.6f);
+    DrawText(TextFormat("IDLE     %d", idle),     (int)tx, (int)ty, fs, idleColor); ty += rowH;
+
+    ty += 6.0f*(float)s;
+    if (GuiButton((Rectangle){ tx, ty, w - 2.0f*pad, btnH }, "SELECT IDLE"))
+    {
+        AudioPlayButton();
+        StrategySelectNearestIdleWorker();
     }
 }
 
@@ -317,8 +391,12 @@ static void GuiCommandPanel(StrategyWorld *world)
     {
         Unit *u = &world->units[lastSel];
         const char *name = StrategyUnitDef(u->kind)->name;
-        GuiInfoRow(infoRow, TextFormat("%s   HP %.0f/%.0f   DMG %.0f",
-                   name, u->hp, u->maxHp, u->damage), NULL);
+        const char *base = TextFormat("%s   HP %.0f/%.0f   DMG %.0f",
+                                      name, u->hp, u->maxHp, u->damage);
+        // A worker mid-chain shows how many jobs are still queued behind it.
+        const char *head = (u->jobQueueCount > 0)
+            ? TextFormat("%s   (+%d queued)", base, u->jobQueueCount) : base;
+        GuiInfoRow(infoRow, head, NULL);
     }
     else if (selCount > 1)
     {
@@ -495,10 +573,12 @@ static void GuiCommandPanel(StrategyWorld *world)
 static void Gui()
 {
     StrategyWorld *world = StrategyWorldGet();
-    world->guiBlock = (Rectangle){ 0 };     // nothing owns the mouse by default
+    world->guiBlock  = (Rectangle){ 0 };    // nothing owns the mouse by default
+    world->guiBlock2 = (Rectangle){ 0 };
 
     if (!paused)
     {
+        GuiPopPanel(world);
         GuiCommandPanel(world);
         return;
     }
