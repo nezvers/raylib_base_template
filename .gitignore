@@ -85,3 +85,4 @@ android.*
 *box2d/samples/
 
 settings.cfg
+build-web/*

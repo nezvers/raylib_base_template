@@ -30,7 +30,13 @@ int main(void)
 #if !defined(_DEBUG)
     SetTraceLogLevel(LOG_NONE);         // Disable raylib trace log messages
 #endif
+#if defined(PLATFORM_WEB)
+    // FLAG_WINDOW_RESIZABLE breaks canvas presentation on Web (raylib 6.0):
+    // the frame renders but never reaches the screen -> black canvas.
+    SetConfigFlags(FLAG_VSYNC_HINT);
+#else
     SetConfigFlags(FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE);
+#endif
     SettingsReset();    // defaults for Settings + Screen + Audio -> SettingsGet()
     SettingsLoad();     // override defaults from settings.cfg (+ future screen load)
 
