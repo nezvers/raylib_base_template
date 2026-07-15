@@ -217,6 +217,66 @@ static void GuiInfoRow(Rectangle row, const char *text, const char *sub)
     }
 }
 
+// ----------------------------------------------------------------------------
+//  Population panel: a small left-middle column listing the player's unit
+//  composition and a SELECT IDLE button that grabs the nearest idle worker and
+//  pans the camera to it. Reserves world->guiBlock2 so clicks don't fall
+//  through to the battlefield (see MouseOnGui).
+// ----------------------------------------------------------------------------
+static void GuiPopPanel(StrategyWorld *world)
+{
+    ScreenState *ss = ScreenStateGet();
+    Rectangle vp = ss->dest_rect;
+    Settings *settings = SettingsGet();
+
+    const float scales[3] = { 1.0f, 2.0f, 3.0f };
+    int s = (int)scales[settings->gui_scale_wish];
+
+    int baseSize = GuiGetFont().baseSize;
+    GuiSetStyle(DEFAULT, TEXT_SIZE, baseSize*s);
+    GuiSetIconScale(s);
+
+    int workers  = StrategyCountUnits(0, KIND_WORKER);
+    int soldiers = StrategyCountUnits(0, KIND_SOLDIER) +
+                   StrategyCountUnits(0, KIND_RANGED);
+    int templars = StrategyCountUnits(0, KIND_TEMPLAR) +
+                   StrategyCountUnits(0, KIND_TEMPLAR_HEALER);
+    int idle     = StrategyCountIdleWorkers(0);
+
+    // Panel geometry: one header row + four census rows + a button, stacked.
+    float rowH = 22.0f*(float)s;
+    float w    = 150.0f*(float)s;
+    float btnH = 30.0f*(float)s;
+    float pad  = 8.0f*(float)s;
+    int   rows = 5;         // header + 4 census lines
+    float panelH = pad*2.0f + (float)rows*rowH + 6.0f*(float)s + btnH;
+    float x = vp.x + 16.0f;
+    float y = vp.y + (vp.height - panelH)*0.5f;
+
+    Rectangle panel = { x, y, w, panelH };
+    world->guiBlock2 = panel;   // block world clicks under the panel
+
+    DrawRectangleRec(panel, Fade(BLACK, 0.7f));
+    DrawRectangleLinesEx(panel, 1.0f, Fade(RAYWHITE, 0.3f));
+
+    int fs = (int)(rowH*0.62f);
+    float tx = x + pad;
+    float ty = y + pad;
+    DrawText("POPULATION", (int)tx, (int)ty, fs, RAYWHITE);            ty += rowH;
+    DrawText(TextFormat("WORKERS  %d", workers),  (int)tx, (int)ty, fs, RAYWHITE); ty += rowH;
+    DrawText(TextFormat("ARMY     %d", soldiers), (int)tx, (int)ty, fs, RAYWHITE); ty += rowH;
+    DrawText(TextFormat("TEMPLARS %d", templars), (int)tx, (int)ty, fs, RAYWHITE); ty += rowH;
+    Color idleColor = (idle > 0) ? (Color){ 240, 210, 90, 255 } : Fade(RAYWHITE, 0.6f);
+    DrawText(TextFormat("IDLE     %d", idle),     (int)tx, (int)ty, fs, idleColor); ty += rowH;
+
+    ty += 6.0f*(float)s;
+    if (GuiButton((Rectangle){ tx, ty, w - 2.0f*pad, btnH }, "SELECT IDLE"))
+    {
+        AudioPlayButton();
+        StrategySelectNearestIdleWorker();
+    }
+}
+
 static void GuiCommandPanel(StrategyWorld *world)
 {
     ScreenState *ss = ScreenStateGet();
@@ -317,8 +377,12 @@ static void GuiCommandPanel(StrategyWorld *world)
     {
         Unit *u = &world->units[lastSel];
         const char *name = StrategyUnitDef(u->kind)->name;
-        GuiInfoRow(infoRow, TextFormat("%s   HP %.0f/%.0f   DMG %.0f",
-                   name, u->hp, u->maxHp, u->damage), NULL);
+        const char *base = TextFormat("%s   HP %.0f/%.0f   DMG %.0f",
+                                      name, u->hp, u->maxHp, u->damage);
+        // A worker mid-chain shows how many jobs are still queued behind it.
+        const char *head = (u->jobQueueCount > 0)
+            ? TextFormat("%s   (+%d queued)", base, u->jobQueueCount) : base;
+        GuiInfoRow(infoRow, head, NULL);
     }
     else if (selCount > 1)
     {
@@ -495,10 +559,12 @@ static void GuiCommandPanel(StrategyWorld *world)
 static void Gui()
 {
     StrategyWorld *world = StrategyWorldGet();
-    world->guiBlock = (Rectangle){ 0 };     // nothing owns the mouse by default
+    world->guiBlock  = (Rectangle){ 0 };    // nothing owns the mouse by default
+    world->guiBlock2 = (Rectangle){ 0 };
 
     if (!paused)
     {
+        GuiPopPanel(world);
         GuiCommandPanel(world);
         return;
     }
