@@ -63,7 +63,7 @@ static void InitAnimations() {
         intro_animation.introTextPhases[1] = (AnimPhase){ TP_FADE_OUT, 2.00f, 2.80f, sineEaseInf };    // then fade away
 
         intro_animation.introGlobalPhases[0] = (AnimPhase){ GP_UNFADE_BLACK, 0.00f, 0.60f, sineEaseOutf };  // black -> level reveal
-        intro_animation.introTexts[0] = (AnimText){ "GAME ON", 0.15f, {0.5f, 0.42f}, RAYWHITE, introTextPhases, 2,  NULL, 0 };
+        intro_animation.introTexts[0] = (AnimText){ "GAME ON", 0.15f, {0.5f, 0.42f}, RAYWHITE, intro_animation.introTextPhases, 2,  NULL, 0 };
 
         intro_animation.introAnim = (SceneAnim){
             .texts = intro_animation.introTexts,
