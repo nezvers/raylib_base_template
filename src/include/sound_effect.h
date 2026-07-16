@@ -28,7 +28,13 @@ typedef struct {
 extern "C" {
 #endif
 
-bool SoundEffectPlay(SoundEffect *sound, f64 time_seconds, f32 rand_f);
+#ifdef STATIC_API
+#define SERAPI static
+#else
+#define SERAPI
+#endif
+
+SERAPI bool SoundEffectPlay(SoundEffect *sound, f64 time_seconds, f32 rand_f);
 
 #ifdef __cplusplus
 }
@@ -63,7 +69,7 @@ static void SoundEffectUpdatePitch(SoundEffect *sound, f32 delta, f32 rand_f) {
     }
 }
 
-bool SoundEffectPlay(SoundEffect *sound, f64 time_seconds, f32 rand_f) {
+SERAPI bool SoundEffectPlay(SoundEffect *sound, f64 time_seconds, f32 rand_f) {
     if (time_seconds < sound->last_time + sound->retrigger_treshold) {
         return false;
     }
@@ -75,3 +81,5 @@ bool SoundEffectPlay(SoundEffect *sound, f64 time_seconds, f32 rand_f) {
 }
 
 #endif // SOUND_EFFECT_IMPLEMENTATION
+
+#undef SERAPI

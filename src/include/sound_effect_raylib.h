@@ -16,10 +16,16 @@ typedef struct {
     Sound sound;
 } SoundEffectRaylib;
 
-void SoundEffectInit(SoundEffect *sound_effect, Sound *sound);
-void SoundEffectInitRaylib(SoundEffectRaylib *sound_effect);
-void SoundEffectPlayRaylib(SoundEffectRaylib *sound_effect, f64 time_seconds, f32 rand_f);
-void SoundEffectPlayRaylibAlt(SoundEffect *sound_effect, Sound *sound, f64 time_seconds, f32 rand_f);
+#ifdef STATIC_API
+#define SERRAPI static
+#else
+#define SERRAPI
+#endif
+
+SERRAPI void SoundEffectInit(SoundEffect *sound_effect, Sound *sound);
+SERRAPI void SoundEffectInitRaylib(SoundEffectRaylib *sound_effect);
+SERRAPI void SoundEffectPlayRaylib(SoundEffectRaylib *sound_effect, f64 time_seconds, f32 rand_f);
+SERRAPI void SoundEffectPlayRaylibAlt(SoundEffect *sound_effect, Sound *sound, f64 time_seconds, f32 rand_f);
 
 #ifdef __cplusplus
 }
@@ -32,15 +38,15 @@ void SoundEffectPlayRaylibAlt(SoundEffect *sound_effect, Sound *sound, f64 time_
 #ifdef SOUND_EFFECT_RAYLIB_IMPLEMENTATION
 #undef SOUND_EFFECT_RAYLIB_IMPLEMENTATION
 
-void SoundEffectInit(SoundEffect *sound_effect, Sound *sound) {
+SERRAPI void SoundEffectInit(SoundEffect *sound_effect, Sound *sound) {
     SetSoundVolume(*sound, sound_effect->volume);
 }
 
-void SoundEffectInitRaylib(SoundEffectRaylib *sound_effect) {
+SERRAPI void SoundEffectInitRaylib(SoundEffectRaylib *sound_effect) {
     SetSoundVolume(sound_effect->sound, sound_effect->sound_effect.volume);
 }
 
-void SoundEffectPlayRaylibAlt(SoundEffect *sound_effect, Sound *sound, f64 time_seconds, f32 rand_f) {
+SERRAPI void SoundEffectPlayRaylibAlt(SoundEffect *sound_effect, Sound *sound, f64 time_seconds, f32 rand_f) {
     if (!SoundEffectPlay(sound_effect, time_seconds, rand_f)) {
         return;
     }
@@ -50,7 +56,7 @@ void SoundEffectPlayRaylibAlt(SoundEffect *sound_effect, Sound *sound, f64 time_
     PlaySound(*sound);
 }
 
-void SoundEffectPlayRaylib(SoundEffectRaylib *sound_effect, f64 time_seconds, f32 rand_f) {
+SERRAPI void SoundEffectPlayRaylib(SoundEffectRaylib *sound_effect, f64 time_seconds, f32 rand_f) {
     if (!SoundEffectPlay(&sound_effect->sound_effect, time_seconds, rand_f)) {
         return;
     }
@@ -61,3 +67,5 @@ void SoundEffectPlayRaylib(SoundEffectRaylib *sound_effect, f64 time_seconds, f3
 }
 
 #endif // SOUND_EFFECT_IMPLEMENTATION
+
+#undef SERRAPI

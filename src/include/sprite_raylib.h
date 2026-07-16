@@ -15,8 +15,14 @@ typedef struct {
 extern "C" {
 #endif
 
-void DrawSpriteRaylib(SpriteRaylib *raylib_sprite);
-void DrawSprite(Sprite *sprite, Texture2D *texture, Color tint);
+#ifdef STATIC_API
+#define SRAPI static
+#else
+#define SRAPI
+#endif
+
+SRAPI void DrawSpriteRaylib(SpriteRaylib *raylib_sprite);
+SRAPI void DrawSprite(Sprite *sprite, Texture2D *texture, Color tint);
 
 #ifdef __cplusplus
 }
@@ -30,11 +36,11 @@ void DrawSprite(Sprite *sprite, Texture2D *texture, Color tint);
 
 #include <math.h>
 
-void DrawSpriteRaylib(SpriteRaylib *raylib_sprite) {
+SRAPI void DrawSpriteRaylib(SpriteRaylib *raylib_sprite) {
     DrawSprite(&raylib_sprite->sprite, raylib_sprite->texture, raylib_sprite->tint);
 }
 
-void DrawSprite(Sprite *sprite, Texture2D *texture, Color tint) {
+SRAPI void DrawSprite(Sprite *sprite, Texture2D *texture, Color tint) {
     rectf source_rect;
     rectf target_rect;
     GetSpriteFrame(sprite, &source_rect, &target_rect);
@@ -65,3 +71,5 @@ void DrawSprite(Sprite *sprite, Texture2D *texture, Color tint) {
 }
 
 #endif // SPRITE_RAYLIB_IMPLEMENTATION
+
+#undef SRAPI
