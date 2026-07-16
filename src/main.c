@@ -106,4 +106,6 @@ void UpdateDrawFrame(void)
         AppStateGui();
 
     EndDrawing();
+
+    TempAllocReset();
 }
