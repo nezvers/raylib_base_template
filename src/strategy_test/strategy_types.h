@@ -22,6 +22,7 @@
 #define STRAT_MAX_UNITS      96
 #define STRAT_MAX_BUILDINGS  24
 #define STRAT_MAX_NODES      48
+#define UNIT_MAX_JOB_QUEUE   8      // build/repair/gather jobs one worker Shift-queues
 #define STRAT_FACTIONS       2      // 0 = player (blue), 1 = enemy (red)
 #define FACTION_NEUTRAL      2      // animals: no stockpile, no color entry -
                                     //   always guard before indexing by faction
@@ -58,6 +59,11 @@
 #define STRAT_TEND_SPACING 1.4f   // min gap to any node/building at a plant spot
 #define STRAT_TEND_PERIOD  1.5f   // seconds to plant one node once in position
 #define STRAT_TEND_MAX     8       // planted nodes near the building before gathering
+#define STRAT_TEND_EQUIP_TIME 0.5f // dwell at the building to grab a hat + sapling
+
+// Auto-gather: a worker that finishes / is right-clicked onto a gathering
+// building looks this far from the building for a node of the right kind.
+#define STRAT_AUTO_GATHER_RANGE 15.0f
 
 // Quarry: spend providence to conjure a fresh stone node beside it.
 #define STRAT_QUARRY_STONE_PROV   2     // providence spent per spawn
@@ -120,6 +126,19 @@ typedef enum {
     UNIT_REPAIR,        // worker restoring a damaged building (.targetBuilding)
 } UnitState;
 
+// A queued worker job (Shift-RMB chain). One building index serves all kinds;
+// gather resolves its resource node at dispatch time. See WorkerStartNextJob.
+typedef enum {
+    WJOB_BUILD = 0,     // finish a scaffold
+    WJOB_REPAIR,        // repair a damaged building
+    WJOB_GATHER,        // auto-assign to gather for a building (tend or dropoff)
+} WorkerJobKind;
+
+typedef struct {
+    WorkerJobKind kind;
+    int           building;         // buildings[] index this job targets
+} WorkerJob;
+
 typedef struct {
     bool         active;
     int          faction;
@@ -151,6 +170,16 @@ typedef struct {
                                     //   and paces the templar bless cycle
     bool         selected;          // player faction only
     int          controlGroup;      // 0 = none, 1..3 = ctrl+digit group
+
+    // Node-tending: UNIT_FARM planting is a round-trip. tendEquipped is true
+    // once the worker has walked back to the building for a hat + sapling and
+    // is carrying them out to the plant spot; cleared after planting/harvest.
+    bool         tendEquipped;
+
+    // Job queue: Shift-RMB build/repair/gather targets onto one worker to chain
+    // them. The active job is the current state + targetBuilding; these follow.
+    WorkerJob    jobQueue[UNIT_MAX_JOB_QUEUE];
+    int          jobQueueCount;     // 0..UNIT_MAX_JOB_QUEUE
 } Unit;
 
 typedef struct {
@@ -230,6 +259,7 @@ typedef struct {
     float     aiTimer;              // countdown to the next enemy think tick
     Rectangle guiBlock;             // REAL-screen px area where the GUI owns the
                                     //   mouse (command panel); world clicks ignore it
+    Rectangle guiBlock2;            // second reserved area (left pop panel)
 } StrategyWorld;
 
 #endif // STRATEGY_TYPES_H

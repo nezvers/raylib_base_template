@@ -86,7 +86,9 @@ static Vector2 WorldToGame(Vector3 p)
 // REAL screen pixels) - world clicks must not fire "through" the buttons.
 static bool MouseOnGui(void)
 {
-    return CheckCollisionPointRec(GetMousePosition(), world.guiBlock);
+    Vector2 m = GetMousePosition();
+    return CheckCollisionPointRec(m, world.guiBlock) ||
+           CheckCollisionPointRec(m, world.guiBlock2);
 }
 
 static ResourceKind NodeResource(NodeKind kind)
@@ -256,6 +258,10 @@ void StrategyWorldInit(void)
         UnitSpawn(1, kind, (Vector3){  14.0f - (float)i*1.2f + 3.0f, 0.0f,  11.0f });
     }
 
+    // The player starts with a lone templar (no Chantry needed): it idles into
+    // FOLLOW and blesses whichever worker starts gathering, seeding providence.
+    UnitSpawn(0, KIND_TEMPLAR, (Vector3){ -13.0f, 0.0f, -10.0f });
+
     // Resources scattered between the bases; wheat near each base so both
     // factions can feed their training queue.
     NodeCluster(NODE_TREE,  (Vector3){ -7.0f, 0.0f,  -3.0f }, 6, 2.5f, 12);
@@ -347,6 +353,7 @@ void StrategyOrderFarm(Unit *u, int bldIndex)
     u->targetNode     = -1;
     u->carryAmount    = 0;
     u->gatherTimer    = 0.0f;
+    u->tendEquipped   = false;      // start the plant round-trip at the building
 }
 
 void StrategyOrderBuild(Unit *u, int bldIndex)
@@ -449,6 +456,123 @@ int StrategyNearestNodeOfKind(Vector3 pos, int nodeKind, float radius)
     return best;
 }
 
+// The node kind a dropoff building's accepted resource comes from, or -1.
+// (WOOD->tree, STONE->rock, FOOD->wheat; corpses aren't a gather target.)
+static int GatherNodeForBuilding(const BuildingDef *bd)
+{
+    if (bd->accepts[RES_WOOD])  return NODE_TREE;
+    if (bd->accepts[RES_STONE]) return NODE_ROCK;
+    if (bd->accepts[RES_FOOD])  return NODE_WHEAT;
+    return -1;
+}
+
+// Assign a worker to work a gathering building: farms/forestries tend, town
+// halls (accept everything) gather the nearest node of ANY kind, single-
+// resource dropoffs gather that resource's node kind. Search is limited to
+// STRAT_AUTO_GATHER_RANGE around the building. Returns false (worker left to
+// the caller) when the building isn't a gatherer or nothing is in range.
+static bool WorkerAutoGatherForBuilding(Unit *u, int bldIndex)
+{
+    if (bldIndex < 0) return false;
+    Building *b = &world.buildings[bldIndex];
+    if (!b->active || b->underConstruction) return false;
+
+    const BuildingDef *bd = StrategyBuildingDef(b->kind);
+
+    // Farm / forestry: reuse the tend (plant + harvest) behavior.
+    if (bd->tendNode >= 0)
+    {
+        StrategyOrderFarm(u, bldIndex);
+        return true;
+    }
+
+    // Town hall accepts all three -> gather whatever node is nearest.
+    // A single-resource dropoff gathers only its own node kind.
+    bool acceptsAll = bd->accepts[RES_WOOD] && bd->accepts[RES_STONE] &&
+                      bd->accepts[RES_FOOD];
+    int nodeKind = acceptsAll ? -1 : GatherNodeForBuilding(bd);
+    if (!acceptsAll && nodeKind < 0) return false;     // not a gatherer
+
+    int node = StrategyNearestNodeOfKind(b->pos, nodeKind, STRAT_AUTO_GATHER_RANGE);
+    if (node < 0) return false;
+    StrategyOrderGather(u, node);
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+//  Worker job queue: build / repair / gather chained by Shift-RMB. One typed
+//  queue, one dispatcher, popped by every terminal worker state.
+// ----------------------------------------------------------------------------
+// Turn one job into a concrete order (reuses the plain StrategyOrder* funcs).
+static void WorkerDispatchJob(Unit *u, WorkerJob job)
+{
+    switch (job.kind)
+    {
+        case WJOB_BUILD:  StrategyOrderBuild(u, job.building);          break;
+        case WJOB_REPAIR: StrategyOrderRepair(u, job.building);         break;
+        case WJOB_GATHER: WorkerAutoGatherForBuilding(u, job.building); break;
+    }
+}
+
+// True while a queued job still has something to do (skip dead/finished ones).
+static bool WorkerJobStillValid(WorkerJob job)
+{
+    if (job.building < 0) return false;
+    Building *b = &world.buildings[job.building];
+    if (!b->active) return false;
+    switch (job.kind)
+    {
+        case WJOB_BUILD:  return b->underConstruction;
+        case WJOB_REPAIR: return !b->underConstruction && b->hp < b->maxHp;
+        case WJOB_GATHER: return !b->underConstruction;
+    }
+    return false;
+}
+
+// Pop the front of the queue (shifting the rest down), skipping jobs whose
+// target went invalid, and dispatch the first live one. Returns whether a job
+// was started; false means the queue drained with nothing left to do.
+static bool WorkerStartNextJob(Unit *u)
+{
+    while (u->jobQueueCount > 0)
+    {
+        WorkerJob job = u->jobQueue[0];
+        for (int i = 1; i < u->jobQueueCount; i++) u->jobQueue[i - 1] = u->jobQueue[i];
+        u->jobQueueCount--;
+
+        if (!WorkerJobStillValid(job)) continue;
+        WorkerDispatchJob(u, job);
+        return true;
+    }
+    return false;
+}
+
+// Issue a worker job. append=false starts it now and clears the queue;
+// append=true chains it after the current job, or starts it now if the worker
+// isn't already running a queueable job. Every terminal state pops the queue.
+void StrategyOrderJob(Unit *u, WorkerJobKind kind, int bldIndex, bool append)
+{
+    WorkerJob job = { kind, bldIndex };
+
+    if (!append)
+    {
+        u->jobQueueCount = 0;
+        WorkerDispatchJob(u, job);
+        return;
+    }
+
+    // Chain only onto an in-progress build/repair; anything else starts now.
+    bool queueable = (u->state == UNIT_BUILD || u->state == UNIT_REPAIR);
+    if (!queueable)
+    {
+        WorkerDispatchJob(u, job);
+        return;
+    }
+    if (u->targetBuilding == bldIndex && u->jobQueueCount == 0) return;  // dup
+    if (u->jobQueueCount >= UNIT_MAX_JOB_QUEUE) return;
+    u->jobQueue[u->jobQueueCount++] = job;
+}
+
 // ----------------------------------------------------------------------------
 //  Population + training + building destruction (shared by GUI and AI)
 // ----------------------------------------------------------------------------
@@ -474,6 +598,63 @@ int StrategyPopUsed(int faction)
         if (world.units[i].active && world.units[i].faction == faction) used++;
     }
     return used;
+}
+
+// Composition census for the pop panel. kind < 0 counts every kind.
+int StrategyCountUnits(int faction, int kind)
+{
+    int n = 0;
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    {
+        Unit *u = &world.units[i];
+        if (!u->active || u->faction != faction) continue;
+        if (kind >= 0 && (int)u->kind != kind) continue;
+        n++;
+    }
+    return n;
+}
+
+int StrategyCountIdleWorkers(int faction)
+{
+    int n = 0;
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    {
+        Unit *u = &world.units[i];
+        if (u->active && u->faction == faction &&
+            u->kind == KIND_WORKER && u->state == UNIT_IDLE) n++;
+    }
+    return n;
+}
+
+// Select the player's idle worker nearest the camera focus, deselect the rest,
+// and pan the camera onto it. No-op when there is no idle worker.
+void StrategySelectNearestIdleWorker(void)
+{
+    Vector3 focus = (Vector3){ world.camFocus.x, 0.0f, world.camFocus.y };
+    int best = -1;
+    float bestDist = 1000000.0f;
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    {
+        Unit *u = &world.units[i];
+        if (!u->active || u->faction != 0) continue;
+        if (u->kind != KIND_WORKER || u->state != UNIT_IDLE) continue;
+
+        float d = DistXZ(u->pos, focus);
+        if (d < bestDist) { bestDist = d; best = i; }
+    }
+    if (best < 0) return;
+
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    {
+        if (world.units[i].active && world.units[i].faction == 0)
+            world.units[i].selected = false;
+    }
+    world.units[best].selected = true;
+    world.selectedBuilding = -1;
+
+    world.camFocus = (Vector2){ world.units[best].pos.x, world.units[best].pos.z };
+    CameraRefresh();
+    EffectSpawn(FX_RING, world.units[best].pos, GREEN);
 }
 
 // Refund a to-be-cancelled trainee's paid cost back to the faction stockpile.
@@ -969,27 +1150,32 @@ static void SelectionInput(void)
 
 // One selected unit's right-click routing. `hostile` covers enemy units AND
 // animals (hunting); soldiers can't gather/farm/build, so those fall back to
-// move. ownScaffold/ownRepair/ownFarm are worker-only own-building jobs.
+// move. ownGather/ownScaffold/ownRepair are worker-only own-building jobs, all
+// routed through StrategyOrderJob so Shift chains ANY of them (build, repair,
+// or gather-assign) onto the worker's queue instead of replacing.
 static void OrderUnitAt(Unit *u, int hostile, int enemyBld, int node,
-                        int ownFarm, int ownScaffold, int ownRepair, Vector3 ground)
+                        int ownGather, int ownScaffold, int ownRepair,
+                        bool shift, Vector3 ground)
 {
     bool worker = (u->kind == KIND_WORKER);
 
     if (hostile >= 0)                     StrategyOrderAttack(u, hostile);
     else if (enemyBld >= 0)               StrategyOrderAttackBuilding(u, enemyBld);
     else if (node >= 0 && worker)         StrategyOrderGather(u, node);
-    else if (ownScaffold >= 0 && worker)  StrategyOrderBuild(u, ownScaffold);
-    else if (ownRepair >= 0 && worker)    StrategyOrderRepair(u, ownRepair);
-    else if (ownFarm >= 0 && worker)      StrategyOrderFarm(u, ownFarm);
+    else if (ownScaffold >= 0 && worker)  StrategyOrderJob(u, WJOB_BUILD,  ownScaffold, shift);
+    else if (ownRepair >= 0 && worker)    StrategyOrderJob(u, WJOB_REPAIR, ownRepair,   shift);
+    else if (ownGather >= 0 && worker)    StrategyOrderJob(u, WJOB_GATHER, ownGather,   shift);
     else                                  StrategyOrderMove(u, ground);
 }
 
 // Right click: hostile unit/animal > enemy building > resource node >
-// own farm > plain move - checked in that priority so a click near a tree
-// still prefers the deer standing beside it.
+// own building job > plain move - checked in that priority so a click near a
+// tree still prefers the deer standing beside it.
 static void OrderInput(void)
 {
     if (!IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) || MouseOnGui()) return;
+
+    bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
 
     Vector3 ground;
     if (!MouseGroundPoint(&ground)) return;
@@ -1016,17 +1202,22 @@ static void OrderInput(void)
     int node     = (hostile < 0 && enemyBld < 0) ? PickNode(ground, 0.9f) : -1;
 
     // Own building under the cursor -> build (scaffold), repair (damaged), or
-    // farm work, in that priority. Worker-only; OrderUnitAt gates by kind.
-    int ownFarm = -1, ownScaffold = -1, ownRepair = -1;
+    // gather work (finished tend/dropoff), in that priority. Worker-only;
+    // OrderUnitAt gates by kind. A gatherer is a tend building OR any dropoff
+    // (Logging/Quarry/Town Hall) - WorkerAutoGatherForBuilding sorts out which.
+    int ownGather = -1, ownScaffold = -1, ownRepair = -1;
     if (hostile < 0 && enemyBld < 0 && node < 0)
     {
         int own = PickBuilding(ground, 0, 1.4f);
         if (own >= 0)
         {
             Building *b = &world.buildings[own];
+            const BuildingDef *bd = StrategyBuildingDef(b->kind);
+            bool gatherer = bd->tendNode >= 0 || bd->accepts[RES_WOOD] ||
+                            bd->accepts[RES_STONE] || bd->accepts[RES_FOOD];
             if (b->underConstruction)      ownScaffold = own;
             else if (b->hp < b->maxHp)      ownRepair   = own;
-            else if (StrategyBuildingDef(b->kind)->tendNode >= 0) ownFarm = own;
+            else if (gatherer)              ownGather   = own;
         }
     }
 
@@ -1036,19 +1227,20 @@ static void OrderInput(void)
         Unit *u = &world.units[i];
         if (!u->active || u->faction != 0 || !u->selected) continue;
 
-        OrderUnitAt(u, hostile, enemyBld, node, ownFarm, ownScaffold, ownRepair, ground);
+        OrderUnitAt(u, hostile, enemyBld, node, ownGather, ownScaffold, ownRepair,
+                    shift, ground);
         any = true;
     }
     if (!any) return;
 
     // Order feedback: red ring on an attack target, yellow on a resource,
-    // green on a build/repair/farm target, lime ripple on plain ground.
+    // green on a build/repair/gather target, lime ripple on plain ground.
     if (hostile >= 0)         EffectSpawn(FX_RING, world.units[hostile].pos, RED);
     else if (enemyBld >= 0)   EffectSpawn(FX_RING, world.buildings[enemyBld].pos, RED);
     else if (node >= 0)       EffectSpawn(FX_RING, world.nodes[node].pos, YELLOW);
     else if (ownScaffold >= 0)EffectSpawn(FX_RING, world.buildings[ownScaffold].pos, GREEN);
     else if (ownRepair >= 0)  EffectSpawn(FX_RING, world.buildings[ownRepair].pos, GREEN);
-    else if (ownFarm >= 0)    EffectSpawn(FX_RING, world.buildings[ownFarm].pos, GREEN);
+    else if (ownGather >= 0)  EffectSpawn(FX_RING, world.buildings[ownGather].pos, GREEN);
     else                      EffectSpawn(FX_RING, ground, LIME);
 }
 
@@ -1468,20 +1660,47 @@ static void UnitUpdate(int index, float dt)
             }
 
             // 3) Area full of nodes: switch to harvesting the nearest one.
-            if (NodesNear(nk, tb->pos, STRAT_TEND_RANGE + 2.0f) >= STRAT_TEND_MAX)
+            //    Only a worker NOT already carrying a sapling may switch - one
+            //    that has equipped must finish planting its cycle first, so a
+            //    node tipping the cap doesn't yank every tending worker off
+            //    mid-trip to clump on one node.
+            if (!u->tendEquipped &&
+                NodesNear(nk, tb->pos, STRAT_TEND_RANGE + 2.0f) >= STRAT_TEND_MAX)
             {
                 int near = StrategyNearestNodeOfKind(tb->pos, nk, STRAT_TEND_RANGE + 2.0f);
-                if (near >= 0) { u->targetNode = near; u->gatherTimer = 0.0f; break; }
+                if (near >= 0)
+                {
+                    u->targetNode   = near;
+                    u->gatherTimer  = 0.0f;
+                    u->tendEquipped = false;    // drop the sapling, go harvest
+                    break;
+                }
                 // (fallthrough to planting if none found somehow)
             }
 
-            // 4) Plant: walk to a chosen free spot, then drop a fresh node.
-            //    target == building pos is the "no spot yet" sentinel.
-            if (DistXZ(u->target, tb->pos) < 0.001f)
+            // 4) Plant is a round-trip: first walk BACK to the building to grab
+            //    a hat + sapling (equip leg), then carry them out to a free spot
+            //    and plant (plant leg). tendEquipped marks which leg we're on;
+            //    target == building pos is the "no plant spot yet" sentinel.
+            if (!u->tendEquipped)
             {
-                u->target = PlantSpotNear(tb->pos);
-                u->gatherTimer = 0.0f;
+                // Equip leg: return to the building and dwell to gear up.
+                if (DistXZ(u->pos, tb->pos) > STRAT_BUILD_RANGE)
+                {
+                    MoveToward(u, tb->pos, dt);
+                    break;
+                }
+                u->gatherTimer += dt;
+                if (u->gatherTimer >= STRAT_TEND_EQUIP_TIME)
+                {
+                    u->gatherTimer  = 0.0f;
+                    u->tendEquipped = true;
+                    u->target       = PlantSpotNear(tb->pos);
+                }
+                break;
             }
+
+            // Plant leg: walk to the chosen spot, then drop a fresh node.
             if (DistXZ(u->pos, u->target) > 0.6f) { MoveToward(u, u->target, dt); break; }
             u->gatherTimer += dt;
             if (u->gatherTimer >= STRAT_TEND_PERIOD)
@@ -1492,7 +1711,8 @@ static void UnitUpdate(int index, float dt)
                 EffectSpawn(FX_PUFF, (Vector3){ u->target.x, 0.6f, u->target.z },
                             (nk == NODE_TREE) ? (Color){ 60, 140, 60, 255 }
                                               : (Color){ 220, 190, 90, 255 });
-                u->target = tb->pos;    // reset sentinel -> pick a new spot next
+                u->tendEquipped = false;    // used the sapling: re-equip next
+                u->target = tb->pos;        // sentinel -> pick a new spot next
             }
         } break;
 
@@ -1522,21 +1742,34 @@ static void UnitUpdate(int index, float dt)
                 b->underConstruction = false;
                 b->hp = b->maxHp;
                 EffectSpawn(FX_RING, b->pos, strategyFactionColor[b->faction]);
+                int finished = u->targetBuilding;
                 u->state = UNIT_IDLE;
                 u->targetBuilding = -1;
+
+                // Next queued job, else drain fallback: work the building we
+                // just finished if it gathers, otherwise stay idle. Auto-gather
+                // is player-only (the AI has no build behavior).
+                if (!WorkerStartNextJob(u) && u->faction == 0)
+                    WorkerAutoGatherForBuilding(u, finished);
             }
         } break;
 
         case UNIT_REPAIR:
         {
-            // Restore a damaged own building over time, free. Full HP -> idle.
+            // Restore a damaged own building over time, free. Full HP -> done:
+            // advance the job queue, else resume gathering for it (repair
+            // targets are often gatherers), else idle. Same tail on an already-
+            // invalid target so a chain isn't stranded on a dead building.
             Building *b = (u->targetBuilding >= 0)
                 ? &world.buildings[u->targetBuilding] : NULL;
             if ((b == NULL) || !b->active || b->underConstruction ||
                 b->hp >= b->maxHp)
             {
+                int repaired = u->targetBuilding;
                 u->state = UNIT_IDLE;
                 u->targetBuilding = -1;
+                if (!WorkerStartNextJob(u) && u->faction == 0)
+                    WorkerAutoGatherForBuilding(u, repaired);
                 break;
             }
             if (DistXZ(u->pos, b->pos) > STRAT_BUILD_RANGE)
@@ -1549,8 +1782,11 @@ static void UnitUpdate(int index, float dt)
                         (Color){ 200, 200, 120, 255 });
             if (b->hp >= b->maxHp)
             {
+                int repaired = u->targetBuilding;
                 u->state = UNIT_IDLE;
                 u->targetBuilding = -1;
+                if (!WorkerStartNextJob(u) && u->faction == 0)
+                    WorkerAutoGatherForBuilding(u, repaired);
             }
         } break;
 
@@ -1917,7 +2153,8 @@ static void DrawUnit(const Unit *u)
 
             // Tending workers wear a "hat" shaped like the resource they plant:
             // a green cone (forestry -> wood) or a golden cone (farm -> wheat).
-            if (u->state == UNIT_FARM && u->targetBuilding >= 0)
+            // Only worn once equipped (after the trip back to the building).
+            if (u->state == UNIT_FARM && u->tendEquipped && u->targetBuilding >= 0)
             {
                 const BuildingDef *tb =
                     StrategyBuildingDef(world.buildings[u->targetBuilding].kind);
