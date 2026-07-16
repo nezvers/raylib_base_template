@@ -4,7 +4,10 @@
 #include <stddef.h> // used for NULL
 
 #define SPRITE_IMPLEMENTATION
+#define STATIC_API  // To not conflict with main project
+#include "sprite.h"
 #define SPRITE_RAYLIB_IMPLEMENTATION
+#define STATIC_API  // To not conflict with main project
 #include "sprite_raylib.h"
 
 

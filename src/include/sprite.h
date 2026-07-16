@@ -52,11 +52,17 @@ typedef struct {
 extern "C" {
 #endif
 
-void ChangeAnimation(AnimationSet *animation_set, u32 new_animation);
-void UpdateAnimation(AnimationSet *animation_set, f32 delta_time);
-void UpdateSprite(Sprite *sprite, f32 delta_time);
-rectf GetAnimationFrame(AnimationSet *animation_set);
-void GetSpriteFrame(Sprite *sprite, rectf *sprite_rect, rectf *texture_rect);
+#ifdef STATIC_API
+#define SAPI static
+#else
+#define SAPI
+#endif
+
+SAPI void ChangeAnimation(AnimationSet *animation_set, u32 new_animation);
+SAPI void UpdateAnimation(AnimationSet *animation_set, f32 delta_time);
+SAPI void UpdateSprite(Sprite *sprite, f32 delta_time);
+SAPI rectf GetAnimationFrame(AnimationSet *animation_set);
+SAPI void GetSpriteFrame(Sprite *sprite, rectf *sprite_rect, rectf *texture_rect);
 
 #ifdef __cplusplus
 }
@@ -72,14 +78,14 @@ void GetSpriteFrame(Sprite *sprite, rectf *sprite_rect, rectf *texture_rect);
 
 #include <assert.h>
 
-void ChangeAnimation(AnimationSet *animation_set, u32 new_animation) {
+SAPI void ChangeAnimation(AnimationSet *animation_set, u32 new_animation) {
     assert(new_animation < animation_set->count);
     animation_set->animation_index = new_animation;
     animation_set->image_index = 0;
     animation_set->time = 0;
 }
 
-void UpdateAnimation(AnimationSet *animation_set, f32 delta_time) {
+SAPI void UpdateAnimation(AnimationSet *animation_set, f32 delta_time) {
     animation_set->time += delta_time * animation_set->frame_rate;
     if (animation_set->time < 1) { return; }
 
@@ -90,11 +96,11 @@ void UpdateAnimation(AnimationSet *animation_set, f32 delta_time) {
     animation_set->image_index = (animation_set->image_index + increment) % image_count;
 }
 
-void UpdateSprite(Sprite *sprite, f32 delta_time) {
+SAPI void UpdateSprite(Sprite *sprite, f32 delta_time) {
     UpdateAnimation(&sprite->animation_set, delta_time);
 }
 
-rectf GetAnimationFrame(AnimationSet *animation_set) {
+SAPI rectf GetAnimationFrame(AnimationSet *animation_set) {
     const Frames *frame = animation_set->frames[animation_set->animation_index];
     const vec2 pos = frame->data[animation_set->image_index];
     const vec2 size = frame->size;
@@ -104,9 +110,11 @@ rectf GetAnimationFrame(AnimationSet *animation_set) {
 
 // texture_out = source rectangle from texture
 // sprite_out = destination rectangle on screen
-void GetSpriteFrame(Sprite *sprite, rectf *texture_out, rectf *sprite_out) {
+SAPI void GetSpriteFrame(Sprite *sprite, rectf *texture_out, rectf *sprite_out) {
     *texture_out = GetAnimationFrame(&sprite->animation_set);
     *sprite_out = (rectf){sprite->position.x, sprite->position.y, texture_out->w, texture_out->h};
 }
 
 #endif
+
+#undef SAPI 

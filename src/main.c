@@ -11,6 +11,10 @@
 #include "app_state/app_state.h"
 #include "audio_state/audio_state.h"
 
+#define TEMPORARY_ALLOCATOR_IMPLEMENTATION
+#define TEMPORARY_ALLOCATOR_SIZE (1024 * 1024)
+#include "temporary_allocator.h"
+
 
 // Simple log system to avoid printf() calls if required
 // NOTE: Avoiding those calls, also avoids const strings memory usage
@@ -102,4 +106,6 @@ void UpdateDrawFrame(void)
         AppStateGui();
 
     EndDrawing();
+
+    TempAllocReset();
 }

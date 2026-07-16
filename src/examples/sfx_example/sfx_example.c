@@ -5,6 +5,7 @@
 
 #define SOUND_EFFECT_IMPLEMENTATION
 #define SOUND_EFFECT_RAYLIB_IMPLEMENTATION
+#define STATIC_API  // To not conflict with main project
 #include "sound_effect_raylib.h"
 
 
