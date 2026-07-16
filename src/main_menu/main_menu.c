@@ -349,6 +349,17 @@ static void Gui()
     // ========================================================================
     if (menuPage == MENU_PAGE_MAIN)
     {
+        // -- LEFT-side tool button ------------------------------------------
+        // Mirrors the right column's anchor (vp.x + vp.width - w - 40) to the
+        // left edge. It is NOT part of the auto-scaled right column, so it does
+        // not count toward LAYOUT_UNITS - it stands alone on the left.
+        float xLeft = vp.x + 40.0f;
+        if (GuiButton((Rectangle){ xLeft, y, w, h }, "ANIM EDITOR"))
+        {
+            AudioPlayButton();
+            AppStateTransition(&app_state_anim_editor);
+        }
+
         // -- Label: static text, no interaction ------------------------------
         GuiLabel((Rectangle){ x, y, w, h }, "--- raygui widgets ---");
         y += h + gap;

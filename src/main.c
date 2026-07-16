@@ -10,6 +10,7 @@
 #include "settings_state/settings_state.h"
 #include "app_state/app_state.h"
 #include "audio_state/audio_state.h"
+#include "signal/signal.h"
 
 #define TEMPORARY_ALLOCATOR_IMPLEMENTATION
 #define TEMPORARY_ALLOCATOR_SIZE (1024 * 1024)
@@ -43,6 +44,7 @@ int main(void)
 #endif
     SettingsReset();    // defaults for Settings + Screen + Audio -> SettingsGet()
     SettingsLoad();     // override defaults from settings.cfg (+ future screen load)
+    SignalReset();      // clear the named-signal bus (anim system listeners)
 
     ScreenState *screen_state = ScreenStateGet();
     InitWindow(screen_state->width, screen_state->height, "raylib gamejam template");
