@@ -12,8 +12,15 @@ extern "C" {
 #define TAAPI
 #endif
 
+
+// Resets to a begining, intended for game loop start or end
 TAAPI void TempAllocReset();
+// Reserve a buffer from allicator
 TAAPI void *TempAllocGet(unsigned int size);
+// Store allocator position at current moment
+TAAPI unsigned int TempAllocSave();
+// Roll back to specific position
+TAAPI void TempAllocLoad(unsigned int index);
 
 #ifdef __cplusplus
 }
@@ -48,6 +55,14 @@ TAAPI void *TempAllocGet(unsigned int size) {
     void *ptr = &temp_alloc_buffer.buffer[temp_alloc_buffer.len];
     temp_alloc_buffer.len += size;
     return ptr;
+}
+
+TAAPI unsigned int TempAllocSave() {
+    return temp_alloc_buffer.len;
+}
+
+TAAPI void TempAllocLoad(unsigned int index) {
+    temp_alloc_buffer.len = index;
 }
 
 
