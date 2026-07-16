@@ -99,6 +99,19 @@ if(WIN32)
     endif()
 endif()
 
+# Headless unit tests for the anim / signal modules (desktop only; the test
+# stubs ScreenStateTargetSize so no window/screen_state is needed).
+if (NOT "${PLATFORM}" STREQUAL "Web")
+    add_executable(anim_tests
+        tests/anim_tests.c
+        src/anim/anim.c
+        src/anim/anim_io.c
+        src/signal/signal.c
+        src/signal/anim_signal.c
+        src/include/easing.c)
+    target_link_libraries(anim_tests raylib)
+endif()
+
 # Checks if OSX and links appropriate frameworks (Only required on MacOS)
 if (APPLE)
     target_link_libraries(${PROJECT_NAME} "-framework IOKit")

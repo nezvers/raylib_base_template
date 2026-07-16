@@ -32,16 +32,35 @@
 #define ANIM_H
 
 #include "raylib.h"
-#include "../include/easing.h"   // EaseFn typedef + easing function bodies
 #include <stdbool.h>
 
 // --- capacities (kept small; a document is copied by value for undo) --------
 #define ANIM_NAME_MAX      32   // element / signal / doc name buffer
 #define ANIM_TEXT_LEN_MAX  64   // a TEXT element's string buffer
-#define ANIM_KEYS_MAX       8   // keyframes per track
+#define ANIM_KEYS_MAX      16   // keyframes per track
 #define ANIM_TRACKS_MAX     6   // tracks (animated properties) per element
-#define ANIM_ELEMS_MAX      8   // elements per document
-#define ANIM_SIGNALS_MAX    6   // signals per document
+#define ANIM_ELEMS_MAX     12   // elements per document
+#define ANIM_SIGNALS_MAX    8   // signals per document
+
+// ---------------------------------------------------------------------------
+//  Easing, as a plain id (keeps AnimKey pointer-free: memcpy/fscanf-clean).
+//  Order matches the stable .cfg names in anim.c's table - do not reorder.
+// ---------------------------------------------------------------------------
+typedef enum {
+    ANIM_EASE_LINEAR = 0,
+    ANIM_EASE_SINE_IN,  ANIM_EASE_SINE_OUT,  ANIM_EASE_SINE_INOUT,
+    ANIM_EASE_QUAD_IN,  ANIM_EASE_QUAD_OUT,  ANIM_EASE_QUAD_INOUT,
+    ANIM_EASE_CUBIC_IN, ANIM_EASE_CUBIC_OUT, ANIM_EASE_CUBIC_INOUT,
+    ANIM_EASE_EXPO_IN,  ANIM_EASE_EXPO_OUT,
+    ANIM_EASE_BACK_IN,  ANIM_EASE_BACK_OUT,
+    ANIM_EASE_ELASTIC_OUT, ANIM_EASE_BOUNCE_OUT,
+    ANIM_EASE_COUNT
+} AnimEase;
+
+const char *AnimEaseName(int ease);           // id -> "sineOut"; bad id -> "linear"
+int         AnimEaseByName(const char *name); // name -> id; unknown -> LINEAR
+float       AnimEaseApply(int ease, float p); // eased p; LINEAR/bad id -> p
+int         AnimEaseCount(void);              // == ANIM_EASE_COUNT
 
 // ---------------------------------------------------------------------------
 //  Which PROPERTY a track drives. The ranges are disjoint per element type so
@@ -74,9 +93,9 @@ typedef enum {
 
 // A single keyframe on the shared clock.
 typedef struct {
-    float  t;           // seconds
-    float  value;       // property value AT this keyframe (absolute)
-    EaseFn ease;        // easing used on the segment ENDING at this key; NULL=linear
+    float t;            // seconds
+    float value;        // property value AT this keyframe (absolute)
+    int   ease;         // AnimEase id; eases the segment ENDING at this key
 } AnimKey;
 
 // One animated property = an ordered list of keyframes.
@@ -134,10 +153,24 @@ typedef struct {
 void AnimDocInit(AnimDoc *doc);                 // empty doc, sane duration/name
 void AnimElemInit(AnimElem *e, AnimElemKind kind);   // one element w/ base props
 AnimElem *AnimDocAddElem(AnimDoc *doc, AnimElemKind kind);   // NULL if full
+void AnimDocRemoveElem(AnimDoc *doc, int idx);               // shift down over idx
 AnimTrack *AnimElemAddTrack(AnimElem *e, int prop);         // NULL if full/dupe
 AnimTrack *AnimElemFindTrack(AnimElem *e, int prop);        // NULL if absent
-AnimKey *AnimTrackAddKey(AnimTrack *tr, float t, float value, EaseFn ease);
+AnimKey *AnimTrackAddKey(AnimTrack *tr, float t, float value, int ease);
+void AnimTrackRemoveKey(AnimTrack *tr, int idx);
 void AnimTrackSortKeys(AnimTrack *tr);          // keep keys ascending in t
+
+// Move key `idx` to time t, keeping keys sorted; returns the key's NEW index
+// (enables continuous timeline drags across neighbours). -1 if idx invalid.
+int AnimTrackSetKeyTime(AnimTrack *tr, int idx, float t);
+
+// Auto-key core: if a key lies within `eps` of t, update its value (ease kept);
+// otherwise insert a new LINEAR key at t. NULL if the track is full.
+AnimKey *AnimTrackWriteKeyAt(AnimTrack *tr, float t, float value, float eps);
+
+// Editor slider range for a property (e.g. fractions 0..1, rotation -360..360).
+float AnimPropMin(int prop);
+float AnimPropMax(int prop);
 
 // ---------------------------------------------------------------------------
 //  Evaluation

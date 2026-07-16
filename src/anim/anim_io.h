@@ -25,11 +25,7 @@ bool AnimDocSave(const AnimDoc *doc, const char *path);
 bool AnimDocLoad(AnimDoc *doc, const char *path);
 
 // --- name <-> value tables (stable strings; used by .cfg and editor UI) -----
-// Easings: NULL function pointer <-> "linear".
-EaseFn      AnimEaseByName(const char *name);   // unknown -> NULL (linear)
-const char *AnimEaseName(EaseFn fn);            // NULL -> "linear"
-int         AnimEaseCount(void);                // for dropdown enumeration
-const char *AnimEaseNameAt(int index);          // dropdown item text
+// Easing name<->id lookups live in anim.h (AnimEaseName/AnimEaseByName).
 
 // Property kinds valid for a given element kind (for the "add track" dropdown).
 const char *AnimPropName(int prop);                     // AP_* -> "pos_x" etc.

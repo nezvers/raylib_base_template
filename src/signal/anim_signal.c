@@ -16,6 +16,7 @@
 typedef struct {
     const AnimDoc *doc;
     AnimPlayer    *player;
+    char           name[ANIM_NAME_MAX];   // signal name AT registration time
     int            dir;
     float          secStart, secEnd;
     bool           used;
@@ -49,6 +50,7 @@ void AnimSignalRegister(const AnimDoc *doc, AnimPlayer *player)
         if (!b) return;   // pool full
         b->doc      = doc;
         b->player   = player;
+        TextCopy(b->name, sg->name);
         b->dir      = sg->dir;
         b->secStart = sg->sectionStart;
         b->secEnd   = sg->sectionEnd;
@@ -64,11 +66,9 @@ void AnimSignalUnregister(const AnimDoc *doc, AnimPlayer *player)
         Binding *b = &s_bindings[i];
         if (b->used && b->doc == doc && b->player == player)
         {
-            // We don't keep the signal name on the binding, but SignalStop
-            // matches on (name, fn, user); the user pointer alone is unique per
-            // binding, so stop by scanning the doc's signal names.
-            for (int j = 0; j < doc->signalCount; j++)
-                SignalStopListening(doc->signals[j].name, StartFromBinding, b);
+            // The binding remembers the name it registered under, so this works
+            // even if the doc's signals were renamed/removed since Register.
+            SignalStopListening(b->name, StartFromBinding, b);
             b->used = false;
         }
     }

@@ -26,66 +26,6 @@
 #include <stddef.h>
 
 // ---------------------------------------------------------------------------
-//  Easing name table. Built once on first use (avoids file-scope function-
-//  pointer initializers - keeps the unit MSVC-clean and matches the project's
-//  runtime-init convention).
-// ---------------------------------------------------------------------------
-typedef struct { const char *name; EaseFn fn; } EaseRow;
-
-#define EASE_TABLE_MAX 24
-static EaseRow  s_ease[EASE_TABLE_MAX];
-static int      s_easeCount = 0;
-static bool     s_easeInit  = false;
-
-static void EaseTableInit(void)
-{
-    if (s_easeInit) return;
-    s_easeCount = 0;
-    // "linear" MUST be index 0 so a NULL/unknown ease maps to it in the UI.
-    s_ease[s_easeCount++] = (EaseRow){ "linear",     NULL };
-    s_ease[s_easeCount++] = (EaseRow){ "sineIn",     sineEaseInf };
-    s_ease[s_easeCount++] = (EaseRow){ "sineOut",    sineEaseOutf };
-    s_ease[s_easeCount++] = (EaseRow){ "sineInOut",  sineEaseInOutf };
-    s_ease[s_easeCount++] = (EaseRow){ "quadIn",     quadraticEaseInf };
-    s_ease[s_easeCount++] = (EaseRow){ "quadOut",    quadraticEaseOutf };
-    s_ease[s_easeCount++] = (EaseRow){ "quadInOut",  quadraticEaseInOutf };
-    s_ease[s_easeCount++] = (EaseRow){ "cubicIn",    cubicEaseInf };
-    s_ease[s_easeCount++] = (EaseRow){ "cubicOut",   cubicEaseOutf };
-    s_ease[s_easeCount++] = (EaseRow){ "cubicInOut", cubicEaseInOutf };
-    s_ease[s_easeCount++] = (EaseRow){ "expoIn",     exponentialEaseInf };
-    s_ease[s_easeCount++] = (EaseRow){ "expoOut",    exponentialEaseOutf };
-    s_ease[s_easeCount++] = (EaseRow){ "backIn",     backEaseInf };
-    s_ease[s_easeCount++] = (EaseRow){ "backOut",    backEaseOutf };
-    s_ease[s_easeCount++] = (EaseRow){ "elasticOut", elasticEaseOutf };
-    s_ease[s_easeCount++] = (EaseRow){ "bounceOut",  bounceEaseOutf };
-    s_easeInit = true;
-}
-
-EaseFn AnimEaseByName(const char *name)
-{
-    EaseTableInit();
-    for (int i = 0; i < s_easeCount; i++)
-        if (TextIsEqual(s_ease[i].name, name)) return s_ease[i].fn;
-    return NULL;   // unknown -> linear
-}
-
-const char *AnimEaseName(EaseFn fn)
-{
-    EaseTableInit();
-    for (int i = 0; i < s_easeCount; i++)
-        if (s_ease[i].fn == fn) return s_ease[i].name;
-    return "linear";
-}
-
-int AnimEaseCount(void)          { EaseTableInit(); return s_easeCount; }
-const char *AnimEaseNameAt(int i)
-{
-    EaseTableInit();
-    if (i < 0 || i >= s_easeCount) return "linear";
-    return s_ease[i].name;
-}
-
-// ---------------------------------------------------------------------------
 //  Property name table (per element kind, in the order the editor lists them).
 // ---------------------------------------------------------------------------
 typedef struct { int prop; const char *name; } PropRow;
