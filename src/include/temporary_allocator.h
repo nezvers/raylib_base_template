@@ -28,8 +28,8 @@ TAAPI void *TempAllocGet(unsigned int size);
 
 #include <assert.h>
 
-#ifndef TEMPORARY_ALLOCATOR_SIZE 
-static_assert(false)
+#ifndef TEMPORARY_ALLOCATOR_SIZE
+#define TEMPORARY_ALLOCATOR_SIZE 1024
 #endif
 
 typedef struct {
