@@ -148,20 +148,30 @@ AnimTrack *AnimElemAddTrack(AnimElem *e, int prop)
     return tr;
 }
 
-AnimKey *AnimTrackAddKey(AnimTrack *tr, float t, float value, int ease)
+// Insert a whole key at its sorted slot (keys stay ascending in t) so the
+// exact slot is known - no re-find that could alias an equal key.
+static AnimKey *TrackInsertKey(AnimTrack *tr, AnimKey k)
 {
     if (tr->keyCount >= ANIM_KEYS_MAX) return NULL;
-    // Insert in place at the sorted position (keys stay ascending in t) so the
-    // exact slot is known - no re-find that could alias an equal key.
     int at = tr->keyCount;
-    while (at > 0 && tr->keys[at - 1].t > t)
+    while (at > 0 && tr->keys[at - 1].t > k.t)
     {
         tr->keys[at] = tr->keys[at - 1];
         at--;
     }
     tr->keyCount++;
-    tr->keys[at] = (AnimKey){ t, value, ease };
+    tr->keys[at] = k;
     return &tr->keys[at];
+}
+
+AnimKey *AnimTrackAddKey(AnimTrack *tr, float t, float value, int ease)
+{
+    return TrackInsertKey(tr, (AnimKey){ t, value, (Color){0,0,0,0}, ease });
+}
+
+AnimKey *AnimTrackAddColorKey(AnimTrack *tr, float t, Color c, int ease)
+{
+    return TrackInsertKey(tr, (AnimKey){ t, 0.0f, c, ease });
 }
 
 void AnimTrackRemoveKey(AnimTrack *tr, int idx)
@@ -177,8 +187,8 @@ int AnimTrackSetKeyTime(AnimTrack *tr, int idx, float t)
     AnimKey k = tr->keys[idx];
     k.t = t;
     AnimTrackRemoveKey(tr, idx);
-    // Re-insert at the sorted slot; AddKey cannot fail (we just freed a slot).
-    AnimKey *slot = AnimTrackAddKey(tr, k.t, k.value, k.ease);
+    // Re-insert at the sorted slot; insert cannot fail (we just freed a slot).
+    AnimKey *slot = TrackInsertKey(tr, k);
     return (int)(slot - tr->keys);
 }
 
@@ -191,6 +201,22 @@ AnimKey *AnimTrackWriteKeyAt(AnimTrack *tr, float t, float value, float eps)
             return &tr->keys[i];
         }
     return AnimTrackAddKey(tr, t, value, ANIM_EASE_LINEAR);
+}
+
+AnimKey *AnimTrackWriteColorKeyAt(AnimTrack *tr, float t, Color c, float eps)
+{
+    for (int i = 0; i < tr->keyCount; i++)
+        if (fabsf(tr->keys[i].t - t) <= eps)
+        {
+            tr->keys[i].cval = c;           // ease kept
+            return &tr->keys[i];
+        }
+    return AnimTrackAddColorKey(tr, t, c, ANIM_EASE_LINEAR);
+}
+
+bool AnimPropIsColor(int prop)
+{
+    return prop == AP_T_COLOR || prop == AP_S_COLOR || prop == AP_G_COLOR;
 }
 
 void AnimTrackSortKeys(AnimTrack *tr)
@@ -212,26 +238,70 @@ void AnimTrackSortKeys(AnimTrack *tr)
 // ---------------------------------------------------------------------------
 //  Evaluation
 // ---------------------------------------------------------------------------
-float AnimTrackEval(const AnimTrack *tr, float t, float missing)
+bool AnimTrackSegment(const AnimTrack *tr, float t, int *i0, int *i1)
 {
-    if (!tr || tr->keyCount == 0) return missing;
-    if (t <= tr->keys[0].t)                return tr->keys[0].value;
-    if (t >= tr->keys[tr->keyCount-1].t)   return tr->keys[tr->keyCount-1].value;
+    if (!tr || tr->keyCount == 0) return false;
+    if (t <= tr->keys[0].t)              { *i0 = *i1 = 0; return true; }
+    if (t >= tr->keys[tr->keyCount-1].t) { *i0 = *i1 = tr->keyCount - 1; return true; }
 
     // Find the segment [a, b] containing t (keys are sorted ascending).
     for (int i = 1; i < tr->keyCount; i++)
+        if (t <= tr->keys[i].t) { *i0 = i - 1; *i1 = i; return true; }
+
+    *i0 = *i1 = tr->keyCount - 1;               // unreachable, keeps compiler happy
+    return true;
+}
+
+// Eased fraction through the segment [a, b] at time t (right key's ease).
+static float SegmentFraction(const AnimKey *a, const AnimKey *b, float t)
+{
+    float span = b->t - a->t;
+    float p    = (span > 0.0f) ? (t - a->t) / span : 1.0f;
+    return AnimEaseApply(b->ease, p);
+}
+
+float AnimTrackEval(const AnimTrack *tr, float t, float missing)
+{
+    int i0, i1;
+    if (!AnimTrackSegment(tr, t, &i0, &i1)) return missing;
+    const AnimKey *a = &tr->keys[i0], *b = &tr->keys[i1];
+    if (i0 == i1) return a->value;
+    float p = SegmentFraction(a, b, t);
+    return a->value + (b->value - a->value) * p;
+}
+
+// One colour channel mixed by p, clamped so back/elastic overshoot can't wrap.
+static unsigned char MixChannel(unsigned char a, unsigned char b, float p)
+{
+    float v = (float)a + ((float)b - (float)a) * p;
+    if (v < 0.0f) v = 0.0f; if (v > 255.0f) v = 255.0f;
+    return (unsigned char)(v + 0.5f);
+}
+
+Color AnimTrackEvalColor(const AnimTrack *tr, float t, Color missing)
+{
+    int i0, i1;
+    if (!AnimTrackSegment(tr, t, &i0, &i1)) return missing;
+    const AnimKey *a = &tr->keys[i0], *b = &tr->keys[i1];
+    Color out;
+    if (i0 == i1) out = a->cval;
+    else
     {
-        const AnimKey *b = &tr->keys[i];
-        if (t <= b->t)
-        {
-            const AnimKey *a = &tr->keys[i - 1];
-            float span = b->t - a->t;
-            float p    = (span > 0.0f) ? (t - a->t) / span : 1.0f;
-            p = AnimEaseApply(b->ease, p);     // right key's ease shapes segment
-            return a->value + (b->value - a->value) * p;
-        }
+        float p = SegmentFraction(a, b, t);
+        out = (Color){ MixChannel(a->cval.r, b->cval.r, p),
+                       MixChannel(a->cval.g, b->cval.g, p),
+                       MixChannel(a->cval.b, b->cval.b, p), 255 };
     }
-    return tr->keys[tr->keyCount-1].value;      // unreachable, keeps compiler happy
+    out.a = missing.a;   // alpha is NOT part of colour tracks (alpha track/base)
+    return out;
+}
+
+Color AnimElemColor(const AnimElem *e, float t)
+{
+    for (int i = 0; i < e->trackCount; i++)
+        if (AnimPropIsColor(e->tracks[i].prop))
+            return AnimTrackEvalColor(&e->tracks[i], t, e->color);
+    return e->color;
 }
 
 // Element base value for a property (the rest pose when no track drives it).
@@ -275,6 +345,7 @@ float AnimPropMin(int prop)
 
 float AnimPropMax(int prop)
 {
+    if (AnimPropIsColor(prop)) return 255.0f;   // channels, if ever slid as floats
     switch (prop)
     {
         case AP_T_ROT:   case AP_S_ROT:   return 360.0f;
@@ -323,7 +394,7 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game)
     Vector2 box   = MeasureTextEx(font, e->text, sizePx, spacing);
     float left    = game.x * cxF - box.x * 0.5f;   // cxF = center
     float top     = game.y * topF;
-    Color col     = Fade(e->color, alpha * (1.0f - crumble));
+    Color col     = Fade(AnimElemColor(e, t), alpha * (1.0f - crumble));
     if (col.a == 0) return;
 
     if (crumble > 0.0f)
@@ -381,7 +452,7 @@ static void DrawShapeElem(const AnimElem *e, float t, Vector2 game)
     float hF  = AnimElemProp(e, AP_S_H,     t);
     float rot = AnimElemProp(e, AP_S_ROT,   t);
 
-    Color col = Fade(e->color, alpha);
+    Color col = Fade(AnimElemColor(e, t), alpha);
     if (col.a == 0) return;
 
     float cx = game.x * cxF;
@@ -420,7 +491,7 @@ static void DrawGlobalElem(const AnimElem *e, float t, Vector2 game)
 {
     float fade = AnimElemProp(e, AP_G_FADE, t);
     if (fade <= 0.0f) return;
-    DrawRectangle(0, 0, (int)game.x, (int)game.y, Fade(e->color, fade));
+    DrawRectangle(0, 0, (int)game.x, (int)game.y, Fade(AnimElemColor(e, t), fade));
 }
 
 void AnimDocDraw(const AnimDoc *doc, float t)

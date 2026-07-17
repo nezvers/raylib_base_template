@@ -50,6 +50,89 @@ static void TestEval(void)
     CHECK(v == 0.0f || v == 5.0f);                          // no NaN/crash
 }
 
+static void TestSegment(void)
+{
+    AnimTrack tr = { AP_T_ALPHA, {{0}}, 0 };
+    int i0 = -1, i1 = -1;
+    CHECK(!AnimTrackSegment(&tr, 0.5f, &i0, &i1));          // empty -> false
+
+    AnimTrackAddKey(&tr, 1.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(&tr, 2.0f, 1.0f, ANIM_EASE_LINEAR);
+    CHECK(AnimTrackSegment(&tr, 0.0f, &i0, &i1) && i0 == 0 && i1 == 0);  // before
+    CHECK(AnimTrackSegment(&tr, 1.5f, &i0, &i1) && i0 == 0 && i1 == 1);  // mid
+    CHECK(AnimTrackSegment(&tr, 5.0f, &i0, &i1) && i0 == 1 && i1 == 1);  // after
+}
+
+// ---------------------------------------------------------------------------
+//  Colour tracks
+// ---------------------------------------------------------------------------
+static void TestEvalColor(void)
+{
+    CHECK(AnimPropIsColor(AP_T_COLOR) && AnimPropIsColor(AP_S_COLOR) &&
+          AnimPropIsColor(AP_G_COLOR) && !AnimPropIsColor(AP_T_ALPHA));
+
+    AnimTrack tr = { AP_S_COLOR, {{0}}, 0 };
+    Color miss = { 1, 2, 3, 4 };
+    Color got  = AnimTrackEvalColor(&tr, 0.5f, miss);
+    CHECK(got.r == 1 && got.a == 4);                        // empty -> missing
+
+    AnimTrackAddColorKey(&tr, 0.0f, (Color){ 0, 0, 0, 255 },      ANIM_EASE_LINEAR);
+    AnimTrackAddColorKey(&tr, 1.0f, (Color){ 200, 100, 50, 255 }, ANIM_EASE_LINEAR);
+    got = AnimTrackEvalColor(&tr, 0.5f, miss);
+    CHECK(got.r == 100 && got.g == 50 && got.b == 25);
+    CHECK(got.a == 4);                                      // alpha from missing
+    got = AnimTrackEvalColor(&tr, -1.0f, miss);             // clamp before first
+    CHECK(got.r == 0 && got.a == 4);
+
+    // overshooting ease must clamp channels, not wrap the unsigned char.
+    tr.keys[1].ease = ANIM_EASE_BACK_OUT;
+    for (float t = 0.0f; t <= 1.0f; t += 0.05f)
+    {
+        Color c = AnimTrackEvalColor(&tr, t, miss);
+        CHECK(c.r <= 255 && c.g <= 255);                    // uchar can't be <0;
+    }                                                        // wrap would show high
+
+    // element colour: no track -> base, colour track -> eval
+    AnimElem e;
+    AnimElemInit(&e, AE_SHAPE);
+    e.color = (Color){ 9, 9, 9, 9 };
+    got = AnimElemColor(&e, 0.5f);
+    CHECK(got.r == 9 && got.a == 9);
+    AnimTrack *ct = AnimElemAddTrack(&e, AP_S_COLOR);
+    AnimTrackAddColorKey(ct, 0.0f, (Color){ 100, 0, 0, 255 }, ANIM_EASE_LINEAR);
+    got = AnimElemColor(&e, 0.5f);
+    CHECK(got.r == 100 && got.a == 9);                      // alpha stays base
+}
+
+static void TestColorKeyTimeMove(void)
+{
+    // regression: SetKeyTime must carry cval through the re-insert.
+    AnimTrack tr = { AP_S_COLOR, {{0}}, 0 };
+    AnimTrackAddColorKey(&tr, 0.0f, (Color){ 11, 22, 33, 44 }, ANIM_EASE_LINEAR);
+    AnimTrackAddColorKey(&tr, 1.0f, (Color){ 55, 66, 77, 88 }, ANIM_EASE_LINEAR);
+    int ni = AnimTrackSetKeyTime(&tr, 0, 1.5f);             // drag past neighbour
+    CHECK(ni == 1);
+    CHECK(tr.keys[1].cval.r == 11 && tr.keys[1].cval.a == 44);
+    CHECK(tr.keys[0].cval.r == 55);
+
+    // WriteColorKeyAt: within eps updates cval (ease kept), outside inserts.
+    AnimKey *u = AnimTrackWriteColorKeyAt(&tr, 1.01f, (Color){ 1, 1, 1, 1 }, 0.02f);
+    CHECK(tr.keyCount == 2 && u->cval.r == 1);
+    AnimTrackWriteColorKeyAt(&tr, 0.5f, (Color){ 2, 2, 2, 2 }, 0.02f);
+    CHECK(tr.keyCount == 3 && tr.keys[0].cval.r == 2 && tr.keys[1].cval.r == 1);
+}
+
+static void TestTrackCap(void)
+{
+    // every text property (incl. colour) fits in ANIM_TRACKS_MAX.
+    AnimElem e;
+    AnimElemInit(&e, AE_TEXT);
+    int n = AnimPropCountFor(AE_TEXT);
+    for (int i = 0; i < n; i++)
+        CHECK(AnimElemAddTrack(&e, AnimPropAt(AE_TEXT, i)) != NULL);
+    CHECK(e.trackCount == n);
+}
+
 // ---------------------------------------------------------------------------
 //  Ease tables
 // ---------------------------------------------------------------------------
@@ -176,6 +259,9 @@ static void TestIO(void)
     AnimElem *s = AnimDocAddElem(&doc, AE_SHAPE);
     s->shapeKind = SHAPE_CIRCLE;
     s->sizeFrac = (Vector2){ 0.4f, 0.2f };
+    AnimTrack *sc = AnimElemAddTrack(s, AP_S_COLOR);
+    AnimTrackAddColorKey(sc, 0.0f, (Color){ 10, 20, 30, 40 },     ANIM_EASE_LINEAR);
+    AnimTrackAddColorKey(sc, 1.0f, (Color){ 250, 200, 150, 255 }, ANIM_EASE_SINE_OUT);
 
     doc.signalCount = 2;
     TextCopy(doc.signals[0].name, "enter");
@@ -200,6 +286,12 @@ static void TestIO(void)
     CHECK(in.elems[0].tracks[1].keys[0].ease == ANIM_EASE_BACK_IN);
     CHECK(in.elems[1].kind == AE_SHAPE && in.elems[1].shapeKind == SHAPE_CIRCLE);
     CHECK_NEAR(in.elems[1].sizeFrac.y, 0.2f);
+    CHECK(in.elems[1].trackCount == 1 && in.elems[1].tracks[0].prop == AP_S_COLOR);
+    CHECK(in.elems[1].tracks[0].keyCount == 2);
+    CHECK(in.elems[1].tracks[0].keys[0].cval.b == 30);
+    CHECK(in.elems[1].tracks[0].keys[1].cval.r == 250 &&
+          in.elems[1].tracks[0].keys[1].cval.a == 255);
+    CHECK(in.elems[1].tracks[0].keys[1].ease == ANIM_EASE_SINE_OUT);
     CHECK(in.signalCount == 2);
     CHECK(in.signals[1].dir == ANIM_REV);
     CHECK_NEAR(in.signals[1].sectionStart, 0.5f);
@@ -266,6 +358,10 @@ static void TestSignals(void)
 int main(void)
 {
     TestEval();
+    TestSegment();
+    TestEvalColor();
+    TestColorKeyTimeMove();
+    TestTrackCap();
     TestEase();
     TestKeys();
     TestDoc();

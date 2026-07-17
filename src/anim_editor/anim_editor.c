@@ -56,6 +56,21 @@ static float playhead = 0.0f;       // scrubber time, 0..doc.duration
 static bool  playing  = false;      // timeline play/pause
 static bool  loopPlay = true;
 
+// playback UI slide: 0 = editing (panels shown) .. 1 = playing (panels hidden,
+// timeline collapsed to a thin clickable strip). Eased in Gui().
+static float panelAnim = 0.0f;
+static bool  prevPlaybackUi = false;
+
+// inspector wheel-scroll (content can overflow the panel; no visible bar)
+static float inspScroll = 0.0f;
+static float inspContentH = 0.0f;   // measured last frame
+static Rectangle inspPanelRect;     // this frame's inspector panel (scissor)
+static bool scrollToSelKey = false; // scroll the selected key row into view
+
+// add-track dropdown header rect (list drawn last as an overlay, like ease)
+static Rectangle addTrackRect;
+static bool addTrackVisible = false;
+
 // undo ring (snapshots of the whole doc)
 static AnimDoc undoBuf[UNDO_MAX];
 static int     undoHead = 0;        // next write slot
@@ -205,6 +220,7 @@ static void Enter()
     ClearKeySelection();
     edSigIdx = -1; sliderGestureOpen = false;
     playhead = 0.0f; playing = false;
+    panelAnim = 0.0f; prevPlaybackUi = false; inspScroll = 0.0f;
     undoCount = redoCount = 0; undoHead = 0;
 
     // register the doc's signals so the "Fire" buttons drive the preview player.
@@ -260,6 +276,19 @@ static void Update()
         else playing = !playing;
         preview.playing = false;
     }
+
+    // Slide the tool panels away while anything is playing, back when paused.
+    bool playbackUi = playing || !AnimPlayerDone(&preview);
+    if (playbackUi && !prevPlaybackUi)
+    {
+        // hidden widgets must not keep capturing input
+        edName = edText = edKeyTime = false; edSigIdx = -1;
+        addTrackDrop = -1; keyEaseDropOpen = false;
+    }
+    prevPlaybackUi = playbackUi;
+    float step = dt / 0.25f;
+    if (playbackUi) { panelAnim += step; if (panelAnim > 1.0f) panelAnim = 1.0f; }
+    else            { panelAnim -= step; if (panelAnim < 0.0f) panelAnim = 0.0f; }
 }
 
 // ===========================================================================
@@ -307,6 +336,30 @@ static void EnsureZeroKey(AnimElem *e, AnimTrack *tr)
 {
     if (tr->keyCount == 0)
         AnimTrackAddKey(tr, 0.0f, AnimElemProp(e, tr->prop, 0.0f), ANIM_EASE_LINEAR);
+}
+
+static void EnsureZeroColorKey(AnimElem *e, AnimTrack *tr)
+{
+    if (tr->keyCount == 0)
+        AnimTrackAddColorKey(tr, 0.0f, AnimElemColor(e, 0.0f), ANIM_EASE_LINEAR);
+}
+
+// The colour property for an element kind (each kind has exactly one).
+static int ColorPropFor(int kind)
+{
+    switch (kind)
+    {
+        case AE_TEXT:  return AP_T_COLOR;
+        case AE_SHAPE: return AP_S_COLOR;
+        default:       return AP_G_COLOR;
+    }
+}
+
+// Small colour preview square with an outline (used by the colour editors).
+static void DrawSwatch(Rectangle r, Color c)
+{
+    DrawRectangleRec(r, c);
+    DrawRectangleLinesEx(r, 1.0f, (Color){ 70, 74, 84, 255 });
 }
 
 // Slider for an ANIMATABLE property. No track -> edits the base field (rest
@@ -390,13 +443,14 @@ static void DrawElementList(float x, float y, float w)
 // ---------------------------------------------------------------------------
 //  Right panel: inspector for the primary selection.
 // ---------------------------------------------------------------------------
-static void DrawInspector(float x, float y, float w)
+static float DrawInspector(float x, float y, float w)   // returns content height
 {
+    float y0 = y;
     GuiLabel((Rectangle){ x, y, w, 20 }, "INSPECTOR"); y += 24;
     if (selElem < 0 || selElem >= doc.elemCount)
     {
         GuiLabel((Rectangle){ x, y, w, 20 }, "(no element selected)");
-        return;
+        return (y + 20) - y0;
     }
     AnimElem *e = &doc.elems[selElem];
     float rh = 24.0f, gap = 6.0f;
@@ -427,27 +481,49 @@ static void DrawInspector(float x, float y, float w)
     if (e->kind != AE_GLOBAL)
     {
         bool isText = e->kind == AE_TEXT;
-        PropSlider((Rectangle){ x+44, y, w-44, rh }, e, isText ? AP_T_POS_X : AP_S_POS_X, &e->posFrac.x);
+        PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_POS_X : AP_S_POS_X, &e->posFrac.x);
         GuiLabel((Rectangle){ x, y, 44, rh }, "posX"); y += rh + gap;
-        PropSlider((Rectangle){ x+44, y, w-44, rh }, e, isText ? AP_T_POS_Y : AP_S_POS_Y, &e->posFrac.y);
+        PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_POS_Y : AP_S_POS_Y, &e->posFrac.y);
         GuiLabel((Rectangle){ x, y, 44, rh }, "posY"); y += rh + gap;
-        PropSlider((Rectangle){ x+44, y, w-44, rh }, e, isText ? AP_T_SIZE : AP_S_W, &e->sizeFrac.x);
+        PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_SIZE : AP_S_W, &e->sizeFrac.x);
         GuiLabel((Rectangle){ x, y, 44, rh }, isText ? "size" : "w"); y += rh + gap;
         if (e->kind == AE_SHAPE)
         {
-            PropSlider((Rectangle){ x+44, y, w-44, rh }, e, AP_S_H, &e->sizeFrac.y);
+            PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_H, &e->sizeFrac.y);
             GuiLabel((Rectangle){ x, y, 44, rh }, "h"); y += rh + gap;
         }
     }
 
-    // colour (RGBA sliders keep it compact and stable across raygui versions)
-    GuiLabel((Rectangle){ x, y, w, rh }, "color (rgba)"); y += rh;
-    float cr=e->color.r, cg=e->color.g, cb=e->color.b, ca=e->color.a;
-    EditSlider((Rectangle){ x+16, y, w-16, 16 }, "R", &cr, 0,255); y+=18;
-    EditSlider((Rectangle){ x+16, y, w-16, 16 }, "G", &cg, 0,255); y+=18;
-    EditSlider((Rectangle){ x+16, y, w-16, 16 }, "B", &cb, 0,255); y+=18;
-    EditSlider((Rectangle){ x+16, y, w-16, 16 }, "A", &ca, 0,255); y+=22;
-    e->color = (Color){ (unsigned char)cr,(unsigned char)cg,(unsigned char)cb,(unsigned char)ca };
+    // colour (RGBA sliders keep it compact and stable across raygui versions).
+    // With a colour track the sliders follow the playhead and auto-key writes
+    // colour keys there (mirrors PropSlider); without one they edit the base.
+    // RGB is animatable via the colour track; alpha stays separate (the base
+    // channel here, the alpha track for animation) so it is never keyed along.
+    AnimTrack *ctr = AnimElemFindTrack(e, ColorPropFor(e->kind));
+    Color cc = AnimElemColor(e, playhead);
+    GuiLabel((Rectangle){ x, y, w-24, rh }, ctr ? "color (rgb, keyed)" : "color (rgb)");
+    DrawSwatch((Rectangle){ x+w-20, y+3, 18, 18 }, cc);
+    y += rh;
+    float cr=cc.r, cg=cc.g, cb=cc.b, ca=e->color.a;
+    bool rgbChanged = false;
+    if (ctr && !autoKey) GuiSetState(STATE_DISABLED);
+    if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "R", &cr, 0,255)) rgbChanged=true; y+=18;
+    if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "G", &cg, 0,255)) rgbChanged=true; y+=18;
+    if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "B", &cb, 0,255)) rgbChanged=true; y+=18;
+    if (ctr && !autoKey) GuiSetState(STATE_NORMAL);
+    if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "A", &ca, 0,255))
+        e->color.a = (unsigned char)ca;
+    y+=22;
+    if (rgbChanged)
+    {
+        Color nc = { (unsigned char)cr,(unsigned char)cg,(unsigned char)cb, 255 };
+        if (!ctr) { e->color.r = nc.r; e->color.g = nc.g; e->color.b = nc.b; }
+        else
+        {
+            if (playhead > AUTOKEY_EPS) EnsureZeroColorKey(e, ctr);
+            AnimTrackWriteColorKeyAt(ctr, playhead, nc, AUTOKEY_EPS);
+        }
+    }
 
     // --- tracks list: every track and ALL of its keys, always visible --------
     GuiLine((Rectangle){ x, y, w, 8 }, "tracks"); y += 12;
@@ -460,9 +536,19 @@ static void DrawInspector(float x, float y, float w)
         if (GuiButton((Rectangle){ x+w-102, y, 50, rh }, "+key"))
         {
             AudioPlayButton(); UndoPush();
-            float v = AnimElemProp(e, tr->prop, playhead);
-            if (playhead > AUTOKEY_EPS) EnsureZeroKey(e, tr);
-            AnimKey *k = AnimTrackWriteKeyAt(tr, playhead, v, AUTOKEY_EPS);
+            AnimKey *k;
+            if (AnimPropIsColor(tr->prop))
+            {
+                Color c = AnimElemColor(e, playhead);
+                if (playhead > AUTOKEY_EPS) EnsureZeroColorKey(e, tr);
+                k = AnimTrackWriteColorKeyAt(tr, playhead, c, AUTOKEY_EPS);
+            }
+            else
+            {
+                float v = AnimElemProp(e, tr->prop, playhead);
+                if (playhead > AUTOKEY_EPS) EnsureZeroKey(e, tr);
+                k = AnimTrackWriteKeyAt(tr, playhead, v, AUTOKEY_EPS);
+            }
             if (k) SelectKey(selElem, j, (int)(k - tr->keys));
         }
         if (GuiButton((Rectangle){ x+w-48, y, 48, rh }, "del"))
@@ -476,16 +562,50 @@ static void DrawInspector(float x, float y, float w)
         y += rh + 2;
 
         // key rows: "t  value  ease" - click to select (same as the timeline).
+        // The two keys bracketing the playhead (= the ones being lerped right
+        // now) carry a warm tint so it's clear which keys are in effect.
+        int segA = -1, segB = -1;
+        AnimTrackSegment(tr, playhead, &segA, &segB);
         for (int k = 0; k < tr->keyCount; k++)
         {
             bool sel = (selKeyElem == selElem && selKeyTrack == j && selKeyIdx == k);
+            bool lerping = (k == segA || k == segB);
             Rectangle kr = { x+12, y, w-12, 18 };
-            if (sel) DrawRectangleRec(kr, (Color){ 60, 90, 140, 120 });
-            if (GuiButton(kr, TextFormat("%.2f   %.2f   %s", tr->keys[k].t,
-                          tr->keys[k].value, AnimEaseName(tr->keys[k].ease))))
+            const char *label = AnimPropIsColor(tr->prop)
+                ? TextFormat("%.2f   #%02X%02X%02X   %s", tr->keys[k].t,
+                             tr->keys[k].cval.r, tr->keys[k].cval.g,
+                             tr->keys[k].cval.b,
+                             AnimEaseName(tr->keys[k].ease))
+                : TextFormat("%.2f   %.2f   %s", tr->keys[k].t,
+                             tr->keys[k].value, AnimEaseName(tr->keys[k].ease));
+            bool pressed = GuiButton(kr, label);
+            // markers AFTER the button (raygui paints its own background)
+            if (sel)     DrawRectangleRec(kr, (Color){ 60, 90, 140, 120 });
+            if (lerping)
+            {
+                DrawRectangleRec(kr, (Color){ 255, 210, 90, 40 });
+                DrawRectangleRec((Rectangle){ kr.x, kr.y, 3, kr.height },
+                                 (Color){ 255, 210, 90, 255 });
+            }
+            if (AnimPropIsColor(tr->prop))
+            {
+                Color sc = tr->keys[k].cval; sc.a = 255;
+                DrawSwatch((Rectangle){ kr.x + kr.width - 18, kr.y + 2, 14, 14 }, sc);
+            }
+            if (pressed)
             {
                 AudioPlayButton();
                 SelectKey(selElem, j, k);
+            }
+            // a timeline click asked to reveal this key: nudge the scroll so
+            // the row sits inside the panel (applies next frame).
+            if (sel && scrollToSelKey)
+            {
+                float top = inspPanelRect.y + 24.0f;
+                float bot = inspPanelRect.y + inspPanelRect.height - 24.0f;
+                if (kr.y < top)                    inspScroll += top - kr.y;
+                else if (kr.y + kr.height > bot)   inspScroll -= (kr.y + kr.height) - bot;
+                scrollToSelKey = false;
             }
             y += 20;
         }
@@ -495,14 +615,7 @@ static void DrawInspector(float x, float y, float w)
     // add-track dropdown (built from the element kind's valid props)
     y += 4;
     int propCount = AnimPropCountFor(e->kind);
-    // build a ';'-joined option string for the dropdown.
-    char opts[128]; opts[0]=0; int pos=0;
-    for (int i=0;i<propCount;i++)
-    {
-        const char *nm = AnimPropName(AnimPropAt(e->kind,i));
-        if (i) TextAppend(opts, ";", &pos);
-        TextAppend(opts, nm, &pos);
-    }
+    if (addTrackSel >= propCount) addTrackSel = 0;   // kinds differ in count
     Rectangle addR = { x, y, w-56, rh };
     if (GuiButton((Rectangle){ x+w-52, y, 52, rh }, "+track"))
     {
@@ -511,7 +624,17 @@ static void DrawInspector(float x, float y, float w)
         // seed the START key at t=0, and - when the scrubber sits later on the
         // clock - a second key right at the playhead, ready to edit.
         AnimTrack *tr = AnimElemAddTrack(e, prop);
-        if (tr)
+        if (tr && AnimPropIsColor(prop))
+        {
+            Color c = AnimElemColor(e, playhead);
+            EnsureZeroColorKey(e, tr);
+            if (playhead > AUTOKEY_EPS)
+            {
+                AnimKey *k = AnimTrackWriteColorKeyAt(tr, playhead, c, AUTOKEY_EPS);
+                if (k) SelectKey(selElem, e->trackCount - 1, (int)(k - tr->keys));
+            }
+        }
+        else if (tr)
         {
             float v = AnimElemProp(e, prop, playhead);
             EnsureZeroKey(e, tr);
@@ -522,8 +645,16 @@ static void DrawInspector(float x, float y, float w)
             }
         }
     }
-    if (GuiDropdownBox(addR, opts, &addTrackSel, addTrackDrop == selElem))
+    // dropdown HEADER only - the open list is drawn last as an overlay so it
+    // can flip above the header instead of being culled at the screen bottom.
+    if (GuiButton(addR, TextFormat("%s  v",
+                  AnimPropName(AnimPropAt(e->kind, addTrackSel)))))
+    {
+        AudioPlayButton();
         addTrackDrop = (addTrackDrop == selElem) ? -1 : selElem;
+        keyEaseDropOpen = false;
+    }
+    addTrackRect = addR; addTrackVisible = true;
     y += rh + 10;
 
     // --- key inspector: the selected timeline diamond's t / value / ease ----
@@ -555,56 +686,106 @@ static void DrawInspector(float x, float y, float w)
         }
         y += rh + gap;
 
-        // value (range depends on the property)
+        // value: colour keys get RGBA sliders + swatch, scalar keys one slider
         AnimKey *k = &tr->keys[selKeyIdx];
-        GuiLabel((Rectangle){ x, y, 44, rh }, "value");
-        float v = k->value;
-        if (EditSlider((Rectangle){ x+44, y, w-44, rh }, "", &v,
-                       AnimPropMin(tr->prop), AnimPropMax(tr->prop)))
-            k->value = v;
-        y += rh + gap;
+        if (AnimPropIsColor(tr->prop))
+        {
+            GuiLabel((Rectangle){ x, y, w-24, rh }, "value (rgb)");
+            DrawSwatch((Rectangle){ x+w-20, y+3, 18, 18 },
+                       (Color){ k->cval.r, k->cval.g, k->cval.b, 255 });
+            y += rh;
+            float kr=k->cval.r, kg=k->cval.g, kb=k->cval.b;
+            bool ch = false;
+            if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "R", &kr, 0,255)) ch=true; y+=18;
+            if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "G", &kg, 0,255)) ch=true; y+=18;
+            if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "B", &kb, 0,255)) ch=true; y+=22;
+            if (ch) k->cval = (Color){ (unsigned char)kr,(unsigned char)kg,
+                                       (unsigned char)kb, 255 };
+        }
+        else
+        {
+            GuiLabel((Rectangle){ x, y, 44, rh }, "value");
+            float v = k->value;
+            if (EditSlider((Rectangle){ x+44, y, w-44-50, rh }, "", &v,
+                           AnimPropMin(tr->prop), AnimPropMax(tr->prop)))
+                k->value = v;
+            y += rh + gap;
+        }
 
-        // ease dropdown: only the RECT is reserved here; the widget is drawn
-        // last in Gui() so its open list overlays the timeline (raygui z-order)
+        // ease dropdown header; its open list is drawn last as an overlay that
+        // flips above the header when there is no room below.
         GuiLabel((Rectangle){ x, y, 44, rh }, "ease");
         keyEaseRect = (Rectangle){ x+44, y, w-44-54, rh };
         keyEaseVisible = true;
+        if (GuiButton(keyEaseRect, TextFormat("%s  v", AnimEaseName(keyEaseSel))))
+        {
+            AudioPlayButton();
+            keyEaseDropOpen = !keyEaseDropOpen;
+            addTrackDrop = -1;
+        }
         if (GuiButton((Rectangle){ x+w-50, y, 50, rh }, "del"))
         {
             AudioPlayButton(); UndoPush();
             AnimTrackRemoveKey(tr, selKeyIdx);
             ClearKeySelection();
         }
+        y += rh;
     }
+    return (y + 12) - y0;
 }
 
-// The key inspector's ease dropdown, drawn AFTER every other widget so its
-// open list overlays them (immediate mode: last drawn wins).
-static void DrawKeyEaseDropdown()
+// The open dropdown LIST (ease or add-track), drawn AFTER every other widget
+// so it overlays them (immediate mode: last drawn wins). Unlike raygui's
+// GuiDropdownBox - which always opens downward and gets culled at the screen
+// bottom - the list flips ABOVE the header when there is no room below.
+static void DrawDropdownOverlays()
 {
-    if (!keyEaseVisible) return;
+    bool easeMode  = keyEaseDropOpen && keyEaseVisible && selKeyElem >= 0;
+    bool trackMode = !easeMode && addTrackVisible && addTrackDrop == selElem &&
+                     selElem >= 0 && selElem < doc.elemCount;
+    if (!easeMode && !trackMode) return;
 
-    static char opts[256]; static bool optsInit = false;   // "linear;sineIn;..."
-    if (!optsInit)
+    ScreenState *ss = ScreenStateGet();
+    float H = (float)ss->height;
+    Rectangle hdr = easeMode ? keyEaseRect : addTrackRect;
+    int count = easeMode ? AnimEaseCount() : AnimPropCountFor(doc.elems[selElem].kind);
+    int cur   = easeMode ? keyEaseSel : addTrackSel;
+
+    float ih = 20.0f, listH = ih * count;
+    float ly = (hdr.y + hdr.height + listH <= H - 4.0f)
+             ? hdr.y + hdr.height          // fits below
+             : hdr.y - listH;              // flip above the header
+    if (ly < 4.0f) ly = 4.0f;              // clamp to the screen top
+    Rectangle bg = { hdr.x, ly, hdr.width, listH };
+    DrawRectangleRec(bg, (Color){ 32, 34, 40, 255 });
+    DrawRectangleLinesEx(bg, 1.0f, (Color){ 70, 74, 84, 255 });
+
+    int picked = -1;
+    for (int i = 0; i < count; i++)
     {
-        int pos = 0;
-        for (int i = 0; i < AnimEaseCount(); i++)
-        {
-            if (i) TextAppend(opts, ";", &pos);
-            TextAppend(opts, AnimEaseName(i), &pos);
-        }
-        optsInit = true;
+        Rectangle rr = { bg.x, bg.y + i*ih, bg.width, ih };
+        const char *nm = easeMode ? AnimEaseName(i)
+                                  : AnimPropName(AnimPropAt(doc.elems[selElem].kind, i));
+        if (GuiButton(rr, nm)) picked = i;
+        if (i == cur) DrawRectangleRec(rr, (Color){ 90, 140, 220, 60 });
     }
 
-    if (GuiDropdownBox(keyEaseRect, opts, &keyEaseSel, keyEaseDropOpen))
+    if (picked >= 0)
     {
-        if (keyEaseDropOpen && selKeyElem >= 0)
+        AudioPlayButton();
+        if (easeMode)
         {
             UndoPush();
-            doc.elems[selKeyElem].tracks[selKeyTrack].keys[selKeyIdx].ease = keyEaseSel;
+            keyEaseSel = picked;
+            doc.elems[selKeyElem].tracks[selKeyTrack].keys[selKeyIdx].ease = picked;
+            keyEaseDropOpen = false;
         }
-        keyEaseDropOpen = !keyEaseDropOpen;
+        else { addTrackSel = picked; addTrackDrop = -1; }
     }
+    else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+             !CheckCollisionPointRec(GetMousePosition(), bg) &&
+             !CheckCollisionPointRec(GetMousePosition(), hdr))
+    { keyEaseDropOpen = false; addTrackDrop = -1; }    // click-away closes
 }
 
 // ---------------------------------------------------------------------------
@@ -676,11 +857,23 @@ static float DrawSignals(float x, float y, float w)   // returns height used
     return (sy - y) + rh + 6;
 }
 
+// A filled diamond. DrawTriangle culls back faces: vertices must be counter-
+// clockwise ON SCREEN (y-down), i.e. top -> left -> right; the old clockwise
+// order made every keyframe diamond invisible.
+static void DrawDiamond(float cx, float cy, float r, Color c)
+{
+    DrawTriangle((Vector2){cx,cy-r},(Vector2){cx-r,cy},(Vector2){cx+r,cy}, c);
+    DrawTriangle((Vector2){cx-r,cy},(Vector2){cx,cy+r},(Vector2){cx+r,cy}, c);
+}
+
 // ---------------------------------------------------------------------------
 //  Timeline scrubber: playhead + keyframe diamonds for the selected element.
+//  Below `thin` height (playback mode) only the ticks + playhead remain; the
+//  whole bar stays clickable so a click pauses and scrubs.
 // ---------------------------------------------------------------------------
 static void DrawTimeline(float x, float y, float w, float h)
 {
+    bool thin = h < 60.0f;
     Rectangle bar = { x, y, w, h };
     DrawRectangleRec(bar, (Color){ 24, 26, 30, 255 });
     DrawRectangleLinesEx(bar, 1.0f, (Color){ 70, 74, 84, 255 });
@@ -708,16 +901,27 @@ static void DrawTimeline(float x, float y, float w, float h)
     // Raw-mouse input is suppressed while the ease dropdown is open (raygui's
     // GuiLock only covers gui widgets, not this hand-drawn timeline).
     Vector2 mouse = GetMousePosition();
-    bool press  = !keyEaseDropOpen && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+    bool press  = !keyEaseDropOpen && addTrackDrop < 0 &&
+                  IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     bool keyHit = false;
-    if (selElem >= 0 && selElem < doc.elemCount)
+    if (!thin && selElem >= 0 && selElem < doc.elemCount)
     {
         AnimElem *e = &doc.elems[selElem];
+        if (e->trackCount == 0)
+            DrawText("(no tracks - add one in the inspector to key frames)",
+                     (int)(x + w*0.5f - 130), (int)(y + h*0.5f - 5), 10,
+                     (Color){ 110, 116, 128, 255 });
         float rowH = (h - 24) / (float)(e->trackCount > 0 ? e->trackCount : 1);
         for (int j = 0; j < e->trackCount; j++)
         {
             AnimTrack *tr = &e->tracks[j];
             float ry = y + 4 + j*rowH + rowH*0.5f;
+            // alternating lane backgrounds + a baseline so tracks read as rows
+            if (j & 1)
+                DrawRectangleRec((Rectangle){ x+1, y+4 + j*rowH, w-2, rowH },
+                                 (Color){ 255, 255, 255, 6 });
+            DrawLine((int)trackLeft, (int)ry, (int)(x+w-padR), (int)ry,
+                     (Color){ 45, 48, 56, 255 });
             DrawText(AnimPropName(tr->prop), (int)x+2, (int)ry-5, 10, (Color){130,136,148,255});
             for (int k = 0; k < tr->keyCount; k++)
             {
@@ -726,22 +930,32 @@ static void DrawTimeline(float x, float y, float w, float h)
                 Rectangle hit = { kx-10, ry-10, 20, 20 };
                 bool hot = CheckCollisionPointRec(mouse, hit);
                 bool sel = (selKeyElem == selElem && selKeyTrack == j && selKeyIdx == k);
-                Color c = sel ? (Color){255,255,255,255}
-                        : hot ? (Color){255,210,90,255} : (Color){120,180,240,255};
-                // diamond
-                DrawTriangle((Vector2){kx,ry-6},(Vector2){kx+6,ry},(Vector2){kx-6,ry}, c);
-                DrawTriangle((Vector2){kx-6,ry},(Vector2){kx+6,ry},(Vector2){kx,ry+6}, c);
+                float r = hot ? 9.0f : 7.0f;
+                // outline ring underneath: amber = selected, white = hover
+                Color ring = sel ? (Color){255,210,90,255}
+                           : hot ? (Color){255,255,255,255} : (Color){15,16,20,255};
+                Color fill = AnimPropIsColor(tr->prop)
+                           ? (Color){ tr->keys[k].cval.r, tr->keys[k].cval.g,
+                                      tr->keys[k].cval.b, 255 }
+                           : sel ? (Color){255,255,255,255} : (Color){120,180,240,255};
+                DrawDiamond(kx, ry, r + 2.0f, ring);
+                DrawDiamond(kx, ry, r, fill);
 
                 if (hot && press)
                 {
                     UndoPush();                       // once per drag gesture
                     dragKeyElem = selElem; dragKeyTrack = j; dragKeyIdx = k;
                     SelectKey(selElem, j, k);
+                    scrollToSelKey = true;            // reveal it in the inspector
                     keyHit = true;
                 }
             }
         }
     }
+    else if (!thin)
+        DrawText("(select an element to see its keys)",
+                 (int)(x + w*0.5f - 90), (int)(y + h*0.5f - 5), 10,
+                 (Color){ 110, 116, 128, 255 });
 
     // playhead line + grab handle.
     float phx = T2X(playhead);
@@ -837,31 +1051,61 @@ static void Gui()
     float pad = 10.0f;
     float toolbarH = 34.0f;
     float leftW = 220.0f;
-    float rightW = 260.0f;
+    float rightW = 320.0f;
     float bottomH = 180.0f;
+    float thinH = 26.0f;        // timeline strip height while playing
 
     // a slider drag gesture (one undo snapshot) ends when the button comes up.
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) sliderGestureOpen = false;
 
-    // while the key-ease dropdown is open every other widget is locked; the
-    // dropdown itself is drawn (unlocked) last so its list overlays them.
-    if (keyEaseDropOpen) GuiLock();
+    // while a dropdown list is open every other widget is locked; the list
+    // itself is drawn (unlocked) last so it overlays them.
+    addTrackVisible = false;
+    if (keyEaseDropOpen || addTrackDrop >= 0) GuiLock();
 
     DrawToolbar(pad, pad, W - 2*pad);
 
-    // left + right panels flank the central preview (which Draw() already drew).
-    Rectangle leftPanel = { pad, toolbarH+pad, leftW, H - toolbarH - bottomH - 3*pad };
-    Rectangle rightPanel = { W - rightW - pad, toolbarH+pad, rightW, H - toolbarH - bottomH - 3*pad };
-    GuiPanel(leftPanel, NULL);
-    GuiPanel(rightPanel, NULL);
-    DrawElementList(leftPanel.x+8, leftPanel.y+8, leftW-16);
-    DrawInspector(rightPanel.x+8, rightPanel.y+8, rightW-16);
+    // playback slide: panels move off the sides, the bottom block drops until
+    // only a thin timeline strip remains. Skip the panels entirely once hidden
+    // so off-screen widgets can't hit-test or capture input.
+    float k = AnimEaseApply(ANIM_EASE_SINE_INOUT, panelAnim);
+    bool uiHidden = k >= 0.999f;
 
-    // bottom: signal rows (wraps, reports its height) then the timeline.
-    float by = H - bottomH - pad;
-    float sigH = DrawSignals(pad, by, W - 2*pad);
-    DrawTimeline(pad, by + sigH, W - 2*pad, bottomH - sigH);
+    // left + right panels flank the central preview (which Draw() already drew).
+    Rectangle leftPanel = { pad - (leftW + 2*pad)*k, toolbarH+pad,
+                            leftW, H - toolbarH - bottomH - 3*pad };
+    Rectangle rightPanel = { W - rightW - pad + (rightW + 2*pad)*k, toolbarH+pad,
+                             rightW, H - toolbarH - bottomH - 3*pad };
+    if (!uiHidden)
+    {
+        GuiPanel(leftPanel, NULL);
+        GuiPanel(rightPanel, NULL);
+        DrawElementList(leftPanel.x+8, leftPanel.y+8, leftW-16);
+
+        // inspector scrolls (content can overflow); scissor keeps it in-panel.
+        if (CheckCollisionPointRec(GetMousePosition(), rightPanel))
+            inspScroll += GetMouseWheelMove() * 30.0f;
+        float maxScroll = inspContentH - (rightPanel.height - 16);
+        if (maxScroll < 0) maxScroll = 0;
+        if (inspScroll < -maxScroll) inspScroll = -maxScroll;
+        if (inspScroll > 0) inspScroll = 0;
+        inspPanelRect = rightPanel;
+        BeginScissorMode((int)rightPanel.x+1, (int)rightPanel.y+1,
+                         (int)rightPanel.width-2, (int)rightPanel.height-2);
+        inspContentH = DrawInspector(rightPanel.x+8, rightPanel.y+8 + inspScroll,
+                                     rightW-16);
+        EndScissorMode();
+    }
+    else keyEaseVisible = false;    // inspector skipped: no ease dropdown
+
+    // bottom: signal rows (wraps, reports its height) then the timeline. The
+    // whole block slides down by k so only the thin strip stays on screen.
+    float by = H - bottomH - pad + k * (bottomH - thinH);
+    float sigH = uiHidden ? 0.0f : DrawSignals(pad, by, W - 2*pad);
+    float tlY = by + sigH, tlH = H - pad - tlY;
+    if (tlH < thinH) { tlH = thinH; tlY = H - pad - thinH; }   // wrapped signals
+    DrawTimeline(pad, tlY, W - 2*pad, tlH);
 
     GuiUnlock();
-    DrawKeyEaseDropdown();
+    DrawDropdownOverlays();
 }

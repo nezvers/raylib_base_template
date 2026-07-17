@@ -11,8 +11,9 @@
 //      pos    <xFrac> <yFrac>
 //      size   <xFrac> <yFrac>
 //      shape  <rect|circle>              # (shape elements)
-//      track  <prop> <keyCount>         # then keyCount x: <t> <value> <ease>
-//        key  <t> <value> <ease>
+//      track  <prop> <keyCount>         # then keyCount x `key` lines
+//        key  <t> <value> <ease>            # scalar tracks
+//        key  <t> <r> <g> <b> <ease>        # colour tracks (RGB; no alpha)
 //      end
 //    signal   <name> <fwd|rev> <secStart> <secEnd>
 //
@@ -33,13 +34,15 @@ typedef struct { int prop; const char *name; } PropRow;
 static const PropRow k_textProps[] = {
     { AP_T_POS_X, "pos_x" }, { AP_T_POS_Y, "pos_y" }, { AP_T_SIZE, "size" },
     { AP_T_ALPHA, "alpha" }, { AP_T_ROT, "rot" },     { AP_T_CRUMBLE, "crumble" },
+    { AP_T_COLOR, "color" },
 };
 static const PropRow k_shapeProps[] = {
     { AP_S_POS_X, "pos_x" }, { AP_S_POS_Y, "pos_y" }, { AP_S_W, "w" },
     { AP_S_H, "h" },         { AP_S_ALPHA, "alpha" }, { AP_S_ROT, "rot" },
+    { AP_S_COLOR, "color" },
 };
 static const PropRow k_globalProps[] = {
-    { AP_G_FADE, "fade" },
+    { AP_G_FADE, "fade" }, { AP_G_COLOR, "color" },
 };
 
 static const PropRow *PropsFor(int elemKind, int *count)
@@ -149,8 +152,15 @@ bool AnimDocSave(const AnimDoc *doc, const char *path)
             const AnimTrack *tr = &e->tracks[j];
             fprintf(f, "  track %s %d\n", AnimPropName(tr->prop), tr->keyCount);
             for (int k = 0; k < tr->keyCount; k++)
-                fprintf(f, "    key %f %f %s\n", tr->keys[k].t, tr->keys[k].value,
-                        AnimEaseName(tr->keys[k].ease));
+            {
+                if (AnimPropIsColor(tr->prop))
+                    fprintf(f, "    key %f %d %d %d %s\n", tr->keys[k].t,
+                            tr->keys[k].cval.r, tr->keys[k].cval.g,
+                            tr->keys[k].cval.b, AnimEaseName(tr->keys[k].ease));
+                else
+                    fprintf(f, "    key %f %f %s\n", tr->keys[k].t, tr->keys[k].value,
+                            AnimEaseName(tr->keys[k].ease));
+            }
         }
         fprintf(f, "  end\n");
     }
@@ -231,9 +241,21 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
         }
         else if (TextIsEqual(key, "key") && curTrack)
         {
-            float t, v; char easeName[32];
-            if (fscanf(f, "%f %f %31s", &t, &v, easeName) == 3)
-                AnimTrackAddKey(curTrack, t, v, AnimEaseByName(easeName));
+            if (AnimPropIsColor(curTrack->prop))
+            {
+                float t; int r, g, b; char easeName[32];
+                if (fscanf(f, "%f %d %d %d %31s", &t, &r, &g, &b, easeName) == 5)
+                    AnimTrackAddColorKey(curTrack,
+                        t, (Color){ (unsigned char)r, (unsigned char)g,
+                                    (unsigned char)b, 255 },
+                        AnimEaseByName(easeName));
+            }
+            else
+            {
+                float t, v; char easeName[32];
+                if (fscanf(f, "%f %f %31s", &t, &v, easeName) == 3)
+                    AnimTrackAddKey(curTrack, t, v, AnimEaseByName(easeName));
+            }
         }
         else if (TextIsEqual(key, "end"))
         {

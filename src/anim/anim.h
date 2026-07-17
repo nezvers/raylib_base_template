@@ -38,7 +38,7 @@
 #define ANIM_NAME_MAX      32   // element / signal / doc name buffer
 #define ANIM_TEXT_LEN_MAX  64   // a TEXT element's string buffer
 #define ANIM_KEYS_MAX      16   // keyframes per track
-#define ANIM_TRACKS_MAX     6   // tracks (animated properties) per element
+#define ANIM_TRACKS_MAX     8   // tracks (animated properties) per element
 #define ANIM_ELEMS_MAX     12   // elements per document
 #define ANIM_SIGNALS_MAX    8   // signals per document
 
@@ -78,6 +78,7 @@ typedef enum {
     AP_T_ALPHA,         // 0..1 opacity
     AP_T_ROT,           // whole-text rotation, degrees
     AP_T_CRUMBLE,       // 0..1 per-glyph crumble amount (0 = intact)
+    AP_T_COLOR,         // RGBA tint; keys use AnimKey.cval, not value
 
     // SHAPE (100..) ---------------------------------------------------------
     AP_S_POS_X = 100,   // shape center X, fraction of game width
@@ -86,15 +87,19 @@ typedef enum {
     AP_S_H,             // height, fraction of game height
     AP_S_ALPHA,         // 0..1 opacity
     AP_S_ROT,           // rotation, degrees
+    AP_S_COLOR,         // RGBA fill; keys use AnimKey.cval, not value
 
     // GLOBAL (200..) --------------------------------------------------------
     AP_G_FADE = 200,    // whole-screen fade-to-color amount, 0..1
+    AP_G_COLOR,         // RGBA fade-to colour; keys use AnimKey.cval
 } AnimPropKind;
 
 // A single keyframe on the shared clock.
 typedef struct {
     float t;            // seconds
     float value;        // property value AT this keyframe (absolute)
+    Color cval;         // RGB AT this keyframe (AP_*_COLOR tracks only; the
+                        // alpha channel is ignored - alpha has its own track)
     int   ease;         // AnimEase id; eases the segment ENDING at this key
 } AnimKey;
 
@@ -168,6 +173,13 @@ int AnimTrackSetKeyTime(AnimTrack *tr, int idx, float t);
 // otherwise insert a new LINEAR key at t. NULL if the track is full.
 AnimKey *AnimTrackWriteKeyAt(AnimTrack *tr, float t, float value, float eps);
 
+// Colour-track variants of AddKey/WriteKeyAt (AP_*_COLOR: keys carry cval).
+AnimKey *AnimTrackAddColorKey(AnimTrack *tr, float t, Color c, int ease);
+AnimKey *AnimTrackWriteColorKeyAt(AnimTrack *tr, float t, Color c, float eps);
+
+// True for the AP_*_COLOR properties (keys carry cval instead of value).
+bool AnimPropIsColor(int prop);
+
 // Editor slider range for a property (e.g. fractions 0..1, rotation -360..360).
 float AnimPropMin(int prop);
 float AnimPropMax(int prop);
@@ -179,6 +191,18 @@ float AnimPropMax(int prop);
 // last -> last value; between two keys -> eased interpolation (the RIGHT key's
 // ease shapes the segment). Empty track -> `missing`.
 float AnimTrackEval(const AnimTrack *tr, float t, float missing);
+
+// Bracketing keys [i0, i1] at time t (clamped: before first -> 0/0, after last
+// -> last/last; between keys -> the segment ends). false if the track is empty.
+bool AnimTrackSegment(const AnimTrack *tr, float t, int *i0, int *i1);
+
+// Colour of a colour track at time t (per-channel eased RGB mix; overshoot-
+// safe). Alpha always comes from `missing` - colour tracks are RGB only.
+// Empty/NULL track -> `missing`.
+Color AnimTrackEvalColor(const AnimTrack *tr, float t, Color missing);
+
+// Element's colour at time t: colour track if present, else the base e->color.
+Color AnimElemColor(const AnimElem *e, float t);
 
 // Value of property `prop` on element e at time t. If e has no track for prop,
 // returns the element's BASE value for that property (rest pose).
