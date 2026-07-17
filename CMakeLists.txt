@@ -108,7 +108,7 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
         src/anim/anim_io.c
         src/signal/signal.c
         src/signal/anim_signal.c
-        src/include/easing.c)
+        src/easing/easing.c)
     target_link_libraries(anim_tests raylib)
 endif()
 
