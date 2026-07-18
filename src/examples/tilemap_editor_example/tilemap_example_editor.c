@@ -44,10 +44,11 @@ extern AppState app_tilemap_example_tileset;
 extern AppState app_tilemap_example_tilemap;
 extern AppState app_tilemap_example_grid;
 extern AppState app_tilemap_example_paint;
+extern AppState app_tilemap_example_region;
 
 static AppState *current_example = &app_tilemap_example_atlas;
 
-#define BUTTON_COUNT 6
+#define BUTTON_COUNT 7
 static AppState *example_list[BUTTON_COUNT];
 static const char *button_text[BUTTON_COUNT] = {
     "Atlas",
@@ -56,6 +57,7 @@ static const char *button_text[BUTTON_COUNT] = {
     "TileMap",
     "Grid",
     "Tile Paint",
+	"Region Draw",
 };
 
 
@@ -156,6 +158,7 @@ static void Enter(){
     example_list[3] = &app_tilemap_example_tilemap;
     example_list[4] = &app_tilemap_example_grid;
     example_list[5] = &app_tilemap_example_paint;
+    example_list[6] = &app_tilemap_example_region;
 	
 
     if (current_example->enter != NULL){ current_example->enter(); }
