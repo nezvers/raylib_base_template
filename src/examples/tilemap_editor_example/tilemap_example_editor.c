@@ -46,10 +46,11 @@ extern AppState app_tilemap_example_grid;
 extern AppState app_tilemap_example_paint;
 extern AppState app_tilemap_example_region;
 extern AppState app_tilemap_example_drag;
+extern AppState app_tilemap_example_resize;
 
 static AppState *current_example = &app_tilemap_example_atlas;
 
-#define BUTTON_COUNT 8
+#define BUTTON_COUNT 9
 static AppState *example_list[BUTTON_COUNT];
 static const char *button_text[BUTTON_COUNT] = {
     "Atlas",
@@ -60,6 +61,7 @@ static const char *button_text[BUTTON_COUNT] = {
     "Tile Paint",
 	"Region Draw",
 	"Selection Drag",
+	"Tilemap Resize",
 };
 
 
@@ -162,7 +164,7 @@ static void Enter(){
     example_list[5] = &app_tilemap_example_paint;
     example_list[6] = &app_tilemap_example_region;
     example_list[7] = &app_tilemap_example_drag;
-	
+    example_list[8] = &app_tilemap_example_resize;	
 
     if (current_example->enter != NULL){ current_example->enter(); }
 }
@@ -199,6 +201,13 @@ static void Gui() {
 			is_editor_button_hover = true;
 		}
 		button_rect.y += BUTTON_STEP;
+	}
+	
+	if (GuiButton(button_rect, "Reset")) {
+		CreateTilemap();
+	}
+	if (CheckCollisionPointRec(mouse_position, button_rect)){
+		is_editor_button_hover = true;
 	}
 
 	DrawText(current_example->name, 10, 10, 20, LIGHTGRAY);
