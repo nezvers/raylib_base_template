@@ -60,11 +60,11 @@ enum ACTOR_TYPE {
 };
 
 typedef struct {
-    f32 jump_force;
-    f32 speed_max;
-    f32 acceleration;
-    f32 deacceleration;
-    u32 jump_count;
+    float jump_force;
+    float speed_max;
+    float acceleration;
+    float deacceleration;
+    uint32_t jump_count;
     vec2 size;
 } ActorValues;
 
@@ -73,11 +73,11 @@ typedef struct {
     bool grounded;
     bool is_jumping;
     Vector2 velocity;
-    u32 remaining_jumps;
+    uint32_t remaining_jumps;
 } ActorState;
 
 typedef struct {
-    f32 x;
+    float x;
     bool jump;
 } ActorInput;
 

@@ -61,8 +61,8 @@ static void Exit(){
 }
 
 static void Update(){
-    f32 current_time = GetTime();
-    f32 rand_f = (GetRandomValue(0, 1000000) / 1000000.f) / 1.0f;
+    float current_time = GetTime();
+    float rand_f = (GetRandomValue(0, 1000000) / 1000000.f) / 1.0f;
 
     if (IsKeyPressed(KEY_SPACE)) {
         SoundEffectPlayRaylib(&button_sfx, current_time, rand_f);

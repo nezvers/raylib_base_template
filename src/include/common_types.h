@@ -1,19 +1,22 @@
-#ifndef COMMON_TYPES_H
-#define COMMON_TYPES_H
+#ifndef COMMON_TYPEDEF_DEFINED
+#define COMMON_TYPEDEF_DEFINED
 
 #include <stdint.h>
 
-typedef uint32_t u32;
-typedef int32_t  i32;
-typedef float    f32;
-typedef double   f64;
-
-typedef struct { f32 x; f32 y; } vec2;
+typedef struct { float x; float y; } vec2;
+typedef struct { int32_t x; int32_t y; } vec2i;
 typedef struct {
-    f32 x;
-    f32 y;
-    f32 w;
-    f32 h;
+    float x;
+    float y;
+    float w;
+    float h;
 } rectf;
 
-#endif // COMMON_TYPES_H
+typedef struct {
+    int32_t x;
+    int32_t y;
+    int32_t w;
+    int32_t h;
+} recti;
+
+#endif // COMMON_TYPEDEF_DEFINED

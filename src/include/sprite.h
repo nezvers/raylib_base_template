@@ -1,38 +1,42 @@
 #ifndef SPRITE_H
 #define SPRITE_H
 
+// "common_types.h"
+#ifndef COMMON_TYPEDEF_DEFINED
+#define COMMON_TYPEDEF_DEFINED
 #include <stdint.h>
 
-typedef uint32_t u32;
-typedef int32_t  i32;
-typedef float    f32;
-
+typedef struct { float x; float y; } vec2;
+typedef struct { int32_t x; int32_t y; } vec2i;
 typedef struct {
-    f32 x;
-    f32 y;
-} vec2;
-
-typedef struct {
-    f32 x;
-    f32 y;
-    f32 w;
-    f32 h;
+    float x;
+    float y;
+    float w;
+    float h;
 } rectf;
+
+typedef struct {
+    int32_t x;
+    int32_t y;
+    int32_t w;
+    int32_t h;
+} recti;
+#endif // ---> COMMON_TYPEDEF_DEFINED
 
 // Animation frame list, asuming all frames have same region size
 typedef struct {
     vec2 *data; // Frame position array
-    u32 count;
+    uint32_t count;
     vec2 size; // width & height
 } Frames;
 
 typedef struct {
     Frames **frames; // Array of Frame pointers
-    u32 count;
-    u32 animation_index;
-    u32 image_index;
-    f32 frame_rate;
-    f32 time;
+    uint32_t count;
+    uint32_t animation_index;
+    uint32_t image_index;
+    float frame_rate;
+    float time;
 } AnimationSet;
 
 
@@ -42,7 +46,7 @@ typedef struct {
     vec2 origin;
     vec2 offset;
     vec2 scale;
-    f32 rotation;
+    float rotation;
 } Sprite;
 
 /* _________________________________________________________________ */
@@ -58,9 +62,9 @@ extern "C" {
 #define SAPI
 #endif
 
-SAPI void ChangeAnimation(AnimationSet *animation_set, u32 new_animation);
-SAPI void UpdateAnimation(AnimationSet *animation_set, f32 delta_time);
-SAPI void UpdateSprite(Sprite *sprite, f32 delta_time);
+SAPI void ChangeAnimation(AnimationSet *animation_set, uint32_t new_animation);
+SAPI void UpdateAnimation(AnimationSet *animation_set, float delta_time);
+SAPI void UpdateSprite(Sprite *sprite, float delta_time);
 SAPI rectf GetAnimationFrame(AnimationSet *animation_set);
 SAPI void GetSpriteFrame(Sprite *sprite, rectf *sprite_rect, rectf *texture_rect);
 
@@ -78,25 +82,25 @@ SAPI void GetSpriteFrame(Sprite *sprite, rectf *sprite_rect, rectf *texture_rect
 
 #include <assert.h>
 
-SAPI void ChangeAnimation(AnimationSet *animation_set, u32 new_animation) {
+SAPI void ChangeAnimation(AnimationSet *animation_set, uint32_t new_animation) {
     assert(new_animation < animation_set->count);
     animation_set->animation_index = new_animation;
     animation_set->image_index = 0;
     animation_set->time = 0;
 }
 
-SAPI void UpdateAnimation(AnimationSet *animation_set, f32 delta_time) {
+SAPI void UpdateAnimation(AnimationSet *animation_set, float delta_time) {
     animation_set->time += delta_time * animation_set->frame_rate;
     if (animation_set->time < 1) { return; }
 
     const Frames *frame = animation_set->frames[animation_set->animation_index];
-    const u32 image_count = frame->count;
-    const u32 increment = animation_set->time;
+    const uint32_t image_count = frame->count;
+    const uint32_t increment = animation_set->time;
     animation_set->time -= increment;
     animation_set->image_index = (animation_set->image_index + increment) % image_count;
 }
 
-SAPI void UpdateSprite(Sprite *sprite, f32 delta_time) {
+SAPI void UpdateSprite(Sprite *sprite, float delta_time) {
     UpdateAnimation(&sprite->animation_set, delta_time);
 }
 

@@ -9,10 +9,10 @@ typedef enum {
     INPUT_TYPE_MOUSE,
     INPUT_TYPE_GAMEPAD,
     INPUT_TYPE_AXIS,
-} InputType;
+} tmInputType;
 
 typedef struct {
-    InputType     type;
+    tmInputType     type;
     unsigned      id;        // button index for lookup
     float         dead_zone; // for gamepad axis
     unsigned char device;    // for gamepads

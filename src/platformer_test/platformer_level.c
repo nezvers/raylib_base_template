@@ -16,11 +16,11 @@ typedef struct {
     Coin *coins;
     Jumpad *jumpads;
 
-    u32 actor_count;
-    u32 platform_count;
-    u32 box_count;
-    u32 coin_count;
-    u32 jumpad_count;
+    uint32_t actor_count;
+    uint32_t platform_count;
+    uint32_t box_count;
+    uint32_t coin_count;
+    uint32_t jumpad_count;
 
     // Carry physics info
     WorldContext world_ctx;
@@ -53,16 +53,16 @@ void LevelBoxInit(Box *box);
 void LevelJumpadInit(Jumpad *jumpad);
 void LevelCoinsInit(Coin *coin);
 
-void LevelActorUpdate(f32 delta_time);
-void LevelBoxesUpdate(f32 delta_time);
-void LevelCoinsUpdate(f32 delta_time);
+void LevelActorUpdate(float delta_time);
+void LevelBoxesUpdate(float delta_time);
+void LevelCoinsUpdate(float delta_time);
 
 void LevelSensorBegin(b2SensorBeginTouchEvent event);
 void LevelSensorEnd(b2SensorEndTouchEvent event);
 bool LevelPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context );
 
 void LevelUpdate() {
-    f32 delta_time = GetFrameTime(); // OPTION: turn into bullet time
+    float delta_time = GetFrameTime(); // OPTION: turn into bullet time
     WorldContextUpdate(&level.world_ctx, delta_time);
     LevelBoxesUpdate(delta_time);
     LevelCoinsUpdate(delta_time);
@@ -70,7 +70,7 @@ void LevelUpdate() {
     if (player != NULL) {
         bool right = IsKeyDown(KEY_D);
         bool left = IsKeyDown(KEY_A);
-        player->input.x = (f32)(i32)right - (f32)(i32)left;
+        player->input.x = (float)(int32_t)right - (float)(int32_t)left;
         player->input.jump = IsKeyDown(KEY_SPACE);
     }
     LevelActorUpdate(delta_time);
@@ -209,8 +209,8 @@ void LevelActorInit(Actor *actor) {
     torso_def.material.friction = 0;
     torso_def.density = 1.0f;
 
-    const f32 RADIUS = 3.f;
-    const f32 HEIGHT = 16.f;
+    const float RADIUS = 3.f;
+    const float HEIGHT = 16.f;
     // Capsule above position
     b2Vec2 p1 = b2Add(pos, (b2Vec2){0.f, -HEIGHT + RADIUS});
     b2Vec2 p2 = b2Add(pos, (b2Vec2){0.f, -RADIUS});
@@ -352,7 +352,7 @@ void LevelCoinsInit(Coin *coin) {
     coin->triggered = false;
 }
 
-void LevelBoxesUpdate(f32 delta_time) {
+void LevelBoxesUpdate(float delta_time) {
     // Reverse order to have option to remove by replacing with last
     for (int i = level.box_count -1; i > -1; i -= 1) {
         Box *box = &boxes[i];
@@ -362,7 +362,7 @@ void LevelBoxesUpdate(f32 delta_time) {
     }
 }
 
-void LevelCoinsUpdate(f32 delta_time) {
+void LevelCoinsUpdate(float delta_time) {
     // Reverse order to have option to remove by replacing with last
     for (int i = level.coin_count -1; i > -1; i -= 1) {
         Coin *coin = &coins[i];
@@ -382,7 +382,7 @@ void LevelCoinsUpdate(f32 delta_time) {
 }
 
 
-void LevelActorUpdate(f32 delta_time) {
+void LevelActorUpdate(float delta_time) {
     // Reverse order to have option to remove by replacing with last
     for (int i = level.actor_count -1; i > -1; i -= 1) {
         Actor *actor = &actors[i];
@@ -401,9 +401,9 @@ void LevelActorUpdate(f32 delta_time) {
                 actor->values.speed_max
             );
         } else {
-            f32 abs_speed = fabsf(target_velocity.x);
+            float abs_speed = fabsf(target_velocity.x);
             if (abs_speed > actor->values.deacceleration * delta_time) {
-                f32 sign_speed = SIGN_F(target_velocity.x);
+                float sign_speed = SIGN_F(target_velocity.x);
                 target_velocity.x += -sign_speed * delta_time * actor->values.deacceleration;
             } else {
                 target_velocity.x = 0;
