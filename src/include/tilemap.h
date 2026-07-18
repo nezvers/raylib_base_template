@@ -1050,6 +1050,4 @@ TMAPI void MoveTilemap(
     }
 }
 
-
-
 #endif // TILEMAP_IMPLEMENTATION
