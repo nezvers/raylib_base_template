@@ -91,7 +91,7 @@ TMRAPI void DrawTilemapTileId(Tilemap *tilemap, Font font, int32_t font_size, Co
 
     for (int32_t y = 0; y < tilemap->size.y; y += 1) {
         int32_t cell_y = tilemap->position.y + y * tilemap->tile_size.y;
-        for (int32_t x; x < tilemap->size.x; x += 1) {
+        for (int32_t x = 0; x < tilemap->size.x; x += 1) {
             int32_t cell_x = tilemap->position.x + x * tilemap->tile_size.x;
             int32_t cell_i = x + y * tilemap->size.x;
             assert(cell_i < (int32_t)tilemap->capacity);

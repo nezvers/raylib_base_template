@@ -56,7 +56,8 @@ int main(void)
     
     // TODO: Load resources / Initialize variables at this point
     // Check app_state.h for "public" AppStates
-    AppStateTransition(&app_state_main_menu);
+    extern AppState app_tilemap_example_editor;
+    AppStateTransition(&app_tilemap_example_editor);
     
 
 #if defined(PLATFORM_WEB)

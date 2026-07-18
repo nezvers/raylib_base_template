@@ -40,5 +40,8 @@ extern TileAtlas tile_atlas;
 extern Tileset tileset;
 extern Tilemap tilemap;
 
+extern bool is_editor_button_hover;
+
+float GetExampleAnimationTime(float speed);
 
 #endif // TILEMAP_EXAMPLE_H

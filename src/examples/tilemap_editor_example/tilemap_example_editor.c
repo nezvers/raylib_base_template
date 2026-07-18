@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "tilemap_example_common.h"
+#include "raygui.h"
 
 // Forward declare functions
 static void Enter();
@@ -12,7 +13,7 @@ static void Exit();
 static void Draw();
 static void Gui();
                                /* Enter, Exit, Update, Draw, Gui, "Name" */
-AppState app_tilemap_editor = {Enter, Exit, Update, Draw, Gui, "Placeholder"};
+AppState app_tilemap_example_editor = {Enter, Exit, Update, Draw, Gui, "Placeholder"};
 
 
 // TODO: Refactor into state struct
@@ -34,6 +35,28 @@ Tile tile_list[ATLAS_SIZE_X * ATLAS_SIZE_Y + 1];
 
 Tilemap tilemap;
 TileID tilemap_buffer[MAP_SIZE_X * MAP_SIZE_Y];
+
+bool is_editor_button_hover;
+
+extern AppState app_tilemap_example_atlas;
+extern AppState app_tilemap_example_tile;
+extern AppState app_tilemap_example_tileset;
+extern AppState app_tilemap_example_tilemap;
+extern AppState app_tilemap_example_grid;
+extern AppState app_tilemap_example_paint;
+
+static AppState *current_example = &app_tilemap_example_atlas;
+
+#define BUTTON_COUNT 6
+static AppState *example_list[BUTTON_COUNT];
+static const char *button_text[BUTTON_COUNT] = {
+    "Atlas",
+    "Tile",
+    "Tileset",
+    "TileMap",
+    "Grid",
+    "Tile Paint",
+};
 
 
 static void CreateTiles() {
@@ -71,7 +94,7 @@ static void CreateTiles() {
 }
 
 static void CreateTilemap() {
-	tilemap = TilemapInit((vec2i){100, 100}, (vec2i){MAP_SIZE_X, MAP_SIZE_Y}, (vec2i){16,16}, tilemap_buffer, TILEMAP_BUFFER_SIZE);
+	tilemap = TilemapInit((vec2i){32, 32}, (vec2i){MAP_SIZE_X, MAP_SIZE_Y}, (vec2i){16,16}, tilemap_buffer, TILEMAP_BUFFER_SIZE);
 	// reset map to predictable state
 	TilemapClear(&tilemap);
 	
@@ -98,28 +121,79 @@ static void CreateTilemap() {
 	TilemapSetTile(&tilemap, (vec2i){6, 6}, 4 + (TileID)ATLAS_SIZE_X * 3);
 }
 
+float GetExampleAnimationTime(float speed) {
+	static float t;
+    float delta_time = GetFrameTime();
+	t += delta_time * speed;
+	if (t > 1.0) {
+		t -= (float)(int32_t)t;
+	}
+	return t;
+}
+
+static void ChangeExample(AppState *value) {
+    if (current_example->exit != NULL){ current_example->exit(); }
+    current_example = value;
+    if (current_example->enter != NULL){ current_example->enter(); }
+}
+
 static void Enter(){
+	// Change game resolution
     ScreenState *screen_state = ScreenStateGet();
+	screen_state->game_width = 1920 / 4;
+	screen_state->game_height = 1080 / 4;
+	ScreenStateResize();
     screen_state->clear_color = WHITE;
 
     tileset_texture = LoadTexture(RESOURCES_PATH"/textures/tileset_template.png");
 
     CreateTiles();
     CreateTilemap();
+
+    example_list[0] = &app_tilemap_example_atlas;
+    example_list[1] = &app_tilemap_example_tile;
+    example_list[2] = &app_tilemap_example_tileset;
+    example_list[3] = &app_tilemap_example_tilemap;
+    example_list[4] = &app_tilemap_example_grid;
+    example_list[5] = &app_tilemap_example_paint;
+	
+
+    if (current_example->enter != NULL){ current_example->enter(); }
 }
 
 static void Exit(){
+    if (current_example->exit != NULL){ current_example->exit(); }
     UnloadTexture(tileset_texture);
 }
 
 static void Update(){
-
+    if (current_example->update != NULL){ current_example->update(); }
 }
 
 static void Draw(){
-    
+    if (current_example->draw != NULL){ current_example->draw(); }
 }
 
 static void Gui() {
+    if (current_example->gui != NULL){ current_example->gui(); }
+	is_editor_button_hover = false;
 
+	Vector2 mouse_position = GetMousePosition();
+	Vector2 screen_size = ScreenStateSize();
+	const float BUTTON_WIDTH = 100.f;
+	const float BUTTON_HEIGHT = 20.f;
+	const float BUTTON_STEP = 25.f;
+	Rectangle button_rect = {screen_size.x - BUTTON_WIDTH - 10, 10, BUTTON_WIDTH, BUTTON_HEIGHT};
+	
+	for (int i = 0; i < BUTTON_COUNT; i += 1) {
+		if (GuiButton(button_rect, button_text[i])) {
+			ChangeExample(example_list[i]);
+		}
+		if (CheckCollisionPointRec(mouse_position, button_rect)){
+			is_editor_button_hover = true;
+		}
+		button_rect.y += BUTTON_STEP;
+	}
+
+	DrawText(current_example->name, 10, 10, 20, LIGHTGRAY);
 }

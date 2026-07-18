@@ -506,6 +506,8 @@ TMAPI TileID TilemapGetTile(Tilemap *tilemap, vec2i tile_pos) {
 TMAPI TileID TilemapGetTileWorld(Tilemap *tilemap, vec2i world_pos) {
     vec2i relative_pos = {world_pos.x - tilemap->position.x, world_pos.y - tilemap->position.y};
     vec2i tile_pos = {relative_pos.x / tilemap->tile_size.x, relative_pos.y / tilemap->tile_size.y};
+    if (relative_pos.x < 0) {tile_pos.x -= 1;}
+    if (relative_pos.y < 0) {tile_pos.y -= 1;}
     TileID result = TilemapGetTile(tilemap, tile_pos);
     return result;
 }
