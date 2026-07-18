@@ -15,8 +15,6 @@ static void Gui();
                                /* Enter, Exit, Update, Draw, Gui, "Name" */
 AppState app_tilemap_example_drag = {NULL, NULL, NULL, Draw, NULL, "left mouse select, right mouse drag,\n\thold CTRL to remove source, ALT to write empty tiles"};
 
-#define TAU (PI*2)
-
 static void Draw() {
 	// Persistent variables to hold state
 	static vec2i selection_state;

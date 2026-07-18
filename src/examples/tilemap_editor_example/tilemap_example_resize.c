@@ -15,8 +15,6 @@ static void Gui();
                                /* Enter, Exit, Update, Draw, Gui, "Name" */
 AppState app_tilemap_example_resize = {NULL, NULL, NULL, Draw, NULL, "left mouse select, release to resize"};
 
-#define TAU (PI*2)
-
 static void Draw(){
     // Persistent variables to hold state
 	static recti rect_state;

@@ -15,8 +15,6 @@ static void Gui();
                                /* Enter, Exit, Update, Draw, Gui, "Name" */
 AppState app_tilemap_example_region = {NULL, NULL, NULL, Draw, NULL, "Reveal tiles with rectangle"};
 
-#define TAU (PI*2)
-
 static void Draw(){
     Vector2 mouse_position = Screen2Target(GetMousePosition());
 	vec2i mouse_position_i = {(int32_t)mouse_position.x, (int32_t)mouse_position.y};

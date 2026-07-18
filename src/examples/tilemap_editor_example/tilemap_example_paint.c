@@ -15,8 +15,6 @@ static void Gui();
                                /* Enter, Exit, Update, Draw, Gui, "Name" */
 AppState app_tilemap_example_paint = {NULL, NULL, NULL, Draw, NULL, "left mouse draw, right mouse copy, mouse scroll change ID"};
 
-#define TAU (PI*2)
-
 static void Draw(){
     static TileID tile_id;
 	static vec2i position_state;

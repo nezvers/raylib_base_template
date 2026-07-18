@@ -15,8 +15,6 @@ static void Gui();
                                /* Enter, Exit, Update, Draw, Gui, "Name" */
 AppState app_tilemap_example_grid = {NULL, NULL, NULL, Draw, NULL, "Grid drawing example"};
 
-#define TAU (PI*2)
-
 static void Draw(){
     DrawTilemapGrid(&tilemap, LIGHTGRAY);
 	DrawTilemapTileId(&tilemap, GetFontDefault(), 10, LIGHTGRAY);
