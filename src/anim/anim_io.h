@@ -35,4 +35,7 @@ int         AnimPropAt(int elemKind, int index);        // the index-th AP_* pro
 
 const char *AnimElemKindName(int kind);   // AE_* -> "text"/"shape"/"global"
 
+const char *AnimShapeKindName(int kind);        // SHAPE_* -> "rect" etc.
+int         AnimShapeKindByName(const char *s); // unknown -> SHAPE_RECT
+
 #endif // ANIM_IO_H

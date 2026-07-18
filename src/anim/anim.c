@@ -89,17 +89,19 @@ void AnimDocInit(AnimDoc *doc)
 void AnimElemInit(AnimElem *e, AnimElemKind kind)
 {
     memset(e, 0, sizeof(*e));
-    e->kind       = kind;
-    e->color      = RAYWHITE;
-    e->shapeKind  = SHAPE_RECT;
-    e->trackCount = 0;
+    e->kind         = kind;
+    e->color        = RAYWHITE;
+    e->shapeKind    = SHAPE_RECT;
+    e->outlineColor = RAYWHITE;
+    e->outlineFrac  = 0.0f;              // outline off by default
+    e->trackCount   = 0;
 
     switch (kind)
     {
         case AE_TEXT:
             TextCopy(e->name, "text");
             TextCopy(e->text, "TEXT");
-            e->posFrac  = (Vector2){ 0.5f, 0.4f };   // x=center, y=top edge
+            e->posFrac  = (Vector2){ 0.5f, 0.4f };   // center
             e->sizeFrac = (Vector2){ 0.10f, 0.10f }; // x=font size (of height)
             break;
         case AE_SHAPE:
@@ -146,6 +148,13 @@ AnimTrack *AnimElemAddTrack(AnimElem *e, int prop)
     tr->prop     = prop;
     tr->keyCount = 0;
     return tr;
+}
+
+void AnimElemRemoveTrack(AnimElem *e, int idx)
+{
+    if (idx < 0 || idx >= e->trackCount) return;
+    for (int i = idx; i < e->trackCount - 1; i++) e->tracks[i] = e->tracks[i + 1];
+    e->trackCount--;
 }
 
 // Insert a whole key at its sorted slot (keys stay ascending in t) so the
@@ -216,7 +225,8 @@ AnimKey *AnimTrackWriteColorKeyAt(AnimTrack *tr, float t, Color c, float eps)
 
 bool AnimPropIsColor(int prop)
 {
-    return prop == AP_T_COLOR || prop == AP_S_COLOR || prop == AP_G_COLOR;
+    return prop == AP_T_COLOR || prop == AP_S_COLOR ||
+           prop == AP_S_OUTLINE_COLOR || prop == AP_G_COLOR;
 }
 
 void AnimTrackSortKeys(AnimTrack *tr)
@@ -296,12 +306,23 @@ Color AnimTrackEvalColor(const AnimTrack *tr, float t, Color missing)
     return out;
 }
 
+Color AnimElemColorProp(const AnimElem *e, int prop, float t)
+{
+    // Exact-prop lookup: a shape can carry BOTH a fill and an outline colour
+    // track, so "any colour track" would alias them.
+    Color base = (prop == AP_S_OUTLINE_COLOR) ? e->outlineColor : e->color;
+    for (int i = 0; i < e->trackCount; i++)
+        if (e->tracks[i].prop == prop)
+            return AnimTrackEvalColor(&e->tracks[i], t, base);
+    return base;
+}
+
 Color AnimElemColor(const AnimElem *e, float t)
 {
-    for (int i = 0; i < e->trackCount; i++)
-        if (AnimPropIsColor(e->tracks[i].prop))
-            return AnimTrackEvalColor(&e->tracks[i], t, e->color);
-    return e->color;
+    int prop = (e->kind == AE_SHAPE)  ? AP_S_COLOR
+             : (e->kind == AE_GLOBAL) ? AP_G_COLOR
+                                      : AP_T_COLOR;
+    return AnimElemColorProp(e, prop, t);
 }
 
 // Element base value for a property (the rest pose when no track drives it).
@@ -313,7 +334,11 @@ static float ElemBaseProp(const AnimElem *e, int prop)
         case AP_T_POS_Y: case AP_S_POS_Y: return e->posFrac.y;
         case AP_T_SIZE:  case AP_S_W:     return e->sizeFrac.x;
         case AP_S_H:                      return e->sizeFrac.y;
-        case AP_T_ALPHA: case AP_S_ALPHA: return 1.0f;
+        // rest-pose opacity comes from the base colour's alpha channel, so an
+        // untracked element set semi-transparent in the inspector stays so.
+        case AP_T_ALPHA: case AP_S_ALPHA: return (float)e->color.a / 255.0f;
+        case AP_S_OUTLINE_ALPHA:          return (float)e->outlineColor.a / 255.0f;
+        case AP_S_OUTLINE:                return e->outlineFrac;
         case AP_T_ROT:   case AP_S_ROT:   return 0.0f;
         case AP_T_CRUMBLE:                return 0.0f;
         case AP_G_FADE:                   return 0.0f;
@@ -351,6 +376,7 @@ float AnimPropMax(int prop)
         case AP_T_ROT:   case AP_S_ROT:   return 360.0f;
         case AP_T_POS_X: case AP_S_POS_X:
         case AP_T_POS_Y: case AP_S_POS_Y: return 2.0f;
+        case AP_S_OUTLINE:                return 0.05f;   // ~36 px at 720p
         default:                          return 1.0f;
     }
 }
@@ -382,7 +408,7 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game)
     if (alpha <= 0.0f) return;
 
     float cxF   = AnimElemProp(e, AP_T_POS_X, t);
-    float topF  = AnimElemProp(e, AP_T_POS_Y, t);
+    float cyF   = AnimElemProp(e, AP_T_POS_Y, t);
     float sizeF = AnimElemProp(e, AP_T_SIZE,  t);
     float rot   = AnimElemProp(e, AP_T_ROT,   t);
     float crumble = AnimElemProp(e, AP_T_CRUMBLE, t);
@@ -392,8 +418,8 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game)
     Font  font    = GetFontDefault();
 
     Vector2 box   = MeasureTextEx(font, e->text, sizePx, spacing);
-    float left    = game.x * cxF - box.x * 0.5f;   // cxF = center
-    float top     = game.y * topF;
+    float left    = game.x * cxF - box.x * 0.5f;   // pos = text center
+    float top     = game.y * cyF - box.y * 0.5f;
     Color col     = Fade(AnimElemColor(e, t), alpha * (1.0f - crumble));
     if (col.a == 0) return;
 
@@ -441,10 +467,87 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game)
     }
 }
 
+#define ELLIPSE_SEGS       36
+// Max rim points of any shape (the ellipse).
+#define SHAPE_RIM_MAX      ELLIPSE_SEGS
+
+// Rotate local point (x, y) about the origin by (cr, sr) and place it at c.
+static Vector2 RimPoint(Vector2 c, float x, float y, float cr, float sr)
+{
+    return (Vector2){ c.x + x*cr - y*sr, c.y + x*sr + y*cr };
+}
+
+// Rim builders: closed polygon outlines in SCREEN-CCW order (y-down, so local
+// angles run NEGATIVE - raylib's DrawTriangleFan culls clockwise fans).
+// All take half-extents and the rotation's cos/sin; return the point count.
+static int RimRect(Vector2 c, float hw, float hh, float cr, float sr, Vector2 *out)
+{
+    out[0] = RimPoint(c, -hw, -hh, cr, sr);
+    out[1] = RimPoint(c, -hw,  hh, cr, sr);
+    out[2] = RimPoint(c,  hw,  hh, cr, sr);
+    out[3] = RimPoint(c,  hw, -hh, cr, sr);
+    return 4;
+}
+
+static int RimRhombus(Vector2 c, float hw, float hh, float cr, float sr, Vector2 *out)
+{
+    out[0] = RimPoint(c, 0.0f, -hh, cr, sr);
+    out[1] = RimPoint(c, -hw, 0.0f, cr, sr);
+    out[2] = RimPoint(c, 0.0f,  hh, cr, sr);
+    out[3] = RimPoint(c,  hw, 0.0f, cr, sr);
+    return 4;
+}
+
+static int RimTriangle(Vector2 c, float hw, float hh, float cr, float sr, Vector2 *out)
+{
+    out[0] = RimPoint(c, 0.0f, -hh, cr, sr);   // apex up
+    out[1] = RimPoint(c, -hw,   hh, cr, sr);
+    out[2] = RimPoint(c,  hw,   hh, cr, sr);
+    return 3;
+}
+
+static int RimEllipse(Vector2 c, float rx, float ry, float cr, float sr, Vector2 *out)
+{
+    for (int i = 0; i < ELLIPSE_SEGS; i++)
+    {
+        float a = -(float)i / ELLIPSE_SEGS * 2.0f * PI;   // negative = screen CCW
+        out[i] = RimPoint(c, cosf(a) * rx, sinf(a) * ry, cr, sr);
+    }
+    return ELLIPSE_SEGS;
+}
+
+// Fill + outline of a closed polygon whose rim is already in screen space.
+// Fill is a triangle fan about the center (rim must be screen-CCW); outline is
+// a DrawLineEx loop with circle-capped corners (raylib has no rotatable
+// thick-outline primitive).
+static void DrawPolyShape(Vector2 center, const Vector2 *pts, int n,
+                          Color fill, Color line, float thickPx)
+{
+    if (fill.a > 0)
+    {
+        Vector2 fan[SHAPE_RIM_MAX + 2];
+        fan[0] = center;
+        for (int i = 0; i < n; i++) fan[i + 1] = pts[i];
+        fan[n + 1] = pts[0];                    // close the fan
+        DrawTriangleFan(fan, n + 2, fill);
+    }
+    if (thickPx >= 0.5f && line.a > 0)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            Vector2 a = pts[i], b = pts[(i + 1) % n];
+            DrawLineEx(a, b, thickPx, line);
+            DrawCircleV(a, thickPx * 0.5f, line);   // cap the corner
+        }
+    }
+}
+
 static void DrawShapeElem(const AnimElem *e, float t, Vector2 game)
 {
-    float alpha = AnimElemProp(e, AP_S_ALPHA, t);
-    if (alpha <= 0.0f) return;
+    float fillA = AnimElemProp(e, AP_S_ALPHA,         t);
+    float outA  = AnimElemProp(e, AP_S_OUTLINE_ALPHA, t);
+    float thickPx = game.y * AnimElemProp(e, AP_S_OUTLINE, t);
+    if (fillA <= 0.0f && (outA <= 0.0f || thickPx < 0.5f)) return;
 
     float cxF = AnimElemProp(e, AP_S_POS_X, t);
     float cyF = AnimElemProp(e, AP_S_POS_Y, t);
@@ -452,39 +555,39 @@ static void DrawShapeElem(const AnimElem *e, float t, Vector2 game)
     float hF  = AnimElemProp(e, AP_S_H,     t);
     float rot = AnimElemProp(e, AP_S_ROT,   t);
 
-    Color col = Fade(AnimElemColor(e, t), alpha);
-    if (col.a == 0) return;
+    Color fill = Fade(AnimElemColorProp(e, AP_S_COLOR,         t), fillA);
+    Color line = Fade(AnimElemColorProp(e, AP_S_OUTLINE_COLOR, t), outA);
 
-    float cx = game.x * cxF;
-    float cy = game.y * cyF;
-    float w  = game.x * wF;
-    float h  = game.y * hF;
+    Vector2 c  = { game.x * cxF, game.y * cyF };
+    float   hw = game.x * wF * 0.5f;
+    float   hh = game.y * hF * 0.5f;
+    float   cr = cosf(rot * DEG2RAD), sr = sinf(rot * DEG2RAD);
 
-    if (e->shapeKind == SHAPE_CIRCLE)
+    if (e->shapeKind == SHAPE_LINE)
     {
-        // Rotated ellipse: w/h are the axes, pos is the center. raylib has no
-        // rotated-ellipse primitive, so draw a triangle fan around the rim.
-        #define ELLIPSE_SEGS 36
-        float rx = w * 0.5f, ry = h * 0.5f;
-        float cr = cosf(rot * DEG2RAD), sr = sinf(rot * DEG2RAD);
-        Vector2 pts[ELLIPSE_SEGS + 2];
-        pts[0] = (Vector2){ cx, cy };
-        for (int i = 0; i <= ELLIPSE_SEGS; i++)
-        {
-            float a  = (float)i / ELLIPSE_SEGS * 2.0f * PI;
-            float ex = cosf(a) * rx, ey = sinf(a) * ry;
-            pts[i + 1] = (Vector2){ cx + ex*cr - ey*sr, cy + ex*sr + ey*cr };
-        }
-        DrawTriangleFan(pts, ELLIPSE_SEGS + 2, col);
-        #undef ELLIPSE_SEGS
+        // Segment through the center: length = w, thickness = h, fill colour.
+        float len = fmaxf(hw, 0.0f), th = fmaxf(game.y * hF, 1.0f);
+        Vector2 a = { c.x - len * cr, c.y - len * sr };
+        Vector2 b = { c.x + len * cr, c.y + len * sr };
+        if (fill.a == 0) return;
+        DrawLineEx(a, b, th, fill);
+        DrawCircleV(a, th * 0.5f, fill);        // round caps
+        DrawCircleV(b, th * 0.5f, fill);
+        return;
     }
-    else
+
+    Vector2 rim[SHAPE_RIM_MAX];
+    int n = 0;
+    switch (e->shapeKind)
     {
-        // Rectangle about its center, rotatable.
-        Rectangle rec = { cx, cy, w, h };
-        Vector2   org = { w * 0.5f, h * 0.5f };
-        DrawRectanglePro(rec, org, rot, col);
+        case SHAPE_CIRCLE:   n = RimEllipse(c, hw, hh, cr, sr, rim);       break;
+        case SHAPE_SQUARE:   n = RimRect(c, hh, hh, cr, sr, rim);          break;
+        case SHAPE_RHOMBUS:  n = RimRhombus(c, hw, hh, cr, sr, rim);       break;
+        case SHAPE_TRIANGLE: n = RimTriangle(c, hw, hh, cr, sr, rim);      break;
+        case SHAPE_RECT:
+        default:             n = RimRect(c, hw, hh, cr, sr, rim);          break;
     }
+    DrawPolyShape(c, rim, n, fill, line, thickPx);
 }
 
 static void DrawGlobalElem(const AnimElem *e, float t, Vector2 game)

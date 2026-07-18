@@ -122,6 +122,62 @@ static void TestColorKeyTimeMove(void)
     CHECK(tr.keyCount == 3 && tr.keys[0].cval.r == 2 && tr.keys[1].cval.r == 1);
 }
 
+// ---------------------------------------------------------------------------
+//  Shape outline props + per-prop colour evaluation
+// ---------------------------------------------------------------------------
+static void TestShapeProps(void)
+{
+    CHECK(AnimPropIsColor(AP_S_OUTLINE_COLOR));
+    CHECK(!AnimPropIsColor(AP_S_OUTLINE) && !AnimPropIsColor(AP_S_OUTLINE_ALPHA));
+    CHECK(AnimPropByName("outline", AE_SHAPE) == AP_S_OUTLINE);
+    CHECK(AnimPropByName("outline_color", AE_SHAPE) == AP_S_OUTLINE_COLOR);
+    CHECK(AnimPropByName("outline_alpha", AE_SHAPE) == AP_S_OUTLINE_ALPHA);
+    CHECK(AnimPropByName("outline", AE_TEXT) == -1);         // shape-only
+
+    // shape kind name round-trip; unknown falls back to rect (old-file compat)
+    for (int i = 0; i < SHAPE_KIND_COUNT; i++)
+        CHECK(AnimShapeKindByName(AnimShapeKindName(i)) == i);
+    CHECK(AnimShapeKindByName("nonsense") == SHAPE_RECT);
+
+    // base fallback: outline off / fully opaque by default
+    AnimElem e;
+    AnimElemInit(&e, AE_SHAPE);
+    CHECK_NEAR(AnimElemProp(&e, AP_S_OUTLINE, 0.5f), 0.0f);
+    CHECK_NEAR(AnimElemProp(&e, AP_S_OUTLINE_ALPHA, 0.5f), 1.0f);
+    e.outlineFrac = 0.01f;
+    CHECK_NEAR(AnimElemProp(&e, AP_S_OUTLINE, 0.5f), 0.01f);
+    CHECK_NEAR(AnimPropMax(AP_S_OUTLINE), 0.05f);
+
+    // regression: base alpha (no track) comes from the colour's A channel
+    e.color.a = 0;
+    CHECK_NEAR(AnimElemProp(&e, AP_S_ALPHA, 0.5f), 0.0f);
+    e.color.a = 128;
+    CHECK_NEAR(AnimElemProp(&e, AP_S_ALPHA, 0.5f), 128.0f/255.0f);
+    e.outlineColor.a = 51;
+    CHECK_NEAR(AnimElemProp(&e, AP_S_OUTLINE_ALPHA, 0.5f), 0.2f);
+
+    // per-prop colour: fill and outline tracks must NOT alias each other
+    e.color        = (Color){ 1, 1, 1, 255 };
+    e.outlineColor = (Color){ 2, 2, 2, 255 };
+    Color got = AnimElemColorProp(&e, AP_S_OUTLINE_COLOR, 0.0f);
+    CHECK(got.r == 2);                                       // base fallback
+    AnimTrack *fc = AnimElemAddTrack(&e, AP_S_COLOR);
+    AnimTrack *oc = AnimElemAddTrack(&e, AP_S_OUTLINE_COLOR);
+    AnimTrackAddColorKey(fc, 0.0f, (Color){ 100, 0, 0, 255 }, ANIM_EASE_LINEAR);
+    AnimTrackAddColorKey(oc, 0.0f, (Color){ 0, 200, 0, 255 }, ANIM_EASE_LINEAR);
+    CHECK(AnimElemColorProp(&e, AP_S_COLOR, 0.5f).r == 100);
+    CHECK(AnimElemColorProp(&e, AP_S_OUTLINE_COLOR, 0.5f).g == 200);
+    CHECK(AnimElemColor(&e, 0.5f).r == 100);                 // primary = fill
+
+    // every shape property fits in ANIM_TRACKS_MAX
+    AnimElem s;
+    AnimElemInit(&s, AE_SHAPE);
+    int n = AnimPropCountFor(AE_SHAPE);
+    for (int i = 0; i < n; i++)
+        CHECK(AnimElemAddTrack(&s, AnimPropAt(AE_SHAPE, i)) != NULL);
+    CHECK(s.trackCount == n);
+}
+
 static void TestTrackCap(void)
 {
     // every text property (incl. colour) fits in ANIM_TRACKS_MAX.
@@ -233,6 +289,38 @@ static void TestDoc(void)
     CHECK_NEAR(AnimPropMin(AP_S_W), 0.0f);
 }
 
+static void TestRemoveTrack(void)
+{
+    AnimElem e;
+    AnimElemInit(&e, AE_TEXT);
+    AnimElemAddTrack(&e, AP_T_POS_X);
+    AnimElemAddTrack(&e, AP_T_POS_Y);
+    AnimElemAddTrack(&e, AP_T_ALPHA);
+    CHECK(e.trackCount == 3);
+
+    AnimElemRemoveTrack(&e, 1);                             // middle: later shift
+    CHECK(e.trackCount == 2);
+    CHECK(e.tracks[0].prop == AP_T_POS_X && e.tracks[1].prop == AP_T_ALPHA);
+
+    AnimElemRemoveTrack(&e, -1);                            // out of range: no-op
+    AnimElemRemoveTrack(&e, 2);
+    CHECK(e.trackCount == 2);
+
+    AnimElemRemoveTrack(&e, 1);
+    AnimElemRemoveTrack(&e, 0);
+    CHECK(e.trackCount == 0);
+
+    // deleting down to the LAST key is legal - empty track -> base value
+    AnimTrack *tr = AnimElemAddTrack(&e, AP_T_ALPHA);
+    AnimTrackAddKey(tr, 0.0f, 0.25f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 1.0f, 0.75f, ANIM_EASE_LINEAR);
+    AnimTrackRemoveKey(tr, 1);
+    AnimTrackRemoveKey(tr, 0);
+    CHECK(tr->keyCount == 0);
+    e.color.a = 255;
+    CHECK_NEAR(AnimElemProp(&e, AP_T_ALPHA, 0.5f), 1.0f);   // base fallback
+}
+
 // ---------------------------------------------------------------------------
 //  IO round-trip
 // ---------------------------------------------------------------------------
@@ -259,9 +347,23 @@ static void TestIO(void)
     AnimElem *s = AnimDocAddElem(&doc, AE_SHAPE);
     s->shapeKind = SHAPE_CIRCLE;
     s->sizeFrac = (Vector2){ 0.4f, 0.2f };
+    s->outlineColor = (Color){ 130, 150, 180, 255 };
+    s->outlineFrac  = 0.004f;
     AnimTrack *sc = AnimElemAddTrack(s, AP_S_COLOR);
     AnimTrackAddColorKey(sc, 0.0f, (Color){ 10, 20, 30, 40 },     ANIM_EASE_LINEAR);
     AnimTrackAddColorKey(sc, 1.0f, (Color){ 250, 200, 150, 255 }, ANIM_EASE_SINE_OUT);
+    AnimTrack *oc = AnimElemAddTrack(s, AP_S_OUTLINE_COLOR);
+    AnimTrackAddColorKey(oc, 0.5f, (Color){ 7, 8, 9, 255 }, ANIM_EASE_LINEAR);
+    AnimTrack *oa = AnimElemAddTrack(s, AP_S_OUTLINE_ALPHA);
+    AnimTrackAddKey(oa, 0.0f, 1.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(oa, 2.0f, 0.0f, ANIM_EASE_SINE_OUT);
+
+    // one elem per remaining shape kind so every kind name round-trips
+    for (int k = SHAPE_SQUARE; k < SHAPE_KIND_COUNT; k++)
+    {
+        AnimElem *x = AnimDocAddElem(&doc, AE_SHAPE);
+        x->shapeKind = k;
+    }
 
     doc.signalCount = 2;
     TextCopy(doc.signals[0].name, "enter");
@@ -277,7 +379,7 @@ static void TestIO(void)
     CHECK(AnimDocLoad(&in, path));
     CHECK(TextIsEqual(in.name, "roundtrip"));
     CHECK_NEAR(in.duration, 3.25f);
-    CHECK(in.elemCount == 2);
+    CHECK(in.elemCount == 2 + (SHAPE_KIND_COUNT - SHAPE_SQUARE));
     CHECK(TextIsEqual(in.elems[0].text, "HELLO WORLD"));
     CHECK(in.elems[0].color.a == 200);
     CHECK(in.elems[0].trackCount == 2);
@@ -286,17 +388,55 @@ static void TestIO(void)
     CHECK(in.elems[0].tracks[1].keys[0].ease == ANIM_EASE_BACK_IN);
     CHECK(in.elems[1].kind == AE_SHAPE && in.elems[1].shapeKind == SHAPE_CIRCLE);
     CHECK_NEAR(in.elems[1].sizeFrac.y, 0.2f);
-    CHECK(in.elems[1].trackCount == 1 && in.elems[1].tracks[0].prop == AP_S_COLOR);
+    CHECK(in.elems[1].trackCount == 3 && in.elems[1].tracks[0].prop == AP_S_COLOR);
     CHECK(in.elems[1].tracks[0].keyCount == 2);
     CHECK(in.elems[1].tracks[0].keys[0].cval.b == 30);
     CHECK(in.elems[1].tracks[0].keys[1].cval.r == 250 &&
           in.elems[1].tracks[0].keys[1].cval.a == 255);
     CHECK(in.elems[1].tracks[0].keys[1].ease == ANIM_EASE_SINE_OUT);
+
+    // outline base + tracks round-trip
+    CHECK(in.elems[1].outlineColor.r == 130 && in.elems[1].outlineColor.b == 180);
+    CHECK_NEAR(in.elems[1].outlineFrac, 0.004f);
+    CHECK(in.elems[1].tracks[1].prop == AP_S_OUTLINE_COLOR);
+    CHECK(in.elems[1].tracks[1].keys[0].cval.g == 8);
+    CHECK(in.elems[1].tracks[2].prop == AP_S_OUTLINE_ALPHA);
+    CHECK(in.elems[1].tracks[2].keyCount == 2 &&
+          in.elems[1].tracks[2].keys[1].ease == ANIM_EASE_SINE_OUT);
+
+    // every shape kind survives the name round-trip
+    for (int k = SHAPE_SQUARE; k < SHAPE_KIND_COUNT; k++)
+        CHECK(in.elems[2 + k - SHAPE_SQUARE].shapeKind == k);
     CHECK(in.signalCount == 2);
     CHECK(in.signals[1].dir == ANIM_REV);
     CHECK_NEAR(in.signals[1].sectionStart, 0.5f);
     CHECK_NEAR(in.signals[1].sectionEnd, 3.0f);
 
+    remove(path);
+}
+
+// Old-format files (no `outline` line, pre-refactor shape names) still load
+// with outline defaults - forward compatibility for saved docs.
+static void TestIOOldFormat(void)
+{
+    const char *path = "anim_tests_old_tmp.cfg";
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL);
+    if (!f) return;
+    fprintf(f, "doc old 2.0\n"
+               "elem shape box\n"
+               "  shape circle\n"
+               "  color 10 20 30 255\n"
+               "  pos 0.5 0.5\n"
+               "  size 0.2 0.2\n"
+               "  end\n");
+    fclose(f);
+
+    AnimDoc in;
+    CHECK(AnimDocLoad(&in, path));
+    CHECK(in.elemCount == 1 && in.elems[0].shapeKind == SHAPE_CIRCLE);
+    CHECK_NEAR(in.elems[0].outlineFrac, 0.0f);              // default: off
+    CHECK(in.elems[0].outlineColor.r == 245);               // RAYWHITE default
     remove(path);
 }
 
@@ -361,11 +501,14 @@ int main(void)
     TestSegment();
     TestEvalColor();
     TestColorKeyTimeMove();
+    TestShapeProps();
     TestTrackCap();
     TestEase();
     TestKeys();
     TestDoc();
+    TestRemoveTrack();
     TestIO();
+    TestIOOldFormat();
     TestSignals();
 
     printf("anim_tests: %d checks, %d failed\n", s_checks, s_fails);

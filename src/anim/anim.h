@@ -38,7 +38,7 @@
 #define ANIM_NAME_MAX      32   // element / signal / doc name buffer
 #define ANIM_TEXT_LEN_MAX  64   // a TEXT element's string buffer
 #define ANIM_KEYS_MAX      16   // keyframes per track
-#define ANIM_TRACKS_MAX     8   // tracks (animated properties) per element
+#define ANIM_TRACKS_MAX    10   // tracks (animated properties) per element
 #define ANIM_ELEMS_MAX     12   // elements per document
 #define ANIM_SIGNALS_MAX    8   // signals per document
 
@@ -73,7 +73,7 @@ int         AnimEaseCount(void);              // == ANIM_EASE_COUNT
 typedef enum {
     // TEXT (0..) ------------------------------------------------------------
     AP_T_POS_X = 0,     // text center X, fraction of game width
-    AP_T_POS_Y,         // text top Y,    fraction of game height
+    AP_T_POS_Y,         // text center Y, fraction of game height
     AP_T_SIZE,          // font size,     fraction of game height
     AP_T_ALPHA,         // 0..1 opacity
     AP_T_ROT,           // whole-text rotation, degrees
@@ -87,7 +87,10 @@ typedef enum {
     AP_S_H,             // height, fraction of game height
     AP_S_ALPHA,         // 0..1 opacity
     AP_S_ROT,           // rotation, degrees
-    AP_S_COLOR,         // RGBA fill; keys use AnimKey.cval, not value
+    AP_S_COLOR,         // RGB fill; keys use AnimKey.cval, not value
+    AP_S_OUTLINE_COLOR, // RGB outline; keys use AnimKey.cval, not value
+    AP_S_OUTLINE,       // outline thickness, fraction of game height (0 = off)
+    AP_S_OUTLINE_ALPHA, // 0..1 outline opacity (AP_S_ALPHA is the FILL opacity)
 
     // GLOBAL (200..) --------------------------------------------------------
     AP_G_FADE = 200,    // whole-screen fade-to-color amount, 0..1
@@ -111,7 +114,20 @@ typedef struct {
 } AnimTrack;
 
 typedef enum { AE_TEXT = 0, AE_SHAPE, AE_GLOBAL } AnimElemKind;
-typedef enum { SHAPE_RECT = 0, SHAPE_CIRCLE } AnimShapeKind;
+// Shape geometry, all center-anchored on posFrac and rotated about the center.
+// sizeFrac meaning per kind:
+//   RECT     w x h box
+//   CIRCLE   ellipse with axes w x h
+//   SQUARE   side = game.y * h for BOTH pixel axes (stays square; w unused)
+//   RHOMBUS  diamond with diagonals w (horizontal) and h (vertical)
+//   TRIANGLE isosceles pointing up: apex at -h/2, base w wide at +h/2
+//   LINE     segment of length game.x * w, thickness game.y * h; fill colour
+// Order is the stable .cfg representation (anim_io.c) - do not reorder.
+typedef enum {
+    SHAPE_RECT = 0, SHAPE_CIRCLE, SHAPE_SQUARE,
+    SHAPE_RHOMBUS, SHAPE_TRIANGLE, SHAPE_LINE,
+    SHAPE_KIND_COUNT
+} AnimShapeKind;
 
 // One animated thing. Which base fields matter depends on `kind`:
 //   AE_TEXT   : text, color, and base posFrac/sizeFrac (defaults when no track)
@@ -124,10 +140,13 @@ typedef struct {
     // base (static) properties - used as the value for any property that has
     // NO track, and as the starting point the editor seeds new tracks from.
     char    text[ANIM_TEXT_LEN_MAX];   // AE_TEXT only
-    Color   color;
-    Vector2 posFrac;                   // center (text: x=center, y=top edge)
+    Color   color;                     // fill / text / fade colour
+    Vector2 posFrac;                   // center (both text and shapes)
     Vector2 sizeFrac;                  // x=width/size, y=height (shape height)
     int     shapeKind;                 // AnimShapeKind (AE_SHAPE only)
+    Color   outlineColor;              // AE_SHAPE: outline tint (rest pose)
+    float   outlineFrac;               // AE_SHAPE: outline thickness, fraction
+                                       // of game height; 0 = no outline
 
     AnimTrack tracks[ANIM_TRACKS_MAX];
     int       trackCount;
@@ -161,6 +180,7 @@ AnimElem *AnimDocAddElem(AnimDoc *doc, AnimElemKind kind);   // NULL if full
 void AnimDocRemoveElem(AnimDoc *doc, int idx);               // shift down over idx
 AnimTrack *AnimElemAddTrack(AnimElem *e, int prop);         // NULL if full/dupe
 AnimTrack *AnimElemFindTrack(AnimElem *e, int prop);        // NULL if absent
+void AnimElemRemoveTrack(AnimElem *e, int idx);             // shift down over idx
 AnimKey *AnimTrackAddKey(AnimTrack *tr, float t, float value, int ease);
 void AnimTrackRemoveKey(AnimTrack *tr, int idx);
 void AnimTrackSortKeys(AnimTrack *tr);          // keep keys ascending in t
@@ -201,7 +221,11 @@ bool AnimTrackSegment(const AnimTrack *tr, float t, int *i0, int *i1);
 // Empty/NULL track -> `missing`.
 Color AnimTrackEvalColor(const AnimTrack *tr, float t, Color missing);
 
-// Element's colour at time t: colour track if present, else the base e->color.
+// Colour of a SPECIFIC colour property at time t: that prop's track if present,
+// else its base colour (AP_S_OUTLINE_COLOR -> e->outlineColor, else e->color).
+Color AnimElemColorProp(const AnimElem *e, int prop, float t);
+
+// Element's PRIMARY colour at time t (fill/text/fade), via AnimElemColorProp.
 Color AnimElemColor(const AnimElem *e, float t);
 
 // Value of property `prop` on element e at time t. If e has no track for prop,

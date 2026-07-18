@@ -340,8 +340,10 @@ static void EnsureZeroKey(AnimElem *e, AnimTrack *tr)
 
 static void EnsureZeroColorKey(AnimElem *e, AnimTrack *tr)
 {
+    // seed from the track's OWN property (a shape has fill AND outline colour)
     if (tr->keyCount == 0)
-        AnimTrackAddColorKey(tr, 0.0f, AnimElemColor(e, 0.0f), ANIM_EASE_LINEAR);
+        AnimTrackAddColorKey(tr, 0.0f, AnimElemColorProp(e, tr->prop, 0.0f),
+                             ANIM_EASE_LINEAR);
 }
 
 // The colour property for an element kind (each kind has exactly one).
@@ -380,6 +382,39 @@ static void PropSlider(Rectangle r, AnimElem *e, int prop, float *baseField)
         AnimTrackWriteKeyAt(tr, playhead, v, AUTOKEY_EPS);
     }
     if (!autoKey) GuiSetState(STATE_NORMAL);
+}
+
+// RGB slider rows for ONE colour property (fill or outline). Tracked -> the
+// sliders follow the playhead and auto-key writes colour keys there (mirrors
+// PropSlider); untracked -> they edit the base colour. Returns the new y.
+static float ColorRGBRows(float x, float y, float w, AnimElem *e, int prop,
+                          Color *base, const char *label)
+{
+    float rh = 24.0f;
+    AnimTrack *ctr = AnimElemFindTrack(e, prop);
+    Color cc = AnimElemColorProp(e, prop, playhead);
+    GuiLabel((Rectangle){ x, y, w-24, rh },
+             TextFormat(ctr ? "%s (rgb, keyed)" : "%s (rgb)", label));
+    DrawSwatch((Rectangle){ x+w-20, y+3, 18, 18 }, cc);
+    y += rh;
+    float cr=cc.r, cg=cc.g, cb=cc.b;
+    bool changed = false;
+    if (ctr && !autoKey) GuiSetState(STATE_DISABLED);
+    if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "R", &cr, 0,255)) changed=true; y+=18;
+    if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "G", &cg, 0,255)) changed=true; y+=18;
+    if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "B", &cb, 0,255)) changed=true; y+=18;
+    if (ctr && !autoKey) GuiSetState(STATE_NORMAL);
+    if (changed)
+    {
+        Color nc = { (unsigned char)cr,(unsigned char)cg,(unsigned char)cb, 255 };
+        if (!ctr) { base->r = nc.r; base->g = nc.g; base->b = nc.b; }
+        else
+        {
+            if (playhead > AUTOKEY_EPS) EnsureZeroColorKey(e, ctr);
+            AnimTrackWriteColorKeyAt(ctr, playhead, nc, AUTOKEY_EPS);
+        }
+    }
+    return y;
 }
 
 static bool IsSelected(int i)
@@ -470,11 +505,19 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
     }
     if (e->kind == AE_SHAPE)
     {
-        int sk = e->shapeKind;
+        // 2x3 grid of kind toggles (a single GuiToggleGroup can't wrap rows)
         GuiLabel((Rectangle){ x, y, 40, rh }, "shape");
-        if (GuiToggleGroup((Rectangle){ x+44, y, (w-44)/2-2, rh }, "Rect;Circle", &sk))
-        { UndoPush(); e->shapeKind = sk; }
-        y += rh + gap;
+        float bw3 = (w - 44 - 8) / 3.0f;
+        for (int si = 0; si < SHAPE_KIND_COUNT; si++)
+        {
+            int rowI = si / 3, colI = si % 3;
+            Rectangle rr = { x + 44 + (float)colI * (bw3 + 4),
+                             y + (float)rowI * (rh + 4), bw3, rh };
+            bool on = (e->shapeKind == si);
+            GuiToggle(rr, AnimShapeKindName(si), &on);
+            if (on && e->shapeKind != si) { UndoPush(); e->shapeKind = si; }
+        }
+        y += 2*(rh + 4) + gap - 4;
     }
 
     // position / size: tracked props follow the playhead (see PropSlider)
@@ -494,39 +537,37 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         }
     }
 
-    // colour (RGBA sliders keep it compact and stable across raygui versions).
+    // colour (RGB sliders keep it compact and stable across raygui versions).
     // With a colour track the sliders follow the playhead and auto-key writes
     // colour keys there (mirrors PropSlider); without one they edit the base.
     // RGB is animatable via the colour track; alpha stays separate (the base
     // channel here, the alpha track for animation) so it is never keyed along.
-    AnimTrack *ctr = AnimElemFindTrack(e, ColorPropFor(e->kind));
-    Color cc = AnimElemColor(e, playhead);
-    GuiLabel((Rectangle){ x, y, w-24, rh }, ctr ? "color (rgb, keyed)" : "color (rgb)");
-    DrawSwatch((Rectangle){ x+w-20, y+3, 18, 18 }, cc);
-    y += rh;
-    float cr=cc.r, cg=cc.g, cb=cc.b, ca=e->color.a;
-    bool rgbChanged = false;
-    if (ctr && !autoKey) GuiSetState(STATE_DISABLED);
-    if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "R", &cr, 0,255)) rgbChanged=true; y+=18;
-    if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "G", &cg, 0,255)) rgbChanged=true; y+=18;
-    if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "B", &cb, 0,255)) rgbChanged=true; y+=18;
-    if (ctr && !autoKey) GuiSetState(STATE_NORMAL);
+    y = ColorRGBRows(x, y, w, e, ColorPropFor(e->kind), &e->color, "color");
+    float ca = e->color.a;
     if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "A", &ca, 0,255))
         e->color.a = (unsigned char)ca;
     y+=22;
-    if (rgbChanged)
+
+    // outline: thickness + its own colour track (fill and outline are separate
+    // colour PROPERTIES, each with its own base + optional track).
+    if (e->kind == AE_SHAPE)
     {
-        Color nc = { (unsigned char)cr,(unsigned char)cg,(unsigned char)cb, 255 };
-        if (!ctr) { e->color.r = nc.r; e->color.g = nc.g; e->color.b = nc.b; }
-        else
-        {
-            if (playhead > AUTOKEY_EPS) EnsureZeroColorKey(e, ctr);
-            AnimTrackWriteColorKeyAt(ctr, playhead, nc, AUTOKEY_EPS);
-        }
+        GuiLine((Rectangle){ x, y, w, 8 }, "outline"); y += 12;
+        PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_OUTLINE, &e->outlineFrac);
+        GuiLabel((Rectangle){ x, y, 44, rh }, "thick"); y += rh + gap;
+        y = ColorRGBRows(x, y, w, e, AP_S_OUTLINE_COLOR, &e->outlineColor, "outline");
+        float oa = e->outlineColor.a;
+        if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "A", &oa, 0,255))
+            e->outlineColor.a = (unsigned char)oa;
+        y += 22;
     }
 
     // --- tracks list: every track and ALL of its keys, always visible --------
     GuiLine((Rectangle){ x, y, w, 8 }, "tracks"); y += 12;
+    // deletion is deferred past the loop: removing mid-draw shifts the array
+    // and re-draws the next track's del button on the same rect this frame,
+    // which re-fires and cascade-deletes.
+    int pendingTrackDel = -1;
     for (int j = 0; j < e->trackCount; j++)
     {
         AnimTrack *tr = &e->tracks[j];
@@ -539,7 +580,7 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
             AnimKey *k;
             if (AnimPropIsColor(tr->prop))
             {
-                Color c = AnimElemColor(e, playhead);
+                Color c = AnimElemColorProp(e, tr->prop, playhead);
                 if (playhead > AUTOKEY_EPS) EnsureZeroColorKey(e, tr);
                 k = AnimTrackWriteColorKeyAt(tr, playhead, c, AUTOKEY_EPS);
             }
@@ -554,10 +595,7 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         if (GuiButton((Rectangle){ x+w-48, y, 48, rh }, "del"))
         {
             AudioPlayButton(); UndoPush();
-            for (int m=j; m<e->trackCount-1; m++) e->tracks[m]=e->tracks[m+1];
-            e->trackCount--; j--;
-            ClearKeySelection();
-            continue;
+            pendingTrackDel = j;
         }
         y += rh + 2;
 
@@ -611,6 +649,17 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         }
         y += 4;
     }
+    if (pendingTrackDel >= 0)
+    {
+        AnimElemRemoveTrack(e, pendingTrackDel);
+        // keep the key selection pointing at the same track after the shift
+        if (selKeyElem == selElem)
+        {
+            if (selKeyTrack == pendingTrackDel)     ClearKeySelection();
+            else if (selKeyTrack > pendingTrackDel) selKeyTrack--;
+        }
+        ClampSelection();
+    }
 
     // add-track dropdown (built from the element kind's valid props)
     y += 4;
@@ -626,7 +675,7 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         AnimTrack *tr = AnimElemAddTrack(e, prop);
         if (tr && AnimPropIsColor(prop))
         {
-            Color c = AnimElemColor(e, playhead);
+            Color c = AnimElemColorProp(e, prop, playhead);
             EnsureZeroColorKey(e, tr);
             if (playhead > AUTOKEY_EPS)
             {
@@ -728,6 +777,7 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
             AudioPlayButton(); UndoPush();
             AnimTrackRemoveKey(tr, selKeyIdx);
             ClearKeySelection();
+            ClampSelection();
         }
         y += rh;
     }

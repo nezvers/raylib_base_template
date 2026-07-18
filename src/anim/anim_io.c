@@ -10,7 +10,8 @@
 //      color  <r> <g> <b> <a>
 //      pos    <xFrac> <yFrac>
 //      size   <xFrac> <yFrac>
-//      shape  <rect|circle>              # (shape elements)
+//      shape  <rect|circle|square|rhombus|triangle|line>   # (shape elements)
+//      outline <r> <g> <b> <a> <thickFrac>                 # (shape elements)
 //      track  <prop> <keyCount>         # then keyCount x `key` lines
 //        key  <t> <value> <ease>            # scalar tracks
 //        key  <t> <r> <g> <b> <ease>        # colour tracks (RGB; no alpha)
@@ -40,6 +41,9 @@ static const PropRow k_shapeProps[] = {
     { AP_S_POS_X, "pos_x" }, { AP_S_POS_Y, "pos_y" }, { AP_S_W, "w" },
     { AP_S_H, "h" },         { AP_S_ALPHA, "alpha" }, { AP_S_ROT, "rot" },
     { AP_S_COLOR, "color" },
+    { AP_S_OUTLINE_COLOR, "outline_color" },
+    { AP_S_OUTLINE, "outline" },
+    { AP_S_OUTLINE_ALPHA, "outline_alpha" },
 };
 static const PropRow k_globalProps[] = {
     { AP_G_FADE, "fade" }, { AP_G_COLOR, "color" },
@@ -101,6 +105,24 @@ static int ElemKindByName(const char *name)
     return AE_TEXT;
 }
 
+// Shape kind <-> stable .cfg name (order matches AnimShapeKind).
+static const char *k_shapeKindNames[SHAPE_KIND_COUNT] = {
+    "rect", "circle", "square", "rhombus", "triangle", "line",
+};
+
+const char *AnimShapeKindName(int kind)
+{
+    if (kind < 0 || kind >= SHAPE_KIND_COUNT) return k_shapeKindNames[SHAPE_RECT];
+    return k_shapeKindNames[kind];
+}
+
+int AnimShapeKindByName(const char *name)
+{
+    for (int i = 0; i < SHAPE_KIND_COUNT; i++)
+        if (TextIsEqual(k_shapeKindNames[i], name)) return i;
+    return SHAPE_RECT;    // unknown -> rect (old-file compatible)
+}
+
 // ---------------------------------------------------------------------------
 //  Text-token helpers: the reader is whitespace-delimited, so a text element's
 //  string is stored with spaces as '_' (and '_' as itself is fine - simplest
@@ -141,7 +163,12 @@ bool AnimDocSave(const AnimDoc *doc, const char *path)
             fprintf(f, "  text %s\n", enc);
         }
         if (e->kind == AE_SHAPE)
-            fprintf(f, "  shape %s\n", e->shapeKind == SHAPE_CIRCLE ? "circle" : "rect");
+        {
+            fprintf(f, "  shape %s\n", AnimShapeKindName(e->shapeKind));
+            fprintf(f, "  outline %d %d %d %d %f\n",
+                    e->outlineColor.r, e->outlineColor.g,
+                    e->outlineColor.b, e->outlineColor.a, e->outlineFrac);
+        }
 
         fprintf(f, "  color %d %d %d %d\n", e->color.r, e->color.g, e->color.b, e->color.a);
         fprintf(f, "  pos %f %f\n",  e->posFrac.x,  e->posFrac.y);
@@ -217,7 +244,17 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
         {
             char s[16];
             if (fscanf(f, "%15s", s) == 1)
-                curElem->shapeKind = TextIsEqual(s, "circle") ? SHAPE_CIRCLE : SHAPE_RECT;
+                curElem->shapeKind = AnimShapeKindByName(s);
+        }
+        else if (TextIsEqual(key, "outline") && curElem)
+        {
+            int r, g, b, a; float th;
+            if (fscanf(f, "%d %d %d %d %f", &r, &g, &b, &a, &th) == 5)
+            {
+                curElem->outlineColor = (Color){ (unsigned char)r, (unsigned char)g,
+                                                 (unsigned char)b, (unsigned char)a };
+                curElem->outlineFrac  = th;
+            }
         }
         else if (TextIsEqual(key, "color") && curElem)
         {
