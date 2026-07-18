@@ -181,9 +181,7 @@ TMAPI void MoveTilemap(Tilemap *tilemap,vec2i input_position,vec2i *drag_start_p
 #endif
 #endif // TILEMAP_H
 
-
 /* ------------------------------------- */
-#define TILEMAP_IMPLEMENTATION // TODO: remove - auto implement for prototype
 
 #ifdef TILEMAP_IMPLEMENTATION
 #undef TILEMAP_IMPLEMENTATION
@@ -447,7 +445,7 @@ TMAPI TileID TilesetGetId(Tileset *tileset, TileID tile_id) {
 TMAPI Tile TilesetGetTile(Tileset *tileset, TileID tile_id) {
     assert(tile_id != TILE_INVALID);
     if (tile_id > (TileID)(tileset->length - 1)) {
-        return {};
+        return (Tile){NULL};
     }
     Tile result = tileset->data[tile_id];
     return result;
@@ -481,12 +479,12 @@ TMAPI TileID TilesetGetTileAltDeterministic(Tileset *tileset, TileID tile_id, in
 
 // Optional initialization through a function
 TMAPI Tilemap TilemapInit(vec2i position, vec2i size, vec2i tile_size, TileID *buffer, uint32_t capacity) {
-    return { position, size, tile_size, buffer, capacity };
+    return (Tilemap){ position, size, tile_size, buffer, capacity };
 }
 
 // Get rectangle representing tilemap's size
 TMAPI recti TilemapRecti(Tilemap *tilemap) {
-    return {0, 0, tilemap->size.x, tilemap->size.y};
+    return (recti){0, 0, tilemap->size.x, tilemap->size.y};
 }
 
 // Writes TILE_EMPTY on all cells
@@ -764,7 +762,7 @@ TMAPI void AutotileRuleUpdateCell(Tilemap *tilemap_in, Tilemap *tilemap_out, Aut
         is_matching = true;
         for (int32_t j = 0; j < (int32_t)rule->capacity; j += 1) {
             match_rule = &rule->match[j];
-            match_pos = {tile_pos.x + match_rule->offset.x, tile_pos.y + match_rule->offset.y};
+            match_pos = (vec2i){tile_pos.x + match_rule->offset.x, tile_pos.y + match_rule->offset.y};
             
             // Check X boundry
             if (match_pos.x < 0 || match_pos.x > (tilemap_in->size.x - 1)) {
@@ -811,7 +809,7 @@ TMAPI void AutotileRuleUpdateTilemap(Tilemap *tilemap_in, Tilemap *tilemap_out, 
     vec2i tile_pos;
     for (int32_t y = 0; y < tilemap_in->size.y; y += 1) {
         for (int32_t x = 0; x < tilemap_in->size.x; x += 1) {
-            tile_pos = {x, y};
+            tile_pos = (vec2i){x, y};
             AutotileRuleUpdateCell(tilemap_in, tilemap_out, rules, rule_count, tile_pos);
         }
     }
@@ -822,7 +820,7 @@ TMAPI void AutotileRuleUpdateRect(Tilemap *tilemap_in, Tilemap *tilemap_out, Aut
     vec2i tile_pos;
     for (int32_t y = rect.y; y < (rect.y + rect.h); y += 1) {
         for (int32_t x = rect.x; x < (rect.x + rect.x); x += 1) {
-            tile_pos = {x, y};
+            tile_pos = (vec2i){x, y};
             AutotileRuleUpdateCell(tilemap_in, tilemap_out, rules, rule_count, tile_pos);
         }
     }
@@ -922,7 +920,7 @@ TMAPI void DragTiles(
             return;
         }
 
-        TilemapGetRegionData(tilemap, *selection_rect, temp_buffer);
+        TilemapGetRegionData(tilemap, *selection_rect, temp_buffer, capacity);
         
         vec2i selection_position = {selection_rect->x, selection_rect->y};
         vec2i map_position = {tilemap->position.x + tilemap->tile_size.x * selection_position.x, tilemap->position.y + tilemap->tile_size.y * selection_position.y};
@@ -932,17 +930,17 @@ TMAPI void DragTiles(
         TilemapSetData(temp_tilemap_out, temp_buffer, capacity, (uint32_t)map_size.x, (uint32_t)map_size.y);
 
         vec2i tile_pos = TilemapGetWorld2Tile(tilemap, input_position);
-        *drag_start_position = {selection_position.x - tile_pos.x, selection_position.y - tile_pos.y};
+        *drag_start_position = (vec2i){selection_position.x - tile_pos.x, selection_position.y - tile_pos.y};
     } else if (input_state == tmInputState_HOLD){
 
         vec2i tile_pos = TilemapGetWorld2Tile(tilemap, input_position);
         vec2i tile_offset = {tile_pos.x + drag_start_position->x, tile_pos.y + drag_start_position->y};
-        temp_tilemap_out->position = {tilemap->position.x + tile_offset.x * tilemap->tile_size.x, tilemap->position.y + tile_offset.y * tilemap->tile_size.y};
+        temp_tilemap_out->position = (vec2i){tilemap->position.x + tile_offset.x * tilemap->tile_size.x, tilemap->position.y + tile_offset.y * tilemap->tile_size.y};
     } else if (input_state == tmInputState_RELEASE){
         // Place tile data
         vec2i tile_pos = TilemapGetWorld2Tile(tilemap, input_position);
         vec2i tile_offset = {tile_pos.x + drag_start_position->x, tile_pos.y + drag_start_position->y};
-        temp_tilemap_out->position = {tilemap->position.x + tile_offset.x * tilemap->tile_size.x, tilemap->position.y + tile_offset.y * tilemap->tile_size.y};
+        temp_tilemap_out->position = (vec2i){tilemap->position.x + tile_offset.x * tilemap->tile_size.x, tilemap->position.y + tile_offset.y * tilemap->tile_size.y};
 
         if (remove_from_source) {
             TilemapSetTileIdBlock(tilemap, selection_rect->x, selection_rect->y, selection_rect->w, selection_rect->h, TILE_EMPTY);
@@ -956,7 +954,7 @@ TMAPI void DragTiles(
         };
         TilemapSetRegionData(tilemap, data_rect, temp_buffer, capacity, write_empty);
 
-        temp_tilemap_out->size = {0, 0};
+        temp_tilemap_out->size = (vec2i){0, 0};
         selection_rect->w = 0.0;
         selection_rect->h = 0.0;
     }
@@ -1035,7 +1033,7 @@ TMAPI void MoveTilemap(
     } else if (input_state == tmInputState_HOLD) {
         vec2i drag_difference = {input_position.x - drag_start_position->x, input_position.y - drag_start_position->y};
         if (!grid_lock) {
-            tilemap->position = {map_start_position->x + drag_difference.x, map_start_position->y + drag_difference.y};
+            tilemap->position = (vec2i){map_start_position->x + drag_difference.x, map_start_position->y + drag_difference.y};
             return;
         }
         vec2i tile_difference = {drag_difference.x / tilemap->tile_size.x, drag_difference.y / tilemap->tile_size.y};
@@ -1046,7 +1044,7 @@ TMAPI void MoveTilemap(
             tile_difference.y -= 1;
         }
 
-        tilemap->position = {map_start_position->x + tile_difference.x * tilemap->tile_size.x, map_start_position->y + tile_difference.y * tilemap->tile_size.y};
+        tilemap->position = (vec2i){map_start_position->x + tile_difference.x * tilemap->tile_size.x, map_start_position->y + tile_difference.y * tilemap->tile_size.y};
     }
 }
 

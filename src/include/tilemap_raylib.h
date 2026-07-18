@@ -33,7 +33,6 @@ TMRAPI void DrawTilemapRecti(Tilemap *tilemap, Tileset *tileset, TileAtlas *tile
 #endif // TILEMAP_RAYLIB_H
 
 /* ------------------------------------------- */
-#define TILEMAP_RAYLIB_IMPLEMENTATION // TODO: remove this
 
 
 #ifdef TILEMAP_RAYLIB_IMPLEMENTATION
