@@ -100,14 +100,14 @@ typedef enum {
     tmInputState_START,
     tmInputState_HOLD,
     tmInputState_RELEASE,
-} InputState;
+} tmInputState;
 
 // Used for tilemap editing interactions
 typedef enum {
     tmInputDirection_NONE,
     tmInputDirection_INCREASE,
     tmInputDirection_DECREASE,
-} InputType;
+} tmInputType;
 
 // Remove name mangling for C++
 #ifdef __cplusplus
@@ -168,13 +168,13 @@ TMAPI uint32_t tmRndState(uint32_t *nProcGen);                     // Random num
 TMAPI int32_t tmRndInt(uint32_t *seed, int32_t min, int32_t max);  // Random signed integer range number using seed state
 TMAPI int tmRndCash(uint32_t seed, int x, int y);                  // cash stands for chaos hash :D
 
-TMAPI InputState GetInputState(bool is_pressed, bool is_held, bool is_released);
-TMAPI InputType GetInputType(bool is_increase, bool is_decrease);
-TMAPI void CreateSelection(Tilemap *tilemap, vec2i input_position, vec2i *position_state, recti *rect_state, InputState input_state); // Draw a rectangle around tiles from press to release
-TMAPI void DragTiles(Tilemap *tilemap,Tilemap *temp_tilemap_out,vec2i input_position,vec2i *drag_start_position,recti *selection_rect,InputState input_state,bool remove_from_source,bool write_empty,TileID *temp_buffer,uint32_t capacity); // Copy tiles inside map_rect and drop them when released
-TMAPI void EditTiles(Tilemap *tilemap,vec2i input_position,TileID *tile_id_state,InputType input_type); // Increase or decrease tile ID under input_position 
-TMAPI void PaintTiles(Tilemap *tilemap,vec2i input_position,vec2i *state_position,TileID tile_id_input,InputState input_state); // Draw with tile_id
-TMAPI void MoveTilemap(Tilemap *tilemap,vec2i input_position,vec2i *drag_start_position,vec2i *map_start_position,InputState input_state,bool grid_lock); // Drag'n'Drop a tilemap
+TMAPI tmInputState GetInputState(bool is_pressed, bool is_held, bool is_released);
+TMAPI tmInputType GetInputType(bool is_increase, bool is_decrease);
+TMAPI void CreateSelection(Tilemap *tilemap, vec2i input_position, vec2i *position_state, recti *rect_state, tmInputState input_state); // Draw a rectangle around tiles from press to release
+TMAPI void DragTiles(Tilemap *tilemap,Tilemap *temp_tilemap_out,vec2i input_position,vec2i *drag_start_position,recti *selection_rect,tmInputState input_state,bool remove_from_source,bool write_empty,TileID *temp_buffer,uint32_t capacity); // Copy tiles inside map_rect and drop them when released
+TMAPI void EditTiles(Tilemap *tilemap,vec2i input_position,TileID *tile_id_state,tmInputType input_type); // Increase or decrease tile ID under input_position 
+TMAPI void PaintTiles(Tilemap *tilemap,vec2i input_position,vec2i *state_position,TileID tile_id_input,tmInputState input_state); // Draw with tile_id
+TMAPI void MoveTilemap(Tilemap *tilemap,vec2i input_position,vec2i *drag_start_position,vec2i *map_start_position,tmInputState input_state,bool grid_lock); // Drag'n'Drop a tilemap
 
 #ifdef __cplusplus
 }
@@ -856,7 +856,7 @@ TMAPI void AutotileRuleUpdateNeighbours(Tilemap *tilemap_in, Tilemap *tilemap_ou
 
 /* ----- Tilemap editing ----- */
 
-TMAPI InputState GetInputState(bool is_pressed, bool is_held, bool is_released) {
+TMAPI tmInputState GetInputState(bool is_pressed, bool is_held, bool is_released) {
     if (is_pressed) {
         return tmInputState_START;
     }
@@ -869,7 +869,7 @@ TMAPI InputState GetInputState(bool is_pressed, bool is_held, bool is_released) 
     return tmInputState_NONE;
 }
 
-TMAPI InputType GetInputType(bool is_increase, bool is_decrease) {
+TMAPI tmInputType GetInputType(bool is_increase, bool is_decrease) {
     if (is_increase) {
         return tmInputDirection_INCREASE;
     }
@@ -885,7 +885,7 @@ TMAPI void CreateSelection(
     vec2i input_position,
     vec2i *position_state,
     recti *rect_state,
-    InputState input_state
+    tmInputState input_state
 ) {
     if (input_state == tmInputState_START) {
         *position_state = TilemapGetWorld2Tile(tilemap, input_position);
@@ -903,7 +903,7 @@ TMAPI void DragTiles(
     vec2i input_position,
     vec2i *drag_start_position,
     recti *selection_rect,
-    InputState input_state,
+    tmInputState input_state,
     bool remove_from_source,
     bool write_empty,
     TileID *temp_buffer,
@@ -967,7 +967,7 @@ TMAPI void EditTiles(
     Tilemap *tilemap,
     vec2i input_position,
     TileID *tile_id_state,
-    InputType input_type
+    tmInputType input_type
 ) {
     if (input_type == tmInputDirection_NONE){
         return;
@@ -993,7 +993,7 @@ TMAPI void PaintTiles(
     vec2i input_position,
     vec2i *state_position,
     TileID tile_id_input,
-    InputState input_state
+    tmInputState input_state
 ) {
     if (tile_id_input == TILE_INVALID){
         return;
@@ -1026,7 +1026,7 @@ TMAPI void MoveTilemap(
     vec2i input_position,
     vec2i *drag_start_position,
     vec2i *map_start_position,
-    InputState input_state,
+    tmInputState input_state,
     bool grid_lock
 ){
     if (input_state == tmInputState_START) {

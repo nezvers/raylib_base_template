@@ -26,7 +26,7 @@ static void Draw(){
 
 	bool size_error;
 
-	InputState input_selection = GetInputState(
+	tmInputState input_selection = GetInputState(
 		IsMouseButtonPressed(MOUSE_BUTTON_LEFT), 
 		IsMouseButtonDown(MOUSE_BUTTON_LEFT),
 		IsMouseButtonReleased(MOUSE_BUTTON_LEFT)

@@ -26,13 +26,13 @@ static void Draw() {
 	static Tilemap temp_tilemap;
 	static TileID temp_buffer[MAP_SIZE_X * MAP_SIZE_Y];
 
-	InputState input_selection = GetInputState(
+	tmInputState input_selection = GetInputState(
 		IsMouseButtonPressed(MOUSE_BUTTON_LEFT), 
 		IsMouseButtonDown(MOUSE_BUTTON_LEFT),
 		IsMouseButtonReleased(MOUSE_BUTTON_LEFT)
 	);
 
-	InputState input_drag = GetInputState(
+	tmInputState input_drag = GetInputState(
 		IsMouseButtonPressed(MOUSE_BUTTON_RIGHT), 
 		IsMouseButtonDown(MOUSE_BUTTON_RIGHT),
 		IsMouseButtonReleased(MOUSE_BUTTON_RIGHT)

@@ -23,7 +23,7 @@ static void Draw(){
 	Vector2 mouse_position = Screen2Target(GetMousePosition());
 	vec2i mouse_position_i = {(int32_t)mouse_position.x, (int32_t)mouse_position.y};
 
-	InputState input_paint = GetInputState(
+	tmInputState input_paint = GetInputState(
 		IsMouseButtonPressed(MOUSE_BUTTON_LEFT), 
 		IsMouseButtonDown(MOUSE_BUTTON_LEFT),
 		IsMouseButtonReleased(MOUSE_BUTTON_LEFT)
