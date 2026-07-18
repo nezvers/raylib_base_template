@@ -94,6 +94,21 @@ typedef enum {
     TileRandType_XY,
 } TileRandType;
 
+// Used for tilemap editing interactions
+typedef enum {
+    tmInputState_NONE,
+    tmInputState_START,
+    tmInputState_HOLD,
+    tmInputState_RELEASE,
+} InputState;
+
+// Used for tilemap editing interactions
+typedef enum {
+    tmInputDirection_NONE,
+    tmInputDirection_INCREASE,
+    tmInputDirection_DECREASE,
+} InputType;
+
 // Remove name mangling for C++
 #ifdef __cplusplus
 extern "C" {
@@ -104,11 +119,6 @@ extern "C" {
 #else
 #define TMAPI
 #endif
-
-
-TMAPI uint32_t tmRndState(uint32_t *nProcGen);                     // Random number using seed state: determenistic using same seed state
-TMAPI int32_t tmRndInt(uint32_t *seed, int32_t min, int32_t max);  // Random signed integer range number using seed state
-TMAPI int tmRndCash(uint32_t seed, int x, int y);                  // cash stands for chaos hash :D
 
 TMAPI void TileAtlasInit(TileAtlas *tile_atlas, vec2 tile_size, vec2 *buffer, size_t size);
 TMAPI void TileAtlasInsert(TileAtlas *tile_atlas, vec2 texture_position, uint32_t index);
@@ -149,6 +159,17 @@ TMAPI void TilemapGetRegionData(Tilemap *tilemap, recti rect_section, TileID *ou
 TMAPI void TilemapSetRegionData(Tilemap *tilemap, recti rect_section, TileID *in_buffer, uint32_t capacity, bool write_empty); // Copy TileID from in_buffer assuming data is 1D array representing provided region in tile coordinates
 TMAPI void TilemapSetData(Tilemap *tilemap, TileID *in_buffer, uint32_t capacity, uint32_t data_width, uint32_t data_height); // Copy TileID as 1D array from in_buffer starting from 0th index
 
+TMAPI uint32_t tmRndState(uint32_t *nProcGen);                     // Random number using seed state: determenistic using same seed state
+TMAPI int32_t tmRndInt(uint32_t *seed, int32_t min, int32_t max);  // Random signed integer range number using seed state
+TMAPI int tmRndCash(uint32_t seed, int x, int y);                  // cash stands for chaos hash :D
+
+TMAPI InputState GetInputState(bool is_pressed, bool is_held, bool is_released);
+TMAPI InputType GetInputType(bool is_increase, bool is_decrease);
+TMAPI void CreateSelection(Tilemap *tilemap, vec2i input_position, vec2i *position_state, recti *rect_state, InputState input_state); // Draw a rectangle around tiles from press to release
+TMAPI void DragTiles(Tilemap *tilemap,Tilemap *temp_tilemap_out,vec2i input_position,vec2i *drag_start_position,recti *selection_rect,InputState input_state,bool remove_from_source,bool write_empty,TileID *temp_buffer,uint32_t capacity); // Copy tiles inside map_rect and drop them when released
+TMAPI void EditTiles(Tilemap *tilemap,vec2i input_position,TileID *tile_id_state,InputType input_type); // Increase or decrease tile ID under input_position 
+TMAPI void PaintTiles(Tilemap *tilemap,vec2i input_position,vec2i *state_position,TileID tile_id_input,InputState input_state); // Draw with tile_id
+TMAPI void MoveTilemap(Tilemap *tilemap,vec2i input_position,vec2i *drag_start_position,vec2i *map_start_position,InputState input_state,bool grid_lock); // Drag'n'Drop a tilemap
 
 #ifdef __cplusplus
 }
@@ -707,5 +728,204 @@ TMAPI void TilemapSetData(Tilemap *tilemap, TileID *in_buffer, uint32_t capacity
         }
     }
 }
+
+
+/* ----- Tilemap editing ----- */
+
+TMAPI InputState GetInputState(bool is_pressed, bool is_held, bool is_released) {
+    if (is_pressed) {
+        return tmInputState_START;
+    }
+    if (is_held) {
+        return tmInputState_HOLD;
+    }
+    if (is_released) {
+        return tmInputState_RELEASE;
+    }
+    return tmInputState_NONE;
+}
+
+TMAPI InputType GetInputType(bool is_increase, bool is_decrease) {
+    if (is_increase) {
+        return tmInputDirection_INCREASE;
+    }
+    if (is_decrease) {
+        return tmInputDirection_DECREASE;
+    }
+    return tmInputDirection_NONE;
+}
+
+// Draw a rectangle around tiles from press to release
+TMAPI void CreateSelection(
+    Tilemap *tilemap, 
+    vec2i input_position,
+    vec2i *position_state,
+    recti *rect_state,
+    InputState input_state
+) {
+    if (input_state == tmInputState_START) {
+        *position_state = TilemapGetWorld2Tile(tilemap, input_position);
+    } else
+    if (input_state == tmInputState_HOLD){
+        vec2i drag_position = TilemapGetWorld2Tile(tilemap, input_position);
+        *rect_state = RectiFromRange(*position_state, drag_position);
+    }
+}
+
+// Copy tiles inside map_rect and drop them when released
+TMAPI void DragTiles(
+    Tilemap *tilemap,
+    Tilemap *temp_tilemap_out,
+    vec2i input_position,
+    vec2i *drag_start_position,
+    recti *selection_rect,
+    InputState input_state,
+    bool remove_from_source,
+    bool write_empty,
+    TileID *temp_buffer,
+    uint32_t capacity
+){
+    if (selection_rect->w == 0 || selection_rect->h == 0){
+        return;
+    }
+    if (input_state == tmInputState_START) {
+        // trim selection outside borders
+        recti tilemap_rect = TilemapRecti(tilemap);
+        RectiClipRecti(&tilemap_rect, selection_rect);
+
+        if (selection_rect->w == 0 || selection_rect->h == 0){
+            // no selection
+            return;
+        }
+
+        TilemapGetRegionData(tilemap, *selection_rect, temp_buffer);
+        
+        vec2i selection_position = {selection_rect->x, selection_rect->y};
+        vec2i map_position = {tilemap->position.x + tilemap->tile_size.x * selection_position.x, tilemap->position.y + tilemap->tile_size.y * selection_position.y};
+        vec2i map_size = {selection_rect->w, selection_rect->h};
+        *temp_tilemap_out = TilemapInit(map_position, map_size, tilemap->tile_size, temp_buffer, capacity);
+        // Alternatively - TilemapSetRegionData
+        TilemapSetData(temp_tilemap_out, temp_buffer, capacity, (uint32_t)map_size.x, (uint32_t)map_size.y);
+
+        vec2i tile_pos = TilemapGetWorld2Tile(tilemap, input_position);
+        *drag_start_position = {selection_position.x - tile_pos.x, selection_position.y - tile_pos.y};
+    } else if (input_state == tmInputState_HOLD){
+
+        vec2i tile_pos = TilemapGetWorld2Tile(tilemap, input_position);
+        vec2i tile_offset = {tile_pos.x + drag_start_position->x, tile_pos.y + drag_start_position->y};
+        temp_tilemap_out->position = {tilemap->position.x + tile_offset.x * tilemap->tile_size.x, tilemap->position.y + tile_offset.y * tilemap->tile_size.y};
+    } else if (input_state == tmInputState_RELEASE){
+        // Place tile data
+        vec2i tile_pos = TilemapGetWorld2Tile(tilemap, input_position);
+        vec2i tile_offset = {tile_pos.x + drag_start_position->x, tile_pos.y + drag_start_position->y};
+        temp_tilemap_out->position = {tilemap->position.x + tile_offset.x * tilemap->tile_size.x, tilemap->position.y + tile_offset.y * tilemap->tile_size.y};
+
+        if (remove_from_source) {
+            TilemapSetTileIdBlock(tilemap, selection_rect->x, selection_rect->y, selection_rect->w, selection_rect->h, TILE_EMPTY);
+        }
+
+        recti data_rect = {
+            tile_offset.x,
+            tile_offset.y,
+            selection_rect->w,
+            selection_rect->h,
+        };
+        TilemapSetRegionData(tilemap, data_rect, temp_buffer, capacity, write_empty);
+
+        temp_tilemap_out->size = {0, 0};
+        selection_rect->w = 0.0;
+        selection_rect->h = 0.0;
+    }
+}
+
+// Increase or decrease tile ID under input_position 
+TMAPI void EditTiles(
+    Tilemap *tilemap,
+    vec2i input_position,
+    TileID *tile_id_state,
+    InputType input_type
+) {
+    if (input_type == tmInputDirection_NONE){
+        return;
+    }
+
+    TileID tile_id = TilemapGetTileWorld(tilemap, input_position);
+    if (tile_id == TILE_INVALID){
+        return;
+    }
+
+    if (input_type == tmInputDirection_INCREASE && (tile_id + 1) != TILE_INVALID){
+        *tile_id_state = tile_id + 1;
+    } else if (input_type == tmInputDirection_DECREASE && (tile_id - 1) != TILE_INVALID){
+        *tile_id_state = tile_id - 1;
+    }
+
+    TilemapSetTileWorld(tilemap, input_position, *tile_id_state);
+}
+
+// Draw with tile_id
+TMAPI void PaintTiles(
+    Tilemap *tilemap,
+    vec2i input_position,
+    vec2i *state_position,
+    TileID tile_id_input,
+    InputState input_state
+) {
+    if (tile_id_input == TILE_INVALID){
+        return;
+    }
+
+    if (input_state == tmInputState_START){
+        *state_position = TilemapGetWorld2Tile(tilemap, input_position);
+        TileID tile_id = TilemapGetTile(tilemap, *state_position);
+        if (tile_id == TILE_INVALID){
+            return;
+        }
+        TilemapSetTile(tilemap, *state_position, tile_id_input);
+    } else if (input_state == tmInputState_HOLD){
+        vec2i new_position = TilemapGetWorld2Tile(tilemap, input_position);
+        if ((new_position.x == state_position->x) && (new_position.y == state_position->y)){
+            return;
+        }
+        *state_position = new_position;
+        TileID tile_id = TilemapGetTile(tilemap, *state_position);
+        if (tile_id == TILE_INVALID){
+            return;
+        }
+        TilemapSetTile(tilemap, *state_position, tile_id_input);
+    }
+}
+
+// Drag'n'Drop a tilemap
+TMAPI void MoveTilemap(
+    Tilemap *tilemap,
+    vec2i input_position,
+    vec2i *drag_start_position,
+    vec2i *map_start_position,
+    InputState input_state,
+    bool grid_lock
+){
+    if (input_state == tmInputState_START) {
+        *map_start_position = tilemap->position;
+        *drag_start_position = input_position;
+    } else if (input_state == tmInputState_HOLD) {
+        vec2i drag_difference = {input_position.x - drag_start_position->x, input_position.y - drag_start_position->y};
+        if (!grid_lock) {
+            tilemap->position = {map_start_position->x + drag_difference.x, map_start_position->y + drag_difference.y};
+            return;
+        }
+        vec2i tile_difference = {drag_difference.x / tilemap->tile_size.x, drag_difference.y / tilemap->tile_size.y};
+        if (drag_difference.x < 0 ) {
+            tile_difference.x -= 1;
+        }
+        if (drag_difference.y < 0 ) {
+            tile_difference.y -= 1;
+        }
+
+        tilemap->position = {map_start_position->x + tile_difference.x * tilemap->tile_size.x, map_start_position->y + tile_difference.y * tilemap->tile_size.y};
+    }
+}
+
+
 
 #endif // TILEMAP_IMPLEMENTATION
