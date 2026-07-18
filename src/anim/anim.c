@@ -377,6 +377,8 @@ float AnimPropMax(int prop)
         case AP_T_POS_X: case AP_S_POS_X:
         case AP_T_POS_Y: case AP_S_POS_Y: return 2.0f;
         case AP_S_OUTLINE:                return 0.05f;   // ~36 px at 720p
+        case AP_T_SIZE:  case AP_S_W:
+        case AP_S_H:                      return 3.0f;    // allow off-screen sizes
         default:                          return 1.0f;
     }
 }

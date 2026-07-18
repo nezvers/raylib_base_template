@@ -26,6 +26,7 @@
 #include "../signal/anim_signal.h"
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdio.h>          // remove() for deleting anim files off disk
 #include <math.h>
 
 // Forward declares (house pattern).
@@ -41,12 +42,37 @@ AppState app_state_anim_editor = {Enter, Exit, Update, Draw, Gui, "AnimEditor"};
 // ---------------------------------------------------------------------------
 //  Editor state (file-scope singleton - persists across frames like the menu).
 // ---------------------------------------------------------------------------
-#define SAVE_PATH "anim_doc.cfg"   // relative to CWD, like settings.cfg
+// Animations live as one .cfg each under ANIM_DIR (CWD-relative, writable -
+// NOT RESOURCES_PATH, which is read-only/preloaded on release+web). The dropdown
+// enumerates this dir; each file's basename (no extension) is one animation.
+#define ANIM_DIR      "anims"
+#define ANIM_EXT      ".cfg"
+#define ANIM_LIST_MAX 64
+#define LEGACY_PATH   "anim_doc.cfg"   // pre-dir single file; migrated in on first run
 #define UNDO_MAX  16
 #define AUTOKEY_EPS 0.02f          // playhead-to-key snap when auto-keying (s)
 
 static AnimDoc doc;                 // the working document
 static AnimPlayer preview;          // plays the doc for signal-fire testing
+
+// animation library (files in ANIM_DIR) + which one `doc` came from.
+static char animList[ANIM_LIST_MAX][ANIM_NAME_MAX];  // basenames, no extension
+static int  animCount = 0;
+static int  animCurrent = -1;       // index into animList of the loaded anim (-1 unsaved)
+static bool docDirty = false;       // `doc` has edits not written to its file
+
+// animation-switch dropdown (header in toolbar, list drawn as overlay like ease)
+static bool animSwitchOpen = false;
+static Rectangle animSwitchRect;
+static bool animSwitchVisible = false;
+
+// modal prompts driven by the switch dropdown (drawn topmost, block other input).
+typedef enum { PROMPT_NONE, PROMPT_SAVE_THEN_SWITCH, PROMPT_CONFIRM_DELETE,
+               PROMPT_NEW_NAME } PromptKind;
+static PromptKind prompt = PROMPT_NONE;
+static int  promptTargetIdx = -1;   // anim to switch-to / delete
+static char nameBuf[ANIM_NAME_MAX]; // New... name input
+static bool edNameBuf = false;      // name textbox edit flag
 
 static int  selElem = -1;           // primary selected element (-1 = none)
 static bool multiSel[ANIM_ELEMS_MAX];   // additional selected elements
@@ -98,6 +124,14 @@ static bool autoKey = true;
 // one UndoPush per slider drag gesture (cleared on mouse release in Gui())
 static bool sliderGestureOpen = false;
 
+// precise slider input: double-click the value label to type an exact value,
+// or Ctrl+wheel over a slider to step it in fixed increments.
+static bool      edSliderActive = false;    // a slider textbox is open
+static Rectangle edSliderRect = {0};        // rect of the slider that owns it
+static char      edSliderBuf[16];
+static double    lastSliderClick = 0.0;     // double-click timing
+static Rectangle lastSliderClickRect = {0};
+
 // dragging on the timeline
 static bool dragPlayhead = false;
 static int  dragKeyElem = -1, dragKeyTrack = -1, dragKeyIdx = -1;
@@ -111,6 +145,7 @@ static void UndoPush()
     undoHead = (undoHead + 1) % UNDO_MAX;
     if (undoCount < UNDO_MAX - 1) undoCount++;
     redoCount = 0;                              // a new edit invalidates redo
+    docDirty = true;                            // every mutating edit routes here
 }
 
 static void ClearKeySelection()
@@ -206,19 +241,99 @@ static void MakeStarterDoc()
     selElem = 0;
 }
 
+// ---------------------------------------------------------------------------
+//  Animation library: files under ANIM_DIR, one .cfg per animation.
+// ---------------------------------------------------------------------------
+
+// Path to an animation file by basename (rotating TextFormat buffer - use now).
+static const char *AnimPath(const char *name)
+{
+    return TextFormat("%s/%s%s", ANIM_DIR, name, ANIM_EXT);
+}
+
+// Index of an animation in animList by name, or -1.
+static int AnimFind(const char *name)
+{
+    for (int i = 0; i < animCount; i++)
+        if (TextIsEqual(animList[i], name)) return i;
+    return -1;
+}
+
+// (Re)build animList from disk. Creates ANIM_DIR if missing and, on first run,
+// migrates the legacy single anim_doc.cfg into it so old work isn't lost.
+static void RescanAnims()
+{
+    if (!DirectoryExists(ANIM_DIR)) MakeDirectory(ANIM_DIR);
+
+    // one-time migration: legacy file present, new dir still empty.
+    FilePathList probe = LoadDirectoryFilesEx(ANIM_DIR, ANIM_EXT, false);
+    bool empty = probe.count == 0;
+    UnloadDirectoryFiles(probe);
+    if (empty && FileExists(LEGACY_PATH))
+    {
+        AnimDoc tmp;
+        if (AnimDocLoad(&tmp, LEGACY_PATH))
+        {
+            const char *nm = tmp.name[0] ? tmp.name : "main";
+            AnimDocSave(&tmp, AnimPath(nm));
+        }
+    }
+
+    animCount = 0;
+    FilePathList fl = LoadDirectoryFilesEx(ANIM_DIR, ANIM_EXT, false);
+    for (unsigned int i = 0; i < fl.count && animCount < ANIM_LIST_MAX; i++)
+        TextCopy(animList[animCount++], GetFileNameWithoutExt(fl.paths[i]));
+    UnloadDirectoryFiles(fl);
+}
+
+// Load animList[idx] into `doc`, making it the current (clean) animation.
+static void LoadAnimByIndex(int idx)
+{
+    if (idx < 0 || idx >= animCount) return;
+    UndoPush();                                 // switching is undoable
+    AnimSignalUnregister(&doc, &preview);       // bindings match the OLD doc
+    if (!AnimDocLoad(&doc, AnimPath(animList[idx]))) MakeStarterDoc();
+    AnimSignalRegister(&doc, &preview);
+    animCurrent = idx;
+    docDirty = false;                           // freshly loaded == clean
+    selElem = doc.elemCount > 0 ? 0 : -1;
+    ClearKeySelection();
+    ClampSelection();
+    playhead = 0.0f; playing = false;
+}
+
+// Save `doc` to its current file (or under doc.name if never saved), refresh list.
+static void SaveCurrent()
+{
+    const char *nm = (animCurrent >= 0) ? animList[animCurrent]
+                   : (doc.name[0] ? doc.name : "untitled");
+    AnimDocSave(&doc, AnimPath(nm));
+    RescanAnims();
+    animCurrent = AnimFind(nm);
+    docDirty = false;
+}
+
 // ===========================================================================
 //  State lifecycle
 // ===========================================================================
 static void Enter()
 {
-    // Load a previously saved doc if present, else start on a demo.
-    if (!AnimDocLoad(&doc, SAVE_PATH) || doc.elemCount == 0)
+    // Enumerate the animation library (creates the dir + migrates legacy file).
+    RescanAnims();
+
+    // Open the first saved animation if any, else start on a demo.
+    animCurrent = -1;
+    if (animCount > 0 && AnimDocLoad(&doc, AnimPath(animList[0])) && doc.elemCount > 0)
+        animCurrent = 0;
+    else
         MakeStarterDoc();
+    docDirty = false;
 
     selElem  = doc.elemCount > 0 ? 0 : -1;
     for (int i = 0; i < ANIM_ELEMS_MAX; i++) multiSel[i] = false;
     ClearKeySelection();
-    edSigIdx = -1; sliderGestureOpen = false;
+    edSigIdx = -1; sliderGestureOpen = false; edSliderActive = false;
+    animSwitchOpen = false; prompt = PROMPT_NONE; edNameBuf = false;
     playhead = 0.0f; playing = false;
     panelAnim = 0.0f; prevPlaybackUi = false; inspScroll = 0.0f;
     undoCount = redoCount = 0; undoHead = 0;
@@ -265,7 +380,7 @@ static void Update()
 
     // Space = play/pause, Ctrl+Space = play-from-start/stop (playhead to 0).
     // Ignored while any textbox is capturing typing.
-    bool typing = edName || edText || edKeyTime || edSigIdx >= 0;
+    bool typing = edName || edText || edKeyTime || edSigIdx >= 0 || edSliderActive;
     if (!typing && IsKeyPressed(KEY_SPACE))
     {
         if (ctrl)
@@ -282,7 +397,7 @@ static void Update()
     if (playbackUi && !prevPlaybackUi)
     {
         // hidden widgets must not keep capturing input
-        edName = edText = edKeyTime = false; edSigIdx = -1;
+        edName = edText = edKeyTime = false; edSigIdx = -1; edSliderActive = false;
         addTrackDrop = -1; keyEaseDropOpen = false;
     }
     prevPlaybackUi = playbackUi;
@@ -320,10 +435,94 @@ static void Draw()
 // A labelled float slider that snapshots the doc ONCE per drag gesture: the
 // UndoPush lands before the first change is written, and the gesture stays
 // open until the mouse is released (cleared at the top of Gui()).
+// same slider rect two frames running -> same widget (positions are stable)
+static bool SameRect(Rectangle a, Rectangle b)
+{
+    return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
+}
+
+// step size for Ctrl+wheel / Ctrl-drag snapping, keyed on the value range:
+// fine for fractional 0..1/0..2 sliders, coarser for duration/time.
+static float SliderStep(float lo, float hi) { return (hi - lo <= 2.0f) ? 0.01f : 0.1f; }
+
+static float ClampF(float v, float lo, float hi)
+{
+    if (v < lo) return lo; if (v > hi) return hi; return v;
+}
+
 static bool EditSlider(Rectangle r, const char *label, float *v, float lo, float hi)
 {
+    // a disabled slider (auto-key off) gets no precise input either: fall through
+    // to the plain draw so it can't sneak a value/keyframe write.
+    if (GuiGetState() == STATE_DISABLED)
+    {
+        float tmp = *v;
+        GuiSlider(r, label, TextFormat("%.2f", tmp), &tmp, lo, hi);
+        return false;
+    }
+
+    // value label sits just right of the bar (raygui draws it there too).
+    float pad = (float)GuiGetStyle(SLIDER, TEXT_PADDING);
+    Rectangle lbl = { r.x + r.width + pad, r.y, 44, r.height };
+    Vector2 mouse = GetMousePosition();
+
+    // --- textbox mode: this slider owns the open value editor ------------------
+    if (edSliderActive && SameRect(edSliderRect, r))
+    {
+        GuiSlider(r, label, "", &(float){ *v }, lo, hi);   // draw bar, ignore drag
+        bool commit = false, cancel = false;
+        // Esc cancels; Enter or a click outside the box commits.
+        if (IsKeyPressed(KEY_ESCAPE)) cancel = true;
+        else if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) commit = true;
+        else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+                 !CheckCollisionPointRec(mouse, lbl)) commit = true;
+
+        GuiTextBox(lbl, edSliderBuf, sizeof(edSliderBuf), true);
+
+        if (commit || cancel)
+        {
+            edSliderActive = false;
+            if (commit)
+            {
+                float nv = ClampF((float)atof(edSliderBuf), lo, hi);
+                if (nv != *v) { UndoPush(); *v = nv; return true; }
+            }
+        }
+        return false;
+    }
+
+    // --- open the textbox on a double-click of the value label -----------------
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, lbl))
+    {
+        if (GetTime() - lastSliderClick < 0.3 && SameRect(lastSliderClickRect, r))
+        {
+            edSliderActive = true; edSliderRect = r;
+            TextCopy(edSliderBuf, TextFormat("%.2f", *v));
+            lastSliderClick = 0.0;
+            return false;
+        }
+        lastSliderClick = GetTime(); lastSliderClickRect = r;
+    }
+
+    // --- Ctrl+wheel steps the value in fixed increments ------------------------
+    bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    float wheel = GetMouseWheelMove();
+    if (ctrl && wheel != 0.0f && CheckCollisionPointRec(mouse, r))
+    {
+        float step = SliderStep(lo, hi);
+        float nv = ClampF(*v + wheel * step, lo, hi);
+        if (nv != *v) { UndoPush(); *v = nv; return true; }
+        return false;
+    }
+
+    // --- normal drag -----------------------------------------------------------
     float tmp = *v;
     GuiSlider(r, label, TextFormat("%.2f", tmp), &tmp, lo, hi);
+    if (ctrl && tmp != *v)                       // Ctrl-drag snaps to increments
+    {
+        float step = SliderStep(lo, hi);
+        tmp = ClampF(roundf(tmp / step) * step, lo, hi);
+    }
     if (tmp == *v) return false;
     if (!sliderGestureOpen) { UndoPush(); sliderGestureOpen = true; }
     *v = tmp;
@@ -838,6 +1037,165 @@ static void DrawDropdownOverlays()
     { keyEaseDropOpen = false; addTrackDrop = -1; }    // click-away closes
 }
 
+// Request switching to animList[idx]: guard unsaved edits with a save prompt,
+// otherwise load immediately. Closes the dropdown either way.
+static void RequestSwitch(int idx)
+{
+    animSwitchOpen = false;
+    if (idx == animCurrent) return;             // already on it
+    if (docDirty) { prompt = PROMPT_SAVE_THEN_SWITCH; promptTargetIdx = idx; }
+    else          LoadAnimByIndex(idx);
+}
+
+// The animation-switch dropdown: one row per saved anim (name switches, X
+// deletes) plus a "+ New..." row. Drawn as a top overlay like the ease list.
+static void DrawAnimSwitchOverlay()
+{
+    if (!animSwitchOpen || !animSwitchVisible) return;
+
+    ScreenState *ss = ScreenStateGet();
+    float H = (float)ss->height;
+    Rectangle hdr = animSwitchRect;
+    int rows = animCount + 1;                    // +1 for the "New..." row
+    float ih = 22.0f, listH = ih * rows;
+    float ly = (hdr.y + hdr.height + listH <= H - 4.0f)
+             ? hdr.y + hdr.height : hdr.y - listH;
+    if (ly < 4.0f) ly = 4.0f;
+    Rectangle bg = { hdr.x, ly, hdr.width, listH };
+    DrawRectangleRec(bg, (Color){ 32, 34, 40, 255 });
+    DrawRectangleLinesEx(bg, 1.0f, (Color){ 70, 74, 84, 255 });
+
+    int reqSwitch = -1, reqDelete = -1;
+    bool reqNew = false;
+    float xw = 22.0f;                            // width of the X delete button
+    for (int i = 0; i < animCount; i++)
+    {
+        Rectangle rr = { bg.x, bg.y + i*ih, bg.width, ih };
+        Rectangle nameR = { rr.x, rr.y, rr.width - xw, ih };
+        Rectangle delR  = { rr.x + rr.width - xw, rr.y, xw, ih };
+        if (GuiButton(nameR, animList[i])) reqSwitch = i;
+        if (GuiButton(delR, "#143#")) reqDelete = i;   // trash icon
+        if (i == animCurrent) DrawRectangleRec(nameR, (Color){ 90, 140, 220, 60 });
+    }
+    Rectangle newR = { bg.x, bg.y + animCount*ih, bg.width, ih };
+    if (GuiButton(newR, "+ New...")) reqNew = true;
+
+    if (reqNew)
+    {
+        AudioPlayButton(); animSwitchOpen = false;
+        nameBuf[0] = '\0'; edNameBuf = true; prompt = PROMPT_NEW_NAME;
+    }
+    else if (reqDelete >= 0)
+    {
+        AudioPlayButton(); animSwitchOpen = false;
+        prompt = PROMPT_CONFIRM_DELETE; promptTargetIdx = reqDelete;
+    }
+    else if (reqSwitch >= 0) { AudioPlayButton(); RequestSwitch(reqSwitch); }
+    else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+             !CheckCollisionPointRec(GetMousePosition(), bg) &&
+             !CheckCollisionPointRec(GetMousePosition(), hdr))
+        animSwitchOpen = false;                  // click-away closes
+}
+
+// Actually delete animList[idx] from disk, refresh the list, and if it was the
+// current animation fall back to another (or a fresh starter doc).
+static void DeleteAnim(int idx)
+{
+    if (idx < 0 || idx >= animCount) return;
+    bool wasCurrent = (idx == animCurrent);
+    // remember the current anim's NAME - rescan may reorder/shift indices.
+    char curName[ANIM_NAME_MAX] = {0};
+    if (animCurrent >= 0) TextCopy(curName, animList[animCurrent]);
+
+    remove(AnimPath(animList[idx]));
+    RescanAnims();
+
+    if (wasCurrent)
+    {
+        animCurrent = -1;
+        if (animCount > 0) LoadAnimByIndex(0);
+        else { UndoPush(); AnimSignalUnregister(&doc,&preview); MakeStarterDoc();
+               AnimSignalRegister(&doc,&preview); docDirty = false; ClampSelection(); }
+    }
+    else animCurrent = AnimFind(curName);        // follow the current anim by name
+}
+
+// Create a fresh named animation from nameBuf, save it, make it current.
+static void CreateAnim(const char *name)
+{
+    UndoPush();
+    AnimSignalUnregister(&doc, &preview);
+    MakeStarterDoc();
+    TextCopy(doc.name, name);
+    AnimSignalRegister(&doc, &preview);
+    AnimDocSave(&doc, AnimPath(name));
+    RescanAnims();
+    animCurrent = AnimFind(name);
+    docDirty = false;
+    ClampSelection();
+    playhead = 0.0f; playing = false;
+}
+
+// A small centered modal for the switch/delete/new flows. Drawn topmost.
+static void DrawPromptModal()
+{
+    if (prompt == PROMPT_NONE) return;
+
+    ScreenState *ss = ScreenStateGet();
+    float W = (float)ss->width, H = (float)ss->height;
+    float mw = 320, mh = 120;
+    Rectangle m = { (W-mw)/2, (H-mh)/2, mw, mh };
+    DrawRectangle(0, 0, (int)W, (int)H, (Color){ 0, 0, 0, 120 });   // dim behind
+    DrawRectangleRec(m, (Color){ 40, 42, 48, 255 });
+    DrawRectangleLinesEx(m, 1.0f, (Color){ 90, 94, 104, 255 });
+
+    float bw = 90, bh = 28, by = m.y + mh - bh - 12;
+    Rectangle msg = { m.x+16, m.y+14, mw-32, 40 };
+
+    if (prompt == PROMPT_SAVE_THEN_SWITCH)
+    {
+        GuiLabel(msg, TextFormat("Save changes to \"%s\" before switching?",
+                                 animCurrent >= 0 ? animList[animCurrent] : "*unsaved"));
+        if (GuiButton((Rectangle){ m.x+16, by, bw, bh }, "Save"))
+        {   // saving rescans (list may reorder), so re-find the target by name.
+            AudioPlayButton();
+            char target[ANIM_NAME_MAX];
+            TextCopy(target, animList[promptTargetIdx]);
+            SaveCurrent();
+            prompt = PROMPT_NONE;
+            LoadAnimByIndex(AnimFind(target));
+        }
+        if (GuiButton((Rectangle){ m.x+(mw-bw)/2, by, bw, bh }, "Discard"))
+        { AudioPlayButton(); docDirty = false; int t = promptTargetIdx; prompt = PROMPT_NONE;
+          LoadAnimByIndex(t); }
+        if (GuiButton((Rectangle){ m.x+mw-bw-16, by, bw, bh }, "Cancel"))
+        { AudioPlayButton(); prompt = PROMPT_NONE; }
+    }
+    else if (prompt == PROMPT_CONFIRM_DELETE)
+    {
+        const char *nm = (promptTargetIdx >= 0 && promptTargetIdx < animCount)
+                       ? animList[promptTargetIdx] : "?";
+        GuiLabel(msg, TextFormat("Delete animation \"%s\"? This cannot be undone.", nm));
+        if (GuiButton((Rectangle){ m.x+mw-2*bw-24, by, bw, bh }, "Delete"))
+        { AudioPlayButton(); DeleteAnim(promptTargetIdx); prompt = PROMPT_NONE; }
+        if (GuiButton((Rectangle){ m.x+mw-bw-16, by, bw, bh }, "Cancel"))
+        { AudioPlayButton(); prompt = PROMPT_NONE; }
+    }
+    else if (prompt == PROMPT_NEW_NAME)
+    {
+        GuiLabel(msg, "New animation name:");
+        Rectangle tb = { m.x+16, m.y+44, mw-32, 26 };
+        if (GuiTextBox(tb, nameBuf, ANIM_NAME_MAX, edNameBuf)) edNameBuf = !edNameBuf;
+        bool valid = nameBuf[0] && AnimFind(nameBuf) < 0;
+        if (!valid) GuiDisable();
+        if (GuiButton((Rectangle){ m.x+mw-2*bw-24, by, bw, bh }, "Create"))
+        { AudioPlayButton(); CreateAnim(nameBuf); prompt = PROMPT_NONE; edNameBuf = false; }
+        if (!valid) GuiEnable();
+        if (GuiButton((Rectangle){ m.x+mw-bw-16, by, bw, bh }, "Cancel"))
+        { AudioPlayButton(); prompt = PROMPT_NONE; edNameBuf = false; }
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  Signals row.
 // ---------------------------------------------------------------------------
@@ -1053,16 +1411,19 @@ static void DrawTimeline(float x, float y, float w, float h)
 static void DrawToolbar(float x, float y, float w)
 {
     float bw = 70, rh = 26, gx = x;
-    if (GuiButton((Rectangle){ gx, y, bw, rh }, "New"))
-    { AudioPlayButton(); UndoPush(); MakeStarterDoc();
-      AnimSignalUnregister(&doc,&preview); AnimSignalRegister(&doc,&preview); }
-    gx += bw+4;
-    if (GuiButton((Rectangle){ gx, y, bw, rh }, "Load"))
-    { AudioPlayButton(); UndoPush(); AnimDocLoad(&doc, SAVE_PATH); ClampSelection();
-      AnimSignalUnregister(&doc,&preview); AnimSignalRegister(&doc,&preview); }
-    gx += bw+4;
+
+    // animation switcher: header shows current anim (or "*unsaved") + dropdown.
+    // The list itself is drawn as an overlay in DrawDropdownOverlays().
+    float dw = bw + 44;
+    const char *label = (animCurrent >= 0) ? animList[animCurrent] : "*unsaved";
+    Rectangle switchR = { gx, y, dw, rh };
+    if (GuiButton(switchR, TextFormat("%s  v", label)))
+    { AudioPlayButton(); animSwitchOpen = !animSwitchOpen;
+      keyEaseDropOpen = false; addTrackDrop = -1; }
+    animSwitchRect = switchR; animSwitchVisible = true;
+    gx += dw+4;
     if (GuiButton((Rectangle){ gx, y, bw, rh }, "Save"))
-    { AudioPlayButton(); AnimDocSave(&doc, SAVE_PATH); }
+    { AudioPlayButton(); SaveCurrent(); }
     gx += bw+8;
     if (GuiButton((Rectangle){ gx, y, bw, rh }, "Undo")) { AudioPlayButton(); UndoApply(-1); }
     gx += bw+4;
@@ -1108,10 +1469,12 @@ static void Gui()
     // a slider drag gesture (one undo snapshot) ends when the button comes up.
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) sliderGestureOpen = false;
 
-    // while a dropdown list is open every other widget is locked; the list
-    // itself is drawn (unlocked) last so it overlays them.
+    // while a dropdown list or modal prompt is open every other widget is
+    // locked; the overlay itself is drawn (unlocked) last so it sits on top.
     addTrackVisible = false;
-    if (keyEaseDropOpen || addTrackDrop >= 0) GuiLock();
+    animSwitchVisible = false;
+    if (keyEaseDropOpen || addTrackDrop >= 0 || animSwitchOpen || prompt != PROMPT_NONE)
+        GuiLock();
 
     DrawToolbar(pad, pad, W - 2*pad);
 
@@ -1133,7 +1496,9 @@ static void Gui()
         DrawElementList(leftPanel.x+8, leftPanel.y+8, leftW-16);
 
         // inspector scrolls (content can overflow); scissor keeps it in-panel.
-        if (CheckCollisionPointRec(GetMousePosition(), rightPanel))
+        // Ctrl+wheel is reserved for stepping the hovered slider, not scrolling.
+        bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+        if (!ctrl && CheckCollisionPointRec(GetMousePosition(), rightPanel))
             inspScroll += GetMouseWheelMove() * 30.0f;
         float maxScroll = inspContentH - (rightPanel.height - 16);
         if (maxScroll < 0) maxScroll = 0;
@@ -1158,4 +1523,6 @@ static void Gui()
 
     GuiUnlock();
     DrawDropdownOverlays();
+    DrawAnimSwitchOverlay();    // animation list (over widgets, under the modal)
+    DrawPromptModal();          // topmost: save-before-switch / delete / new
 }
