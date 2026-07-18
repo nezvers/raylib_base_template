@@ -159,6 +159,11 @@ TMAPI void TilemapGetRegionData(Tilemap *tilemap, recti rect_section, TileID *ou
 TMAPI void TilemapSetRegionData(Tilemap *tilemap, recti rect_section, TileID *in_buffer, uint32_t capacity, bool write_empty); // Copy TileID from in_buffer assuming data is 1D array representing provided region in tile coordinates
 TMAPI void TilemapSetData(Tilemap *tilemap, TileID *in_buffer, uint32_t capacity, uint32_t data_width, uint32_t data_height); // Copy TileID as 1D array from in_buffer starting from 0th index
 
+TMAPI void AutotileRuleUpdateCell(Tilemap *tilemap_in, Tilemap *tilemap_out, AutotileRule *rules, uint32_t rule_count, vec2i tile_pos); // Process single cell for tilemap_out
+TMAPI void AutotileRuleUpdateTilemap(Tilemap *tilemap_in, Tilemap *tilemap_out, AutotileRule *rules, uint32_t rule_count);
+TMAPI void AutotileRuleUpdateRect(Tilemap *tilemap_in, Tilemap *tilemap_out, AutotileRule *rules, uint32_t rule_count, recti region);
+TMAPI void AutotileRuleUpdateNeighbours(Tilemap *tilemap_in, Tilemap *tilemap_out, AutotileRule *rules, uint32_t rule_count, vec2i tile_pos);
+
 TMAPI uint32_t tmRndState(uint32_t *nProcGen);                     // Random number using seed state: determenistic using same seed state
 TMAPI int32_t tmRndInt(uint32_t *seed, int32_t min, int32_t max);  // Random signed integer range number using seed state
 TMAPI int tmRndCash(uint32_t seed, int x, int y);                  // cash stands for chaos hash :D
@@ -729,6 +734,125 @@ TMAPI void TilemapSetData(Tilemap *tilemap, TileID *in_buffer, uint32_t capacity
     }
 }
 
+/* ----- Ruletile ------ */
+
+// Process single cell for tilemap_out
+TMAPI void AutotileRuleUpdateCell(Tilemap *tilemap_in, Tilemap *tilemap_out, AutotileRule *rules, uint32_t rule_count, vec2i tile_pos) {
+    assert(tile_pos.x >= 0);
+    assert(tile_pos.y >= 0);
+    assert(tile_pos.x < tilemap_in->tile_size.x);
+    assert(tile_pos.y < tilemap_in->tile_size.y);
+    assert(tile_pos.x < tilemap_out->tile_size.x);
+    assert(tile_pos.y < tilemap_out->tile_size.y);
+
+    AutotileRule *rule;
+    TileID test_id;
+    bool is_matching;
+    vec2i match_pos;
+    RuleMatch *match_rule;
+    
+    int32_t index_out = tile_pos.x + tile_pos.y * tilemap_out->size.x;
+    // TODO: remove
+    TileID tile_in = TilemapGetTile(tilemap_in, tile_pos);
+    if (tile_in != TILE_EMPTY) {
+        tile_in = tile_in;
+    }
+
+    for (int32_t i; i < rule_count; i += 1) {
+        rule = &rules[i];
+        
+        is_matching = true;
+        for (int32_t j = 0; j < (int32_t)rule->capacity; j += 1) {
+            match_rule = &rule->match[j];
+            match_pos = {tile_pos.x + match_rule->offset.x, tile_pos.y + match_rule->offset.y};
+            
+            // Check X boundry
+            if (match_pos.x < 0 || match_pos.x > (tilemap_in->size.x - 1)) {
+                if (!match_rule->exclude || match_rule->id == TILE_EMPTY) {
+                    is_matching = false;
+                    break;
+                }
+                continue;
+            }
+            // Check Y boundry
+            if (match_pos.y < 0 || match_pos.y > (tilemap_in->size.y - 1)) {
+                if (!match_rule->exclude || match_rule->id == TILE_EMPTY) {
+                    is_matching = false;
+                    break;
+                }
+                continue;
+            }
+
+            test_id = TilemapGetTile(tilemap_in, match_pos);
+            if (test_id != match_rule->id && !match_rule->exclude) {
+                is_matching = false;
+                break;
+            }
+            if (test_id == match_rule->id && match_rule->exclude) {
+                is_matching = false;
+                break;
+            }
+        }
+        if (!is_matching) {
+            continue;
+        }
+
+        // Match found
+        // TODO: optionaly random skip
+        tilemap_out->grid[index_out] = rule->tile_id;
+        break;
+    }
+}
+
+TMAPI void AutotileRuleUpdateTilemap(Tilemap *tilemap_in, Tilemap *tilemap_out, AutotileRule *rules, uint32_t rule_count) {
+    assert((tilemap_in->size.x == tilemap_out->size.x) && (tilemap_in->size.y == tilemap_out->size.y));
+    assert(tilemap_in->capacity >= tilemap_out->capacity);
+
+    vec2i tile_pos;
+    for (int32_t y = 0; y < tilemap_in->size.y; y += 1) {
+        for (int32_t x = 0; x < tilemap_in->size.x; x += 1) {
+            tile_pos = {x, y};
+            AutotileRuleUpdateCell(tilemap_in, tilemap_out, rules, rule_count, tile_pos);
+        }
+    }
+}
+
+TMAPI void AutotileRuleUpdateRect(Tilemap *tilemap_in, Tilemap *tilemap_out, AutotileRule *rules, uint32_t rule_count, recti region) {
+    recti rect = TilemapClampRecti(tilemap_in, region);
+    vec2i tile_pos;
+    for (int32_t y = rect.y; y < (rect.y + rect.h); y += 1) {
+        for (int32_t x = rect.x; x < (rect.x + rect.x); x += 1) {
+            tile_pos = {x, y};
+            AutotileRuleUpdateCell(tilemap_in, tilemap_out, rules, rule_count, tile_pos);
+        }
+    }
+}
+
+TMAPI void AutotileRuleUpdateNeighbours(Tilemap *tilemap_in, Tilemap *tilemap_out, AutotileRule *rules, uint32_t rule_count, vec2i tile_pos) {
+    vec2i neighbour_list[] = {
+        {tile_pos.x - -1, tile_pos.y - -1},
+        {tile_pos.x - 0,  tile_pos.y - -1},
+        {tile_pos.x - 1,  tile_pos.y - -1},
+        {tile_pos.x - -1, tile_pos.y - 0},
+        {tile_pos.x - 1,  tile_pos.y - 0},
+        {tile_pos.x - -1, tile_pos.y - 1},
+        {tile_pos.x - 0,  tile_pos.y - 1},
+        {tile_pos.x - 1,  tile_pos.y - 1},
+    };
+    const char neighbour_count = 8;
+
+    vec2i test_pos;
+    for (char i = 0; i < neighbour_count; i += 1) {
+        test_pos = neighbour_list[i];
+        if (test_pos.x < 0 || test_pos.y < 0 ) {
+            continue;
+        }
+        if (test_pos.x > tilemap_in->size.x -1 || test_pos.y > tilemap_in->size.y -1) {
+            continue;
+        }
+        AutotileRuleUpdateCell(tilemap_in, tilemap_out, rules, rule_count, test_pos);
+    }
+}
 
 /* ----- Tilemap editing ----- */
 
