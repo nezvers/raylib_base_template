@@ -95,6 +95,8 @@ typedef enum {
     // GLOBAL (200..) --------------------------------------------------------
     AP_G_FADE = 200,    // whole-screen fade-to-color amount, 0..1
     AP_G_COLOR,         // RGBA fade-to colour; keys use AnimKey.cval
+    AP_G_BG_ALPHA,      // 0..1 opacity of the scene background fill
+    AP_G_BG_COLOR,      // RGB scene background; keys use AnimKey.cval
 } AnimPropKind;
 
 // A single keyframe on the shared clock.
@@ -132,7 +134,8 @@ typedef enum {
 // One animated thing. Which base fields matter depends on `kind`:
 //   AE_TEXT   : text, color, and base posFrac/sizeFrac (defaults when no track)
 //   AE_SHAPE  : shapeKind, color, base posFrac + sizeFrac(w)/ h via base fields
-//   AE_GLOBAL : color (the fade colour); position/size unused
+//   AE_GLOBAL : color (the fade colour) + bgColor (scene background, drawn
+//               behind every element); position/size unused
 typedef struct {
     AnimElemKind kind;
     char         name[ANIM_NAME_MAX];
@@ -147,6 +150,9 @@ typedef struct {
     Color   outlineColor;              // AE_SHAPE: outline tint (rest pose)
     float   outlineFrac;               // AE_SHAPE: outline thickness, fraction
                                        // of game height; 0 = no outline
+    Color   bgColor;                   // AE_GLOBAL: scene background fill; the
+                                       // alpha channel is the rest-pose
+                                       // AP_G_BG_ALPHA (0 = no background)
 
     AnimTrack tracks[ANIM_TRACKS_MAX];
     int       trackCount;

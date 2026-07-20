@@ -114,6 +114,7 @@ void AnimElemInit(AnimElem *e, AnimElemKind kind)
         case AE_GLOBAL:
             TextCopy(e->name, "global");
             e->color    = BLACK;                     // fade-to colour
+            e->bgColor  = (Color){ 0, 0, 0, 0 };     // background off (a = 0)
             e->posFrac  = (Vector2){ 0.0f, 0.0f };
             e->sizeFrac = (Vector2){ 0.0f, 0.0f };
             break;
@@ -330,7 +331,8 @@ AnimKey *AnimTrackWriteColorKeyAt(AnimTrack *tr, float t, Color c, float eps)
 bool AnimPropIsColor(int prop)
 {
     return prop == AP_T_COLOR || prop == AP_S_COLOR ||
-           prop == AP_S_OUTLINE_COLOR || prop == AP_G_COLOR;
+           prop == AP_S_OUTLINE_COLOR || prop == AP_G_COLOR ||
+           prop == AP_G_BG_COLOR;
 }
 
 void AnimTrackSortKeys(AnimTrack *tr)
@@ -439,7 +441,9 @@ Color AnimElemColorProp(const AnimElem *e, int prop, float t)
 {
     // Exact-prop lookup: a shape can carry BOTH a fill and an outline colour
     // track, so "any colour track" would alias them.
-    Color base = (prop == AP_S_OUTLINE_COLOR) ? e->outlineColor : e->color;
+    Color base = (prop == AP_S_OUTLINE_COLOR) ? e->outlineColor
+               : (prop == AP_G_BG_COLOR)      ? e->bgColor
+                                              : e->color;
 
     if (s_ovr)
     {
@@ -483,6 +487,7 @@ static float ElemBaseProp(const AnimElem *e, int prop)
         case AP_T_ROT:   case AP_S_ROT:   return 0.0f;
         case AP_T_CRUMBLE:                return 0.0f;
         case AP_G_FADE:                   return 0.0f;
+        case AP_G_BG_ALPHA:               return (float)e->bgColor.a / 255.0f;
         default:                          return 0.0f;
     }
 }
@@ -765,6 +770,17 @@ static void DrawShapeElem(const AnimElem *e, float t, Vector2 game)
     DrawPolyShape(c, rim, n, fill, line, thickPx);
 }
 
+// Scene background: a full-screen fill drawn BEFORE any element, so it never
+// depends on where the global element sits in the list. Fully separate from
+// the fade (which is drawn last, over everything, by DrawGlobalElem).
+static void DrawGlobalBackground(const AnimElem *e, float t, Vector2 game)
+{
+    float a = AnimElemProp(e, AP_G_BG_ALPHA, t);
+    if (a <= 0.0f) return;
+    DrawRectangle(0, 0, (int)game.x, (int)game.y,
+                  Fade(AnimElemColorProp(e, AP_G_BG_COLOR, t), a));
+}
+
 static void DrawGlobalElem(const AnimElem *e, float t, Vector2 game)
 {
     float fade = AnimElemProp(e, AP_G_FADE, t);
@@ -780,6 +796,12 @@ void AnimDocDrawEx(const AnimDoc *doc, float t, const AnimSignalPlayer *ovr)
     // consult it), and always tear it down so it can't leak into a later draw.
     s_ovr    = (ovr && ovr->playing) ? ovr : NULL;
     s_ovrDoc = doc;
+
+    // backgrounds first, in list order, so a global element's fill sits behind
+    // every element regardless of its own index.
+    for (int i = 0; i < doc->elemCount; i++)
+        if (doc->elems[i].kind == AE_GLOBAL)
+            DrawGlobalBackground(&doc->elems[i], t, game);
 
     for (int i = 0; i < doc->elemCount; i++)
     {

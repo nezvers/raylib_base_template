@@ -51,6 +51,7 @@ static const PropRow k_shapeProps[] = {
 };
 static const PropRow k_globalProps[] = {
     { AP_G_FADE, "fade" }, { AP_G_COLOR, "color" },
+    { AP_G_BG_ALPHA, "bg_alpha" }, { AP_G_BG_COLOR, "bg_color" },
 };
 
 static const PropRow *PropsFor(int elemKind, int *count)
@@ -167,6 +168,11 @@ void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind)
                 e->outlineColor.r, e->outlineColor.g,
                 e->outlineColor.b, e->outlineColor.a, e->outlineFrac);
     }
+    if (e->kind == AE_GLOBAL)
+    {
+        fprintf(f, "%s  bg %d %d %d %d\n", ind,
+                e->bgColor.r, e->bgColor.g, e->bgColor.b, e->bgColor.a);
+    }
 
     fprintf(f, "%s  color %d %d %d %d\n", ind, e->color.r, e->color.g, e->color.b, e->color.a);
     fprintf(f, "%s  pos %f %f\n",  ind, e->posFrac.x,  e->posFrac.y);
@@ -263,6 +269,13 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
                                              (unsigned char)b, (unsigned char)a };
             curElem->outlineFrac  = th;
         }
+    }
+    else if (TextIsEqual(key, "bg"))
+    {
+        int r, g, b, a;
+        if (fscanf(f, "%d %d %d %d", &r, &g, &b, &a) == 4 && curElem)
+            curElem->bgColor = (Color){ (unsigned char)r, (unsigned char)g,
+                                        (unsigned char)b, (unsigned char)a };
     }
     else if (TextIsEqual(key, "color"))
     {

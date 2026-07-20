@@ -898,6 +898,21 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         e->color.a = (unsigned char)ca;
     y+=22;
 
+    // background: the scene fill behind every element. Its own colour track
+    // plus an alpha track, both independent of the fade colour above.
+    if (e->kind == AE_GLOBAL)
+    {
+        GuiLine((Rectangle){ x, y, w, 8 }, "background"); y += 12;
+        y = ColorRGBRows(x, y, w, e, AP_G_BG_COLOR, &e->bgColor, "background");
+        // alpha doubles as the on/off control (0 = no background). Matches the
+        // fill/outline alpha rows: the base channel here, AP_G_BG_ALPHA for
+        // animation.
+        float ba = e->bgColor.a;
+        if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "A", &ba, 0,255))
+            e->bgColor.a = (unsigned char)ba;
+        y += 22;
+    }
+
     // outline: thickness + its own colour track (fill and outline are separate
     // colour PROPERTIES, each with its own base + optional track).
     if (e->kind == AE_SHAPE)
@@ -2113,6 +2128,13 @@ static float DrawToolbar(float x, float y, float w)
     // so the groups (file / history / playback / clock) still read apart.
     float rh = 26*s, gx = x, gap = 8*s, grp = 20*s;
     float bw = TextW("Library", 20*s);      // widest of the plain buttons
+    // Undo/Redo are short words: sizing them off "Library" leaves a lot of dead
+    // space, so give them their own (narrower) width.
+    float uw = TextW("Undo", 16*s);
+    // EditSlider parks its value label just right of the bar, so any slider
+    // must reserve that much room before the next widget or the two numbers
+    // run into each other.
+    float valW = (float)GuiGetStyle(SLIDER, TEXT_PADDING) + 44.0f;
     float rowY = y;                         // first row (Back stays pinned here)
 
     // animation switcher: header shows current anim (or "*unsaved") + dropdown.
@@ -2131,10 +2153,10 @@ static float DrawToolbar(float x, float y, float w)
     if (GuiButton((Rectangle){ gx, y, bw, rh }, "Library"))
     { AudioPlayButton(); libScroll = 0.0f; prompt = PROMPT_LIBRARY; }
     gx += bw+grp;
-    if (GuiButton((Rectangle){ gx, y, bw, rh }, "Undo")) { AudioPlayButton(); UndoApply(-1); }
-    gx += bw+gap;
-    if (GuiButton((Rectangle){ gx, y, bw, rh }, "Redo")) { AudioPlayButton(); UndoApply(+1); }
-    gx += bw+grp;
+    if (GuiButton((Rectangle){ gx, y, uw, rh }, "Undo")) { AudioPlayButton(); UndoApply(-1); }
+    gx += uw+gap;
+    if (GuiButton((Rectangle){ gx, y, uw, rh }, "Redo")) { AudioPlayButton(); UndoApply(+1); }
+    gx += uw+grp;
     if (GuiButton((Rectangle){ gx, y, bw, rh }, playing ? "Pause" : "Play"))
     { AudioPlayButton(); playing = !playing; preview.playing = false; }
     gx += bw+gap;
@@ -2144,13 +2166,15 @@ static float DrawToolbar(float x, float y, float w)
     GuiCheckBox((Rectangle){ gx, y+(rh-cb)*0.5f, cb, cb }, "loop", &loopPlay);
     gx += cb + TextW("loop", 8*s) + gap;
     GuiCheckBox((Rectangle){ gx, y+(rh-cb)*0.5f, cb, cb }, "autokey", &autoKey);
-    gx += cb + TextW("autokey", 8*s) + grp;
+    // TextW's `extra` already pads past the glyphs, so a full group gap here
+    // reads as a gaping hole - the plain gap is enough separation.
+    gx += cb + TextW("autokey", 4*s) + gap;
 
     // The clock group (dur slider + length readout) is the widest block, and
     // "Back" is pinned to the right edge. If they would collide, wrap the group
     // onto a second row instead of letting it run under the button.
     float dlw = TextW("dur", 6*s);
-    float clockW = dlw + gap + 120*s + grp + TextW("60.00 (60.00)", 10*s);
+    float clockW = dlw + gap + 120*s + valW + grp + TextW("60.00 (60.00)", 10*s);
     float rows = 1.0f;
     if (gx + clockW > x + w - bw - grp)
     { gx = x; y += rh + gap; rows = 2.0f; }
@@ -2165,7 +2189,7 @@ static float DrawToolbar(float x, float y, float w)
         if (doc.outroStart > doc.duration) doc.outroStart = doc.duration;
         if (doc.introEnd   > doc.outroStart) doc.introEnd = doc.outroStart;
     }
-    gx += 120*s + grp;
+    gx += 120*s + valW + grp;
 
     // Played length, with the FULL timeline length in brackets: the outro is
     // trimmed, so these differ whenever the outro marker has been moved in.
