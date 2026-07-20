@@ -106,6 +106,7 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
         tests/anim_tests.c
         src/anim/anim.c
         src/anim/anim_io.c
+        src/anim/anim_library.c
         src/signal/signal.c
         src/signal/anim_signal.c
         src/easing/easing.c)

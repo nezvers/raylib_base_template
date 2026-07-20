@@ -22,6 +22,7 @@
 #include "../audio_state/audio_state.h"
 #include "../anim/anim.h"
 #include "../anim/anim_io.h"
+#include "../anim/anim_library.h"
 #include "../signal/signal.h"
 #include "../signal/anim_signal.h"
 #include <stddef.h>
@@ -49,11 +50,15 @@ AppState app_state_anim_editor = {Enter, Exit, Update, Draw, Gui, "AnimEditor"};
 #define ANIM_EXT      ".cfg"
 #define ANIM_LIST_MAX 64
 #define LEGACY_PATH   "anim_doc.cfg"   // pre-dir single file; migrated in on first run
+// element library: '_'-prefixed so RescanAnims() skips it (it is not an anim).
+#define LIB_PATH      ANIM_DIR "/_library" ANIM_EXT
 #define UNDO_MAX  16
 #define AUTOKEY_EPS 0.02f          // playhead-to-key snap when auto-keying (s)
 
 static AnimDoc doc;                 // the working document
-static AnimPlayer preview;          // plays the doc for signal-fire testing
+// A fired signal runs as an OVERRIDE on top of the timeline: the playhead keeps
+// meaning what it always did, and the signal transiently drives its targets.
+static AnimSignalPlayer preview;
 
 // animation library (files in ANIM_DIR) + which one `doc` came from.
 static char animList[ANIM_LIST_MAX][ANIM_NAME_MAX];  // basenames, no extension
@@ -68,12 +73,33 @@ static bool animSwitchVisible = false;
 
 // modal prompts driven by the switch dropdown (drawn topmost, block other input).
 typedef enum { PROMPT_NONE, PROMPT_SAVE_THEN_SWITCH, PROMPT_CONFIRM_DELETE,
-               PROMPT_NEW_NAME } PromptKind;
+               PROMPT_NEW_NAME, PROMPT_LIBRARY, PROMPT_LIB_SAVE_NAME,
+               PROMPT_LIB_RENAME } PromptKind;
 static PromptKind prompt = PROMPT_NONE;
 static int  promptTargetIdx = -1;   // anim to switch-to / delete
 static char nameBuf[ANIM_NAME_MAX]; // New... name input
 static bool edNameBuf = false;      // name textbox edit flag
 
+// element library: one shelf shared by every animation, loaded once in Enter()
+// and written back on every mutation (small file, same eager style as Save).
+static AnimLibrary library;
+static float libScroll = 0.0f;      // library modal list scroll
+static int   libTargetIdx = -1;     // entry being renamed / deleted
+
+// signal modal: which signal is open (-1 = none). Unlike the PROMPT_* modals
+// this one SURVIVES playback (shrunk to Fire/Close) so a signal can be tested
+// mid-animation, which is the whole point of a signal.
+static int   sigModalIdx = -1;
+static float sigScroll = 0.0f;      // modal's target/key list scroll
+static int   sigPropDrop = -1;      // target row whose property dropdown is open
+static int   sigKeyEaseDrop = -1;   // packed target*256+key whose ease list is open
+static float sigLastU = 1.0f;       // last u the user set on ANY signal key; new
+                                    // keys seed from it so placing a beat across
+                                    // several tracks doesn't mean retyping it
+
+static bool guiLocked = false;      // mirrors GuiLock() for this frame: raygui
+                                    // exposes no query, and PanelScroll must
+                                    // not GuiUnlock() an outer modal's lock
 static int  selElem = -1;           // primary selected element (-1 = none)
 static bool multiSel[ANIM_ELEMS_MAX];   // additional selected elements
 
@@ -87,9 +113,17 @@ static bool  loopPlay = true;
 static float panelAnim = 0.0f;
 static bool  prevPlaybackUi = false;
 
+// A scrolling panel view: content taller than the panel scrolls under the
+// wheel, clipped by a scissor. Three panels use this (elements, signals,
+// inspector) so the bookkeeping lives in one place - see PanelScroll().
+typedef struct {
+    float scroll;       // <= 0; how far the content is pulled up
+    float contentH;     // measured by the draw callback last frame
+} PanelView;
+
+static PanelView elemView, sigView, inspView;
+
 // inspector wheel-scroll (content can overflow the panel; no visible bar)
-static float inspScroll = 0.0f;
-static float inspContentH = 0.0f;   // measured last frame
 static Rectangle inspPanelRect;     // this frame's inspector panel (scissor)
 static bool scrollToSelKey = false; // scroll the selected key row into view
 
@@ -119,7 +153,7 @@ static Rectangle keyEaseRect;       // where the dropdown goes (drawn LAST in Gu
 static bool keyEaseVisible = false; // key inspector on screen this frame
 
 // auto-key: inspector sliders on TRACKED props write a key at the playhead
-static bool autoKey = true;
+static bool autoKey = false;
 
 // one UndoPush per slider drag gesture (cleared on mouse release in Gui())
 static bool sliderGestureOpen = false;
@@ -135,6 +169,7 @@ static Rectangle lastSliderClickRect = {0};
 // dragging on the timeline
 static bool dragPlayhead = false;
 static int  dragKeyElem = -1, dragKeyTrack = -1, dragKeyIdx = -1;
+static bool dragIntro = false, dragOutro = false;   // the trim triangles
 
 // ---------------------------------------------------------------------------
 //  Undo helpers: snapshot the doc before a mutating edit.
@@ -178,6 +213,13 @@ static void ClampSelection()
             selKeyIdx   >= doc.elems[selKeyElem].tracks[selKeyTrack].keyCount)
             ClearKeySelection();
     }
+
+    // an undo/redo or doc switch can shrink signalCount under the open modal
+    if (sigModalIdx >= doc.signalCount)
+    {
+        sigModalIdx = -1; edSigIdx = -1;
+        sigPropDrop = -1; sigKeyEaseDrop = -1;
+    }
 }
 
 // Bindings capture a signal's name/dir/section by value at register time, so
@@ -185,7 +227,7 @@ static void ClampSelection()
 static void ReRegisterSignals()
 {
     AnimSignalUnregister(&doc, &preview);
-    AnimSignalRegister(&doc, &preview);
+    AnimSignalRegister(&doc, &preview, &playhead);
 }
 
 static void UndoApply(int delta)   // delta -1 = undo, +1 = redo
@@ -209,7 +251,7 @@ static void UndoApply(int delta)   // delta -1 = undo, +1 = redo
         undoHead = (undoHead + 1) % UNDO_MAX;
         undoCount++; redoCount--;
     }
-    AnimSignalRegister(&doc, &preview);
+    AnimSignalRegister(&doc, &preview, &playhead);
     ClampSelection();
 }
 
@@ -231,11 +273,10 @@ static void MakeStarterDoc()
     AnimTrackAddKey(a, 0.0f, 0.0f, ANIM_EASE_LINEAR);
     AnimTrackAddKey(a, 0.6f, 1.0f, ANIM_EASE_SINE_OUT);
 
-    // one signal so the doc is playable straight away.
+    // one signal so there is something to open and fill in straight away.
     TextCopy(doc.signals[0].name, "enter");
-    doc.signals[0].dir = ANIM_FWD;
-    doc.signals[0].sectionStart = 0.0f;
-    doc.signals[0].sectionEnd   = doc.duration;
+    doc.signals[0].length      = 1.0f;
+    doc.signals[0].targetCount = 0;
     doc.signalCount = 1;
 
     selElem = 0;
@@ -282,7 +323,13 @@ static void RescanAnims()
     animCount = 0;
     FilePathList fl = LoadDirectoryFilesEx(ANIM_DIR, ANIM_EXT, false);
     for (unsigned int i = 0; i < fl.count && animCount < ANIM_LIST_MAX; i++)
-        TextCopy(animList[animCount++], GetFileNameWithoutExt(fl.paths[i]));
+    {
+        // '_'-prefixed files are editor data, not animations (the element
+        // library lives here too) - keep them out of the switcher.
+        const char *base = GetFileNameWithoutExt(fl.paths[i]);
+        if (base[0] == '_') continue;
+        TextCopy(animList[animCount++], base);
+    }
     UnloadDirectoryFiles(fl);
 }
 
@@ -293,11 +340,18 @@ static void LoadAnimByIndex(int idx)
     UndoPush();                                 // switching is undoable
     AnimSignalUnregister(&doc, &preview);       // bindings match the OLD doc
     if (!AnimDocLoad(&doc, AnimPath(animList[idx]))) MakeStarterDoc();
-    AnimSignalRegister(&doc, &preview);
+    AnimSignalRegister(&doc, &preview, &playhead);
     animCurrent = idx;
     docDirty = false;                           // freshly loaded == clean
     selElem = doc.elemCount > 0 ? 0 : -1;
     ClearKeySelection();
+    // the new doc's signals are unrelated to the old one's: close the modal and
+    // reset the panel scrolls rather than pointing them at a different signal.
+    sigModalIdx = -1; edSigIdx = -1;
+    sigPropDrop = -1; sigKeyEaseDrop = -1;
+    elemView.scroll = sigView.scroll = inspView.scroll = 0.0f;
+
+    preview = (AnimSignalPlayer){0};            // bindings pointed at the OLD doc
     ClampSelection();
     playhead = 0.0f; playing = false;
 }
@@ -321,6 +375,10 @@ static void Enter()
     // Enumerate the animation library (creates the dir + migrates legacy file).
     RescanAnims();
 
+    // the element shelf (absent file -> empty library, which is fine).
+    AnimLibraryLoad(&library, LIB_PATH);
+    libScroll = 0.0f; libTargetIdx = -1;
+
     // Open the first saved animation if any, else start on a demo.
     animCurrent = -1;
     if (animCount > 0 && AnimDocLoad(&doc, AnimPath(animList[0])) && doc.elemCount > 0)
@@ -334,13 +392,16 @@ static void Enter()
     ClearKeySelection();
     edSigIdx = -1; sliderGestureOpen = false; edSliderActive = false;
     animSwitchOpen = false; prompt = PROMPT_NONE; edNameBuf = false;
+    sigModalIdx = -1; sigScroll = 0.0f;
+    sigPropDrop = -1; sigKeyEaseDrop = -1;
+    elemView = sigView = inspView = (PanelView){0};
     playhead = 0.0f; playing = false;
-    panelAnim = 0.0f; prevPlaybackUi = false; inspScroll = 0.0f;
+    panelAnim = 0.0f; prevPlaybackUi = false;
     undoCount = redoCount = 0; undoHead = 0;
 
     // register the doc's signals so the "Fire" buttons drive the preview player.
-    preview = (AnimPlayer){0};
-    AnimSignalRegister(&doc, &preview);
+    preview = (AnimSignalPlayer){0};
+    AnimSignalRegister(&doc, &preview, &playhead);
 }
 
 static void Exit()
@@ -353,25 +414,42 @@ static void Update()
     float dt = GetFrameTime();
 
     // Timeline playback (independent of signal-fired preview).
+    // Playback runs over the TRIMMED section [0..outroStart]; the intro is a
+    // one-shot lead-in, so looping restarts at introEnd, not at 0.
     if (playing)
     {
+        float inEnd = AnimDocIntroEnd(&doc), outStart = AnimDocOutroStart(&doc);
         playhead += dt;
-        if (playhead >= doc.duration)
-            playhead = loopPlay ? fmodf(playhead, doc.duration > 0 ? doc.duration : 1.0f)
-                                : doc.duration;
+        if (playhead >= outStart)
+        {
+            if (loopPlay)
+            {
+                float cycle = outStart - inEnd;
+                playhead = (cycle > 0.0f) ? inEnd + fmodf(playhead - outStart, cycle)
+                                          : inEnd;
+            }
+            else playhead = outStart;
+        }
     }
 
-    // The signal-fired preview player advances too; when it is playing it drives
-    // the visible time so "Fire" shows the real signal playback.
-    if (!AnimPlayerDone(&preview))
-    {
-        AnimPlayerUpdate(&preview, dt);
-        playhead = AnimPlayerSampleTime(&preview);
-    }
+    // A fired signal runs on its OWN clock as an override on top of the
+    // timeline - it does not move the playhead (the whole point is that it
+    // transitions away from wherever the playhead has the scene posed).
+    if (!AnimSignalPlayerDone(&preview)) AnimSignalPlayerUpdate(&preview, dt);
 
-    // ESC returns to the menu.
+    // ESC closes whatever is open, innermost first, and only leaves the editor
+    // once nothing is (so it can't discard work behind a modal by accident).
     if (IsKeyPressed(KEY_ESCAPE))
-        AppStateTransition(&app_state_main_menu);
+    {
+        if (sigPropDrop != -1 || sigKeyEaseDrop >= 0)
+        { sigPropDrop = -1; sigKeyEaseDrop = -1; }
+        else if (prompt != PROMPT_NONE)   { prompt = PROMPT_NONE; edNameBuf = false; }
+        else if (sigModalIdx >= 0)        { sigModalIdx = -1; edSigIdx = -1; }
+        else if (animSwitchOpen)          animSwitchOpen = false;
+        else if (keyEaseDropOpen || addTrackDrop >= 0)
+        { keyEaseDropOpen = false; addTrackDrop = -1; }
+        else AppStateTransition(&app_state_main_menu);
+    }
 
     // Ctrl+Z / Ctrl+Y undo-redo.
     bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
@@ -393,12 +471,15 @@ static void Update()
     }
 
     // Slide the tool panels away while anything is playing, back when paused.
-    bool playbackUi = playing || !AnimPlayerDone(&preview);
+    bool playbackUi = playing || !AnimSignalPlayerDone(&preview);
     if (playbackUi && !prevPlaybackUi)
     {
-        // hidden widgets must not keep capturing input
+        // hidden widgets must not keep capturing input. The signal modal is
+        // deliberately NOT closed (it shrinks to Fire/Close so a signal can be
+        // triggered mid-playback), but its dropdowns do go away with it.
         edName = edText = edKeyTime = false; edSigIdx = -1; edSliderActive = false;
         addTrackDrop = -1; keyEaseDropOpen = false;
+        sigPropDrop = -1; sigKeyEaseDrop = -1;
     }
     prevPlaybackUi = playbackUi;
     float step = dt / 0.25f;
@@ -416,7 +497,8 @@ static void Draw()
     ClearBackground((Color){ 30, 32, 38, 255 });
     DrawRectangleLines(0, 0, (int)game.x, (int)game.y, (Color){ 70, 74, 84, 255 });
 
-    AnimDocDraw(&doc, playhead);
+    // a fired signal layers over the timeline pose (NULL override when idle)
+    AnimDocDrawEx(&doc, playhead, &preview);
 
     // Highlight the selected element's anchor so it's easy to see what's picked.
     if (selElem >= 0 && selElem < doc.elemCount)
@@ -624,22 +706,44 @@ static bool IsSelected(int i)
 // ---------------------------------------------------------------------------
 //  Left panel: element list + add/delete.
 // ---------------------------------------------------------------------------
-static void DrawElementList(float x, float y, float w)
+static float DrawElementList(float x, float y, float w)   // returns content height
 {
-    float rh = 26.0f, gap = 4.0f;
+    float y0 = y, rh = 26.0f, gap = 4.0f;
     GuiLabel((Rectangle){ x, y, w, 20 }, "ELEMENTS"); y += 22;
 
+    // reorder/duplicate are deferred past the loop: mutating doc.elems mid-draw
+    // shifts the array and re-draws the next row's buttons on the same rect this
+    // frame, which re-fires (same hazard as the track `del` button).
+    int pendingMove = -1, pendingMoveDelta = 0, pendingDup = -1;
+    float btnW = 20.0f;                       // ^ / v / dup strip on the right
     for (int i = 0; i < doc.elemCount; i++)
     {
-        Rectangle rr = { x, y, w, rh };
+        Rectangle nameR = { x, y, w - 3*btnW - 2, rh };
         const char *tag = AnimElemKindName(doc.elems[i].kind);
-        bool pressed = GuiButton(rr, TextFormat("%s  [%s]", doc.elems[i].name, tag));
+        bool pressed = GuiButton(nameR, TextFormat("%s  [%s]", doc.elems[i].name, tag));
+
+        // order controls: disabled at the ends so they read as unavailable.
+        if (i == 0) GuiDisable();
+        if (GuiButton((Rectangle){ x + w - 3*btnW, y, btnW, rh }, "#121#"))
+        { AudioPlayButton(); pendingMove = i; pendingMoveDelta = -1; }
+        if (i == 0) GuiEnable();
+
+        if (i == doc.elemCount - 1) GuiDisable();
+        if (GuiButton((Rectangle){ x + w - 2*btnW, y, btnW, rh }, "#120#"))
+        { AudioPlayButton(); pendingMove = i; pendingMoveDelta = +1; }
+        if (i == doc.elemCount - 1) GuiEnable();
+
+        if (doc.elemCount >= ANIM_ELEMS_MAX) GuiDisable();
+        if (GuiButton((Rectangle){ x + w - btnW, y, btnW, rh }, "#016#"))
+        { AudioPlayButton(); pendingDup = i; }
+        if (doc.elemCount >= ANIM_ELEMS_MAX) GuiEnable();
+
         // selection marker AFTER the button - raygui paints its own background,
         // so a tint drawn first would be invisible.
         if (i == selElem)
-            DrawRectangleRec(rr, (Color){ 90, 140, 220, 90 });
+            DrawRectangleRec(nameR, (Color){ 90, 140, 220, 90 });
         else if (IsSelected(i))
-            DrawRectangleRec(rr, (Color){ 60, 90, 140, 70 });
+            DrawRectangleRec(nameR, (Color){ 60, 90, 140, 70 });
         if (pressed)
         {
             AudioPlayButton();
@@ -648,6 +752,38 @@ static void DrawElementList(float x, float y, float w)
             else { selElem = i; for (int k=0;k<ANIM_ELEMS_MAX;k++) multiSel[k]=false; }
         }
         y += rh + gap;
+    }
+
+    if (pendingMove >= 0)
+    {
+        UndoPush();
+        int to = pendingMove + pendingMoveDelta;
+        AnimDocMoveElem(&doc, pendingMove, pendingMoveDelta);
+        // follow the moved element with the selection + key selection, and keep
+        // any ctrl-selected companion rows pointing at the same elements.
+        if      (selElem == pendingMove) selElem = to;
+        else if (selElem == to)          selElem = pendingMove;
+        bool a = multiSel[pendingMove], b = multiSel[to];
+        multiSel[pendingMove] = b; multiSel[to] = a;
+        if      (selKeyElem == pendingMove) selKeyElem = to;
+        else if (selKeyElem == to)          selKeyElem = pendingMove;
+        ClampSelection();
+    }
+    else if (pendingDup >= 0)
+    {
+        UndoPush();
+        if (AnimDocDuplicateElem(&doc, pendingDup))
+        {
+            // the copy is inserted at pendingDup+1: anything at or after that
+            // slot shifted down one, so trailing selections must follow.
+            for (int i = ANIM_ELEMS_MAX - 1; i > pendingDup + 1; i--)
+                multiSel[i] = multiSel[i-1];
+            multiSel[pendingDup + 1] = false;
+            if (selElem    > pendingDup) selElem++;
+            if (selKeyElem > pendingDup) selKeyElem++;
+            selElem = pendingDup + 1;               // select the new copy
+            ClampSelection();
+        }
     }
 
     y += 6;
@@ -659,6 +795,18 @@ static void DrawElementList(float x, float y, float w)
     if (GuiButton((Rectangle){ x+2*bw+8, y, bw, rh }, "+Global"))
     { AudioPlayButton(); UndoPush(); AnimElem *e=AnimDocAddElem(&doc, AE_GLOBAL); if(e) selElem=doc.elemCount-1; }
     y += rh + gap;
+
+    // shelve the primary selection (base props + all its tracks) for reuse
+    if (selElem >= 0 && selElem < doc.elemCount)
+    {
+        if (GuiButton((Rectangle){ x, y, w, rh }, "Save to library"))
+        {
+            AudioPlayButton();
+            TextCopy(nameBuf, doc.elems[selElem].name);
+            edNameBuf = true; libTargetIdx = -1; prompt = PROMPT_LIB_SAVE_NAME;
+        }
+        y += rh + gap;
+    }
 
     if (selElem >= 0 && GuiButton((Rectangle){ x, y, w, rh }, "Delete selected"))
     {
@@ -672,6 +820,9 @@ static void DrawElementList(float x, float y, float w)
         ClearKeySelection();
         ClampSelection();
     }
+    y += rh + gap;
+
+    return (y + 4) - y0;
 }
 
 // ---------------------------------------------------------------------------
@@ -840,8 +991,10 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
             {
                 float top = inspPanelRect.y + 24.0f;
                 float bot = inspPanelRect.y + inspPanelRect.height - 24.0f;
-                if (kr.y < top)                    inspScroll += top - kr.y;
-                else if (kr.y + kr.height > bot)   inspScroll -= (kr.y + kr.height) - bot;
+                // nudge the OWNING view (PanelScroll re-clamps it next frame);
+                // writing a mirror copy here would just be overwritten.
+                if (kr.y < top)                    inspView.scroll += top - kr.y;
+                else if (kr.y + kr.height > bot)   inspView.scroll -= (kr.y + kr.height) - bot;
                 scrollToSelKey = false;
             }
             y += 20;
@@ -1115,7 +1268,7 @@ static void DeleteAnim(int idx)
         animCurrent = -1;
         if (animCount > 0) LoadAnimByIndex(0);
         else { UndoPush(); AnimSignalUnregister(&doc,&preview); MakeStarterDoc();
-               AnimSignalRegister(&doc,&preview); docDirty = false; ClampSelection(); }
+               AnimSignalRegister(&doc, &preview, &playhead); docDirty = false; ClampSelection(); }
     }
     else animCurrent = AnimFind(curName);        // follow the current anim by name
 }
@@ -1127,7 +1280,7 @@ static void CreateAnim(const char *name)
     AnimSignalUnregister(&doc, &preview);
     MakeStarterDoc();
     TextCopy(doc.name, name);
-    AnimSignalRegister(&doc, &preview);
+    AnimSignalRegister(&doc, &preview, &playhead);
     AnimDocSave(&doc, AnimPath(name));
     RescanAnims();
     animCurrent = AnimFind(name);
@@ -1181,6 +1334,36 @@ static void DrawPromptModal()
         if (GuiButton((Rectangle){ m.x+mw-bw-16, by, bw, bh }, "Cancel"))
         { AudioPlayButton(); prompt = PROMPT_NONE; }
     }
+    else if (prompt == PROMPT_LIB_SAVE_NAME || prompt == PROMPT_LIB_RENAME)
+    {
+        bool renaming = (prompt == PROMPT_LIB_RENAME);
+        GuiLabel(msg, renaming ? "Rename library entry:"
+                               : "Save element to library as:");
+        Rectangle tb = { m.x+16, m.y+44, mw-32, 26 };
+        if (GuiTextBox(tb, nameBuf, ANIM_NAME_MAX, edNameBuf)) edNameBuf = !edNameBuf;
+
+        // a name may reuse an existing entry only when SAVING (overwrite); a
+        // rename onto another entry's name is rejected by AnimLibraryRename.
+        int clash = AnimLibraryFind(&library, nameBuf);
+        bool valid = nameBuf[0] && !(renaming && clash >= 0 && clash != libTargetIdx);
+        if (!valid) GuiDisable();
+        if (GuiButton((Rectangle){ m.x+mw-2*bw-24, by, bw, bh },
+                      renaming ? "Rename" : (clash >= 0 ? "Overwrite" : "Save")))
+        {
+            AudioPlayButton();
+            if (renaming) AnimLibraryRename(&library, libTargetIdx, nameBuf);
+            else if (selElem >= 0 && selElem < doc.elemCount)
+                AnimLibraryAdd(&library, nameBuf, &doc.elems[selElem]);
+            AnimLibrarySave(&library, LIB_PATH);
+            edNameBuf = false; libTargetIdx = -1;
+            // back to the shelf so the result is visible straight away
+            prompt = PROMPT_LIBRARY;
+        }
+        if (!valid) GuiEnable();
+        if (GuiButton((Rectangle){ m.x+mw-bw-16, by, bw, bh }, "Cancel"))
+        { AudioPlayButton(); edNameBuf = false; libTargetIdx = -1;
+          prompt = renaming ? PROMPT_LIBRARY : PROMPT_NONE; }
+    }
     else if (prompt == PROMPT_NEW_NAME)
     {
         GuiLabel(msg, "New animation name:");
@@ -1197,72 +1380,506 @@ static void DrawPromptModal()
 }
 
 // ---------------------------------------------------------------------------
-//  Signals row.
+//  Element library modal: insert a shelved element into the doc, rename or
+//  delete entries. Bigger than DrawPromptModal's fixed box (it needs a
+//  scrolling list), so it gets its own drawing routine.
 // ---------------------------------------------------------------------------
-static float DrawSignals(float x, float y, float w)   // returns height used
+static void DrawLibraryModal()
 {
-    float rh = 24.0f;
-    #define SIG_CELL 480.0f
-    GuiLabel((Rectangle){ x, y, 80, rh }, "SIGNALS");
-    float sx = x + 84, sy = y;
-    bool changed = false;       // any edit -> one re-register at the end
+    if (prompt != PROMPT_LIBRARY) return;
 
+    ScreenState *ss = ScreenStateGet();
+    float W = (float)ss->width, H = (float)ss->height;
+    float mw = 420, mh = 340;
+    Rectangle m = { (W-mw)/2, (H-mh)/2, mw, mh };
+    DrawRectangle(0, 0, (int)W, (int)H, (Color){ 0, 0, 0, 120 });
+    DrawRectangleRec(m, (Color){ 40, 42, 48, 255 });
+    DrawRectangleLinesEx(m, 1.0f, (Color){ 90, 94, 104, 255 });
+
+    GuiLabel((Rectangle){ m.x+16, m.y+10, mw-32, 20 }, "ELEMENT LIBRARY");
+    if (library.count == 0)
+        GuiLabel((Rectangle){ m.x+16, m.y+34, mw-32, 20 },
+                 "(empty - use \"Save to library\" on a selected element)");
+
+    // scrolling entry list
+    Rectangle list = { m.x+12, m.y+34, mw-24, mh-34-48 };
+    if (CheckCollisionPointRec(GetMousePosition(), list))
+        libScroll += GetMouseWheelMove() * 24.0f;
+
+    float rh = 26.0f, gap = 4.0f;
+    float contentH = library.count * (rh + gap);
+    float maxScroll = contentH - list.height;
+    if (maxScroll < 0) maxScroll = 0;
+    if (libScroll < -maxScroll) libScroll = -maxScroll;
+    if (libScroll > 0) libScroll = 0;
+
+    int reqInsert = -1, reqRename = -1, reqDelete = -1;
+    BeginScissorMode((int)list.x, (int)list.y, (int)list.width, (int)list.height);
+    float ly = list.y + libScroll;
+    for (int i = 0; i < library.count; i++)
+    {
+        const AnimLibEntry *en = &library.entries[i];
+        float bw2 = 60.0f;
+        Rectangle nameR = { list.x, ly, list.width - 2*bw2 - 8, rh };
+        if (GuiButton(nameR, TextFormat("%s   [%s]", en->name,
+                                        AnimElemKindName(en->elem.kind))))
+            reqInsert = i;
+        if (GuiButton((Rectangle){ list.x + list.width - 2*bw2 - 4, ly, bw2, rh }, "rename"))
+            reqRename = i;
+        if (GuiButton((Rectangle){ list.x + list.width - bw2, ly, bw2, rh }, "delete"))
+            reqDelete = i;
+        ly += rh + gap;
+    }
+    EndScissorMode();
+
+    // footer
+    float bh = 28, by = m.y + mh - bh - 12;
+    GuiLabel((Rectangle){ m.x+16, by, mw-120, bh }, "click an entry to add it here");
+    if (GuiButton((Rectangle){ m.x+mw-90, by, 78, bh }, "Close"))
+    { AudioPlayButton(); prompt = PROMPT_NONE; }
+
+    if (reqInsert >= 0)
+    {
+        AudioPlayButton();
+        if (doc.elemCount < ANIM_ELEMS_MAX)
+        {
+            UndoPush();
+            // add a slot of the right kind, then overwrite it with the shelved
+            // element (a plain value, so tracks and keys come along).
+            AnimElem *dst = AnimDocAddElem(&doc, library.entries[reqInsert].elem.kind);
+            if (dst)
+            {
+                *dst = library.entries[reqInsert].elem;
+                AnimDocUniquifyElemName(&doc, doc.elemCount - 1);
+                selElem = doc.elemCount - 1;
+                for (int k = 0; k < ANIM_ELEMS_MAX; k++) multiSel[k] = false;
+                ClearKeySelection();
+                ClampSelection();
+            }
+        }
+    }
+    else if (reqRename >= 0)
+    {
+        AudioPlayButton();
+        libTargetIdx = reqRename;
+        TextCopy(nameBuf, library.entries[reqRename].name);
+        edNameBuf = true; prompt = PROMPT_LIB_RENAME;
+    }
+    else if (reqDelete >= 0)
+    {
+        AudioPlayButton();
+        AnimLibraryRemove(&library, reqDelete);
+        AnimLibrarySave(&library, LIB_PATH);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Signals list (left panel, below the elements). Deliberately minimal: create,
+//  open, fire, delete. Everything about a signal's contents - its targets and
+//  their keyframes - lives in the modal, so this list stays readable.
+//  Returns the content height (for the panel's scrollbar maths).
+// ---------------------------------------------------------------------------
+static float DrawSignalList(float x, float y, float w)
+{
+    float y0 = y, rh = 26.0f, gap = 4.0f;
+    GuiLabel((Rectangle){ x, y, w, 20 }, "SIGNALS"); y += 22;
+
+    int pendingDel = -1;
+    float bw2 = 22.0f;
     for (int i = 0; i < doc.signalCount; i++)
     {
-        if (sx + SIG_CELL > x + w) { sx = x + 84; sy += rh + 4; }  // wrap row
         AnimSignal *sg = &doc.signals[i];
+        Rectangle openR = { x, y, w - 2*bw2 - 4, rh };
+        if (GuiButton(openR, TextFormat("%s  (%d)", sg->name, sg->targetCount)))
+        { AudioPlayButton(); sigModalIdx = i; sigScroll = 0.0f; }
+        if (i == sigModalIdx) DrawRectangleRec(openR, (Color){ 90, 140, 220, 90 });
 
-        // name (editable; bindings are refreshed on commit)
-        if (GuiTextBox((Rectangle){ sx, sy, 90, rh }, sg->name, ANIM_NAME_MAX,
-                       edSigIdx == i))
-        {
-            if (edSigIdx != i) { UndoPush(); edSigIdx = i; }
-            else               { edSigIdx = -1; changed = true; }
-        }
-
-        int dir = sg->dir;
-        if (GuiToggleGroup((Rectangle){ sx+94, sy, 44, rh }, "fwd;rev", &dir) &&
-            dir != sg->dir)
-        { UndoPush(); sg->dir = dir; changed = true; }
-
-        // playback section [start,end] within the doc clock
-        float s0 = sg->sectionStart, s1 = sg->sectionEnd;
-        if (EditSlider((Rectangle){ sx+190, sy, 70, rh }, "", &s0, 0.0f, doc.duration))
-        { sg->sectionStart = s0; if (sg->sectionEnd < s0) sg->sectionEnd = s0; changed = true; }
-        if (EditSlider((Rectangle){ sx+266, sy, 70, rh }, "", &s1, 0.0f, doc.duration))
-        { sg->sectionEnd = s1; if (sg->sectionStart > s1) sg->sectionStart = s1; changed = true; }
-
-        if (GuiButton((Rectangle){ sx+342, sy, 44, rh }, "Fire"))
-        { AudioPlayButton(); SignalEmit(sg->name); }
-        if (GuiButton((Rectangle){ sx+390, sy, 24, rh }, "x"))
-        {
-            AudioPlayButton(); UndoPush();
-            for (int m = i; m < doc.signalCount - 1; m++)
-                doc.signals[m] = doc.signals[m+1];
-            doc.signalCount--; i--;
-            if (edSigIdx == i+1) edSigIdx = -1;
-            changed = true;
-            continue;
-        }
-        sx += SIG_CELL;
+        if (GuiButton((Rectangle){ x + w - 2*bw2 - 2, y, bw2, rh }, "#131#"))
+        { AudioPlayButton(); SignalEmit(sg->name); }          // fire (play icon)
+        if (GuiButton((Rectangle){ x + w - bw2, y, bw2, rh }, "#143#"))
+        { AudioPlayButton(); pendingDel = i; }                // trash icon
+        y += rh + gap;
     }
 
     if (doc.signalCount < ANIM_SIGNALS_MAX)
     {
-        if (sx + 60 > x + w) { sx = x + 84; sy += rh + 4; }
-        if (GuiButton((Rectangle){ sx, sy, 60, rh }, "+signal"))
+        if (GuiButton((Rectangle){ x, y, w, rh }, "+signal"))
         {
             AudioPlayButton(); UndoPush();
             AnimSignal *sg = &doc.signals[doc.signalCount++];
             TextCopy(sg->name, TextFormat("sig%d", doc.signalCount));
-            sg->dir = ANIM_FWD; sg->sectionStart = 0.0f; sg->sectionEnd = doc.duration;
-            changed = true;
+            sg->length = 1.0f; sg->targetCount = 0;
+            sigModalIdx = doc.signalCount - 1; sigScroll = 0.0f;
+            ReRegisterSignals();
         }
+        y += rh + gap;
     }
 
-    if (changed) ReRegisterSignals();
-    #undef SIG_CELL
-    return (sy - y) + rh + 6;
+    // deferred: deleting mid-loop shifts the array under the next row's buttons
+    if (pendingDel >= 0)
+    {
+        UndoPush();
+        for (int m = pendingDel; m < doc.signalCount - 1; m++)
+            doc.signals[m] = doc.signals[m+1];
+        doc.signalCount--;
+        if      (sigModalIdx == pendingDel) sigModalIdx = -1;   // its modal closes
+        else if (sigModalIdx >  pendingDel) sigModalIdx--;
+        if      (edSigIdx == pendingDel) edSigIdx = -1;
+        else if (edSigIdx >  pendingDel) edSigIdx--;
+        ReRegisterSignals();
+    }
+
+    return (y + 4) - y0;
+}
+
+// ---------------------------------------------------------------------------
+//  Signal modal: everything about ONE signal - its length and its targets,
+//  each an (element, property) pair with its own keyframes.
+//
+//  Two forms:
+//    FULL    (editing)  the whole editor for the signal
+//    SHRUNK  (playing)  a small bar with just Fire + Close, so the signal can
+//                       be triggered at any point during playback to see how
+//                       it blends from the live scene. It deliberately does
+//                       NOT close on playback, unlike the PROMPT_* modals.
+// ---------------------------------------------------------------------------
+static void DrawSignalModal()
+{
+    if (sigModalIdx < 0 || sigModalIdx >= doc.signalCount) { sigModalIdx = -1; return; }
+    AnimSignal *sg = &doc.signals[sigModalIdx];
+
+    ScreenState *ss = ScreenStateGet();
+    float W = (float)ss->width, H = (float)ss->height;
+    bool playbackUi = playing || !AnimSignalPlayerDone(&preview);
+
+    // --- shrunk form ------------------------------------------------------
+    if (playbackUi)
+    {
+        float mw = 240, mh = 40;
+        Rectangle m = { W - mw - 12, 52, mw, mh };      // out of the preview's way
+        DrawRectangleRec(m, (Color){ 40, 42, 48, 235 });
+        DrawRectangleLinesEx(m, 1.0f, (Color){ 90, 94, 104, 255 });
+        GuiLabel((Rectangle){ m.x+10, m.y+10, mw-140, 20 }, sg->name);
+        if (GuiButton((Rectangle){ m.x+mw-116, m.y+7, 52, 26 }, "Fire"))
+        { AudioPlayButton(); SignalEmit(sg->name); }
+        if (GuiButton((Rectangle){ m.x+mw-60, m.y+7, 52, 26 }, "Close"))
+        { AudioPlayButton(); sigModalIdx = -1; }
+        return;
+    }
+
+    // --- full form --------------------------------------------------------
+    float mw = 520, mh = 420;
+    Rectangle m = { (W-mw)/2, (H-mh)/2, mw, mh };
+    DrawRectangle(0, 0, (int)W, (int)H, (Color){ 0, 0, 0, 120 });
+    DrawRectangleRec(m, (Color){ 40, 42, 48, 255 });
+    DrawRectangleLinesEx(m, 1.0f, (Color){ 90, 94, 104, 255 });
+
+    float rh = 24.0f, gap = 6.0f;
+    float x = m.x + 14, w = mw - 28, y = m.y + 12;
+
+    // One of this modal's own dropdowns is expanded over these rows: lock them
+    // so a click lands on the overlay list only. Without this the row widget
+    // underneath the expanded list consumes the click too (picking a target's
+    // element would fire whatever button sat beneath the list item).
+    bool sigDropOpen = sigPropDrop != -1 || sigKeyEaseDrop >= 0;
+    if (sigDropOpen) GuiLock();
+
+    GuiLabel((Rectangle){ x, y, 60, rh }, "signal");
+    if (GuiTextBox((Rectangle){ x+60, y, 150, rh }, sg->name, ANIM_NAME_MAX,
+                   edSigIdx == sigModalIdx))
+    {
+        if (edSigIdx != sigModalIdx) { UndoPush(); edSigIdx = sigModalIdx; }
+        else { edSigIdx = -1; ReRegisterSignals(); }   // name change = rebind
+    }
+    GuiLabel((Rectangle){ x+222, y, 46, rh }, "length");
+    if (EditSlider((Rectangle){ x+270, y, w-270-52, rh }, "", &sg->length, 0.0f, 10.0f))
+    { /* normalized keys rescale automatically - nothing else to do */ }
+    y += rh + 4;
+    GuiLabel((Rectangle){ x, y, w, 18 },
+             sg->length <= 0.0f ? "0.00 = instant snap to the final keys"
+                                : "keys are fractions of the length (0..1)");
+    y += 20;
+    GuiLine((Rectangle){ x, y, w, 8 }, "targets"); y += 12;
+
+    // --- scrolling target list -------------------------------------------
+    Rectangle list = { x, y, w, m.y + mh - 48 - y };
+    bool ctrlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    if (!ctrlDown && CheckCollisionPointRec(GetMousePosition(), list))
+        sigScroll += GetMouseWheelMove() * 24.0f;
+
+    int pendingTgtDel = -1, pendingKeyDel = -1, pendingKeyTgt = -1;
+
+    // Same trap as PanelScroll: scissor hides the rows scrolled past the top of
+    // `list` but leaves them clickable, so hitting the signal name/length row
+    // above also fired whatever row was hidden under the cursor.
+    bool inList = CheckCollisionPointRec(GetMousePosition(), list);
+    if (!inList && !sigDropOpen) GuiLock();
+
+    BeginScissorMode((int)list.x, (int)list.y, (int)list.width, (int)list.height);
+    float ly = list.y + sigScroll;
+
+    // The list is driven by the DOCUMENT's elements, not by the signal's
+    // targets: every element is always shown, and its targets are the tracks
+    // nested under it. Adding a track is therefore a per-element action and
+    // the element itself never has to be picked from a dropdown.
+    for (int e = 0; e < doc.elemCount; e++)
+    {
+        // element header: name + a track adder scoped to this element
+        DrawRectangleRec((Rectangle){ list.x, ly, list.width, rh },
+                         (Color){ 52, 55, 62, 255 });
+        GuiLabel((Rectangle){ list.x+6, ly, 180, rh }, doc.elems[e].name);
+
+        // Show the adder greyed rather than hidden when the target pool is
+        // full: a missing button read as "this element can't have tracks".
+        bool sigFull = sg->targetCount >= ANIM_SIG_TARGETS_MAX;
+        if (sigFull) GuiSetState(STATE_DISABLED);
+        bool addHit = GuiButton((Rectangle){ list.x+list.width-86, ly, 82, rh },
+                                sigFull ? "full" : "+ track");
+        if (sigFull) GuiSetState(STATE_NORMAL);
+        if (!sigFull && addHit)
+        {
+            // sigPropDrop identifies a target row; for the adder there is no
+            // row yet, so it is encoded as a negative element ref (-e-2) and
+            // the overlay creates the target once a property is chosen.
+            // -e-2, not -e-1: -1 is the "nothing open" sentinel, and element 0
+            // would collide with it (opening any other dropdown then resolved
+            // as "adder on element 0").
+            AudioPlayButton();
+            sigPropDrop = (sigPropDrop == -e-2) ? -1 : -e-2;
+            sigKeyEaseDrop = -1;
+        }
+        ly += rh + 2;
+
+        for (int t = 0; t < sg->targetCount; t++)
+        {
+        AnimSigTarget *tg = &sg->targets[t];
+        if (tg->elemIdx != e) continue;      // only this element's tracks
+
+        // property picker (custom overlay dropdown, drawn later)
+        if (GuiButton((Rectangle){ list.x+14, ly, 130, rh },
+                      TextFormat("%s  v", AnimPropName(tg->prop))))
+        { AudioPlayButton(); sigPropDrop = (sigPropDrop == t) ? -1 : t; }
+
+        if (GuiButton((Rectangle){ list.x+152, ly, 46, rh }, "+key"))
+        {
+            AudioPlayButton();
+            if (tg->keyCount < ANIM_SIG_KEYS_MAX)
+            {
+                UndoPush();
+                // Seed u from the last one the user set on ANY signal key, not
+                // 1.0: the common case is placing the same beat across several
+                // tracks, and 1.0 forced a retype every time.
+                AnimKey *k = &tg->keys[tg->keyCount++];
+                k->t = sigLastU; k->ease = ANIM_EASE_SINE_OUT;
+                if (tg->elemIdx >= 0 && tg->elemIdx < doc.elemCount)
+                {
+                    const AnimElem *el = &doc.elems[tg->elemIdx];
+                    k->value = AnimElemProp(el, tg->prop, playhead);
+                    k->cval  = AnimElemColorProp(el, tg->prop, playhead);
+                }
+                else { k->value = 0.0f; k->cval = (Color){0,0,0,255}; }
+            }
+        }
+        if (GuiButton((Rectangle){ list.x+list.width-24, ly, 24, rh }, "#143#"))
+        { AudioPlayButton(); pendingTgtDel = t; }
+        ly += rh + 2;
+
+        // key rows: u / value / ease
+        for (int k = 0; k < tg->keyCount; k++)
+        {
+            AnimKey *kk = &tg->keys[k];
+            GuiLabel((Rectangle){ list.x+14, ly, 16, 20 }, "u");
+            float u = kk->t;
+            if (EditSlider((Rectangle){ list.x+30, ly, 96, 20 }, "", &u, 0.0f, 1.0f))
+            { kk->t = u; sigLastU = u; }    // remember for the next +key
+
+            if (AnimPropIsColor(tg->prop))
+            {
+                float cr=kk->cval.r, cg=kk->cval.g, cb=kk->cval.b;
+                bool ch=false;
+                if (EditSlider((Rectangle){ list.x+180, ly, 60, 20 }, "R", &cr, 0,255)) ch=true;
+                if (EditSlider((Rectangle){ list.x+250, ly, 60, 20 }, "G", &cg, 0,255)) ch=true;
+                if (EditSlider((Rectangle){ list.x+320, ly, 60, 20 }, "B", &cb, 0,255)) ch=true;
+                if (ch) kk->cval = (Color){ (unsigned char)cr,(unsigned char)cg,
+                                            (unsigned char)cb, 255 };
+                DrawSwatch((Rectangle){ list.x+158, ly+2, 16, 16 },
+                           (Color){ kk->cval.r, kk->cval.g, kk->cval.b, 255 });
+            }
+            else
+            {
+                float v = kk->value;
+                if (EditSlider((Rectangle){ list.x+180, ly, 150, 20 }, "", &v,
+                               AnimPropMin(tg->prop), AnimPropMax(tg->prop)))
+                    kk->value = v;
+            }
+
+            if (GuiButton((Rectangle){ list.x+list.width-104, ly, 76, 20 },
+                          AnimEaseName(kk->ease)))
+            {
+                AudioPlayButton();
+                int packed = t*256 + k;
+                sigKeyEaseDrop = (sigKeyEaseDrop == packed) ? -1 : packed;
+            }
+            if (GuiButton((Rectangle){ list.x+list.width-24, ly, 24, 20 }, "x"))
+            { AudioPlayButton(); pendingKeyDel = k; pendingKeyTgt = t; }
+            ly += 22;
+        }
+        ly += 4;
+        }       // targets of this element
+        ly += gap;
+    }           // elements
+    EndScissorMode();
+    if (!inList && !sigDropOpen) GuiUnlock();   // footer/header stay live
+
+    // measured content height -> clamp the scroll
+    float contentH = (ly - (list.y + sigScroll));
+    float maxScroll = contentH - list.height;
+    if (maxScroll < 0) maxScroll = 0;
+    if (sigScroll < -maxScroll) sigScroll = -maxScroll;
+    if (sigScroll > 0) sigScroll = 0;
+
+    // deferred deletions (same reason as everywhere else: mid-draw array
+    // shifts re-fire the next row's button on the same rect this frame)
+    if (pendingTgtDel >= 0)
+    {
+        UndoPush();
+        for (int mI = pendingTgtDel; mI < sg->targetCount - 1; mI++)
+            sg->targets[mI] = sg->targets[mI+1];
+        sg->targetCount--;
+        sigPropDrop = -1; sigKeyEaseDrop = -1;
+    }
+    else if (pendingKeyDel >= 0)
+    {
+        UndoPush();
+        AnimSigTarget *tg = &sg->targets[pendingKeyTgt];
+        for (int mI = pendingKeyDel; mI < tg->keyCount - 1; mI++)
+            tg->keys[mI] = tg->keys[mI+1];
+        tg->keyCount--;
+        sigKeyEaseDrop = -1;
+    }
+
+    // --- footer -----------------------------------------------------------
+    float bh = 28, by = m.y + mh - bh - 12;
+    if (GuiButton((Rectangle){ x, by, 70, bh }, "Fire"))
+    { AudioPlayButton(); SignalEmit(sg->name); }
+    GuiLabel((Rectangle){ x+80, by, mw-200, bh }, "fires from the CURRENT pose");
+    if (GuiButton((Rectangle){ m.x+mw-84, by, 70, bh }, "Close"))
+    { AudioPlayButton(); sigModalIdx = -1; edSigIdx = -1;
+      sigPropDrop = -1; sigKeyEaseDrop = -1; }
+
+    if (sigDropOpen) GuiUnlock();   // the overlay list itself draws unlocked
+}
+
+// The signal modal's own dropdown overlays (element / property / key ease).
+// Drawn after the modal so they sit on top of it, mirroring how
+// DrawDropdownOverlays relates to the main inspector.
+static void DrawSignalModalOverlays()
+{
+    if (sigModalIdx < 0 || sigModalIdx >= doc.signalCount) return;
+    if (playing || !AnimSignalPlayerDone(&preview)) return;    // shrunk: no lists
+    if (sigPropDrop == -1 && sigKeyEaseDrop < 0) return;
+
+    AnimSignal *sg = &doc.signals[sigModalIdx];
+    ScreenState *ss = ScreenStateGet();
+    float H = (float)ss->height;
+
+    // Recompute the row geometry the modal used (same constants).
+    float W = (float)ss->width;
+    float mw = 520, mh = 420;
+    Rectangle m = { (W-mw)/2, (H-mh)/2, mw, mh };
+    float rh = 24.0f;
+    float x = m.x + 14, w = mw - 28;
+    float y = m.y + 12 + rh + 4 + 20 + 12;
+    Rectangle list = { x, y, w, m.y + mh - 48 - y };
+
+    int   count = 0;
+    Rectangle hdr = {0};
+    int   mode = 0;    // 2 = property (existing row), 3 = ease, 4 = new track
+    int   tIdx = -1, kIdx = -1, addElem = -1;
+
+    // walk the rows to find the open dropdown's header rect. This MUST mirror
+    // the element-grouped layout DrawSignalModal lays out above.
+    float ly = list.y + sigScroll;
+    for (int e = 0; e < doc.elemCount && !mode; e++)
+    {
+        // element header row, carrying the "+ track" adder
+        if (sigPropDrop == -e-2)
+        { mode = 4; addElem = e;
+          hdr = (Rectangle){ list.x+list.width-86, ly, 82, rh };
+          count = AnimPropCountFor(doc.elems[e].kind); }
+        ly += rh + 2;
+
+        for (int t = 0; t < sg->targetCount && !mode; t++)
+        {
+            AnimSigTarget *tg = &sg->targets[t];
+            if (tg->elemIdx != e) continue;
+
+            if (sigPropDrop == t)
+            { mode = 2; tIdx = t; hdr = (Rectangle){ list.x+14, ly, 130, rh };
+              count = AnimPropCountFor(doc.elems[e].kind); }
+            ly += rh + 2;
+            for (int k = 0; k < tg->keyCount && !mode; k++)
+            {
+                if (sigKeyEaseDrop == t*256 + k)
+                { mode = 3; tIdx = t; kIdx = k;
+                  hdr = (Rectangle){ list.x+list.width-104, ly, 76, 20 };
+                  count = AnimEaseCount(); }
+                ly += 22;
+            }
+            if (!mode) ly += 4;
+        }
+        if (!mode) ly += 6.0f;      // == `gap` in DrawSignalModal
+    }
+    if (!mode || count <= 0) return;
+
+    float ih = 20.0f, listH = ih * count;
+    float ly2 = (hdr.y + hdr.height + listH <= H - 4.0f)
+              ? hdr.y + hdr.height : hdr.y - listH;
+    if (ly2 < 4.0f) ly2 = 4.0f;
+    Rectangle bg = { hdr.x, ly2, hdr.width, listH };
+    DrawRectangleRec(bg, (Color){ 32, 34, 40, 255 });
+    DrawRectangleLinesEx(bg, 1.0f, (Color){ 70, 74, 84, 255 });
+
+    int picked = -1;
+    for (int i = 0; i < count; i++)
+    {
+        Rectangle rr = { bg.x, bg.y + i*ih, bg.width, ih };
+        const char *nm = (mode == 2) ? AnimPropName(AnimPropAt(
+                             doc.elems[sg->targets[tIdx].elemIdx].kind, i))
+                       : (mode == 4) ? AnimPropName(AnimPropAt(doc.elems[addElem].kind, i))
+                       : AnimEaseName(i);
+        if (GuiButton(rr, nm)) picked = i;
+    }
+
+    if (picked >= 0)
+    {
+        AudioPlayButton(); UndoPush();
+        if (mode == 2)
+        {
+            AnimSigTarget *tg = &sg->targets[tIdx];
+            int np = AnimPropAt(doc.elems[tg->elemIdx].kind, picked);
+            // scalar <-> colour keys are not interchangeable: reset on a switch
+            if (AnimPropIsColor(np) != AnimPropIsColor(tg->prop)) tg->keyCount = 0;
+            tg->prop = np;
+            sigPropDrop = -1;
+        }
+        else if (mode == 4)
+        {
+            // adder: create the target on this element with the chosen property
+            int np = AnimPropAt(doc.elems[addElem].kind, picked);
+            if (sg->targetCount < ANIM_SIG_TARGETS_MAX)
+            {
+                AnimSigTarget *tg = &sg->targets[sg->targetCount++];
+                tg->elemIdx = addElem; tg->prop = np; tg->keyCount = 0;
+            }
+            sigPropDrop = -1;
+        }
+        else { sg->targets[tIdx].keys[kIdx].ease = picked; sigKeyEaseDrop = -1; }
+    }
+    else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+             !CheckCollisionPointRec(GetMousePosition(), bg) &&
+             !CheckCollisionPointRec(GetMousePosition(), hdr))
+    { sigPropDrop = -1; sigKeyEaseDrop = -1; }
 }
 
 // A filled diamond. DrawTriangle culls back faces: vertices must be counter-
@@ -1272,6 +1889,26 @@ static void DrawDiamond(float cx, float cy, float r, Color c)
 {
     DrawTriangle((Vector2){cx,cy-r},(Vector2){cx-r,cy},(Vector2){cx+r,cy}, c);
     DrawTriangle((Vector2){cx-r,cy},(Vector2){cx,cy+r},(Vector2){cx+r,cy}, c);
+}
+
+// A trim marker handle: apex ON the timeline at (cx,cy), body hanging away
+// from it. `down` = apex points down (the intro handle, sitting on the top
+// edge); otherwise it points up (the outro handle, on the bottom edge).
+// Same counter-clockwise winding rule as DrawDiamond.
+static void DrawMarkerTriangle(float cx, float cy, float r, bool down, Color c)
+{
+    if (down) DrawTriangle((Vector2){cx-r,cy-r},(Vector2){cx,cy},(Vector2){cx+r,cy-r}, c);
+    else      DrawTriangle((Vector2){cx,cy},(Vector2){cx-r,cy+r},(Vector2){cx+r,cy+r}, c);
+}
+
+// Dotted vertical line (raylib has no dashed-line primitive).
+static void DrawDottedV(float x, float y0, float y1, Color c)
+{
+    for (float yy = y0; yy < y1; yy += 8.0f)
+    {
+        float seg = (yy + 4.0f < y1) ? yy + 4.0f : y1;
+        DrawLine((int)x, (int)yy, (int)x, (int)seg, c);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,13 +1942,23 @@ static void DrawTimeline(float x, float y, float w, float h)
             DrawText(TextFormat("%.0f", s), (int)tx+2, (int)(y+h-14), 10, (Color){110,116,128,255});
     }
 
-    // keyframe diamonds for the selected element's tracks (stacked rows).
     // Raw-mouse input is suppressed while the ease dropdown is open (raygui's
     // GuiLock only covers gui widgets, not this hand-drawn timeline).
     Vector2 mouse = GetMousePosition();
     bool press  = !keyEaseDropOpen && addTrackDrop < 0 &&
                   IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     bool keyHit = false;
+
+    // --- intro / outro trim: shaded dead zones behind everything else -------
+    float inEnd = AnimDocIntroEnd(&doc), outStart = AnimDocOutroStart(&doc);
+    float inX = T2X(inEnd), outX = T2X(outStart);
+    if (inEnd > 0.0f)
+        DrawRectangleRec((Rectangle){ trackLeft, y+1, inX-trackLeft, h-2 },
+                         (Color){ 90, 140, 200, 26 });      // intro: skipped on loop
+    if (outStart < dur)
+        DrawRectangleRec((Rectangle){ outX, y+1, x+w-padR-outX, h-2 },
+                         (Color){ 0, 0, 0, 120 });          // outro: trimmed away
+
     if (!thin && selElem >= 0 && selElem < doc.elemCount)
     {
         AnimElem *e = &doc.elems[selElem];
@@ -1371,6 +2018,36 @@ static void DrawTimeline(float x, float y, float w, float h)
     Rectangle phHandle = { phx-6, y-2, 12, 10 };
     DrawRectangleRec(phHandle, (Color){255,90,90,255});
 
+    // --- trim markers: dotted lines + grab triangles ------------------------
+    // Drawn over the lanes so they read as boundaries, and hit-tested BEFORE
+    // the bar scrub below so grabbing a handle never moves the playhead.
+    Color introCol = (Color){ 120, 190, 255, 255 };
+    Color outroCol = (Color){ 255, 160, 90, 255 };
+    if (inEnd > 0.0f)    DrawDottedV(inX,  y+2, y+h-2, introCol);
+    if (outStart < dur)  DrawDottedV(outX, y+2, y+h-2, outroCol);
+
+    Rectangle introHit = { inX-9,  y,      18, 14 };
+    Rectangle outroHit = { outX-9, y+h-14, 18, 14 };
+    bool introHot = CheckCollisionPointRec(mouse, introHit);
+    bool outroHot = CheckCollisionPointRec(mouse, outroHit);
+    DrawMarkerTriangle(inX,  y+1.0f,   introHot ? 9.0f : 7.0f, true,  introCol);
+    DrawMarkerTriangle(outX, y+h-1.0f, outroHot ? 9.0f : 7.0f, false, outroCol);
+
+    if (press && (introHot || outroHot))
+    {
+        UndoPush();                                 // once per drag gesture
+        if (introHot) dragIntro = true; else dragOutro = true;
+        keyHit = true;                              // suppress the scrub below
+    }
+    if ((dragIntro || dragOutro) && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+    {
+        float nt = X2T(mouse.x);
+        if (nt < 0) nt = 0; if (nt > dur) nt = dur;
+        // intro and outro may not cross: each clamps against the other.
+        if (dragIntro) doc.introEnd   = (nt > outStart) ? outStart : nt;
+        else           doc.outroStart = (nt < inEnd)    ? inEnd    : nt;
+    }
+
     // --- input -------------------------------------------------------------
     // pressing anywhere on the bar that is NOT a key scrubs the playhead there
     // (and deselects); no tiny grab strip to aim for.
@@ -1399,7 +2076,8 @@ static void DrawTimeline(float x, float y, float w, float h)
         playhead = nt; playing = false; preview.playing = false;
     }
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
-    { dragPlayhead = false; dragKeyElem = -1; dragKeyTrack = -1; dragKeyIdx = -1; }
+    { dragPlayhead = false; dragKeyElem = -1; dragKeyTrack = -1; dragKeyIdx = -1;
+      dragIntro = false; dragOutro = false; }
 
     #undef T2X
     #undef X2T
@@ -1408,47 +2086,136 @@ static void DrawTimeline(float x, float y, float w, float h)
 // ---------------------------------------------------------------------------
 //  Toolbar: New / Load / Save / Undo / Redo / play controls / Back.
 // ---------------------------------------------------------------------------
-static void DrawToolbar(float x, float y, float w)
+// Width a raygui label/button needs to show `text` without squeezing: the
+// glyphs at the CURRENT style text size (which follows the global gui scale)
+// plus the style's own left/right text padding and a little slack.
+static float TextW(const char *text, float extra)
 {
-    float bw = 70, rh = 26, gx = x;
+    float fs = (float)GuiGetStyle(DEFAULT, TEXT_SIZE);
+    float sp = fs/(float)GuiGetFont().baseSize;      // raygui's glyph spacing
+    return MeasureTextEx(GuiGetFont(), text, fs, sp).x + extra;
+}
+
+// Draws the bar and returns the HEIGHT it used, so the panels below can sit
+// under it: at larger gui scales the controls no longer fit on one row and the
+// clock group wraps to a second one.
+static float DrawToolbar(float x, float y, float w)
+{
+    // Everything here scales with the global gui-scale setting: raygui's
+    // TEXT_SIZE is set from it by whichever state drew last, so widget sizes
+    // are derived from the font rather than hardcoded, or big text overflows
+    // small boxes. `s` is that size relative to the 10px base font.
+    float fs = (float)GuiGetStyle(DEFAULT, TEXT_SIZE);
+    float s  = fs / 10.0f;
+
+    // gap = space between related buttons, grp = between groups. The bar is
+    // laid out left to right by advancing gx; keep the two spacings distinct
+    // so the groups (file / history / playback / clock) still read apart.
+    float rh = 26*s, gx = x, gap = 8*s, grp = 20*s;
+    float bw = TextW("Library", 20*s);      // widest of the plain buttons
+    float rowY = y;                         // first row (Back stays pinned here)
 
     // animation switcher: header shows current anim (or "*unsaved") + dropdown.
     // The list itself is drawn as an overlay in DrawDropdownOverlays().
-    float dw = bw + 44;
     const char *label = (animCurrent >= 0) ? animList[animCurrent] : "*unsaved";
+    float dw = TextW(TextFormat("%s  v", label), 24*s);
     Rectangle switchR = { gx, y, dw, rh };
     if (GuiButton(switchR, TextFormat("%s  v", label)))
     { AudioPlayButton(); animSwitchOpen = !animSwitchOpen;
       keyEaseDropOpen = false; addTrackDrop = -1; }
     animSwitchRect = switchR; animSwitchVisible = true;
-    gx += dw+4;
+    gx += dw+gap;
     if (GuiButton((Rectangle){ gx, y, bw, rh }, "Save"))
     { AudioPlayButton(); SaveCurrent(); }
-    gx += bw+8;
+    gx += bw+gap;
+    if (GuiButton((Rectangle){ gx, y, bw, rh }, "Library"))
+    { AudioPlayButton(); libScroll = 0.0f; prompt = PROMPT_LIBRARY; }
+    gx += bw+grp;
     if (GuiButton((Rectangle){ gx, y, bw, rh }, "Undo")) { AudioPlayButton(); UndoApply(-1); }
-    gx += bw+4;
+    gx += bw+gap;
     if (GuiButton((Rectangle){ gx, y, bw, rh }, "Redo")) { AudioPlayButton(); UndoApply(+1); }
-    gx += bw+8;
+    gx += bw+grp;
     if (GuiButton((Rectangle){ gx, y, bw, rh }, playing ? "Pause" : "Play"))
     { AudioPlayButton(); playing = !playing; preview.playing = false; }
-    gx += bw+4;
-    GuiCheckBox((Rectangle){ gx, y+4, 18, 18 }, "loop", &loopPlay);
-    gx += 60;
-    GuiCheckBox((Rectangle){ gx, y+4, 18, 18 }, "autokey", &autoKey);
-    gx += 80;
+    gx += bw+gap;
+    // checkboxes: the box is square (row height) and raygui writes the label to
+    // its RIGHT, so each advance is box + measured label + a gap.
+    float cb = 18*s;
+    GuiCheckBox((Rectangle){ gx, y+(rh-cb)*0.5f, cb, cb }, "loop", &loopPlay);
+    gx += cb + TextW("loop", 8*s) + gap;
+    GuiCheckBox((Rectangle){ gx, y+(rh-cb)*0.5f, cb, cb }, "autokey", &autoKey);
+    gx += cb + TextW("autokey", 8*s) + grp;
+
+    // The clock group (dur slider + length readout) is the widest block, and
+    // "Back" is pinned to the right edge. If they would collide, wrap the group
+    // onto a second row instead of letting it run under the button.
+    float dlw = TextW("dur", 6*s);
+    float clockW = dlw + gap + 120*s + grp + TextW("60.00 (60.00)", 10*s);
+    float rows = 1.0f;
+    if (gx + clockW > x + w - bw - grp)
+    { gx = x; y += rh + gap; rows = 2.0f; }
 
     // duration editor (never below the last keyframe - keys must stay on clock)
-    GuiLabel((Rectangle){ gx, y, 30, rh }, "dur"); gx += 32;
-    if (EditSlider((Rectangle){ gx, y, 120, rh }, "", &doc.duration, 0.2f, 10.0f))
+    GuiLabel((Rectangle){ gx, y, dlw, rh }, "dur"); gx += dlw + gap;
+    if (EditSlider((Rectangle){ gx, y, 120*s, rh }, "", &doc.duration, 0.2f, 60.0f))
     {
         float minDur = AnimDocMaxKeyTime(&doc);
         if (doc.duration < minDur) doc.duration = minDur;
+        // shrinking the clock must not strand the trim markers past its end
+        if (doc.outroStart > doc.duration) doc.outroStart = doc.duration;
+        if (doc.introEnd   > doc.outroStart) doc.introEnd = doc.outroStart;
     }
-    gx += 128;
+    gx += 120*s + grp;
 
-    // Back to menu (right edge).
-    if (GuiButton((Rectangle){ x + w - bw, y, bw, rh }, "Back"))
+    // Played length, with the FULL timeline length in brackets: the outro is
+    // trimmed, so these differ whenever the outro marker has been moved in.
+    // Measured at the WIDEST value it can ever show, so the label neither
+    // clips nor jitters as the numbers change width while dragging.
+    const char *lenTxt = TextFormat("%.2f (%.2f)", AnimDocPlayLen(&doc), doc.duration);
+    float lenW = TextW("60.00 (60.00)", 10*s);
+    GuiLabel((Rectangle){ gx, y, lenW, rh }, lenTxt);
+    gx += lenW + grp;
+
+    // Back to menu: pinned to the right edge of the FIRST row (y0), which the
+    // wrap above deliberately keeps clear.
+    if (GuiButton((Rectangle){ x + w - bw, rowY, bw, rh }, "Back"))
     { AudioPlayButton(); AppStateTransition(&app_state_main_menu); }
+
+    return rows*rh + (rows-1.0f)*gap;
+}
+
+// Draw one scrolling panel: wheel over it scrolls (unless Ctrl is held, which
+// is reserved for stepping the hovered slider), a scissor clips the content to
+// the panel, and `draw` reports the content height for the scroll clamp.
+// Returns that height so the caller can store it back.
+static float PanelScroll(PanelView *v, Rectangle panel,
+                         float (*draw)(float x, float y, float w))
+{
+    bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    if (!ctrl && CheckCollisionPointRec(GetMousePosition(), panel))
+        v->scroll += GetMouseWheelMove() * 30.0f;
+
+    float maxScroll = v->contentH - (panel.height - 16);
+    if (maxScroll < 0) maxScroll = 0;
+    if (v->scroll < -maxScroll) v->scroll = -maxScroll;
+    if (v->scroll > 0) v->scroll = 0;
+
+    // Scissor clips PIXELS, not hit-testing: a row scrolled out of the panel is
+    // invisible but still live, so a click meant for whatever is drawn outside
+    // (a header, another panel) also fired the hidden widget under the cursor.
+    // Lock the gui whenever the mouse is outside this panel - the rows then
+    // draw normally but refuse input, which is exactly the clipped region.
+    bool wasLocked = guiLocked;
+    bool inPanel   = CheckCollisionPointRec(GetMousePosition(), panel);
+    if (!inPanel && !wasLocked) GuiLock();
+
+    BeginScissorMode((int)panel.x+1, (int)panel.y+1,
+                     (int)panel.width-2, (int)panel.height-2);
+    float h = draw(panel.x+8, panel.y+8 + v->scroll, panel.width-16);
+    EndScissorMode();
+
+    if (!inPanel && !wasLocked) GuiUnlock();
+    return h;
 }
 
 // ===========================================================================
@@ -1460,7 +2227,7 @@ static void Gui()
     float W = (float)ss->width, H = (float)ss->height;
 
     float pad = 10.0f;
-    float toolbarH = 34.0f;
+    float toolbarH;             // set by DrawToolbar below (it can wrap)
     float leftW = 220.0f;
     float rightW = 320.0f;
     float bottomH = 180.0f;
@@ -1473,10 +2240,16 @@ static void Gui()
     // locked; the overlay itself is drawn (unlocked) last so it sits on top.
     addTrackVisible = false;
     animSwitchVisible = false;
-    if (keyEaseDropOpen || addTrackDrop >= 0 || animSwitchOpen || prompt != PROMPT_NONE)
-        GuiLock();
+    // The signal modal locks the editor behind it too - EXCEPT in its shrunk
+    // playback form, which is a small bar the user is meant to work around.
+    bool sigModalBlocking = sigModalIdx >= 0 &&
+                            !(playing || !AnimSignalPlayerDone(&preview));
+    guiLocked = keyEaseDropOpen || addTrackDrop >= 0 || animSwitchOpen ||
+                prompt != PROMPT_NONE || sigModalBlocking;
+    if (guiLocked) GuiLock();
 
-    DrawToolbar(pad, pad, W - 2*pad);
+    // the bar reports its own height (it wraps to two rows at large gui scales)
+    toolbarH = DrawToolbar(pad, pad, W - 2*pad) + 8.0f;
 
     // playback slide: panels move off the sides, the bottom block drops until
     // only a thin timeline strip remains. Skip the panels entirely once hidden
@@ -1489,40 +2262,40 @@ static void Gui()
                             leftW, H - toolbarH - bottomH - 3*pad };
     Rectangle rightPanel = { W - rightW - pad + (rightW + 2*pad)*k, toolbarH+pad,
                              rightW, H - toolbarH - bottomH - 3*pad };
+    // the left column is split: ELEMENTS on top, SIGNALS below. Both scroll.
+    float leftGap = 6.0f;
+    float leftElemH = (leftPanel.height - leftGap) * 0.60f;
+    Rectangle elemPanel = { leftPanel.x, leftPanel.y, leftPanel.width, leftElemH };
+    Rectangle sigPanel  = { leftPanel.x, leftPanel.y + leftElemH + leftGap,
+                            leftPanel.width, leftPanel.height - leftElemH - leftGap };
+
     if (!uiHidden)
     {
-        GuiPanel(leftPanel, NULL);
+        GuiPanel(elemPanel, NULL);
+        GuiPanel(sigPanel, NULL);
         GuiPanel(rightPanel, NULL);
-        DrawElementList(leftPanel.x+8, leftPanel.y+8, leftW-16);
 
-        // inspector scrolls (content can overflow); scissor keeps it in-panel.
         // Ctrl+wheel is reserved for stepping the hovered slider, not scrolling.
-        bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
-        if (!ctrl && CheckCollisionPointRec(GetMousePosition(), rightPanel))
-            inspScroll += GetMouseWheelMove() * 30.0f;
-        float maxScroll = inspContentH - (rightPanel.height - 16);
-        if (maxScroll < 0) maxScroll = 0;
-        if (inspScroll < -maxScroll) inspScroll = -maxScroll;
-        if (inspScroll > 0) inspScroll = 0;
-        inspPanelRect = rightPanel;
-        BeginScissorMode((int)rightPanel.x+1, (int)rightPanel.y+1,
-                         (int)rightPanel.width-2, (int)rightPanel.height-2);
-        inspContentH = DrawInspector(rightPanel.x+8, rightPanel.y+8 + inspScroll,
-                                     rightW-16);
-        EndScissorMode();
+        elemView.contentH = PanelScroll(&elemView, elemPanel, DrawElementList);
+        sigView.contentH  = PanelScroll(&sigView,  sigPanel,  DrawSignalList);
+
+        inspPanelRect = rightPanel;                 // key-reveal scrolling uses it
+        inspView.contentH = PanelScroll(&inspView, rightPanel, DrawInspector);
     }
     else keyEaseVisible = false;    // inspector skipped: no ease dropdown
 
-    // bottom: signal rows (wraps, reports its height) then the timeline. The
-    // whole block slides down by k so only the thin strip stays on screen.
+    // bottom: the timeline alone now (signals moved to the left panel), so it
+    // gets the whole block. It slides down by k until only the thin strip shows.
     float by = H - bottomH - pad + k * (bottomH - thinH);
-    float sigH = uiHidden ? 0.0f : DrawSignals(pad, by, W - 2*pad);
-    float tlY = by + sigH, tlH = H - pad - tlY;
-    if (tlH < thinH) { tlH = thinH; tlY = H - pad - thinH; }   // wrapped signals
-    DrawTimeline(pad, tlY, W - 2*pad, tlH);
+    float tlH = H - pad - by;
+    if (tlH < thinH) { tlH = thinH; by = H - pad - thinH; }
+    DrawTimeline(pad, by, W - 2*pad, tlH);
 
     GuiUnlock();
     DrawDropdownOverlays();
     DrawAnimSwitchOverlay();    // animation list (over widgets, under the modal)
-    DrawPromptModal();          // topmost: save-before-switch / delete / new
+    DrawLibraryModal();         // element shelf (its own scrolling list)
+    DrawSignalModal();          // one signal's targets/keys (survives playback)
+    DrawSignalModalOverlays();  // its element/prop/ease lists, over the modal
+    DrawPromptModal();          // topmost: save-before-switch / delete / new / lib names
 }

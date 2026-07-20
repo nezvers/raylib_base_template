@@ -82,6 +82,8 @@ void AnimDocInit(AnimDoc *doc)
     memset(doc, 0, sizeof(*doc));
     TextCopy(doc->name, "untitled");
     doc->duration   = 2.0f;
+    doc->introEnd   = 0.0f;
+    doc->outroStart = doc->duration;
     doc->elemCount  = 0;
     doc->signalCount = 0;
 }
@@ -126,11 +128,113 @@ AnimElem *AnimDocAddElem(AnimDoc *doc, AnimElemKind kind)
     return e;
 }
 
+// Signal targets address elements BY INDEX, so any reshuffle of doc->elems has
+// to be mirrored onto them or a signal silently starts driving the wrong
+// element. Both helpers below are the only places elems is reordered.
+
+// Drop every target pointing at `gone`, and shift the ones above it down.
+static void SignalsDropElem(AnimDoc *doc, int gone)
+{
+    for (int s = 0; s < doc->signalCount; s++)
+    {
+        AnimSignal *sg = &doc->signals[s];
+        for (int t = sg->targetCount - 1; t >= 0; t--)
+        {
+            if (sg->targets[t].elemIdx == gone)
+            {
+                for (int m = t; m < sg->targetCount - 1; m++)
+                    sg->targets[m] = sg->targets[m + 1];
+                sg->targetCount--;
+            }
+            else if (sg->targets[t].elemIdx > gone)
+                sg->targets[t].elemIdx--;
+        }
+    }
+}
+
+// Follow a swap of elements a <-> b.
+static void SignalsSwapElem(AnimDoc *doc, int a, int b)
+{
+    for (int s = 0; s < doc->signalCount; s++)
+    {
+        AnimSignal *sg = &doc->signals[s];
+        for (int t = 0; t < sg->targetCount; t++)
+        {
+            if      (sg->targets[t].elemIdx == a) sg->targets[t].elemIdx = b;
+            else if (sg->targets[t].elemIdx == b) sg->targets[t].elemIdx = a;
+        }
+    }
+}
+
+// Follow an insertion at `at` (everything from `at` up shifted one slot).
+static void SignalsInsertElem(AnimDoc *doc, int at)
+{
+    for (int s = 0; s < doc->signalCount; s++)
+    {
+        AnimSignal *sg = &doc->signals[s];
+        for (int t = 0; t < sg->targetCount; t++)
+            if (sg->targets[t].elemIdx >= at) sg->targets[t].elemIdx++;
+    }
+}
+
 void AnimDocRemoveElem(AnimDoc *doc, int idx)
 {
     if (idx < 0 || idx >= doc->elemCount) return;
     for (int i = idx; i < doc->elemCount - 1; i++) doc->elems[i] = doc->elems[i + 1];
     doc->elemCount--;
+    SignalsDropElem(doc, idx);
+}
+
+void AnimDocMoveElem(AnimDoc *doc, int idx, int delta)
+{
+    if (idx < 0 || idx >= doc->elemCount) return;
+    int to = idx + delta;
+    if (to < 0 || to >= doc->elemCount) return;         // already at an end
+    AnimElem tmp   = doc->elems[idx];
+    doc->elems[idx] = doc->elems[to];
+    doc->elems[to]  = tmp;
+    SignalsSwapElem(doc, idx, to);
+}
+
+// "title" -> "title_2", "title_3", ... until nothing ELSE in the doc collides.
+// Leaves the name as-is if every suffix is taken (names are cosmetic).
+void AnimDocUniquifyElemName(AnimDoc *doc, int idx)
+{
+    if (!doc || idx < 0 || idx >= doc->elemCount) return;
+    char *name = doc->elems[idx].name;
+
+    bool taken = false;
+    for (int i = 0; i < doc->elemCount && !taken; i++)
+        if (i != idx && TextIsEqual(doc->elems[i].name, name)) taken = true;
+    if (!taken) return;
+
+    char base[ANIM_NAME_MAX];
+    TextCopy(base, name);
+    for (int n = 2; n < 100; n++)
+    {
+        const char *cand = TextFormat("%s_%d", base, n);
+        bool hit = false;
+        for (int i = 0; i < doc->elemCount && !hit; i++)
+            if (i != idx && TextIsEqual(doc->elems[i].name, cand)) hit = true;
+        if (!hit) { TextCopy(name, cand); return; }
+    }
+}
+
+AnimElem *AnimDocDuplicateElem(AnimDoc *doc, int idx)
+{
+    if (idx < 0 || idx >= doc->elemCount) return NULL;
+    if (doc->elemCount >= ANIM_ELEMS_MAX) return NULL;
+
+    // shift the tail up one slot, then drop the copy right after the source so
+    // the duplicate lands next to what it came from (and keeps its z-order).
+    for (int i = doc->elemCount; i > idx + 1; i--) doc->elems[i] = doc->elems[i - 1];
+    doc->elemCount++;
+    SignalsInsertElem(doc, idx + 1);        // targets above the copy shift up
+
+    AnimElem *dup = &doc->elems[idx + 1];
+    *dup = doc->elems[idx];                 // plain value: tracks/keys come along
+    AnimDocUniquifyElemName(doc, idx + 1);
+    return dup;
 }
 
 AnimTrack *AnimElemFindTrack(AnimElem *e, int prop)
@@ -306,11 +410,48 @@ Color AnimTrackEvalColor(const AnimTrack *tr, float t, Color missing)
     return out;
 }
 
+// ---------------------------------------------------------------------------
+//  Signal override hook.
+//
+//  A firing signal transiently drives some (element, property) pairs, winning
+//  over the doc's own timeline. The draw helpers below all funnel through
+//  AnimElemProp / AnimElemColorProp, so the override is applied THERE rather
+//  than threaded through every drawing signature.
+//
+//  The active override is file-scope state installed for the duration of one
+//  AnimDocDrawEx call (same singleton style as the rest of the project). It
+//  needs the element's INDEX, which the const AnimElem* alone can't give, so
+//  the doc being drawn is recorded and the index recovered by pointer offset.
+// ---------------------------------------------------------------------------
+static const AnimSignalPlayer *s_ovr    = NULL;
+static const AnimDoc          *s_ovrDoc = NULL;
+
+// Index of `e` within the doc currently being drawn, or -1.
+static int OverrideElemIdx(const AnimElem *e)
+{
+    if (!s_ovrDoc) return -1;
+    ptrdiff_t d = e - s_ovrDoc->elems;
+    if (d < 0 || d >= s_ovrDoc->elemCount) return -1;
+    return (int)d;
+}
+
 Color AnimElemColorProp(const AnimElem *e, int prop, float t)
 {
     // Exact-prop lookup: a shape can carry BOTH a fill and an outline colour
     // track, so "any colour track" would alias them.
     Color base = (prop == AP_S_OUTLINE_COLOR) ? e->outlineColor : e->color;
+
+    if (s_ovr)
+    {
+        Color oc;
+        int ei = OverrideElemIdx(e);
+        if (ei >= 0 && AnimSignalPlayerEval(s_ovr, ei, prop, NULL, &oc))
+        {
+            oc.a = base.a;      // colour props never carry alpha (see below)
+            return oc;
+        }
+    }
+
     for (int i = 0; i < e->trackCount; i++)
         if (e->tracks[i].prop == prop)
             return AnimTrackEvalColor(&e->tracks[i], t, base);
@@ -348,6 +489,13 @@ static float ElemBaseProp(const AnimElem *e, int prop)
 
 float AnimElemProp(const AnimElem *e, int prop, float t)
 {
+    if (s_ovr)
+    {
+        float ov;
+        int ei = OverrideElemIdx(e);
+        if (ei >= 0 && AnimSignalPlayerEval(s_ovr, ei, prop, &ov, NULL)) return ov;
+    }
+
     const AnimTrack *tr = NULL;
     for (int i = 0; i < e->trackCount; i++)
         if (e->tracks[i].prop == prop) { tr = &e->tracks[i]; break; }
@@ -394,6 +542,31 @@ float AnimDocMaxKeyTime(const AnimDoc *doc)
                 if (tr->keys[k].t > d) d = tr->keys[k].t;
         }
     return d;
+}
+
+float AnimDocOutroStart(const AnimDoc *doc)
+{
+    if (!doc) return 0.0f;
+    // <= 0 is the "unset" case: docs saved before the trim existed, and any
+    // zeroed struct, both mean "play the whole clock".
+    float o = (doc->outroStart > 0.0f) ? doc->outroStart : doc->duration;
+    if (o > doc->duration) o = doc->duration;
+    return o < 0.0f ? 0.0f : o;
+}
+
+float AnimDocIntroEnd(const AnimDoc *doc)
+{
+    if (!doc) return 0.0f;
+    float o = AnimDocOutroStart(doc);
+    float i = doc->introEnd;
+    if (i < 0.0f) i = 0.0f;
+    if (i > o)    i = o;
+    return i;
+}
+
+float AnimDocPlayLen(const AnimDoc *doc)
+{
+    return AnimDocOutroStart(doc) - AnimDocIntroEnd(doc);
 }
 
 // ---------------------------------------------------------------------------
@@ -599,9 +772,15 @@ static void DrawGlobalElem(const AnimElem *e, float t, Vector2 game)
     DrawRectangle(0, 0, (int)game.x, (int)game.y, Fade(AnimElemColor(e, t), fade));
 }
 
-void AnimDocDraw(const AnimDoc *doc, float t)
+void AnimDocDrawEx(const AnimDoc *doc, float t, const AnimSignalPlayer *ovr)
 {
     Vector2 game = ScreenStateTargetSize();
+
+    // install the override for this draw only (AnimElemProp / AnimElemColorProp
+    // consult it), and always tear it down so it can't leak into a later draw.
+    s_ovr    = (ovr && ovr->playing) ? ovr : NULL;
+    s_ovrDoc = doc;
+
     for (int i = 0; i < doc->elemCount; i++)
     {
         const AnimElem *e = &doc->elems[i];
@@ -612,6 +791,124 @@ void AnimDocDraw(const AnimDoc *doc, float t)
             case AE_GLOBAL: DrawGlobalElem(e, t, game); break;
         }
     }
+
+    s_ovr = NULL; s_ovrDoc = NULL;
+}
+
+void AnimDocDraw(const AnimDoc *doc, float t)
+{
+    AnimDocDrawEx(doc, t, NULL);
+}
+
+// ---------------------------------------------------------------------------
+//  Signal player
+// ---------------------------------------------------------------------------
+void AnimSignalPlayerStart(AnimSignalPlayer *p, const AnimSignal *sig,
+                           const AnimDoc *doc, float docTime)
+{
+    if (!p) return;
+    p->sig = sig; p->clock = 0.0f; p->playing = false;
+    if (!sig || sig->targetCount <= 0 || !doc) return;
+
+    // capture the live pose: this is the implicit key at u=0, so the signal
+    // eases FROM whatever is on screen right now.
+    for (int i = 0; i < sig->targetCount && i < ANIM_SIG_TARGETS_MAX; i++)
+    {
+        const AnimSigTarget *tg = &sig->targets[i];
+        if (tg->elemIdx < 0 || tg->elemIdx >= doc->elemCount)
+        {
+            p->fromValue[i] = 0.0f;
+            p->fromColor[i] = BLANK;
+            continue;
+        }
+        const AnimElem *e = &doc->elems[tg->elemIdx];
+        // read through the PLAIN path: a signal captures the timeline pose, it
+        // must not sample a previous signal's override (that would compound).
+        const AnimSignalPlayer *save = s_ovr; s_ovr = NULL;
+        if (AnimPropIsColor(tg->prop))
+            p->fromColor[i] = AnimElemColorProp(e, tg->prop, docTime);
+        else
+            p->fromValue[i] = AnimElemProp(e, tg->prop, docTime);
+        s_ovr = save;
+    }
+    p->playing = true;
+}
+
+void AnimSignalPlayerUpdate(AnimSignalPlayer *p, float dt)
+{
+    if (!p || !p->playing || !p->sig) return;
+    p->clock += dt;
+    if (p->clock >= p->sig->length) { p->clock = p->sig->length; p->playing = false; }
+}
+
+bool AnimSignalPlayerDone(const AnimSignalPlayer *p)
+{
+    return !p || !p->playing;
+}
+
+bool AnimSignalPlayerEval(const AnimSignalPlayer *p, int elemIdx, int prop,
+                          float *outValue, Color *outColor)
+{
+    if (!p || !p->playing || !p->sig) return false;
+
+    for (int i = 0; i < p->sig->targetCount && i < ANIM_SIG_TARGETS_MAX; i++)
+    {
+        const AnimSigTarget *tg = &p->sig->targets[i];
+        if (tg->elemIdx != elemIdx || tg->prop != prop) continue;
+        if (tg->keyCount == 0) return false;         // nothing to drive it with
+
+        // normalized progress; length <= 0 means "instant" -> land on the end.
+        float u = (p->sig->length > 0.0f) ? (p->clock / p->sig->length) : 1.0f;
+        if (u < 0.0f) u = 0.0f; if (u > 1.0f) u = 1.0f;
+
+        // Build the segment against the IMPLICIT u=0 key (the captured pose):
+        // before the first stored key we interpolate from the capture, after
+        // the last we hold it.
+        AnimKey from;
+        from.t = 0.0f; from.ease = ANIM_EASE_LINEAR;
+        from.value = p->fromValue[i];
+        from.cval  = p->fromColor[i];
+
+        const AnimKey *a = &from, *b = &tg->keys[0];
+        if (u >= tg->keys[tg->keyCount - 1].t)
+            a = b = &tg->keys[tg->keyCount - 1];     // past the end: hold
+        else
+        {
+            for (int k = 0; k < tg->keyCount; k++)
+                if (u <= tg->keys[k].t)
+                {
+                    b = &tg->keys[k];
+                    a = (k == 0) ? &from : &tg->keys[k - 1];
+                    break;
+                }
+        }
+
+        if (AnimPropIsColor(prop))
+        {
+            if (outColor)
+            {
+                if (a == b) *outColor = b->cval;
+                else
+                {
+                    float f = SegmentFraction(a, b, u);
+                    *outColor = (Color){ MixChannel(a->cval.r, b->cval.r, f),
+                                         MixChannel(a->cval.g, b->cval.g, f),
+                                         MixChannel(a->cval.b, b->cval.b, f), 255 };
+                }
+            }
+        }
+        else if (outValue)
+        {
+            if (a == b) *outValue = b->value;
+            else
+            {
+                float f = SegmentFraction(a, b, u);
+                *outValue = a->value + (b->value - a->value) * f;
+            }
+        }
+        return true;
+    }
+    return false;
 }
 
 // deterministic pseudo-random in [-1,1] from an int seed (repeatable scatter);
@@ -634,12 +931,14 @@ void AnimPlayerStart(AnimPlayer *p, const AnimDoc *doc, int dir,
     p->secEnd   = secEnd;
     p->clock    = 0.0f;
     p->playing  = true;
+    p->introDone = false;
     // loop is left as the caller set it (default false via zeroed struct).
 }
 
 void AnimPlayerStartAll(AnimPlayer *p, const AnimDoc *doc, int dir)
 {
-    AnimPlayerStart(p, doc, dir, 0.0f, doc ? doc->duration : 0.0f);
+    // The outro is trimmed: playing "the whole doc" stops at outroStart.
+    AnimPlayerStart(p, doc, dir, 0.0f, doc ? AnimDocOutroStart(doc) : 0.0f);
 }
 
 static float SectionLen(const AnimPlayer *p)
@@ -655,8 +954,21 @@ void AnimPlayerUpdate(AnimPlayer *p, float dt)
     float len = SectionLen(p);
     if (p->clock >= len)
     {
-        if (p->loop) p->clock = fmodf(p->clock, len > 0.0f ? len : 1.0f);
-        else       { p->clock = len; p->playing = false; }
+        if (!p->loop) { p->clock = len; p->playing = false; return; }
+
+        // Looping: the INTRO is a one-shot lead-in, so every cycle after the
+        // first restarts at introEnd instead of at the section start. Reverse
+        // playback has no intro concept - it just wraps the whole section.
+        p->introDone = true;
+        float loopStart = 0.0f;
+        if (p->dir != ANIM_REV)
+        {
+            float ie = AnimDocIntroEnd(p->doc) - p->secStart;
+            if (ie > 0.0f && ie < len) loopStart = ie;
+        }
+        float cycle = len - loopStart;
+        p->clock = (cycle > 0.0f) ? loopStart + fmodf(p->clock - len, cycle)
+                                  : loopStart;
     }
 }
 

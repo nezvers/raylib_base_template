@@ -10,6 +10,7 @@
 #include "raylib.h"
 #include "../src/anim/anim.h"
 #include "../src/anim/anim_io.h"
+#include "../src/anim/anim_library.h"
 #include "../src/signal/signal.h"
 #include "../src/signal/anim_signal.h"
 #include <stdio.h>
@@ -322,6 +323,53 @@ static void TestRemoveTrack(void)
 }
 
 // ---------------------------------------------------------------------------
+//  Element reorder / duplicate (element order == draw order)
+// ---------------------------------------------------------------------------
+static void TestMoveDuplicateElem(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    TextCopy(AnimDocAddElem(&doc, AE_TEXT)->name,  "a");
+    TextCopy(AnimDocAddElem(&doc, AE_SHAPE)->name, "b");
+    TextCopy(AnimDocAddElem(&doc, AE_TEXT)->name,  "c");
+    CHECK(doc.elemCount == 3);
+
+    AnimDocMoveElem(&doc, 1, -1);                           // b up: b a c
+    CHECK(TextIsEqual(doc.elems[0].name, "b") &&
+          TextIsEqual(doc.elems[1].name, "a"));
+    AnimDocMoveElem(&doc, 0, +1);                           // back: a b c
+    CHECK(TextIsEqual(doc.elems[0].name, "a") &&
+          TextIsEqual(doc.elems[1].name, "b"));
+
+    AnimDocMoveElem(&doc, 0, -1);                           // top edge: no-op
+    AnimDocMoveElem(&doc, 2, +1);                           // bottom edge: no-op
+    AnimDocMoveElem(&doc, -1, +1);                          // bad index: no-op
+    CHECK(doc.elemCount == 3);
+    CHECK(TextIsEqual(doc.elems[0].name, "a") &&
+          TextIsEqual(doc.elems[2].name, "c"));
+
+    // duplicate carries tracks + keys and lands directly after the source
+    AnimTrack *tr = AnimElemAddTrack(&doc.elems[0], AP_T_ALPHA);
+    AnimTrackAddKey(tr, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 1.0f, 1.0f, ANIM_EASE_SINE_OUT);
+
+    AnimElem *dup = AnimDocDuplicateElem(&doc, 0);
+    CHECK(dup != NULL && doc.elemCount == 4);
+    CHECK(dup == &doc.elems[1]);                            // inserted after src
+    CHECK(TextIsEqual(dup->name, "a_2"));                   // uniquified
+    CHECK(dup->trackCount == 1 && dup->tracks[0].keyCount == 2);
+    CHECK(dup->tracks[0].keys[1].ease == ANIM_EASE_SINE_OUT);
+    CHECK(TextIsEqual(doc.elems[2].name, "b"));             // tail shifted, intact
+
+    AnimElem *dup2 = AnimDocDuplicateElem(&doc, 0);         // "a" again -> a_3
+    CHECK(dup2 != NULL && TextIsEqual(dup2->name, "a_3"));
+
+    CHECK(AnimDocDuplicateElem(&doc, -1) == NULL);          // bad index
+    while (doc.elemCount < ANIM_ELEMS_MAX) AnimDocAddElem(&doc, AE_TEXT);
+    CHECK(AnimDocDuplicateElem(&doc, 0) == NULL);           // full doc
+}
+
+// ---------------------------------------------------------------------------
 //  IO round-trip
 // ---------------------------------------------------------------------------
 static void TestIO(void)
@@ -367,11 +415,28 @@ static void TestIO(void)
 
     doc.signalCount = 2;
     TextCopy(doc.signals[0].name, "enter");
-    doc.signals[0].dir = ANIM_FWD;
-    doc.signals[0].sectionStart = 0.0f;  doc.signals[0].sectionEnd = 1.0f;
+    doc.signals[0].length      = 1.5f;
+    doc.signals[0].targetCount = 0;
+
     TextCopy(doc.signals[1].name, "leave");
-    doc.signals[1].dir = ANIM_REV;
-    doc.signals[1].sectionStart = 0.5f;  doc.signals[1].sectionEnd = 3.0f;
+    doc.signals[1].length      = 2.0f;
+    doc.signals[1].targetCount = 2;
+    // scalar target on elem 0 (a text element)
+    doc.signals[1].targets[0] = (AnimSigTarget){0};
+    doc.signals[1].targets[0].elemIdx  = 0;
+    doc.signals[1].targets[0].prop     = AP_T_POS_Y;
+    doc.signals[1].targets[0].keyCount = 2;
+    doc.signals[1].targets[0].keys[0] =
+        (AnimKey){ 0.5f, 0.25f, (Color){0,0,0,0}, ANIM_EASE_SINE_OUT };
+    doc.signals[1].targets[0].keys[1] =
+        (AnimKey){ 1.0f, 0.90f, (Color){0,0,0,0}, ANIM_EASE_BACK_IN };
+    // colour target on elem 0 (keys carry cval, not value)
+    doc.signals[1].targets[1] = (AnimSigTarget){0};
+    doc.signals[1].targets[1].elemIdx  = 0;
+    doc.signals[1].targets[1].prop     = AP_T_COLOR;
+    doc.signals[1].targets[1].keyCount = 1;
+    doc.signals[1].targets[1].keys[0] =
+        (AnimKey){ 1.0f, 0.0f, (Color){ 7, 8, 9, 255 }, ANIM_EASE_LINEAR };
 
     CHECK(AnimDocSave(&doc, path));
 
@@ -408,10 +473,61 @@ static void TestIO(void)
     for (int k = SHAPE_SQUARE; k < SHAPE_KIND_COUNT; k++)
         CHECK(in.elems[2 + k - SHAPE_SQUARE].shapeKind == k);
     CHECK(in.signalCount == 2);
-    CHECK(in.signals[1].dir == ANIM_REV);
-    CHECK_NEAR(in.signals[1].sectionStart, 0.5f);
-    CHECK_NEAR(in.signals[1].sectionEnd, 3.0f);
+    CHECK_NEAR(in.signals[0].length, 1.5f);
+    CHECK(in.signals[0].targetCount == 0);
 
+    CHECK_NEAR(in.signals[1].length, 2.0f);
+    CHECK(in.signals[1].targetCount == 2);
+    // targets are stored BY ELEMENT NAME and resolved back to an index
+    CHECK(in.signals[1].targets[0].elemIdx == 0);
+    CHECK(in.signals[1].targets[0].prop == AP_T_POS_Y);
+    CHECK(in.signals[1].targets[0].keyCount == 2);
+    CHECK_NEAR(in.signals[1].targets[0].keys[0].t, 0.5f);      // normalized u
+    CHECK_NEAR(in.signals[1].targets[0].keys[1].value, 0.90f);
+    CHECK(in.signals[1].targets[0].keys[1].ease == ANIM_EASE_BACK_IN);
+    CHECK(in.signals[1].targets[1].prop == AP_T_COLOR);
+    CHECK(in.signals[1].targets[1].keys[0].cval.r == 7);
+    CHECK(in.signals[1].targets[1].keys[0].cval.b == 9);
+
+    remove(path);
+}
+
+// A target naming an element that no longer exists must drop cleanly, and the
+// rest of the file must keep parsing (the reader has to consume the orphan's
+// key lines rather than letting their numbers desync the token stream).
+static void TestIOSignalOrphanTarget(void)
+{
+    const char *path = "anim_tests_orphan.cfg";
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL);
+    if (!f) return;
+    fprintf(f, "doc orphan 2.0\n"
+               "elem text keeper\n"
+               "  color 1 2 3 255\n"
+               "  pos 0.5 0.5\n"
+               "  size 0.1 0.1\n"
+               "  end\n"
+               "signal s1 1.0\n"
+               "  target ghost pos_y 2\n"          // element does not exist
+               "    key 0.500000 0.250000 linear\n"
+               "    key 1.000000 0.750000 sineOut\n"
+               "  target keeper pos_x 1\n"         // this one must survive
+               "    key 1.000000 0.800000 linear\n"
+               "  endsig\n"
+               "signal s2 0.5\n"
+               "  endsig\n");
+    fclose(f);
+
+    AnimDoc in;
+    CHECK(AnimDocLoad(&in, path));
+    CHECK(in.elemCount == 1);
+    CHECK(in.signalCount == 2);                    // both signals still parsed
+    CHECK(in.signals[0].targetCount == 1);         // orphan dropped
+    CHECK(in.signals[0].targets[0].prop == AP_T_POS_X);
+    CHECK(in.signals[0].targets[0].keyCount == 1);
+    CHECK_NEAR(in.signals[0].targets[0].keys[0].value, 0.8f);
+    CHECK(TextIsEqual(in.signals[1].name, "s2"));  // stream stayed in sync
+    CHECK_NEAR(in.signals[1].length, 0.5f);
     remove(path);
 }
 
@@ -437,6 +553,196 @@ static void TestIOOldFormat(void)
     CHECK(in.elemCount == 1 && in.elems[0].shapeKind == SHAPE_CIRCLE);
     CHECK_NEAR(in.elems[0].outlineFrac, 0.0f);              // default: off
     CHECK(in.elems[0].outlineColor.r == 245);               // RAYWHITE default
+    // no trim fields on the doc line -> whole clock is played
+    CHECK_NEAR(AnimDocIntroEnd(&in), 0.0f);
+    CHECK_NEAR(AnimDocOutroStart(&in), 2.0f);
+    CHECK_NEAR(AnimDocPlayLen(&in), 2.0f);
+    remove(path);
+}
+
+// Intro/outro trim: accessors clamp, the section round-trips through .cfg, and
+// a looping player replays [introEnd, outroStart) after its first pass.
+static void TestTrim(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration = 10.0f;
+
+    // unset outro (0) means "whole clock"; that is what old docs deserialize to
+    doc.outroStart = 0.0f;
+    CHECK_NEAR(AnimDocOutroStart(&doc), 10.0f);
+    CHECK_NEAR(AnimDocPlayLen(&doc), 10.0f);
+
+    // out-of-range values are clamped by the accessors, not stored raw
+    doc.outroStart = 20.0f;  CHECK_NEAR(AnimDocOutroStart(&doc), 10.0f);
+    doc.outroStart = 6.0f;
+    doc.introEnd   = 9.0f;   CHECK_NEAR(AnimDocIntroEnd(&doc), 6.0f);  // can't cross
+    doc.introEnd   = -1.0f;  CHECK_NEAR(AnimDocIntroEnd(&doc), 0.0f);
+    doc.introEnd   = 2.0f;
+    CHECK_NEAR(AnimDocPlayLen(&doc), 4.0f);
+
+    // round-trip
+    const char *path = "anim_tests_trim_tmp.cfg";
+    CHECK(AnimDocSave(&doc, path));
+    AnimDoc in;
+    CHECK(AnimDocLoad(&in, path));
+    CHECK_NEAR(in.duration, 10.0f);
+    CHECK_NEAR(in.introEnd, 2.0f);
+    CHECK_NEAR(in.outroStart, 6.0f);
+    remove(path);
+
+    // player: StartAll stops at the outro, never sampling the trimmed tail
+    AnimPlayer p = {0};
+    AnimPlayerStartAll(&p, &doc, ANIM_FWD);
+    CHECK_NEAR(p.secEnd, 6.0f);
+    p.loop = false;
+    for (int i = 0; i < 100; i++)
+    {
+        AnimPlayerUpdate(&p, 0.1f);
+        CHECK(AnimPlayerSampleTime(&p) <= 6.0f + 0.0001f);
+    }
+    CHECK(AnimPlayerDone(&p));
+    CHECK_NEAR(AnimPlayerSampleTime(&p), 6.0f);
+
+    // looping: the first pass includes the intro, every later cycle starts at
+    // introEnd and stays inside [introEnd, outroStart)
+    AnimPlayerStartAll(&p, &doc, ANIM_FWD);
+    p.loop = true;
+    CHECK(!p.introDone);
+    CHECK_NEAR(AnimPlayerSampleTime(&p), 0.0f);     // intro plays on pass one
+    for (int i = 0; i < 30; i++) AnimPlayerUpdate(&p, 0.25f);   // 7.5s > 6s
+    CHECK(p.introDone);
+    for (int i = 0; i < 200; i++)
+    {
+        AnimPlayerUpdate(&p, 0.1f);
+        float t = AnimPlayerSampleTime(&p);
+        CHECK(t >= 2.0f - 0.0001f && t <= 6.0f + 0.0001f);
+    }
+}
+
+// Save -> load -> save must be byte-stable: the shared elem writer/reader
+// (AnimElemWriteCfg / AnimElemReadCfgToken) is the single grammar, so a second
+// pass over its own output has to reproduce it exactly.
+static void TestIOIdempotent(void)
+{
+    const char *p1 = "anim_tests_idem1.cfg", *p2 = "anim_tests_idem2.cfg";
+
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    TextCopy(doc.name, "idem");
+    doc.duration = 3.0f;
+
+    AnimElem *t = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(t->name, "title");
+    TextCopy(t->text, "TWO WORDS");                         // exercises the _ encoding
+    AnimTrack *a = AnimElemAddTrack(t, AP_T_ALPHA);
+    AnimTrackAddKey(a, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(a, 1.5f, 1.0f, ANIM_EASE_BOUNCE_OUT);
+    AnimTrack *tc = AnimElemAddTrack(t, AP_T_COLOR);        // colour track: 5-token keys
+    AnimTrackAddColorKey(tc, 0.0f, (Color){ 1, 2, 3, 255 }, ANIM_EASE_LINEAR);
+    AnimTrackAddColorKey(tc, 2.0f, (Color){ 9, 8, 7, 255 }, ANIM_EASE_SINE_OUT);
+
+    AnimElem *s = AnimDocAddElem(&doc, AE_SHAPE);
+    TextCopy(s->name, "box");
+    s->shapeKind   = SHAPE_RHOMBUS;
+    s->outlineFrac = 0.02f;
+    AnimElemAddTrack(s, AP_S_OUTLINE_COLOR);
+
+    CHECK(AnimDocSave(&doc, p1));
+
+    AnimDoc back;
+    CHECK(AnimDocLoad(&back, p1));
+    CHECK(back.elemCount == 2);
+    CHECK(TextIsEqual(back.elems[0].text, "TWO WORDS"));    // decoded back
+    CHECK(back.elems[0].trackCount == 2);
+    CHECK(back.elems[0].tracks[1].keys[1].cval.r == 9);
+    CHECK(back.elems[1].shapeKind == SHAPE_RHOMBUS);
+    CHECK(AnimDocSave(&back, p2));
+
+    // compare the two files byte for byte
+    FILE *f1 = fopen(p1, "rb"), *f2 = fopen(p2, "rb");
+    CHECK(f1 && f2);
+    if (f1 && f2)
+    {
+        int c1, c2, same = 1;
+        do { c1 = fgetc(f1); c2 = fgetc(f2); if (c1 != c2) { same = 0; break; } }
+        while (c1 != EOF);
+        CHECK(same);
+    }
+    if (f1) fclose(f1);
+    if (f2) fclose(f2);
+    remove(p1); remove(p2);
+}
+
+// ---------------------------------------------------------------------------
+//  Element library: CRUD + round-trip through the shared elem grammar
+// ---------------------------------------------------------------------------
+static void TestLibrary(void)
+{
+    const char *path = "anim_tests_lib.cfg";
+
+    AnimLibrary lib;
+    AnimLibraryInit(&lib);
+    CHECK(lib.count == 0);
+    CHECK(AnimLibraryFind(&lib, "nope") == -1);
+
+    AnimElem e;
+    AnimElemInit(&e, AE_SHAPE);
+    TextCopy(e.name, "box");
+    e.shapeKind   = SHAPE_TRIANGLE;
+    e.outlineFrac = 0.03f;
+    e.color       = (Color){ 10, 20, 30, 200 };
+    AnimTrack *tr = AnimElemAddTrack(&e, AP_S_POS_Y);
+    AnimTrackAddKey(tr, 0.0f, 0.1f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 1.0f, 0.9f, ANIM_EASE_BACK_OUT);
+
+    CHECK(AnimLibraryAdd(&lib, "neon_box", &e) == 0);
+    CHECK(lib.count == 1);
+    CHECK(AnimLibraryFind(&lib, "neon_box") == 0);
+
+    // same name overwrites in place rather than appending a duplicate
+    e.outlineFrac = 0.05f;
+    CHECK(AnimLibraryAdd(&lib, "neon_box", &e) == 0);
+    CHECK(lib.count == 1);
+    CHECK_NEAR(lib.entries[0].elem.outlineFrac, 0.05f);
+
+    AnimElem t;
+    AnimElemInit(&t, AE_TEXT);
+    TextCopy(t.text, "TWO WORDS");
+    CHECK(AnimLibraryAdd(&lib, "title_style", &t) == 1);
+
+    // rename rules
+    CHECK(!AnimLibraryRename(&lib, 1, "neon_box"));          // name taken
+    CHECK(!AnimLibraryRename(&lib, 1, ""));                  // empty
+    CHECK(!AnimLibraryRename(&lib, 9, "x"));                 // bad index
+    CHECK(AnimLibraryRename(&lib, 1, "big_title"));
+    CHECK(TextIsEqual(lib.entries[1].name, "big_title"));
+
+    CHECK(AnimLibrarySave(&lib, path));
+
+    AnimLibrary back;
+    CHECK(AnimLibraryLoad(&back, path));
+    CHECK(back.count == 2);
+    CHECK(TextIsEqual(back.entries[0].name, "neon_box"));
+    CHECK(back.entries[0].elem.kind == AE_SHAPE);
+    CHECK(back.entries[0].elem.shapeKind == SHAPE_TRIANGLE);
+    CHECK(back.entries[0].elem.color.a == 200);
+    CHECK(back.entries[0].elem.trackCount == 1);             // tracks survive
+    CHECK(back.entries[0].elem.tracks[0].keyCount == 2);
+    CHECK(back.entries[0].elem.tracks[0].keys[1].ease == ANIM_EASE_BACK_OUT);
+    CHECK(back.entries[1].elem.kind == AE_TEXT);             // kind re-inited
+    CHECK(TextIsEqual(back.entries[1].elem.text, "TWO WORDS"));
+
+    AnimLibraryRemove(&back, 0);
+    CHECK(back.count == 1 && TextIsEqual(back.entries[0].name, "big_title"));
+    AnimLibraryRemove(&back, 5);                             // out of range: no-op
+    CHECK(back.count == 1);
+
+    // missing file -> empty library, false
+    AnimLibrary miss;
+    CHECK(!AnimLibraryLoad(&miss, "anim_tests_no_such_lib.cfg"));
+    CHECK(miss.count == 0);
+
     remove(path);
 }
 
@@ -457,42 +763,129 @@ static void TestSignals(void)
     SignalEmit("ping");
     CHECK(s_pings == 1);
 
-    // bridge: firing a doc signal starts the player at the right section/dir.
+    // bridge: firing a doc signal starts the signal player on that signal.
     SignalReset();
     AnimDoc doc;
     AnimDocInit(&doc);
     doc.duration = 2.0f;
+    AnimElem *e = AnimDocAddElem(&doc, AE_TEXT);
+    e->posFrac = (Vector2){ 0.5f, 0.20f };                  // live pose to ease FROM
+
     doc.signalCount = 1;
     TextCopy(doc.signals[0].name, "enter");
-    doc.signals[0].dir = ANIM_REV;
-    doc.signals[0].sectionStart = 0.5f;
-    doc.signals[0].sectionEnd   = 1.5f;
+    doc.signals[0].length      = 2.0f;
+    doc.signals[0].targetCount = 1;
+    doc.signals[0].targets[0] = (AnimSigTarget){0};
+    doc.signals[0].targets[0].elemIdx  = 0;
+    doc.signals[0].targets[0].prop     = AP_T_POS_Y;
+    doc.signals[0].targets[0].keyCount = 1;
+    doc.signals[0].targets[0].keys[0] =
+        (AnimKey){ 1.0f, 0.80f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
 
+    float docTime = 0.0f;
+    AnimSignalPlayer sp = {0};
+    AnimSignalRegister(&doc, &sp, &docTime);
+    SignalEmit("enter");
+    CHECK(sp.playing);
+    CHECK_NEAR(sp.fromValue[0], 0.20f);                     // captured live pose
+
+    float v = 0.0f;
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_T_POS_Y, &v, NULL));
+    CHECK_NEAR(v, 0.20f);                                   // u=0 -> the capture
+    CHECK(!AnimSignalPlayerEval(&sp, 0, AP_T_POS_X, &v, NULL));   // untargeted
+    CHECK(!AnimSignalPlayerEval(&sp, 1, AP_T_POS_Y, &v, NULL));   // other element
+
+    AnimSignalPlayerUpdate(&sp, 1.0f);                      // halfway
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_T_POS_Y, &v, NULL));
+    CHECK_NEAR(v, 0.50f);                                   // linear 0.2 -> 0.8
+
+    AnimSignalPlayerUpdate(&sp, 10.0f);                     // past the end
+    CHECK(AnimSignalPlayerDone(&sp));
+    CHECK(!AnimSignalPlayerEval(&sp, 0, AP_T_POS_Y, &v, NULL));   // idle: no drive
+
+    AnimSignalUnregister(&doc, &sp);
+    sp.playing = false;
+    SignalEmit("enter");
+    CHECK(!sp.playing);                                     // binding removed
+
+    // length 0 = instant: lands on the final key the moment it starts
+    doc.signals[0].length = 0.0f;
+    AnimSignalPlayerStart(&sp, &doc.signals[0], &doc, 0.0f);
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_T_POS_Y, &v, NULL));
+    CHECK_NEAR(v, 0.80f);
+
+    // normalized keys rescale with the length: same u, twice the wall time
+    doc.signals[0].length = 4.0f;
+    AnimSignalPlayerStart(&sp, &doc.signals[0], &doc, 0.0f);
+    AnimSignalPlayerUpdate(&sp, 2.0f);                      // u = 0.5 again
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_T_POS_Y, &v, NULL));
+    CHECK_NEAR(v, 0.50f);
+
+    // a NULL / empty signal leaves the player idle rather than half-started
+    AnimSignalPlayerStart(&sp, NULL, &doc, 0.0f);
+    CHECK(AnimSignalPlayerDone(&sp));
+
+    // the plain AnimPlayer (still used for whole-doc playback) is unaffected
     AnimPlayer p = {0};
-    AnimSignalRegister(&doc, &p);
-    SignalEmit("enter");
-    CHECK(p.playing);
-    CHECK(p.dir == ANIM_REV);
-    CHECK_NEAR(p.secStart, 0.5f);
-    CHECK_NEAR(p.secEnd, 1.5f);
-    CHECK_NEAR(AnimPlayerSampleTime(&p), 1.5f);             // reverse starts at end
-
-    AnimPlayerUpdate(&p, 0.25f);
-    CHECK_NEAR(AnimPlayerSampleTime(&p), 1.25f);
-    AnimPlayerUpdate(&p, 10.0f);                            // run past the end
-    CHECK(AnimPlayerDone(&p));
-    CHECK_NEAR(AnimPlayerSampleTime(&p), 0.5f);
-
-    AnimSignalUnregister(&doc, &p);
-    p.playing = false;
-    SignalEmit("enter");
-    CHECK(!p.playing);                                      // binding removed
-
-    // forward playback
     AnimPlayerStartAll(&p, &doc, ANIM_FWD);
     CHECK_NEAR(AnimPlayerSampleTime(&p), 0.0f);
     AnimPlayerUpdate(&p, 0.75f);
     CHECK_NEAR(AnimPlayerSampleTime(&p), 0.75f);
+}
+
+// Signal targets address elements BY INDEX, so every reshuffle of doc.elems
+// must be mirrored onto them or a signal silently drives the wrong element.
+static void TestSignalTargetRemap(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    TextCopy(AnimDocAddElem(&doc, AE_TEXT)->name,  "a");    // 0
+    TextCopy(AnimDocAddElem(&doc, AE_TEXT)->name,  "b");    // 1
+    TextCopy(AnimDocAddElem(&doc, AE_TEXT)->name,  "c");    // 2
+
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "s");
+    sg->length = 1.0f;
+    sg->targetCount = 3;
+    for (int i = 0; i < 3; i++)
+    {
+        sg->targets[i] = (AnimSigTarget){0};
+        sg->targets[i].elemIdx = i;              // one target per element
+        sg->targets[i].prop    = AP_T_POS_Y;
+    }
+
+    // move: targets follow their elements through the swap
+    AnimDocMoveElem(&doc, 0, +1);                // a <-> b  => b a c
+    CHECK(sg->targets[0].elemIdx == 1);          // "a" is now at 1
+    CHECK(sg->targets[1].elemIdx == 0);          // "b" is now at 0
+    CHECK(sg->targets[2].elemIdx == 2);          // "c" untouched
+    AnimDocMoveElem(&doc, 1, -1);                // back to a b c
+    CHECK(sg->targets[0].elemIdx == 0 && sg->targets[1].elemIdx == 1);
+
+    // duplicate at 0 inserts at 1: targets at/after 1 shift up
+    CHECK(AnimDocDuplicateElem(&doc, 0) != NULL);   // a a_2 b c
+    CHECK(sg->targets[0].elemIdx == 0);             // "a" stays at 0
+    CHECK(sg->targets[1].elemIdx == 2);             // "b" pushed to 2
+    CHECK(sg->targets[2].elemIdx == 3);             // "c" pushed to 3
+    AnimDocRemoveElem(&doc, 1);                     // drop the copy: a b c
+    CHECK(sg->targets[1].elemIdx == 1 && sg->targets[2].elemIdx == 2);
+
+    // remove a TARGETED element: its target is dropped, later ones shift down
+    AnimDocRemoveElem(&doc, 1);                  // remove "b" => a c
+    CHECK(doc.elemCount == 2);
+    CHECK(sg->targetCount == 2);                 // the "b" target is gone
+    CHECK(sg->targets[0].elemIdx == 0);          // "a"
+    CHECK(sg->targets[1].elemIdx == 1);          // "c", decremented from 2
+
+    // an out-of-range target must not be evaluated or crash the player
+    sg->targets[1].elemIdx = 99;
+    sg->targets[1].keyCount = 1;
+    sg->targets[1].keys[0] = (AnimKey){ 1.0f, 1.0f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
+    AnimSignalPlayer sp = {0};
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f);
+    float v = 0.0f;
+    CHECK(!AnimSignalPlayerEval(&sp, 1, AP_T_POS_Y, &v, NULL));   // idx 1 != 99
 }
 
 int main(void)
@@ -507,9 +900,15 @@ int main(void)
     TestKeys();
     TestDoc();
     TestRemoveTrack();
+    TestMoveDuplicateElem();
     TestIO();
     TestIOOldFormat();
+    TestTrim();
+    TestIOIdempotent();
+    TestIOSignalOrphanTarget();
+    TestLibrary();
     TestSignals();
+    TestSignalTargetRemap();
 
     printf("anim_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails ? 1 : 0;

@@ -11,26 +11,30 @@
 #include "signal.h"
 #include <stddef.h>
 
-#define ANIM_SIGNAL_BINDINGS_MAX 32
+#define ANIM_SIGNAL_BINDINGS_MAX 64
 
 typedef struct {
-    const AnimDoc *doc;
-    AnimPlayer    *player;
-    char           name[ANIM_NAME_MAX];   // signal name AT registration time
-    int            dir;
-    float          secStart, secEnd;
-    bool           used;
+    const AnimDoc    *doc;
+    AnimSignalPlayer *player;
+    const AnimSignal *sig;                // POINTER: the signal's targets/keys
+                                          // are edited live, so the binding must
+                                          // read them at fire time, not copy them
+    const float      *docTime;            // clock the doc is drawn at (may be NULL)
+    char              name[ANIM_NAME_MAX];// signal name AT registration time
+    bool              used;
 } Binding;
 
 static Binding s_bindings[ANIM_SIGNAL_BINDINGS_MAX];
 
-// The one handler all anim-signals share: (re)start the bound player.
+// The one handler all anim-signals share: (re)start the bound player, capturing
+// the live pose at the document's current time.
 static void StartFromBinding(const char *name, void *user)
 {
     (void)name;
     Binding *b = (Binding *)user;
     if (!b || !b->used || !b->player) return;
-    AnimPlayerStart(b->player, b->doc, b->dir, b->secStart, b->secEnd);
+    float t = b->docTime ? *b->docTime : 0.0f;
+    AnimSignalPlayerStart(b->player, b->sig, b->doc, t);
 }
 
 static Binding *AllocBinding(void)
@@ -40,7 +44,8 @@ static Binding *AllocBinding(void)
     return NULL;
 }
 
-void AnimSignalRegister(const AnimDoc *doc, AnimPlayer *player)
+void AnimSignalRegister(const AnimDoc *doc, AnimSignalPlayer *player,
+                        const float *docTime)
 {
     if (!doc || !player) return;
     for (int i = 0; i < doc->signalCount; i++)
@@ -48,18 +53,17 @@ void AnimSignalRegister(const AnimDoc *doc, AnimPlayer *player)
         const AnimSignal *sg = &doc->signals[i];
         Binding *b = AllocBinding();
         if (!b) return;   // pool full
-        b->doc      = doc;
-        b->player   = player;
+        b->doc     = doc;
+        b->player  = player;
+        b->sig     = sg;
+        b->docTime = docTime;
         TextCopy(b->name, sg->name);
-        b->dir      = sg->dir;
-        b->secStart = sg->sectionStart;
-        b->secEnd   = sg->sectionEnd;
-        b->used     = true;
+        b->used    = true;
         SignalListen(sg->name, StartFromBinding, b);
     }
 }
 
-void AnimSignalUnregister(const AnimDoc *doc, AnimPlayer *player)
+void AnimSignalUnregister(const AnimDoc *doc, AnimSignalPlayer *player)
 {
     for (int i = 0; i < ANIM_SIGNAL_BINDINGS_MAX; i++)
     {

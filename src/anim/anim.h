@@ -154,17 +154,51 @@ typedef struct {
 
 typedef enum { ANIM_FWD = 0, ANIM_REV } AnimPlayDir;
 
-// A named edge: firing signal `name` plays the doc in `dir` over the section.
+#define ANIM_SIG_TARGETS_MAX 32   // (element, property) pairs a signal drives
+                                  // (>= ANIM_ELEMS_MAX so every element can be
+                                  //  driven, with several properties each)
+#define ANIM_SIG_KEYS_MAX    8    // keyframes per target
+
+// One property a signal drives, on one element.
+//
+// Key TIMES ARE NORMALIZED 0..1 (a fraction of the owning signal's `length`),
+// so changing the length rescales the whole signal instead of stranding keys
+// past its end. Everything else matches a timeline key: `value` for scalar
+// props, `cval` for AP_*_COLOR props, `ease` shapes the segment ENDING at it.
+//
+// There is an IMPLICIT key at u=0 holding whatever the element looked like
+// when the signal fired (captured by AnimSignalPlayerStart), which is what
+// makes a signal a smooth transition FROM the live scene rather than a jump.
 typedef struct {
-    char  name[ANIM_NAME_MAX];
-    int   dir;                  // AnimPlayDir
-    float sectionStart, sectionEnd;   // seconds; whole doc = [0, duration]
+    int     elemIdx;                    // index into AnimDoc.elems
+    int     prop;                       // an AP_* valid for that element's kind
+    AnimKey keys[ANIM_SIG_KEYS_MAX];    // key.t is 0..1, NOT seconds
+    int     keyCount;
+} AnimSigTarget;
+
+// A named transition: firing signal `name` eases every target from its live
+// value into the target's keys, over `length` seconds. length <= 0 snaps
+// instantly to the final key (an "instant trigger").
+typedef struct {
+    char          name[ANIM_NAME_MAX];
+    float         length;               // seconds; 0 = instant
+    AnimSigTarget targets[ANIM_SIG_TARGETS_MAX];
+    int           targetCount;
 } AnimSignal;
 
 // One animation document = the unit the editor edits and the .cfg stores.
 typedef struct {
     char       name[ANIM_NAME_MAX];
     float      duration;                    // clock length (>= last keyframe)
+
+    // Intro / outro trim on the shared clock. [0,introEnd) is the INTRO: it
+    // plays once when playback starts and is skipped on every loop after that.
+    // [outroStart,duration] is the OUTRO: trimmed - never played, never shown.
+    // A loop cycle is therefore [introEnd, outroStart). Read them through
+    // AnimDocIntroEnd/AnimDocOutroStart, which clamp and handle the unset case.
+    float      introEnd;                    // 0 = no intro
+    float      outroStart;                  // <= 0 means "unset" -> duration
+
     AnimElem   elems[ANIM_ELEMS_MAX];
     int        elemCount;
     AnimSignal signals[ANIM_SIGNALS_MAX];
@@ -178,6 +212,19 @@ void AnimDocInit(AnimDoc *doc);                 // empty doc, sane duration/name
 void AnimElemInit(AnimElem *e, AnimElemKind kind);   // one element w/ base props
 AnimElem *AnimDocAddElem(AnimDoc *doc, AnimElemKind kind);   // NULL if full
 void AnimDocRemoveElem(AnimDoc *doc, int idx);               // shift down over idx
+
+// Reorder: swap element `idx` with its neighbour `delta` slots away (-1 up,
+// +1 down). Element order IS draw order, so this is the z-order control.
+// No-op if idx or the destination is out of range.
+void AnimDocMoveElem(AnimDoc *doc, int idx, int delta);
+
+// Insert a copy of element `idx` directly after it (tracks and keys included),
+// with its name uniquified ("title" -> "title_2"). NULL if idx bad or doc full.
+AnimElem *AnimDocDuplicateElem(AnimDoc *doc, int idx);
+
+// Give element `idx` a name no OTHER element in the doc uses, by appending
+// "_2", "_3", ... Used after duplicating and after inserting a library element.
+void AnimDocUniquifyElemName(AnimDoc *doc, int idx);
 AnimTrack *AnimElemAddTrack(AnimElem *e, int prop);         // NULL if full/dupe
 AnimTrack *AnimElemFindTrack(AnimElem *e, int prop);        // NULL if absent
 void AnimElemRemoveTrack(AnimElem *e, int idx);             // shift down over idx
@@ -235,8 +282,53 @@ float AnimElemProp(const AnimElem *e, int prop, float t);
 // Latest keyframe time across the whole document (what duration should cover).
 float AnimDocMaxKeyTime(const AnimDoc *doc);
 
+// Trim accessors - always use these instead of reading the raw fields, so the
+// clamping (and the "outroStart unset -> duration" default that keeps old .cfg
+// files and zeroed docs working) lives in exactly one place.
+float AnimDocOutroStart(const AnimDoc *doc);  // end of the played section
+float AnimDocIntroEnd(const AnimDoc *doc);    // 0..outroStart
+float AnimDocPlayLen(const AnimDoc *doc);     // outroStart - introEnd (loop len)
+
 // Draw the whole document at clock time t, in GAME space (call inside Draw()).
 void AnimDocDraw(const AnimDoc *doc, float t);
+
+// ---------------------------------------------------------------------------
+//  Signal player: plays ONE AnimSignal as a transition off the LIVE scene.
+//
+//  On Start, each target's current value is captured; while playing, the
+//  target eases from that captured value into the target's own keys (whose
+//  times are 0..1 fractions of sig->length). This is what lets a signal be
+//  fired at any moment and still blend smoothly from whatever is on screen.
+//
+//  A signal player OVERRIDES the document's own timeline for exactly the
+//  (element, property) pairs it targets; everything else keeps animating
+//  normally. Pass one to AnimDocDrawEx to see it.
+// ---------------------------------------------------------------------------
+typedef struct {
+    const AnimSignal *sig;
+    float clock;                                // 0..sig->length
+    bool  playing;
+    // value of each target at fire time (the implicit key at u=0)
+    float fromValue[ANIM_SIG_TARGETS_MAX];
+    Color fromColor[ANIM_SIG_TARGETS_MAX];
+} AnimSignalPlayer;
+
+// Begin `sig`, capturing each target's live value from `doc` at `docTime`.
+// A NULL sig (or one with no targets) leaves the player idle.
+void AnimSignalPlayerStart(AnimSignalPlayer *p, const AnimSignal *sig,
+                           const AnimDoc *doc, float docTime);
+void AnimSignalPlayerUpdate(AnimSignalPlayer *p, float dt);
+bool AnimSignalPlayerDone(const AnimSignalPlayer *p);
+
+// Does this player currently drive (elemIdx, prop)? If so fill whichever of
+// outValue / outColor is non-NULL (per AnimPropIsColor(prop)) and return true.
+// Both may be NULL to just test. False when idle or not a target.
+bool AnimSignalPlayerEval(const AnimSignalPlayer *p, int elemIdx, int prop,
+                          float *outValue, Color *outColor);
+
+// Draw the document with an optional signal player layered on top (NULL = the
+// plain AnimDocDraw behaviour).
+void AnimDocDrawEx(const AnimDoc *doc, float t, const AnimSignalPlayer *ovr);
 
 // ---------------------------------------------------------------------------
 //  Player: plays a doc (or a section of it) in one direction on its own clock.
@@ -250,6 +342,8 @@ typedef struct {
     float clock;                // 0..(secEnd-secStart)
     bool  playing;
     bool  loop;
+    bool  introDone;            // set on the first loop wrap: later cycles
+                                // restart at the doc's introEnd, not at 0
 } AnimPlayer;
 
 void  AnimPlayerStart(AnimPlayer *p, const AnimDoc *doc, int dir,

@@ -17,12 +17,28 @@
 
 #include "anim.h"
 #include <stdbool.h>
+#include <stdio.h>      // FILE, for the shared element reader/writer below
 
 // Save/load a single document. Return false on file error (missing file on
 // load leaves `doc` initialized-empty). `path` is relative to CWD like
 // settings.cfg (e.g. "anim/intro.cfg" or an absolute path).
 bool AnimDocSave(const AnimDoc *doc, const char *path);
 bool AnimDocLoad(AnimDoc *doc, const char *path);
+
+// --- shared `elem ... end` grammar (one writer, one reader) -----------------
+// Used by AnimDocSave/Load AND by the element library (anim_library.*), so an
+// element serializes identically wherever it is stored.
+
+// Write one element as an `elem ... end` block, every line prefixed by `ind`.
+void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind);
+
+// Consume ONE already-read token `key` if it belongs inside an `elem` block
+// (base fields, `track`, `key`, `end`), applying it to `curElem` and the open
+// `*curTrack`. Returns false if the token is not element-scoped, leaving the
+// stream untouched so the caller can handle it. `curElem` may be NULL: tokens
+// are then consumed but discarded (keeps the stream in sync).
+bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
+                          AnimTrack **curTrack);
 
 // --- name <-> value tables (stable strings; used by .cfg and editor UI) -----
 // Easing name<->id lookups live in anim.h (AnimEaseName/AnimEaseByName).

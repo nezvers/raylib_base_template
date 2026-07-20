@@ -4,7 +4,7 @@
 //  Grammar (one token stream, whitespace separated - same reader style as
 //  settings_state.c: fscanf keys, dispatch by TextIsEqual):
 //
-//    doc      <name> <duration>
+//    doc      <name> <duration> [<introEnd> <outroStart>]   # trim optional
 //    elem     <kind> <name>              # kind = text|shape|global
 //      text   <quoted-single-token>      # (text elements) spaces -> '_'
 //      color  <r> <g> <b> <a>
@@ -16,7 +16,11 @@
 //        key  <t> <value> <ease>            # scalar tracks
 //        key  <t> <r> <g> <b> <ease>        # colour tracks (RGB; no alpha)
 //      end
-//    signal   <name> <fwd|rev> <secStart> <secEnd>
+//    signal   <name> <length>          # written AFTER all elems (names resolve)
+//      target <elemName> <prop> <keyCount>
+//        key  <u> <value> <ease>           # u is 0..1 (fraction of length)
+//        key  <u> <r> <g> <b> <ease>       # colour targets
+//      endsig
 //
 //  Unknown leading keys are skipped (forward compatible). Missing file on load
 //  leaves the doc initialized-empty.
@@ -143,63 +147,184 @@ static void DecodeText(char *s)
 // ---------------------------------------------------------------------------
 //  Save
 // ---------------------------------------------------------------------------
+// One element as `elem ... end`, indented by `ind`. Shared by AnimDocSave and
+// the element library (anim_library.c) so the grammar has exactly one writer.
+void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind)
+{
+    fprintf(f, "%selem %s %s\n", ind, AnimElemKindName(e->kind),
+            e->name[0] ? e->name : "elem");
+
+    if (e->kind == AE_TEXT)
+    {
+        char enc[ANIM_TEXT_LEN_MAX];
+        EncodeText(e->text, enc, ANIM_TEXT_LEN_MAX);
+        fprintf(f, "%s  text %s\n", ind, enc);
+    }
+    if (e->kind == AE_SHAPE)
+    {
+        fprintf(f, "%s  shape %s\n", ind, AnimShapeKindName(e->shapeKind));
+        fprintf(f, "%s  outline %d %d %d %d %f\n", ind,
+                e->outlineColor.r, e->outlineColor.g,
+                e->outlineColor.b, e->outlineColor.a, e->outlineFrac);
+    }
+
+    fprintf(f, "%s  color %d %d %d %d\n", ind, e->color.r, e->color.g, e->color.b, e->color.a);
+    fprintf(f, "%s  pos %f %f\n",  ind, e->posFrac.x,  e->posFrac.y);
+    fprintf(f, "%s  size %f %f\n", ind, e->sizeFrac.x, e->sizeFrac.y);
+
+    for (int j = 0; j < e->trackCount; j++)
+    {
+        const AnimTrack *tr = &e->tracks[j];
+        fprintf(f, "%s  track %s %d\n", ind, AnimPropName(tr->prop), tr->keyCount);
+        for (int k = 0; k < tr->keyCount; k++)
+        {
+            if (AnimPropIsColor(tr->prop))
+                fprintf(f, "%s    key %f %d %d %d %s\n", ind, tr->keys[k].t,
+                        tr->keys[k].cval.r, tr->keys[k].cval.g,
+                        tr->keys[k].cval.b, AnimEaseName(tr->keys[k].ease));
+            else
+                fprintf(f, "%s    key %f %f %s\n", ind, tr->keys[k].t, tr->keys[k].value,
+                        AnimEaseName(tr->keys[k].ease));
+        }
+    }
+    fprintf(f, "%s  end\n", ind);
+}
+
 bool AnimDocSave(const AnimDoc *doc, const char *path)
 {
     FILE *f = fopen(path, "w");
     if (!f) return false;
 
-    fprintf(f, "doc %s %f\n", doc->name[0] ? doc->name : "untitled", doc->duration);
+    fprintf(f, "doc %s %f %f %f\n", doc->name[0] ? doc->name : "untitled",
+            doc->duration, AnimDocIntroEnd(doc), AnimDocOutroStart(doc));
 
     for (int i = 0; i < doc->elemCount; i++)
-    {
-        const AnimElem *e = &doc->elems[i];
-        fprintf(f, "elem %s %s\n", AnimElemKindName(e->kind),
-                e->name[0] ? e->name : "elem");
+        AnimElemWriteCfg(f, &doc->elems[i], "");
 
-        if (e->kind == AE_TEXT)
-        {
-            char enc[ANIM_TEXT_LEN_MAX];
-            EncodeText(e->text, enc, ANIM_TEXT_LEN_MAX);
-            fprintf(f, "  text %s\n", enc);
-        }
-        if (e->kind == AE_SHAPE)
-        {
-            fprintf(f, "  shape %s\n", AnimShapeKindName(e->shapeKind));
-            fprintf(f, "  outline %d %d %d %d %f\n",
-                    e->outlineColor.r, e->outlineColor.g,
-                    e->outlineColor.b, e->outlineColor.a, e->outlineFrac);
-        }
-
-        fprintf(f, "  color %d %d %d %d\n", e->color.r, e->color.g, e->color.b, e->color.a);
-        fprintf(f, "  pos %f %f\n",  e->posFrac.x,  e->posFrac.y);
-        fprintf(f, "  size %f %f\n", e->sizeFrac.x, e->sizeFrac.y);
-
-        for (int j = 0; j < e->trackCount; j++)
-        {
-            const AnimTrack *tr = &e->tracks[j];
-            fprintf(f, "  track %s %d\n", AnimPropName(tr->prop), tr->keyCount);
-            for (int k = 0; k < tr->keyCount; k++)
-            {
-                if (AnimPropIsColor(tr->prop))
-                    fprintf(f, "    key %f %d %d %d %s\n", tr->keys[k].t,
-                            tr->keys[k].cval.r, tr->keys[k].cval.g,
-                            tr->keys[k].cval.b, AnimEaseName(tr->keys[k].ease));
-                else
-                    fprintf(f, "    key %f %f %s\n", tr->keys[k].t, tr->keys[k].value,
-                            AnimEaseName(tr->keys[k].ease));
-            }
-        }
-        fprintf(f, "  end\n");
-    }
-
+    // Signals come AFTER every element: their targets name elements, so a
+    // single forward pass can resolve those names on load.
     for (int i = 0; i < doc->signalCount; i++)
     {
         const AnimSignal *sg = &doc->signals[i];
-        fprintf(f, "signal %s %s %f %f\n", sg->name[0] ? sg->name : "sig",
-                sg->dir == ANIM_REV ? "rev" : "fwd", sg->sectionStart, sg->sectionEnd);
+        fprintf(f, "signal %s %f\n", sg->name[0] ? sg->name : "sig", sg->length);
+        for (int j = 0; j < sg->targetCount; j++)
+        {
+            const AnimSigTarget *tg = &sg->targets[j];
+            if (tg->elemIdx < 0 || tg->elemIdx >= doc->elemCount) continue;
+            const AnimElem *e = &doc->elems[tg->elemIdx];
+            fprintf(f, "  target %s %s %d\n",
+                    e->name[0] ? e->name : "elem", AnimPropName(tg->prop), tg->keyCount);
+            for (int k = 0; k < tg->keyCount; k++)
+            {
+                if (AnimPropIsColor(tg->prop))
+                    fprintf(f, "    key %f %d %d %d %s\n", tg->keys[k].t,
+                            tg->keys[k].cval.r, tg->keys[k].cval.g,
+                            tg->keys[k].cval.b, AnimEaseName(tg->keys[k].ease));
+                else
+                    fprintf(f, "    key %f %f %s\n", tg->keys[k].t, tg->keys[k].value,
+                            AnimEaseName(tg->keys[k].ease));
+            }
+        }
+        fprintf(f, "  endsig\n");
     }
 
     fclose(f);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+//  Element-scoped reader: consumes ONE token that belongs inside an `elem`
+//  block (its base fields, `track`, `key`, `end`) and returns true if it was
+//  one. Shared by AnimDocLoad and the element library so the grammar has
+//  exactly one reader. `curElem` may be NULL (tokens are then skipped, not
+//  misapplied); `*curTrack` is the open track, updated in place.
+// ---------------------------------------------------------------------------
+bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
+                          AnimTrack **curTrack)
+{
+    if (TextIsEqual(key, "text"))
+    {
+        char enc[ANIM_TEXT_LEN_MAX];
+        if (fscanf(f, "%63s", enc) == 1 && curElem)
+        { DecodeText(enc); TextCopy(curElem->text, enc); }
+    }
+    else if (TextIsEqual(key, "shape"))
+    {
+        char s[16];
+        if (fscanf(f, "%15s", s) == 1 && curElem)
+            curElem->shapeKind = AnimShapeKindByName(s);
+    }
+    else if (TextIsEqual(key, "outline"))
+    {
+        int r, g, b, a; float th;
+        if (fscanf(f, "%d %d %d %d %f", &r, &g, &b, &a, &th) == 5 && curElem)
+        {
+            curElem->outlineColor = (Color){ (unsigned char)r, (unsigned char)g,
+                                             (unsigned char)b, (unsigned char)a };
+            curElem->outlineFrac  = th;
+        }
+    }
+    else if (TextIsEqual(key, "color"))
+    {
+        int r, g, b, a;
+        if (fscanf(f, "%d %d %d %d", &r, &g, &b, &a) == 4 && curElem)
+            curElem->color = (Color){ (unsigned char)r, (unsigned char)g,
+                                      (unsigned char)b, (unsigned char)a };
+    }
+    else if (TextIsEqual(key, "pos"))
+    {
+        float px, py;
+        if (fscanf(f, "%f %f", &px, &py) == 2 && curElem)
+            curElem->posFrac = (Vector2){ px, py };
+    }
+    else if (TextIsEqual(key, "size"))
+    {
+        float sx, sy;
+        if (fscanf(f, "%f %f", &sx, &sy) == 2 && curElem)
+            curElem->sizeFrac = (Vector2){ sx, sy };
+    }
+    else if (TextIsEqual(key, "track"))
+    {
+        char propName[32]; int keyCount = 0;
+        *curTrack = NULL;
+        if (fscanf(f, "%31s %d", propName, &keyCount) == 2 && curElem)
+        {
+            int prop = AnimPropByName(propName, curElem->kind);
+            if (prop >= 0) *curTrack = AnimElemAddTrack(curElem, prop);
+        }
+    }
+    else if (TextIsEqual(key, "key"))
+    {
+        AnimTrack *tr = *curTrack;
+        if (!tr)
+        {
+            // No open track (unknown property): the key's arity is unknowable,
+            // so swallow the REST OF THE LINE rather than a guessed token count
+            // - a wrong guess would re-read numbers as leading keys and desync
+            // the whole stream.
+            int c;
+            while ((c = fgetc(f)) != EOF && c != '\n') { }
+        }
+        else if (AnimPropIsColor(tr->prop))
+        {
+            float t; int r, g, b; char easeName[32];
+            if (fscanf(f, "%f %d %d %d %31s", &t, &r, &g, &b, easeName) == 5)
+                AnimTrackAddColorKey(tr, t, (Color){ (unsigned char)r,
+                                     (unsigned char)g, (unsigned char)b, 255 },
+                                     AnimEaseByName(easeName));
+        }
+        else
+        {
+            float t, v; char easeName[32];
+            if (fscanf(f, "%f %f %31s", &t, &v, easeName) == 3)
+                AnimTrackAddKey(tr, t, v, AnimEaseByName(easeName));
+        }
+    }
+    else if (TextIsEqual(key, "end"))
+        *curTrack = NULL;          // element stays current until the next `elem`
+    else
+        return false;              // not ours
+
     return true;
 }
 
@@ -216,18 +341,35 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
     char     key[64];
     AnimElem *curElem  = NULL;   // element currently being filled
     AnimTrack *curTrack = NULL;  // track currently being filled
+    AnimSignal    *curSig = NULL;   // signal block currently open
+    AnimSigTarget *curTgt = NULL;   // target inside it
 
     while (fscanf(f, "%63s", key) == 1)
     {
         if (TextIsEqual(key, "doc"))
         {
-            char nm[ANIM_NAME_MAX];
-            if (fscanf(f, "%31s %f", nm, &doc->duration) == 2) TextCopy(doc->name, nm);
-            curElem = NULL; curTrack = NULL;
+            // The trim fields are OPTIONAL (files written before intro/outro
+            // existed have only name+duration), so the rest of the LINE is
+            // taken in one go and the field count decides the defaults.
+            char nm[ANIM_NAME_MAX], rest[128];
+            float dur = 0.0f, inEnd = 0.0f, outStart = 0.0f;
+            if (fscanf(f, "%31s", nm) == 1 && fgets(rest, sizeof(rest), f))
+            {
+                int n = sscanf(rest, "%f %f %f", &dur, &inEnd, &outStart);
+                if (n >= 1)
+                {
+                    TextCopy(doc->name, nm);
+                    doc->duration   = dur;
+                    doc->introEnd   = (n >= 3) ? inEnd : 0.0f;
+                    doc->outroStart = (n >= 3) ? outStart : dur;
+                }
+            }
+            curElem = NULL; curTrack = NULL; curSig = NULL; curTgt = NULL;
         }
         else if (TextIsEqual(key, "elem"))
         {
             char kindStr[16], nm[ANIM_NAME_MAX];
+            curSig = NULL; curTgt = NULL;
             if (fscanf(f, "%15s %31s", kindStr, nm) == 2)
             {
                 curElem  = AnimDocAddElem(doc, ElemKindByName(kindStr));
@@ -235,82 +377,82 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
                 if (curElem) TextCopy(curElem->name, nm);
             }
         }
-        else if (TextIsEqual(key, "text") && curElem)
+        else if (TextIsEqual(key, "signal"))
         {
-            char enc[ANIM_TEXT_LEN_MAX];
-            if (fscanf(f, "%63s", enc) == 1) { DecodeText(enc); TextCopy(curElem->text, enc); }
-        }
-        else if (TextIsEqual(key, "shape") && curElem)
-        {
-            char s[16];
-            if (fscanf(f, "%15s", s) == 1)
-                curElem->shapeKind = AnimShapeKindByName(s);
-        }
-        else if (TextIsEqual(key, "outline") && curElem)
-        {
-            int r, g, b, a; float th;
-            if (fscanf(f, "%d %d %d %d %f", &r, &g, &b, &a, &th) == 5)
+            // signals are written after every element, so target names resolve
+            char nm[ANIM_NAME_MAX]; float len = 0.0f;
+            curElem = NULL; curTrack = NULL; curSig = NULL; curTgt = NULL;
+            if (fscanf(f, "%31s %f", nm, &len) == 2 &&
+                doc->signalCount < ANIM_SIGNALS_MAX)
             {
-                curElem->outlineColor = (Color){ (unsigned char)r, (unsigned char)g,
-                                                 (unsigned char)b, (unsigned char)a };
-                curElem->outlineFrac  = th;
+                curSig = &doc->signals[doc->signalCount++];
+                TextCopy(curSig->name, nm);
+                curSig->length      = len;
+                curSig->targetCount = 0;
             }
         }
-        else if (TextIsEqual(key, "color") && curElem)
+        else if (TextIsEqual(key, "target"))
         {
-            int r, g, b, a;
-            if (fscanf(f, "%d %d %d %d", &r, &g, &b, &a) == 4)
-                curElem->color = (Color){ (unsigned char)r, (unsigned char)g,
-                                          (unsigned char)b, (unsigned char)a };
-        }
-        else if (TextIsEqual(key, "pos") && curElem)
-            fscanf(f, "%f %f", &curElem->posFrac.x, &curElem->posFrac.y);
-        else if (TextIsEqual(key, "size") && curElem)
-            fscanf(f, "%f %f", &curElem->sizeFrac.x, &curElem->sizeFrac.y);
-        else if (TextIsEqual(key, "track") && curElem)
-        {
-            char propName[32]; int keyCount = 0;
-            if (fscanf(f, "%31s %d", propName, &keyCount) == 2)
+            // `<elemName> <prop> <keyCount>`; an unresolvable element or prop
+            // drops the target (curTgt stays NULL) but still consumes the line.
+            char en[ANIM_NAME_MAX], pn[32]; int kc = 0;
+            curTgt = NULL;
+            if (fscanf(f, "%31s %31s %d", en, pn, &kc) == 3 && curSig &&
+                curSig->targetCount < ANIM_SIG_TARGETS_MAX)
             {
-                int prop = AnimPropByName(propName, curElem->kind);
-                curTrack = (prop >= 0) ? AnimElemAddTrack(curElem, prop) : NULL;
+                int ei = -1;
+                for (int i = 0; i < doc->elemCount; i++)
+                    if (TextIsEqual(doc->elems[i].name, en)) { ei = i; break; }
+                int prop = (ei >= 0) ? AnimPropByName(pn, doc->elems[ei].kind) : -1;
+                if (ei >= 0 && prop >= 0)
+                {
+                    curTgt = &curSig->targets[curSig->targetCount++];
+                    curTgt->elemIdx  = ei;
+                    curTgt->prop     = prop;
+                    curTgt->keyCount = 0;
+                }
             }
         }
-        else if (TextIsEqual(key, "key") && curTrack)
+        else if (TextIsEqual(key, "endsig"))
+        { curSig = NULL; curTgt = NULL; }
+        else if (curSig && TextIsEqual(key, "key"))
         {
-            if (AnimPropIsColor(curTrack->prop))
+            // signal keys live in the signal block, NOT in an element - handle
+            // them here so the element reader never sees them.
+            if (curTgt && AnimPropIsColor(curTgt->prop))
             {
-                float t; int r, g, b; char easeName[32];
-                if (fscanf(f, "%f %d %d %d %31s", &t, &r, &g, &b, easeName) == 5)
-                    AnimTrackAddColorKey(curTrack,
-                        t, (Color){ (unsigned char)r, (unsigned char)g,
-                                    (unsigned char)b, 255 },
-                        AnimEaseByName(easeName));
+                float u; int r, g, b; char easeName[32];
+                if (fscanf(f, "%f %d %d %d %31s", &u, &r, &g, &b, easeName) == 5 &&
+                    curTgt->keyCount < ANIM_SIG_KEYS_MAX)
+                {
+                    AnimKey *k = &curTgt->keys[curTgt->keyCount++];
+                    k->t = u; k->value = 0.0f;
+                    k->cval = (Color){ (unsigned char)r, (unsigned char)g,
+                                       (unsigned char)b, 255 };
+                    k->ease = AnimEaseByName(easeName);
+                }
+            }
+            else if (curTgt)
+            {
+                float u, v; char easeName[32];
+                if (fscanf(f, "%f %f %31s", &u, &v, easeName) == 3 &&
+                    curTgt->keyCount < ANIM_SIG_KEYS_MAX)
+                {
+                    AnimKey *k = &curTgt->keys[curTgt->keyCount++];
+                    k->t = u; k->value = v; k->cval = (Color){0,0,0,0};
+                    k->ease = AnimEaseByName(easeName);
+                }
             }
             else
             {
-                float t, v; char easeName[32];
-                if (fscanf(f, "%f %f %31s", &t, &v, easeName) == 3)
-                    AnimTrackAddKey(curTrack, t, v, AnimEaseByName(easeName));
+                // dropped target: arity unknown, swallow the rest of the line
+                int c;
+                while ((c = fgetc(f)) != EOF && c != '\n') { }
             }
         }
-        else if (TextIsEqual(key, "end"))
+        else if (AnimElemReadCfgToken(f, key, curElem, &curTrack))
         {
-            curTrack = NULL;   // element stays current until the next `elem`
-        }
-        else if (TextIsEqual(key, "signal"))
-        {
-            char nm[ANIM_NAME_MAX], dirStr[8]; float a, b;
-            if (fscanf(f, "%31s %7s %f %f", nm, dirStr, &a, &b) == 4 &&
-                doc->signalCount < ANIM_SIGNALS_MAX)
-            {
-                AnimSignal *sg = &doc->signals[doc->signalCount++];
-                TextCopy(sg->name, nm);
-                sg->dir          = TextIsEqual(dirStr, "rev") ? ANIM_REV : ANIM_FWD;
-                sg->sectionStart = a;
-                sg->sectionEnd   = b;
-            }
-            curElem = NULL; curTrack = NULL;
+            // handled: an element-scoped token (text/shape/color/track/key/...)
         }
         else
         {
