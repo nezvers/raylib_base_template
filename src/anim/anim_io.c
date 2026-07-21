@@ -16,7 +16,9 @@
 //        key  <t> <value> <ease>            # scalar tracks
 //        key  <t> <r> <g> <b> <ease>        # colour tracks (RGB; no alpha)
 //      end
-//    signal   <name> <length>          # written AFTER all elems (names resolve)
+//    signal   <name> <length> [terminal]  # AFTER all elems (names resolve).
+//                                       # `terminal` (0/1) is OPTIONAL: files
+//                                       # written before it existed load as 0.
 //      target <elemName> <prop> <keyCount>
 //        key  <u> <value> <ease>           # u is 0..1 (fraction of length)
 //        key  <u> <r> <g> <b> <ease>       # colour targets
@@ -48,6 +50,7 @@ static const PropRow k_shapeProps[] = {
     { AP_S_OUTLINE_COLOR, "outline_color" },
     { AP_S_OUTLINE, "outline" },
     { AP_S_OUTLINE_ALPHA, "outline_alpha" },
+    { AP_S_SCALE, "scale" },
 };
 static const PropRow k_globalProps[] = {
     { AP_G_FADE, "fade" }, { AP_G_COLOR, "color" },
@@ -167,6 +170,9 @@ void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind)
         fprintf(f, "%s  outline %d %d %d %d %f\n", ind,
                 e->outlineColor.r, e->outlineColor.g,
                 e->outlineColor.b, e->outlineColor.a, e->outlineFrac);
+        // its own token, not a third field on `size`, so files written here
+        // still load in readers that predate scale.
+        fprintf(f, "%s  scale %f\n", ind, e->scaleFrac);
     }
     if (e->kind == AE_GLOBAL)
     {
@@ -212,7 +218,8 @@ bool AnimDocSave(const AnimDoc *doc, const char *path)
     for (int i = 0; i < doc->signalCount; i++)
     {
         const AnimSignal *sg = &doc->signals[i];
-        fprintf(f, "signal %s %f\n", sg->name[0] ? sg->name : "sig", sg->length);
+        fprintf(f, "signal %s %f %d\n", sg->name[0] ? sg->name : "sig", sg->length,
+                sg->terminal ? 1 : 0);
         for (int j = 0; j < sg->targetCount; j++)
         {
             const AnimSigTarget *tg = &sg->targets[j];
@@ -269,6 +276,13 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
                                              (unsigned char)b, (unsigned char)a };
             curElem->outlineFrac  = th;
         }
+    }
+    else if (TextIsEqual(key, "scale"))
+    {
+        // absent in files written before scale existed - AnimElemInit's 1.0
+        // stands in that case, so those load at their authored size.
+        float s;
+        if (fscanf(f, "%f", &s) == 1 && curElem) curElem->scaleFrac = s;
     }
     else if (TextIsEqual(key, "bg"))
     {
@@ -392,16 +406,24 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
         }
         else if (TextIsEqual(key, "signal"))
         {
-            // signals are written after every element, so target names resolve
-            char nm[ANIM_NAME_MAX]; float len = 0.0f;
+            // signals are written after every element, so target names resolve.
+            // `terminal` is OPTIONAL (files written before it existed end the
+            // line after the length), so the rest of the LINE is taken in one
+            // go and the field count decides the default - same as `doc` above.
+            char nm[ANIM_NAME_MAX], rest[64];
+            float len = 0.0f; int term = 0;
             curElem = NULL; curTrack = NULL; curSig = NULL; curTgt = NULL;
-            if (fscanf(f, "%31s %f", nm, &len) == 2 &&
-                doc->signalCount < ANIM_SIGNALS_MAX)
+            if (fscanf(f, "%31s", nm) == 1 && fgets(rest, sizeof(rest), f))
             {
-                curSig = &doc->signals[doc->signalCount++];
-                TextCopy(curSig->name, nm);
-                curSig->length      = len;
-                curSig->targetCount = 0;
+                int n = sscanf(rest, "%f %d", &len, &term);
+                if (n >= 1 && doc->signalCount < ANIM_SIGNALS_MAX)
+                {
+                    curSig = &doc->signals[doc->signalCount++];
+                    TextCopy(curSig->name, nm);
+                    curSig->length      = len;
+                    curSig->terminal    = (n >= 2) && (term != 0);
+                    curSig->targetCount = 0;
+                }
             }
         }
         else if (TextIsEqual(key, "target"))

@@ -96,6 +96,7 @@ void AnimElemInit(AnimElem *e, AnimElemKind kind)
     e->shapeKind    = SHAPE_RECT;
     e->outlineColor = RAYWHITE;
     e->outlineFrac  = 0.0f;              // outline off by default
+    e->scaleFrac    = 1.0f;              // shapes start at their authored size
     e->trackCount   = 0;
 
     switch (kind)
@@ -484,6 +485,10 @@ static float ElemBaseProp(const AnimElem *e, int prop)
         case AP_T_ALPHA: case AP_S_ALPHA: return (float)e->color.a / 255.0f;
         case AP_S_OUTLINE_ALPHA:          return (float)e->outlineColor.a / 255.0f;
         case AP_S_OUTLINE:                return e->outlineFrac;
+        // 0 is the "unset" case (docs saved before scale existed, zeroed
+        // structs); it means "as authored", not "collapsed to nothing".
+        case AP_S_SCALE:                  return e->scaleFrac > 0.0f
+                                               ? e->scaleFrac : 1.0f;
         case AP_T_ROT:   case AP_S_ROT:   return 0.0f;
         case AP_T_CRUMBLE:                return 0.0f;
         case AP_G_FADE:                   return 0.0f;
@@ -532,6 +537,7 @@ float AnimPropMax(int prop)
         case AP_S_OUTLINE:                return 0.05f;   // ~36 px at 720p
         case AP_T_SIZE:  case AP_S_W:
         case AP_S_H:                      return 3.0f;    // allow off-screen sizes
+        case AP_S_SCALE:                  return 10.0f;   // multiplier, 1 = rest
         default:                          return 1.0f;
     }
 }
@@ -726,13 +732,17 @@ static void DrawShapeElem(const AnimElem *e, float t, Vector2 game)
 {
     float fillA = AnimElemProp(e, AP_S_ALPHA,         t);
     float outA  = AnimElemProp(e, AP_S_OUTLINE_ALPHA, t);
-    float thickPx = game.y * AnimElemProp(e, AP_S_OUTLINE, t);
+    // uniform multiplier on every size: the box, and the outline with it, so a
+    // shape grown by scale keeps its authored rim-to-body proportion.
+    float sc = AnimElemProp(e, AP_S_SCALE, t);
+    if (sc < 0.0f) sc = 0.0f;
+    float thickPx = game.y * AnimElemProp(e, AP_S_OUTLINE, t) * sc;
     if (fillA <= 0.0f && (outA <= 0.0f || thickPx < 0.5f)) return;
 
     float cxF = AnimElemProp(e, AP_S_POS_X, t);
     float cyF = AnimElemProp(e, AP_S_POS_Y, t);
-    float wF  = AnimElemProp(e, AP_S_W,     t);
-    float hF  = AnimElemProp(e, AP_S_H,     t);
+    float wF  = AnimElemProp(e, AP_S_W,     t) * sc;
+    float hF  = AnimElemProp(e, AP_S_H,     t) * sc;
     float rot = AnimElemProp(e, AP_S_ROT,   t);
 
     Color fill = Fade(AnimElemColorProp(e, AP_S_COLOR,         t), fillA);

@@ -884,6 +884,10 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         {
             PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_H, &e->sizeFrac.y);
             GuiLabel((Rectangle){ x, y, 44, rh }, "h"); y += rh + gap;
+            // uniform multiplier over w/h: the single control for growing a
+            // shape without keeping the two axes in proportion by hand.
+            PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_SCALE, &e->scaleFrac);
+            GuiLabel((Rectangle){ x, y, 44, rh }, "scale"); y += rh + gap;
         }
     }
 
@@ -1610,9 +1614,24 @@ static void DrawSignalModal()
     if (EditSlider((Rectangle){ x+270, y, w-270-52, rh }, "", &sg->length, 0.0f, 10.0f))
     { /* normalized keys rescale automatically - nothing else to do */ }
     y += rh + 4;
-    GuiLabel((Rectangle){ x, y, w, 18 },
+    GuiLabel((Rectangle){ x, y, w-220, 18 },
              sg->length <= 0.0f ? "0.00 = instant snap to the final keys"
                                 : "keys are fractions of the length (0..1)");
+
+    // Terminal: an authored END marker. It changes nothing in this preview (the
+    // playhead is the user's here) - it tells the in-game player (anim_stage.h)
+    // to stop the animation once this signal has run its full length, so a loop
+    // winds down through the transition instead of being cut off.
+    // (snapshot BEFORE writing the new value, like the shape-kind toggle above)
+    bool terminal = sg->terminal;
+    GuiCheckBox((Rectangle){ x+w-206, y, 16, 16 }, "terminal (ends playback)",
+                &terminal);
+    if (terminal != sg->terminal)
+    {
+        AudioPlayButton();
+        UndoPush();
+        sg->terminal = terminal;
+    }
     y += 20;
     GuiLine((Rectangle){ x, y, w, 8 }, "targets"); y += 12;
 

@@ -13,6 +13,7 @@
 #include "../src/anim/anim_library.h"
 #include "../src/signal/signal.h"
 #include "../src/signal/anim_signal.h"
+#include "../src/anim_stage/anim_stage.h"
 #include <stdio.h>
 #include <math.h>
 
@@ -148,6 +149,17 @@ static void TestShapeProps(void)
     e.outlineFrac = 0.01f;
     CHECK_NEAR(AnimElemProp(&e, AP_S_OUTLINE, 0.5f), 0.01f);
     CHECK_NEAR(AnimPropMax(AP_S_OUTLINE), 0.05f);
+
+    // scale: rest pose is 1 (authored size), and a 0 - what an old .cfg or a
+    // zeroed struct yields - must read as 1, never collapse the shape.
+    CHECK_NEAR(AnimElemProp(&e, AP_S_SCALE, 0.5f), 1.0f);
+    e.scaleFrac = 0.0f;
+    CHECK_NEAR(AnimElemProp(&e, AP_S_SCALE, 0.5f), 1.0f);
+    e.scaleFrac = 2.5f;
+    CHECK_NEAR(AnimElemProp(&e, AP_S_SCALE, 0.5f), 2.5f);
+    e.scaleFrac = 1.0f;
+    CHECK(!AnimPropIsColor(AP_S_SCALE));
+    CHECK(AnimPropByName("scale", AE_SHAPE) == AP_S_SCALE);
 
     // regression: base alpha (no track) comes from the colour's A channel
     e.color.a = 0;
@@ -397,6 +409,7 @@ static void TestIO(void)
     s->sizeFrac = (Vector2){ 0.4f, 0.2f };
     s->outlineColor = (Color){ 130, 150, 180, 255 };
     s->outlineFrac  = 0.004f;
+    s->scaleFrac    = 1.75f;
     AnimTrack *sc = AnimElemAddTrack(s, AP_S_COLOR);
     AnimTrackAddColorKey(sc, 0.0f, (Color){ 10, 20, 30, 40 },     ANIM_EASE_LINEAR);
     AnimTrackAddColorKey(sc, 1.0f, (Color){ 250, 200, 150, 255 }, ANIM_EASE_SINE_OUT);
@@ -463,6 +476,7 @@ static void TestIO(void)
     // outline base + tracks round-trip
     CHECK(in.elems[1].outlineColor.r == 130 && in.elems[1].outlineColor.b == 180);
     CHECK_NEAR(in.elems[1].outlineFrac, 0.004f);
+    CHECK_NEAR(in.elems[1].scaleFrac, 1.75f);
     CHECK(in.elems[1].tracks[1].prop == AP_S_OUTLINE_COLOR);
     CHECK(in.elems[1].tracks[1].keys[0].cval.g == 8);
     CHECK(in.elems[1].tracks[2].prop == AP_S_OUTLINE_ALPHA);
@@ -531,8 +545,8 @@ static void TestIOSignalOrphanTarget(void)
     remove(path);
 }
 
-// Old-format files (no `outline` line, pre-refactor shape names) still load
-// with outline defaults - forward compatibility for saved docs.
+// Old-format files (no `outline` or `scale` line, pre-refactor shape names)
+// still load with those defaults - forward compatibility for saved docs.
 static void TestIOOldFormat(void)
 {
     const char *path = "anim_tests_old_tmp.cfg";
@@ -553,6 +567,9 @@ static void TestIOOldFormat(void)
     CHECK(in.elemCount == 1 && in.elems[0].shapeKind == SHAPE_CIRCLE);
     CHECK_NEAR(in.elems[0].outlineFrac, 0.0f);              // default: off
     CHECK(in.elems[0].outlineColor.r == 245);               // RAYWHITE default
+    // no `scale` line either -> authored size, not a collapsed shape
+    CHECK_NEAR(in.elems[0].scaleFrac, 1.0f);
+    CHECK_NEAR(AnimElemProp(&in.elems[0], AP_S_SCALE, 0.0f), 1.0f);
     // no trim fields on the doc line -> whole clock is played
     CHECK_NEAR(AnimDocIntroEnd(&in), 0.0f);
     CHECK_NEAR(AnimDocOutroStart(&in), 2.0f);
@@ -888,6 +905,235 @@ static void TestSignalTargetRemap(void)
     CHECK(!AnimSignalPlayerEval(&sp, 1, AP_T_POS_Y, &v, NULL));   // idx 1 != 99
 }
 
+// ---------------------------------------------------------------------------
+//  Terminal signal flag: round-trips, and defaults false on pre-flag files.
+// ---------------------------------------------------------------------------
+static void TestSignalTerminalIO(void)
+{
+    const char *path = "anim_tests_term.cfg";
+
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    TextCopy(AnimDocAddElem(&doc, AE_TEXT)->name, "a");
+    doc.signalCount = 2;
+    TextCopy(doc.signals[0].name, "ends");
+    doc.signals[0].length   = 1.5f;
+    doc.signals[0].terminal = true;
+    doc.signals[0].targetCount = 0;
+    TextCopy(doc.signals[1].name, "blip");
+    doc.signals[1].length   = 0.5f;
+    doc.signals[1].terminal = false;
+    doc.signals[1].targetCount = 0;
+
+    CHECK(AnimDocSave(&doc, path));
+    AnimDoc in;
+    CHECK(AnimDocLoad(&in, path));
+    CHECK(in.signalCount == 2);
+    CHECK(in.signals[0].terminal);                  // true survives
+    CHECK(!in.signals[1].terminal);                 // false survives
+    CHECK_NEAR(in.signals[0].length, 1.5f);         // length still parses
+    remove(path);
+
+    // a file written BEFORE the flag existed: `signal <name> <length>` only
+    const char *old = "anim_tests_term_old.cfg";
+    FILE *f = fopen(old, "w");
+    CHECK(f != NULL);
+    if (!f) return;
+    fprintf(f, "doc d 2.0\n"
+               "elem text a\n"
+               "  text hi\n"
+               "  end\n"
+               "signal legacy 0.750000\n");
+    fclose(f);
+
+    AnimDoc oldDoc;
+    CHECK(AnimDocLoad(&oldDoc, old));
+    CHECK(oldDoc.signalCount == 1);
+    CHECK(TextIsEqual(oldDoc.signals[0].name, "legacy"));
+    CHECK_NEAR(oldDoc.signals[0].length, 0.75f);
+    CHECK(!oldDoc.signals[0].terminal);             // absent -> false
+    remove(old);
+}
+
+// ---------------------------------------------------------------------------
+//  The playback stage: looping, terminal-signal shutdown, layering.
+// ---------------------------------------------------------------------------
+static int s_doneCalls = 0;
+static void OnStageDone(void *user) { (void)user; s_doneCalls++; }
+
+// Write a doc the stage can load by name from anims/ (its fixed lookup dir).
+static void WriteStageAnim(const char *name, bool terminal)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration   = 2.0f;
+    doc.introEnd   = 0.0f;
+    doc.outroStart = 2.0f;
+
+    AnimElem *e = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(e->name, "a");
+    AnimTrack *tr = AnimElemAddTrack(e, AP_T_ALPHA);
+    AnimTrackAddKey(tr, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 2.0f, 1.0f, ANIM_EASE_LINEAR);
+
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "stage_end");
+    sg->length      = 1.0f;
+    sg->terminal    = terminal;
+    sg->targetCount = 1;
+    sg->targets[0] = (AnimSigTarget){0};
+    sg->targets[0].elemIdx  = 0;
+    sg->targets[0].prop     = AP_T_ALPHA;
+    sg->targets[0].keyCount = 1;
+    sg->targets[0].keys[0]  = (AnimKey){ 1.0f, 0.0f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
+
+    if (!DirectoryExists("anims")) MakeDirectory("anims");
+    AnimDocSave(&doc, TextFormat("anims/%s.cfg", name));
+}
+
+static void TestStage(void)
+{
+    SignalReset();
+    AnimStageReset();
+    WriteStageAnim("_test_loop", true);
+
+    // --- looping never ends on its own ------------------------------------
+    AnimHandle h = AnimStagePlay("_test_loop", true, 0);
+    CHECK(h != ANIM_HANDLE_NONE);
+    CHECK(AnimStageAlive(h));
+    s_doneCalls = 0;
+    AnimStageSetDoneCallback(h, OnStageDone, NULL);
+    for (int i = 0; i < 300; i++) AnimStageUpdate(0.05f);   // 15s >> 2s duration
+    CHECK(AnimStageAlive(h));                    // still looping
+    CHECK(s_doneCalls == 0);
+
+    // --- a terminal signal ends it, but only after its full length --------
+    CHECK(!AnimStageEndsOnCurrentSignal(h));     // nothing running yet
+    SignalEmit("stage_end");
+    CHECK(AnimStageEndsOnCurrentSignal(h));      // armed: safe to wait on done
+    AnimStageUpdate(0.5f);                       // half of the 1.0s signal
+    CHECK(AnimStageAlive(h));                    // NOT cut off mid-transition
+    for (int i = 0; i < 20; i++) AnimStageUpdate(0.05f);
+    CHECK(!AnimStageAlive(h));                   // ended at the signal's end
+    CHECK(s_doneCalls == 1);                     // reported exactly once
+    CHECK(AnimStageActiveCount() == 0);
+
+    // a stale handle is inert, and Stop on it must not re-fire the callback
+    AnimStageStop(h);
+    CHECK(s_doneCalls == 1);
+
+    // --- a NON-terminal signal leaves the loop running --------------------
+    WriteStageAnim("_test_plain", false);
+    AnimHandle p = AnimStagePlay("_test_plain", true, 0);
+    CHECK(p != ANIM_HANDLE_NONE);
+    SignalEmit("stage_end");
+    CHECK(!AnimStageEndsOnCurrentSignal(p));     // playing, but not an ENDING
+    for (int i = 0; i < 60; i++) AnimStageUpdate(0.05f);
+    CHECK(AnimStageAlive(p));                    // signal ended, playback did not
+    AnimStageStopAll();
+    CHECK(!AnimStageAlive(p));
+    CHECK(AnimStageActiveCount() == 0);
+
+    // --- one-shot stops by itself -----------------------------------------
+    AnimHandle o = AnimStagePlay("_test_plain", false, 0);
+    CHECK(AnimStageAlive(o));
+    for (int i = 0; i < 60; i++) AnimStageUpdate(0.05f);   // 3s > 2s duration
+    CHECK(!AnimStageAlive(o));
+
+    // --- layering: drawn low layer first, ties keep start order -----------
+    AnimStageStopAll();
+    AnimHandle top = AnimStagePlay("_test_plain", true, 5);
+    AnimHandle bot = AnimStagePlay("_test_plain", true, 1);
+    AnimHandle mid = AnimStagePlay("_test_plain", true, 5);   // ties with `top`
+    CHECK(top != ANIM_HANDLE_NONE && bot != ANIM_HANDLE_NONE);
+    CHECK(mid != ANIM_HANDLE_NONE);
+    int order[ANIM_STAGE_SLOTS_MAX];
+    int n = AnimStageDrawOrder(order, ANIM_STAGE_SLOTS_MAX);
+    CHECK(n == 3);
+    CHECK(order[0] == AnimStageSlotOf(bot));     // layer 1 first (drawn behind)
+    CHECK(order[1] == AnimStageSlotOf(top));     // layer 5, started earlier
+    CHECK(order[2] == AnimStageSlotOf(mid));     // layer 5, started later
+    AnimStageStopAll();
+
+    // --- an INSTANT terminal signal (length 0) still ends the instance ----
+    // It completes inside its first update, so the completion edge is the only
+    // thing that can catch it - and a caller must not be told to wait for it.
+    {
+        AnimDoc d;
+        AnimDocInit(&d);
+        d.duration = 2.0f; d.outroStart = 2.0f;
+        TextCopy(AnimDocAddElem(&d, AE_TEXT)->name, "a");
+        d.signalCount = 1;
+        TextCopy(d.signals[0].name, "snap");
+        d.signals[0].length      = 0.0f;         // instant
+        d.signals[0].terminal    = true;
+        d.signals[0].targetCount = 1;
+        d.signals[0].targets[0] = (AnimSigTarget){0};
+        d.signals[0].targets[0].elemIdx  = 0;
+        d.signals[0].targets[0].prop     = AP_T_ALPHA;
+        d.signals[0].targets[0].keyCount = 1;
+        d.signals[0].targets[0].keys[0]  =
+            (AnimKey){ 1.0f, 0.0f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
+        AnimDocSave(&d, "anims/_test_snap.cfg");
+
+        AnimHandle s = AnimStagePlay("_test_snap", true, 0);
+        CHECK(s != ANIM_HANDLE_NONE);
+        SignalEmit("snap");
+        AnimStageUpdate(0.016f);
+        CHECK(!AnimStageAlive(s));               // ended on the first update
+        AnimStageStopAll();
+        remove("anims/_test_snap.cfg");
+    }
+
+    // --- a signal with NO targets never plays, so nothing waits on it -----
+    {
+        AnimDoc d;
+        AnimDocInit(&d);
+        d.duration = 2.0f; d.outroStart = 2.0f;
+        TextCopy(AnimDocAddElem(&d, AE_TEXT)->name, "a");
+        d.signalCount = 1;
+        TextCopy(d.signals[0].name, "empty");
+        d.signals[0].length      = 1.0f;
+        d.signals[0].terminal    = true;
+        d.signals[0].targetCount = 0;            // nothing to drive
+        AnimDocSave(&d, "anims/_test_empty.cfg");
+
+        AnimHandle s = AnimStagePlay("_test_empty", true, 0);
+        CHECK(s != ANIM_HANDLE_NONE);
+        SignalEmit("empty");
+        // never armed: the caller must be told NOT to wait, or it would hang
+        CHECK(!AnimStageEndsOnCurrentSignal(s));
+        AnimStageStopAll();
+        remove("anims/_test_empty.cfg");
+    }
+
+    // --- a missing file must not occupy a slot ----------------------------
+    CHECK(AnimStagePlay("_test_does_not_exist", true, 0) == ANIM_HANDLE_NONE);
+    CHECK(AnimStageActiveCount() == 0);
+
+    remove("anims/_test_loop.cfg");
+    remove("anims/_test_plain.cfg");
+    AnimStageReset();
+    SignalReset();
+}
+
+// The animation the main menu asks for by name must actually be loadable from
+// anims/, and must declare the signal the menu emits to end it - otherwise the
+// integration silently degrades to "no overlay" with nothing to point at.
+// Skipped when run outside the repo root (anims/ is CWD-relative).
+static void TestMenuAnimPresent(void)
+{
+    AnimDoc doc;
+    if (!AnimDocLoad(&doc, "anims/signal_test.cfg")) return;   // not at repo root
+    CHECK(doc.elemCount > 0);
+
+    bool found = false;
+    for (int i = 0; i < doc.signalCount; i++)
+        if (TextIsEqual(doc.signals[i].name, "TV-out")) found = true;
+    CHECK(found);       // main_menu.c's MENU_ANIM_END_SIGNAL
+}
+
 int main(void)
 {
     TestEval();
@@ -909,6 +1155,9 @@ int main(void)
     TestLibrary();
     TestSignals();
     TestSignalTargetRemap();
+    TestSignalTerminalIO();
+    TestStage();
+    TestMenuAnimPresent();
 
     printf("anim_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails ? 1 : 0;

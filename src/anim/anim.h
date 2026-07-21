@@ -34,13 +34,59 @@
 #include "raylib.h"
 #include <stdbool.h>
 
-// --- capacities (kept small; a document is copied by value for undo) --------
+// ---------------------------------------------------------------------------
+//  Capacities. Because nothing here is heap-allocated, every one of these is an
+//  ARRAY DIMENSION: raising one grows sizeof(AnimDoc) immediately, and grows it
+//  MULTIPLICATIVELY, since the capacities nest (doc > elems > tracks > keys).
+//
+//  Measured sizes at the current values (x86-64; 4-byte float/int, Color = 4B):
+//
+//      AnimKey            16 B
+//      AnimTrack         264 B   =  16 keys x 16 B  + prop/count
+//      AnimElem        3,312 B   =  12 tracks x 264 B + base props
+//      AnimSigTarget     140 B   =   8 keys x 16 B  + idx/prop/count
+//      AnimSignal      3,404 B   =  24 targets x 140 B + name/length/terminal
+//      AnimDoc        53,412 B   =  12 elems x 3,312 B + 4 signals x 3,404 B
+//                                =  ~52 KB
+//
+//  WHICH KNOBS COST THE MOST, per +1 of each (all else unchanged):
+//
+//      ANIM_ELEMS_MAX      +3.3 KB/doc   elem is the single biggest unit
+//      ANIM_SIGNALS_MAX    +3.4 KB/doc   a signal is bigger than an element
+//      ANIM_TRACKS_MAX     +3.2 KB/doc   264 B x 12 elems - pays per element
+//      ANIM_KEYS_MAX       +2.3 KB/doc   16 B x 12 tracks x 12 elems: the
+//                                        deepest nesting, so the sleeper cost
+//      ANIM_SIG_TARGETS_MAX +0.6 KB/doc  140 B x 4 signals
+//
+//  ...but sizeof(AnimDoc) is NOT the number that matters. Docs are held by
+//  value in bulk, and those multipliers are what actually spend memory:
+//
+//      anim_editor undoBuf[UNDO_MAX=16]        16 x 52 KB = ~0.82 MB
+//      anim_stage  slots[ANIM_STAGE_SLOTS_MAX=8] 8 x 52 KB = ~0.41 MB
+//
+//  So a change to any capacity above lands in the build multiplied by ~24.
+//
+//  WHY THIS MATTERS ON WEB: the Emscripten target links with a FIXED heap,
+//  -sTOTAL_MEMORY=134217728 (128 MB) and no ALLOW_MEMORY_GROWTH (CMakeLists.txt).
+//  There is no growing out of it at runtime - overshoot is an abort, not a
+//  slowdown, and these buffers are static, so they are spent before main()
+//  runs and sit alongside raylib, Box2D and the preloaded resource image.
+//  Desktop has room to spare here; WASM is the binding constraint. Before
+//  raising a capacity, multiply by ~24 and check it against that 128 MB.
+//
+//  Sanity-check a change with:
+//    printf("%zu\n", sizeof(AnimDoc));
+// ---------------------------------------------------------------------------
 #define ANIM_NAME_MAX      32   // element / signal / doc name buffer
 #define ANIM_TEXT_LEN_MAX  64   // a TEXT element's string buffer
-#define ANIM_KEYS_MAX      16   // keyframes per track
-#define ANIM_TRACKS_MAX    10   // tracks (animated properties) per element
+#define ANIM_KEYS_MAX      16   // keyframes per track (deepest nesting: this
+                                // one multiplies by tracks AND elems)
+#define ANIM_TRACKS_MAX    12   // tracks (animated properties) per element
+                                // (>= the largest per-kind property count, so
+                                //  every property of an element is trackable)
 #define ANIM_ELEMS_MAX     12   // elements per document
-#define ANIM_SIGNALS_MAX    8   // signals per document
+#define ANIM_SIGNALS_MAX    4   // signals per document (a signal is the single
+                                // largest sub-struct, ~3.4 KB each)
 
 // ---------------------------------------------------------------------------
 //  Easing, as a plain id (keeps AnimKey pointer-free: memcpy/fscanf-clean).
@@ -91,6 +137,9 @@ typedef enum {
     AP_S_OUTLINE_COLOR, // RGB outline; keys use AnimKey.cval, not value
     AP_S_OUTLINE,       // outline thickness, fraction of game height (0 = off)
     AP_S_OUTLINE_ALPHA, // 0..1 outline opacity (AP_S_ALPHA is the FILL opacity)
+    AP_S_SCALE,         // uniform size MULTIPLIER on top of w/h (1 = authored
+                        // size). The one-track way to grow/shrink a shape
+                        // without keeping w and h in proportion by hand.
 
     // GLOBAL (200..) --------------------------------------------------------
     AP_G_FADE = 200,    // whole-screen fade-to-color amount, 0..1
@@ -117,6 +166,8 @@ typedef struct {
 
 typedef enum { AE_TEXT = 0, AE_SHAPE, AE_GLOBAL } AnimElemKind;
 // Shape geometry, all center-anchored on posFrac and rotated about the center.
+// Both axes are multiplied by AP_S_SCALE before use, so a single scale track
+// grows a shape about its center without disturbing its aspect ratio.
 // sizeFrac meaning per kind:
 //   RECT     w x h box
 //   CIRCLE   ellipse with axes w x h
@@ -146,6 +197,8 @@ typedef struct {
     Color   color;                     // fill / text / fade colour
     Vector2 posFrac;                   // center (both text and shapes)
     Vector2 sizeFrac;                  // x=width/size, y=height (shape height)
+    float   scaleFrac;                 // AE_SHAPE: rest-pose AP_S_SCALE (1 = as
+                                       // authored); multiplies sizeFrac
     int     shapeKind;                 // AnimShapeKind (AE_SHAPE only)
     Color   outlineColor;              // AE_SHAPE: outline tint (rest pose)
     float   outlineFrac;               // AE_SHAPE: outline thickness, fraction
@@ -160,9 +213,12 @@ typedef struct {
 
 typedef enum { ANIM_FWD = 0, ANIM_REV } AnimPlayDir;
 
-#define ANIM_SIG_TARGETS_MAX 32   // (element, property) pairs a signal drives
+// These two are capacities like the ones at the top of the file, and carry the
+// same cost rules - see the memory notes there before raising either.
+#define ANIM_SIG_TARGETS_MAX 24   // (element, property) pairs a signal drives
                                   // (>= ANIM_ELEMS_MAX so every element can be
                                   //  driven, with several properties each)
+                                  // 140 B each; the bulk of AnimSignal's 3.4 KB
 #define ANIM_SIG_KEYS_MAX    8    // keyframes per target
 
 // One property a signal drives, on one element.
@@ -185,9 +241,16 @@ typedef struct {
 // A named transition: firing signal `name` eases every target from its live
 // value into the target's keys, over `length` seconds. length <= 0 snaps
 // instantly to the final key (an "instant trigger").
+//
+// `terminal` marks the signal as an ENDING: a runtime instance playing this doc
+// (see anim_stage.h) stops itself once this signal's player has run its full
+// `length`, so a looping animation winds down through the authored transition
+// instead of being cut off mid-cycle. It means nothing to the editor preview,
+// where the playhead belongs to the user.
 typedef struct {
     char          name[ANIM_NAME_MAX];
     float         length;               // seconds; 0 = instant
+    bool          terminal;             // completing this signal ends playback
     AnimSigTarget targets[ANIM_SIG_TARGETS_MAX];
     int           targetCount;
 } AnimSignal;

@@ -15,6 +15,8 @@
 #include "../audio_state/audio_state.h"
 #include "../scene_anim/scene_anim.h"        // AnimText / AnimPhase / SceneAnim data model
 #include "../transition/transition_state.h"  // TransitionStateStart (generic outro player)
+#include "../anim_stage/anim_stage.h"        // editor-authored animations (anims/*.cfg)
+#include "../signal/signal.h"                // SignalEmit
 #include <stddef.h>
 #include <math.h>
 
@@ -76,6 +78,25 @@ static MainMenUAnimations_t menu_animations;
 // so the outro captures the boxes exactly where the menu just drew them.
 static ZoomBoxes zoomBoxes = { .count = 3, .period = 5.0f };
 
+// ============================================================================
+//  EDITOR-AUTHORED ANIMATION (anim_stage.h) - the NEW model, running alongside
+//  the scene_anim one above rather than replacing it.
+//
+//  This one is not declared in C at all: it is authored in the ANIM EDITOR and
+//  loaded from anims/<MENU_ANIM_NAME>.cfg. It loops over the menu as an overlay
+//  on a layer above the scene's own art, and the menu ends it by emitting its
+//  authored TERMINAL signal (MENU_ANIM_END_SIGNAL) - the animation then plays
+//  that transition through to its end and stops itself, instead of being cut.
+//
+//  How much of the menu shows THROUGH it is decided entirely in the editor, by
+//  the document's global element (AP_G_BG_ALPHA 0 = fully transparent).
+// ============================================================================
+#define MENU_ANIM_NAME       "signal_test"
+#define MENU_ANIM_END_SIGNAL "TV-out"
+#define MENU_ANIM_LAYER      10
+
+static AnimHandle menuAnim = ANIM_HANDLE_NONE;
+
 static void DrawMenuArt(float alpha, float time);   // defined below Draw()
 
 // Plays the INTRO when the menu is entered; after it finishes, the same
@@ -132,11 +153,52 @@ static void AnimationsInit() {
         };
 }
 
-// Leave the menu through the generic outro player (PLAY/STRATEGY and ENTER).
-static void StartGameTransition(AppState *destination)
+// Where StartGameTransition is headed once the overlay has wound down. Held
+// across frames because the hand-off is deferred (see below).
+static AppState *pendingDestination = NULL;
+
+// Hand off to the outro player + destination. This is the ORIGINAL exit path,
+// now reached either immediately or from the overlay's done callback.
+static void EnterGameTransition(void)
 {
+    AppState *destination = pendingDestination ? pendingDestination
+                                               : &app_state_platformer;
+    pendingDestination = NULL;
     TransitionStateStart(&menu_animations.menuAnim, destination);
     AppStateTransition(&app_state_transition);
+}
+
+// Fired by anim_stage when the overlay actually stops (its terminal signal ran
+// its full length). `user` is unused - the destination is in pendingDestination.
+static void OnMenuAnimDone(void *user)
+{
+    (void)user;
+    if (pendingDestination) EnterGameTransition();
+}
+
+// Leave the menu through the generic outro player (PLAY/STRATEGY and ENTER).
+//
+// If the authored overlay is playing, the menu does NOT leave right away: it
+// emits the overlay's TERMINAL signal and waits for the animation to play that
+// transition through to its own end ("end with the signal's allocated time
+// end"), handing off from the done callback. With no overlay loaded there is
+// nothing to wait for and the hand-off happens immediately, exactly as before.
+static void StartGameTransition(AppState *destination)
+{
+    pendingDestination = destination;
+
+    if (AnimStageAlive(menuAnim))
+    {
+        AnimStageSetDoneCallback(menuAnim, OnMenuAnimDone, NULL);
+        SignalEmit(MENU_ANIM_END_SIGNAL);
+        // The signal may be non-terminal (or the name may not exist in the
+        // doc), in which case nothing would ever end the animation and the menu
+        // would hang here. Only wait if the emit actually armed a shutdown.
+        if (AnimStageAlive(menuAnim) && AnimStageEndsOnCurrentSignal(menuAnim))
+            return;
+    }
+
+    EnterGameTransition();
 }
 
 // ----------------------------------------------------------------------------
@@ -155,6 +217,11 @@ static void Enter()
     AnimationsInit();
     SceneAnimStart(&menu_animations.player, &menu_animations.menuAnim, ANIM_INTRO);
 
+    // The editor-authored overlay, looping until a terminal signal ends it.
+    // ANIM_HANDLE_NONE (a missing/unreadable .cfg) is harmless: every call
+    // below simply does nothing, so the menu still works without the file.
+    menuAnim = AnimStagePlay(MENU_ANIM_NAME, true, MENU_ANIM_LAYER);
+
     // No GUI-scale seeding needed: the wish lives in settings->gui_scale_wish, loaded
     // at startup and bound directly to the toggle below.
 }
@@ -165,7 +232,10 @@ static void Enter()
 // ----------------------------------------------------------------------------
 static void Exit()
 {
-    // Nothing loaded in this demo, so nothing to free.
+    // Nothing else loaded in this demo - but no stage slot may outlive the
+    // state that started it, or it would keep drawing over the next one.
+    AnimStageStopAll();
+    menuAnim = ANIM_HANDLE_NONE;
 }
 
 // ----------------------------------------------------------------------------
@@ -180,6 +250,7 @@ static void Update()
 
     SceneAnimUpdate(&menu_animations.player, dt);   // advance the intro (no-op once done)
     ZoomBoxesUpdate(&zoomBoxes, dt);     // the boxes' shared loop clock
+    AnimStageUpdate(dt);                 // the editor-authored overlay(s)
 
     // Keyboard input example: ENTER also starts the game.
     if (IsKeyPressed(KEY_ENTER))
@@ -238,6 +309,13 @@ static void Draw()
     DrawText(TextFormat("size(screen): %.0f, %.0f; size(game): %.0f, %.0f", screen_size.x, screen_size.y, game_size.x, game_size.y), (int)dbgX, (int)game_size.y - (3*(dbgPad+dbgSize)), dbgSize, GRAY);
     DrawText(TextFormat("mouse(screen): %.0f, %.0f", pos_mouse.x, pos_mouse.y), (int)dbgX, (int)game_size.y - (2*(dbgSize+dbgPad)), dbgSize, GRAY);
     DrawText(TextFormat("GetTime(): %.1fs   FPS: %i", GetTime(), GetFPS()), (int)dbgX, (int)game_size.y - (dbgSize+dbgPad), dbgSize, GRAY);
+
+    // -- Editor-authored animations: LAST in Draw() ---------------------------
+    // Last, so they composite over everything the menu drew above (showing it
+    // through wherever the authored global background alpha allows), and still
+    // inside Draw(), so main.c's Gui() pass keeps the raygui column on top and
+    // clickable. Nothing to draw when no animation is playing.
+    AnimStageDraw();
 }
 
 // ----------------------------------------------------------------------------
