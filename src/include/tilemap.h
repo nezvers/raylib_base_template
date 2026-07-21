@@ -164,7 +164,7 @@ TMAPI void AutotileRuleUpdateTilemap(Tilemap *tilemap_in, Tilemap *tilemap_out, 
 TMAPI void AutotileRuleUpdateRect(Tilemap *tilemap_in, Tilemap *tilemap_out, AutotileRule *rules, uint32_t rule_count, recti region);
 TMAPI void AutotileRuleUpdateNeighbours(Tilemap *tilemap_in, Tilemap *tilemap_out, AutotileRule *rules, uint32_t rule_count, vec2i tile_pos);
 
-TMAPI uint32_t tmRndState(uint32_t *nProcGen);                     // Random number using seed state: determenistic using same seed state
+TMAPI uint32_t tmRndState(uint32_t *seed);                     // Random number using seed state: determenistic using same seed state
 TMAPI int32_t tmRndInt(uint32_t *seed, int32_t min, int32_t max);  // Random signed integer range number using seed state
 TMAPI int tmRndCash(uint32_t seed, int x, int y);                  // cash stands for chaos hash :D
 
@@ -244,11 +244,11 @@ static recti RectiFromRange(vec2i from, vec2i to) {
 }
 
 // Random number using seed state: determenistic using same seed state
-TMAPI uint32_t tmRndState(uint32_t *nProcGen) {
+TMAPI uint32_t tmRndState(uint32_t *seed) {
     /* Taken from OneLoneCoder: https://github.com/OneLoneCoder/Javidx9/blob/0c8ec20a9ed3b2daf76a925034ac5e7e6f4096e0/PixelGameEngine/SmallerProjects/OneLoneCoder_PGE_ProcGen_Universe.cpp#L183 */
-    *nProcGen += 0xe120fc15;
+    *seed += 0xe120fc15;
     uint64_t tmp;
-    tmp = (uint64_t)*nProcGen * 0x4a39b70d;
+    tmp = (uint64_t)*seed * 0x4a39b70d;
     uint32_t m1 = (tmp >> 32) ^ tmp;
     tmp = (uint64_t)m1 * 0x12fad5c9;
     uint32_t m2 = (tmp >> 32) ^ tmp;

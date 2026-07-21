@@ -74,6 +74,7 @@ int main(void)
 
     if (SettingsGet()->persist) SettingsSave();   // remember options for next launch
 
+    AppStateExit();
     ScreenStateCleanup();
     // TODO: Unload all loaded resources at this point
     AudioStateUnload();   // free UI sounds before tearing down the audio device

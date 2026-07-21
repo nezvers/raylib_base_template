@@ -15,15 +15,16 @@ extern "C" {
 #define SSAPI
 #endif
 
-SSAPI bool SimpleSave(const char *output_file, char *buffer, size_t size);
-SSAPI bool SimpleLoad(const char *input_file, char *buffer, size_t size, size_t position);
-SSAPI FILE* SimpleSaveOpen(const char *output_file); // TODO: add alternative to continue writing
-SSAPI FILE* SimpleLoadOpen(const char *input_file);
+SSAPI bool SimpleSave(const char *file_path, char *buffer, size_t size);
+SSAPI bool SimpleLoad(const char *file_path, char *buffer, size_t size);
+SSAPI FILE* SimpleSaveOpen(const char *file_path); // TODO: add alternative to continue writing
+SSAPI FILE* SimpleLoadOpen(const char *file_path);
 SSAPI bool SimpleSaveBytes(FILE *file_out, char *buffer, size_t size);
 SSAPI bool SimpleLoadBytes(FILE *file_in, char *buffer, size_t size);
 SSAPI bool SimpleSaveBytesFrom(FILE *file_out, char *buffer, size_t size, size_t position);
 SSAPI bool SimpleLoadBytesFrom(FILE *file_in, char *buffer, size_t size, size_t position);
 SSAPI void SimpleFileClose(FILE *file);
+SSAPI void SimpleDelete(const char *file_path);
 
 #ifdef __cplusplus
 }
@@ -32,32 +33,31 @@ SSAPI void SimpleFileClose(FILE *file);
 #endif // SIMPLE_SAVE_H
 
 /* ---------------------------------------- */
-#define SIMPLE_SAVE_IMPLEMENTATION
 
 #ifdef SIMPLE_SAVE_IMPLEMENTATION
 #undef SIMPLE_SAVE_IMPLEMENTATION
 
-SSAPI bool SimpleSave(const char *output_file, char *buffer, size_t size) {
-    FILE* file = SimpleSaveOpen(output_file);
+SSAPI bool SimpleSave(const char *file_path, char *buffer, size_t size) {
+    FILE* file = SimpleSaveOpen(file_path);
     if (file == NULL) { return false; }
     bool result = SimpleSaveBytes(file, buffer, size);
     SimpleFileClose(file);
     return result;
 }
 
-SSAPI bool SimpleLoad(const char *input_file, char *buffer, size_t size, size_t position) {
-    FILE* file = SimpleLoadOpen(input_file);
+SSAPI bool SimpleLoad(const char *file_path, char *buffer, size_t size) {
+    FILE* file = SimpleLoadOpen(file_path);
     if (file == NULL) { return false; }
-    bool result = SimpleLoadBytesFrom(file, buffer, size, position);
+    bool result = SimpleLoadBytes(file, buffer, size);
     SimpleFileClose(file);
     return result;
 }
 
-SSAPI FILE* SimpleLoadOpen(const char *input_file) {
+SSAPI FILE* SimpleLoadOpen(const char *file_path) {
     FILE *file_in = NULL;
-    file_in = fopen(input_file, "rb");
+    file_in = fopen(file_path, "rb");
     if (!file_in) {
-        printf("Failed to open input file - %s\n", input_file);
+        printf("Failed to open input file - %s\n", file_path);
         goto defer;
     }
     return file_in;
@@ -67,11 +67,11 @@ defer:
     return NULL;
 }
 
-SSAPI FILE* SimpleSaveOpen(const char *output_file) {
+SSAPI FILE* SimpleSaveOpen(const char *file_path) {
     FILE *file_out = NULL;
-    file_out = fopen(output_file, "rb");
+    file_out = fopen(file_path, "wb");
     if (!file_out) {
-        printf("Failed to create file - %s\n", output_file);
+        printf("Failed to create file - %s\n", file_path);
         goto defer;
     }
     return file_out;
@@ -117,6 +117,9 @@ SSAPI bool SimpleSaveBytesFrom(FILE *file_out, char *buffer, size_t size, size_t
 
 SSAPI void SimpleFileClose(FILE *file) {
     if (file) fclose(file);
+}
+SSAPI void SimpleDelete(const char *file_path) {
+    if (file_path) remove(file_path);
 }
 
 #endif // SIMPLE_SAVE_IMPLEMENTATION
