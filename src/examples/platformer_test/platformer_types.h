@@ -3,7 +3,7 @@
 
 #include "box2d/box2d.h"
 #include "raylib.h"
-#include "../box2d_wrap/box2d_wrap.h"
+#include "../../box2d_wrap/box2d_wrap.h"
 #include "common_types.h"
 
 enum ENTITY_KIND {

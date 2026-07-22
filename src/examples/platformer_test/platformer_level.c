@@ -1,6 +1,6 @@
 #include "raylib.h"
 #include "raymath.h"
-#include "../box2d_wrap/box2d_wrap.h"
+#include "../../box2d_wrap/box2d_wrap.h"
 #include "platformer_types.h"
 #include "platformer_constants.h"
 #include "common_types.h"

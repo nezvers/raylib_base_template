@@ -1,5 +1,5 @@
 #include "platformer_physics.h"
-#include "../box2d_wrap/box2d_wrap.h"
+#include "../../box2d_wrap/box2d_wrap.h"
 
 
 void PhysicsWorldInit(WorldContext *ctx, SensorBeginFcn *begin, SensorEndFcn *end, b2PreSolveFcn *pre, void *user_data) {
