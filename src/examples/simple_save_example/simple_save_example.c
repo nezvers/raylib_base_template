@@ -95,3 +95,29 @@ static void Gui() {
     }
     DrawText(example_data.value_str, 10, 90, 20, LIGHTGRAY);
 }
+
+
+/* File as struct array
+typedef struct {
+    int id;
+    float health;
+} Enemy;
+
+Enemy e;
+
+// reserve space for 1024 enemies 
+SimpleArrayReserve("enemies.bin", sizeof(Enemy), 1024);
+
+// overwrite enemy #50 
+SimpleArraySave("enemies.bin", &e, sizeof(Enemy), 50);
+
+// read enemy #50 
+SimpleArrayLoad("enemies.bin", &e, sizeof(Enemy), 50);
+
+// append another enemy 
+SimpleArrayAppend("enemies.bin", &e, sizeof(Enemy));
+
+// query current number of elements 
+size_t count = SimpleArrayCount("enemies.bin", sizeof(Enemy));
+
+*/

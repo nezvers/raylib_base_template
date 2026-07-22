@@ -26,6 +26,13 @@ SSAPI bool SimpleLoadBytesFrom(FILE *file_in, char *buffer, size_t size, size_t 
 SSAPI void SimpleFileClose(FILE *file);
 SSAPI void SimpleDelete(const char *file_path);
 
+// File as struct array
+SSAPI bool SimpleArrayReserve(const char *file_path, size_t element_size, size_t count);
+SSAPI bool SimpleArrayAppend(const char *file_path, const void *element, size_t element_size);
+SSAPI bool SimpleArrayLoad(const char *file_path, void *element, size_t element_size, size_t index);
+SSAPI bool SimpleArraySave(const char *file_path, const void *element, size_t element_size, size_t index);
+SSAPI size_t SimpleArrayCount(const char *file_path, size_t element_size);
+
 #ifdef __cplusplus
 }
 #endif
@@ -121,6 +128,128 @@ SSAPI void SimpleFileClose(FILE *file) {
 SSAPI void SimpleDelete(const char *file_path) {
     if (file_path) remove(file_path);
 }
+
+
+// File as struct array
+
+SSAPI size_t SimpleArrayCount(const char *file_path, size_t element_size)
+{
+    if (element_size == 0) return 0;
+
+    FILE *file = fopen(file_path, "rb");
+    if (!file) return 0;
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return 0;
+    }
+
+    long size = ftell(file);
+    fclose(file);
+
+    if (size < 0) return 0;
+
+    return (size_t)size / element_size;
+}
+
+SSAPI bool SimpleArrayReserve(const char *file_path, size_t element_size, size_t count)
+{
+    FILE *file = fopen(file_path, "wb");
+    if (!file)
+        return false;
+
+    if (count != 0) {
+        if (fseek(file, (long)(element_size * count - 1), SEEK_SET) != 0) {
+            fclose(file);
+            return false;
+        }
+
+        fputc(0, file);
+    }
+
+    fclose(file);
+    return true;
+}
+
+SSAPI bool SimpleArrayAppend(const char *file_path, const void *element, size_t element_size)
+{
+    FILE *file = fopen(file_path, "ab");
+    if (!file)
+        return false;
+
+    bool ok = fwrite(element, element_size, 1, file) == 1;
+
+    fclose(file);
+    return ok;
+}
+
+SSAPI bool SimpleArrayLoad(const char *file_path, void *element, size_t element_size, size_t index)
+{
+    FILE *file = fopen(file_path, "rb");
+    if (!file)
+        return false;
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return false;
+    }
+
+    long size = ftell(file);
+    if (size < 0) {
+        fclose(file);
+        return false;
+    }
+
+    size_t count = (size_t)size / element_size;
+
+    if (index >= count) {
+        printf("SimpleArrayLoad: index out of bounds\n");
+        fclose(file);
+        return false;
+    }
+
+    fseek(file, (long)(index * element_size), SEEK_SET);
+
+    bool ok = fread(element, element_size, 1, file) == 1;
+
+    fclose(file);
+    return ok;
+}
+
+SSAPI bool SimpleArraySave(const char *file_path, const void *element, size_t element_size, size_t index)
+{
+    FILE *file = fopen(file_path, "r+b");
+    if (!file)
+        return false;
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return false;
+    }
+
+    long size = ftell(file);
+    if (size < 0) {
+        fclose(file);
+        return false;
+    }
+
+    size_t count = (size_t)size / element_size;
+
+    if (index >= count) {
+        printf("SimpleArraySave: index out of bounds\n");
+        fclose(file);
+        return false;
+    }
+
+    fseek(file, (long)(index * element_size), SEEK_SET);
+
+    bool ok = fwrite(element, element_size, 1, file) == 1;
+
+    fclose(file);
+    return ok;
+}
+
+
 
 #endif // SIMPLE_SAVE_IMPLEMENTATION
 
