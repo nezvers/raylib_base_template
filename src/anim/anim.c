@@ -836,10 +836,12 @@ void AnimDocDraw(const AnimDoc *doc, float t)
 //  Signal player
 // ---------------------------------------------------------------------------
 void AnimSignalPlayerStart(AnimSignalPlayer *p, const AnimSignal *sig,
-                           const AnimDoc *doc, float docTime)
+                           const AnimDoc *doc, float docTime,
+                           const SignalParams *params)
 {
     if (!p) return;
     p->sig = sig; p->clock = 0.0f; p->playing = false;
+    p->param = params ? *params : (SignalParams){0};
     if (!sig || sig->targetCount <= 0 || !doc) return;
 
     // capture the live pose: this is the implicit key at u=0, so the signal
@@ -937,6 +939,18 @@ bool AnimSignalPlayerEval(const AnimSignalPlayer *p, int elemIdx, int prop,
                 float f = SegmentFraction(a, b, u);
                 *outValue = a->value + (b->value - a->value) * f;
             }
+
+            // ABSOLUTE position parameter: re-anchor a POS_X/POS_Y target so the
+            // transition plays out AT param.pos instead of its authored location.
+            // The authored keys describe the motion RELATIVE to their own end
+            // point (the target's intended resting position = the last key); we
+            // shift the whole blended result by (param.pos - that end point), so
+            // the eased motion is preserved but re-centered on the param. hasPos
+            // false leaves this untouched (byte-identical to the old behaviour).
+            if (p->param.hasPos && (prop == AP_S_POS_X || prop == AP_T_POS_X))
+                *outValue += p->param.pos.x - tg->keys[tg->keyCount - 1].value;
+            else if (p->param.hasPos && (prop == AP_S_POS_Y || prop == AP_T_POS_Y))
+                *outValue += p->param.pos.y - tg->keys[tg->keyCount - 1].value;
         }
         return true;
     }

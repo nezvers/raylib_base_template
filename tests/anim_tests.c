@@ -14,6 +14,7 @@
 #include "../src/signal/signal.h"
 #include "../src/signal/anim_signal.h"
 #include "../src/anim_stage/anim_stage.h"
+#include "../src/anim_stage/anim_scene.h"
 #include <stdio.h>
 #include <math.h>
 
@@ -767,17 +768,17 @@ static void TestLibrary(void)
 //  Signal bus + anim bridge + player
 // ---------------------------------------------------------------------------
 static int s_pings = 0;
-static void Ping(const char *name, void *user) { (void)name; (void)user; s_pings++; }
+static void Ping(const char *name, void *user, const SignalParams *p) { (void)name; (void)user; (void)p; s_pings++; }
 
 static void TestSignals(void)
 {
     SignalReset();
     SignalListen("ping", Ping, NULL);
     SignalListen("ping", Ping, NULL);                       // dedup
-    SignalEmit("ping");
+    SignalEmit("ping", NULL);
     CHECK(s_pings == 1);
     SignalStopListening("ping", Ping, NULL);
-    SignalEmit("ping");
+    SignalEmit("ping", NULL);
     CHECK(s_pings == 1);
 
     // bridge: firing a doc signal starts the signal player on that signal.
@@ -802,7 +803,7 @@ static void TestSignals(void)
     float docTime = 0.0f;
     AnimSignalPlayer sp = {0};
     AnimSignalRegister(&doc, &sp, &docTime);
-    SignalEmit("enter");
+    SignalEmit("enter", NULL);
     CHECK(sp.playing);
     CHECK_NEAR(sp.fromValue[0], 0.20f);                     // captured live pose
 
@@ -822,24 +823,24 @@ static void TestSignals(void)
 
     AnimSignalUnregister(&doc, &sp);
     sp.playing = false;
-    SignalEmit("enter");
+    SignalEmit("enter", NULL);
     CHECK(!sp.playing);                                     // binding removed
 
     // length 0 = instant: lands on the final key the moment it starts
     doc.signals[0].length = 0.0f;
-    AnimSignalPlayerStart(&sp, &doc.signals[0], &doc, 0.0f);
+    AnimSignalPlayerStart(&sp, &doc.signals[0], &doc, 0.0f, NULL);
     CHECK(AnimSignalPlayerEval(&sp, 0, AP_T_POS_Y, &v, NULL));
     CHECK_NEAR(v, 0.80f);
 
     // normalized keys rescale with the length: same u, twice the wall time
     doc.signals[0].length = 4.0f;
-    AnimSignalPlayerStart(&sp, &doc.signals[0], &doc, 0.0f);
+    AnimSignalPlayerStart(&sp, &doc.signals[0], &doc, 0.0f, NULL);
     AnimSignalPlayerUpdate(&sp, 2.0f);                      // u = 0.5 again
     CHECK(AnimSignalPlayerEval(&sp, 0, AP_T_POS_Y, &v, NULL));
     CHECK_NEAR(v, 0.50f);
 
     // a NULL / empty signal leaves the player idle rather than half-started
-    AnimSignalPlayerStart(&sp, NULL, &doc, 0.0f);
+    AnimSignalPlayerStart(&sp, NULL, &doc, 0.0f, NULL);
     CHECK(AnimSignalPlayerDone(&sp));
 
     // the plain AnimPlayer (still used for whole-doc playback) is unaffected
@@ -900,7 +901,7 @@ static void TestSignalTargetRemap(void)
     sg->targets[1].keyCount = 1;
     sg->targets[1].keys[0] = (AnimKey){ 1.0f, 1.0f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
     AnimSignalPlayer sp = {0};
-    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f);
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, NULL);
     float v = 0.0f;
     CHECK(!AnimSignalPlayerEval(&sp, 1, AP_T_POS_Y, &v, NULL));   // idx 1 != 99
 }
@@ -1010,7 +1011,7 @@ static void TestStage(void)
 
     // --- a terminal signal ends it, but only after its full length --------
     CHECK(!AnimStageEndsOnCurrentSignal(h));     // nothing running yet
-    SignalEmit("stage_end");
+    SignalEmit("stage_end", NULL);
     CHECK(AnimStageEndsOnCurrentSignal(h));      // armed: safe to wait on done
     AnimStageUpdate(0.5f);                       // half of the 1.0s signal
     CHECK(AnimStageAlive(h));                    // NOT cut off mid-transition
@@ -1027,7 +1028,7 @@ static void TestStage(void)
     WriteStageAnim("_test_plain", false);
     AnimHandle p = AnimStagePlay("_test_plain", true, 0);
     CHECK(p != ANIM_HANDLE_NONE);
-    SignalEmit("stage_end");
+    SignalEmit("stage_end", NULL);
     CHECK(!AnimStageEndsOnCurrentSignal(p));     // playing, but not an ENDING
     for (int i = 0; i < 60; i++) AnimStageUpdate(0.05f);
     CHECK(AnimStageAlive(p));                    // signal ended, playback did not
@@ -1079,7 +1080,7 @@ static void TestStage(void)
 
         AnimHandle s = AnimStagePlay("_test_snap", true, 0);
         CHECK(s != ANIM_HANDLE_NONE);
-        SignalEmit("snap");
+        SignalEmit("snap", NULL);
         AnimStageUpdate(0.016f);
         CHECK(!AnimStageAlive(s));               // ended on the first update
         AnimStageStopAll();
@@ -1101,11 +1102,100 @@ static void TestStage(void)
 
         AnimHandle s = AnimStagePlay("_test_empty", true, 0);
         CHECK(s != ANIM_HANDLE_NONE);
-        SignalEmit("empty");
+        SignalEmit("empty", NULL);
         // never armed: the caller must be told NOT to wait, or it would hang
         CHECK(!AnimStageEndsOnCurrentSignal(s));
         AnimStageStopAll();
         remove("anims/_test_empty.cfg");
+    }
+
+    // --- a start delay holds the instance back without drawing it ---------
+    // While waiting it is ALIVE and holds its slot, but is not in the draw
+    // order and its clock does not move.
+    {
+        AnimStageStopAll();
+        AnimHandle d = AnimStagePlayEx("_test_plain", true, 0, 1.0f);
+        CHECK(d != ANIM_HANDLE_NONE);
+        CHECK(AnimStageAlive(d));                // alive from the moment played
+        CHECK(AnimStageActiveCount() == 1);      // and it costs a slot already
+
+        int ord[ANIM_STAGE_SLOTS_MAX];
+        CHECK(AnimStageDrawOrder(ord, ANIM_STAGE_SLOTS_MAX) == 0);  // invisible
+        for (int i = 0; i < 10; i++) AnimStageUpdate(0.05f);        // 0.5s < 1s
+        CHECK(AnimStageAlive(d));
+        CHECK(AnimStageDrawOrder(ord, ANIM_STAGE_SLOTS_MAX) == 0);  // still not
+        for (int i = 0; i < 11; i++) AnimStageUpdate(0.05f);        // past 1.0s
+        CHECK(AnimStageDrawOrder(ord, ANIM_STAGE_SLOTS_MAX) == 1);  // now drawn
+        CHECK(ord[0] == AnimStageSlotOf(d));
+        AnimStageStopAll();
+    }
+
+    // --- the delay shifts the whole life of a one-shot by exactly itself ---
+    // A 2s doc played with a 1s delay is still running at 2.5s (a plain one
+    // would have finished at 2s) and is gone by 3.5s. This is what proves the
+    // clock is HELD during the wait rather than merely hidden.
+    {
+        AnimStageStopAll();
+        AnimHandle a = AnimStagePlayEx("_test_plain", false, 0, 1.0f);
+        CHECK(a != ANIM_HANDLE_NONE);
+        for (int i = 0; i < 50; i++) AnimStageUpdate(0.05f);   // t = 2.5s
+        CHECK(AnimStageAlive(a));                              // delayed, so on
+        for (int i = 0; i < 20; i++) AnimStageUpdate(0.05f);   // t = 3.5s
+        CHECK(!AnimStageAlive(a));
+    }
+
+    // --- the stagger survives uneven frames -------------------------------
+    // The remainder of the frame that ends a wait is spent on the animation, so
+    // two copies started 1.0s apart still end 1.0s apart even when no frame
+    // boundary lands on either delay. Fed deliberately ragged dt.
+    {
+        AnimStageStopAll();
+        AnimHandle first  = AnimStagePlayEx("_test_plain", false, 0, 0.0f);
+        AnimHandle second = AnimStagePlayEx("_test_plain", false, 0, 1.0f);
+        CHECK(first != ANIM_HANDLE_NONE && second != ANIM_HANDLE_NONE);
+
+        // Run to just under 2s: neither has finished (the first ends AT 2s).
+        // The bound leaves room for a whole frame, so the loop cannot step
+        // PAST 2.0s and end `first` before the check below.
+        float t = 0.0f;
+        while (t + 0.07f < 1.97f) { AnimStageUpdate(0.07f); t += 0.07f; }
+        CHECK(AnimStageAlive(first));
+        CHECK(AnimStageAlive(second));
+
+        // Cross 2s: the undelayed one ends, the delayed one keeps going.
+        while (t < 2.5f) { AnimStageUpdate(0.07f); t += 0.07f; }
+        CHECK(!AnimStageAlive(first));
+        CHECK(AnimStageAlive(second));
+
+        // Cross 3s (= its 1s delay + 2s duration): now the delayed one ends.
+        while (t < 3.2f) { AnimStageUpdate(0.07f); t += 0.07f; }
+        CHECK(!AnimStageAlive(second));
+        CHECK(AnimStageActiveCount() == 0);
+    }
+
+    // --- stopping a still-waiting instance reports done and frees the slot -
+    {
+        AnimStageStopAll();
+        s_doneCalls = 0;
+        AnimHandle w = AnimStagePlayEx("_test_plain", true, 0, 5.0f);
+        CHECK(w != ANIM_HANDLE_NONE);
+        AnimStageSetDoneCallback(w, OnStageDone, NULL);
+        AnimStageUpdate(0.05f);                  // still deep in the wait
+        CHECK(AnimStageAlive(w));
+        AnimStageStop(w);
+        CHECK(!AnimStageAlive(w));
+        CHECK(s_doneCalls == 1);
+        CHECK(AnimStageActiveCount() == 0);
+    }
+
+    // --- a non-positive delay is exactly AnimStagePlay ---------------------
+    {
+        AnimStageStopAll();
+        AnimHandle z = AnimStagePlayEx("_test_plain", true, 0, -1.0f);
+        CHECK(z != ANIM_HANDLE_NONE);
+        int ord[ANIM_STAGE_SLOTS_MAX];
+        CHECK(AnimStageDrawOrder(ord, ANIM_STAGE_SLOTS_MAX) == 1);  // drawn now
+        AnimStageStopAll();
     }
 
     // --- a missing file must not occupy a slot ----------------------------
@@ -1131,7 +1221,192 @@ static void TestMenuAnimPresent(void)
     bool found = false;
     for (int i = 0; i < doc.signalCount; i++)
         if (TextIsEqual(doc.signals[i].name, "TV-out")) found = true;
-    CHECK(found);       // main_menu.c's MENU_ANIM_END_SIGNAL
+    CHECK(found);       // main_menu.c's MENU_END_SIGNAL
+}
+
+// ---------------------------------------------------------------------------
+//  Signal POSITION parameter: an absolute pos re-anchors a POS target so the
+//  authored transition plays out at the param location instead of its authored
+//  one; no param = byte-identical to before.
+// ---------------------------------------------------------------------------
+static void TestSignalPosParam(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration = 2.0f;
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    e->posFrac = (Vector2){ 0.5f, 0.5f };
+
+    // A signal whose pos_x/pos_y targets rest at the authored center (0.5,0.5).
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "place");
+    sg->length      = 1.0f;
+    sg->targetCount = 2;
+    sg->targets[0] = (AnimSigTarget){0};
+    sg->targets[0].elemIdx = 0; sg->targets[0].prop = AP_S_POS_X;
+    sg->targets[0].keyCount = 1;
+    sg->targets[0].keys[0] = (AnimKey){ 1.0f, 0.5f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
+    sg->targets[1] = (AnimSigTarget){0};
+    sg->targets[1].elemIdx = 0; sg->targets[1].prop = AP_S_POS_Y;
+    sg->targets[1].keyCount = 1;
+    sg->targets[1].keys[0] = (AnimKey){ 1.0f, 0.5f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
+
+    // --- no param: lands at the authored 0.5/0.5 (no-op proof) -------------
+    AnimSignalPlayer sp = {0};
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, NULL);
+    AnimSignalPlayerUpdate(&sp, 0.9f);                 // near end, still playing
+    float vx = 0.0f, vy = 0.0f;
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &vx, NULL));
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_Y, &vy, NULL));
+    CHECK_NEAR(vx, 0.5f);
+    CHECK_NEAR(vy, 0.5f);
+
+    // --- with an absolute pos param: re-anchored to it ---------------------
+    SignalParams pp = { .pos = { 0.8f, 0.2f }, .hasPos = true };
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, &pp);
+    AnimSignalPlayerUpdate(&sp, 0.9f);
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &vx, NULL));
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_Y, &vy, NULL));
+    CHECK_NEAR(vx, 0.8f);                              // authored 0.5 + (0.8-0.5)
+    CHECK_NEAR(vy, 0.2f);
+
+    // hasPos false leaves non-pos targets untouched: alpha param never applies.
+    // (only pos_x/pos_y are re-anchored; nothing else is.)
+}
+
+// A signal param carried through the whole emit path (bus -> bridge -> player).
+static void TestSignalEmitParam(void)
+{
+    SignalReset();
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration = 2.0f;
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    e->posFrac = (Vector2){ 0.5f, 0.5f };
+
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "spawn");
+    sg->length      = 1.0f;
+    sg->targetCount = 1;
+    sg->targets[0] = (AnimSigTarget){0};
+    sg->targets[0].elemIdx = 0; sg->targets[0].prop = AP_S_POS_X;
+    sg->targets[0].keyCount = 1;
+    sg->targets[0].keys[0] = (AnimKey){ 1.0f, 0.5f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
+
+    float docTime = 0.0f;
+    AnimSignalPlayer sp = {0};
+    AnimSignalRegister(&doc, &sp, &docTime);
+
+    SignalParams pp = { .pos = { 0.9f, 0.1f }, .hasPos = true };
+    SignalEmit("spawn", &pp);
+    CHECK(sp.playing);
+    CHECK(sp.param.hasPos);
+    AnimSignalPlayerUpdate(&sp, 0.9f);
+    float vx = 0.0f;
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &vx, NULL));
+    CHECK_NEAR(vx, 0.9f);                              // emit's param reached Eval
+
+    AnimSignalUnregister(&doc, &sp);
+}
+
+// ---------------------------------------------------------------------------
+//  Declarative scene layer: play a table, emit across all matching rows, and
+//  the terminal-then-done flow.
+// ---------------------------------------------------------------------------
+static void TestScene(void)
+{
+    SignalReset();
+    AnimStageReset();
+    WriteStageAnim("_test_scene", false);   // non-terminal signal "stage_end"
+
+    static const AnimStageEntry ENTRIES[] = {
+        { .anim="_test_scene", .loop=true, .delay=0.0f, .layer=0, .tag=10,
+          .signals={ {"stage_end", false} }, .signalCount=1 },
+        { .anim="_test_scene", .loop=true, .delay=0.5f, .layer=1, .tag=11,
+          .signals={ {"stage_end", false} }, .signalCount=1 },
+    };
+    AnimStageScene sc;
+    AnimScenePlay(&sc, ENTRIES, 2);
+
+    CHECK(AnimStageActiveCount() == 2);     // both rows became instances
+    CHECK(AnimSceneAlive(&sc));
+
+    // the delayed row is alive but not yet on the draw list (still waiting)
+    int order[ANIM_STAGE_SLOTS_MAX];
+    CHECK(AnimStageDrawOrder(order, ANIM_STAGE_SLOTS_MAX) == 1);
+    AnimStageUpdate(0.6f);                   // clears the 0.5s delay
+    CHECK(AnimStageDrawOrder(order, ANIM_STAGE_SLOTS_MAX) == 2);
+
+    AnimSceneStop(&sc);
+    CHECK(!AnimSceneAlive(&sc));
+    CHECK(AnimStageActiveCount() == 0);
+}
+
+// AnimSceneEmit reaches EVERY row declaring the name, and ONLY those. Observed
+// through a TERMINAL signal: a matching row is armed to end (EndsOnCurrentSignal
+// true), a non-matching row is not.
+static void TestSceneEmitAll(void)
+{
+    SignalReset();
+    AnimStageReset();
+    WriteStageAnim("_test_scene2", true);   // "stage_end" is terminal here
+
+    static const AnimStageEntry ENTRIES[] = {
+        { .anim="_test_scene2", .loop=true, .delay=0.0f, .layer=0, .tag=0,
+          .signals={ {"stage_end", false} }, .signalCount=1 },
+        { .anim="_test_scene2", .loop=true, .delay=0.0f, .layer=0, .tag=1,
+          .signals={ {"stage_end", false} }, .signalCount=1 },
+        { .anim="_test_scene2", .loop=true, .delay=0.0f, .layer=0, .tag=2,
+          .signals={ {"other", false} }, .signalCount=1 },   // does NOT declare it
+    };
+    AnimStageScene sc;
+    AnimScenePlay(&sc, ENTRIES, 3);
+
+    AnimSceneEmit(&sc, "stage_end", NULL);
+    CHECK(AnimStageEndsOnCurrentSignal(sc.handles[0]));   // matched -> armed
+    CHECK(AnimStageEndsOnCurrentSignal(sc.handles[1]));   // matched -> armed
+    CHECK(!AnimStageEndsOnCurrentSignal(sc.handles[2]));  // not declared -> inert
+
+    AnimSceneStop(&sc);
+}
+
+// Terminal emit across a scene: onDone fires exactly once after all wind down,
+// and immediately when nothing is armed.
+static int s_sceneDone = 0;
+static void OnSceneDone(void *user) { (void)user; s_sceneDone++; }
+
+static void TestSceneTerminal(void)
+{
+    SignalReset();
+    AnimStageReset();
+    WriteStageAnim("_test_term", true);     // terminal "stage_end"
+
+    static const AnimStageEntry ENTRIES[] = {
+        { .anim="_test_term", .loop=true, .delay=0.0f, .layer=0, .tag=0,
+          .signals={ {"stage_end", false} }, .signalCount=1 },
+        { .anim="_test_term", .loop=true, .delay=0.0f, .layer=0, .tag=1,
+          .signals={ {"stage_end", false} }, .signalCount=1 },
+    };
+    AnimStageScene sc;
+    AnimScenePlay(&sc, ENTRIES, 2);
+
+    s_sceneDone = 0;
+    AnimSceneEmitTerminal(&sc, "stage_end", NULL, OnSceneDone, NULL);
+    CHECK(s_sceneDone == 0);                 // two armed, none done yet
+    CHECK(AnimSceneAlive(&sc));
+    for (int i = 0; i < 30; i++) AnimStageUpdate(0.05f);  // > 1.0s signal length
+    CHECK(!AnimSceneAlive(&sc));
+    CHECK(s_sceneDone == 1);                 // fired exactly once, after both
+
+    // nothing to arm (no row names it) -> onDone immediately
+    AnimStageReset();
+    AnimScenePlay(&sc, ENTRIES, 2);
+    s_sceneDone = 0;
+    AnimSceneEmitTerminal(&sc, "no_such_signal", NULL, OnSceneDone, NULL);
+    CHECK(s_sceneDone == 1);
+    AnimSceneStop(&sc);
 }
 
 int main(void)
@@ -1158,6 +1433,11 @@ int main(void)
     TestSignalTerminalIO();
     TestStage();
     TestMenuAnimPresent();
+    TestSignalPosParam();
+    TestSignalEmitParam();
+    TestScene();
+    TestSceneEmitAll();
+    TestSceneTerminal();
 
     printf("anim_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails ? 1 : 0;

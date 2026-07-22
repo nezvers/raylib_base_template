@@ -32,6 +32,7 @@
 #define ANIM_H
 
 #include "raylib.h"
+#include "../signal/signal.h"   // SignalParams (per-emit position parameter)
 #include <stdbool.h>
 
 // ---------------------------------------------------------------------------
@@ -380,12 +381,19 @@ typedef struct {
     // value of each target at fire time (the implicit key at u=0)
     float fromValue[ANIM_SIG_TARGETS_MAX];
     Color fromColor[ANIM_SIG_TARGETS_MAX];
+    // Per-emit params captured at Start (see SignalParams). hasPos re-anchors
+    // this signal's POS_X/POS_Y targets to param.pos, so the same authored
+    // transition can be fired at a runtime location. Zeroed = no override.
+    SignalParams param;
 } AnimSignalPlayer;
 
 // Begin `sig`, capturing each target's live value from `doc` at `docTime`.
-// A NULL sig (or one with no targets) leaves the player idle.
+// A NULL sig (or one with no targets) leaves the player idle. `params` (may be
+// NULL for none) is stored and applied by AnimSignalPlayerEval - a position
+// param re-anchors the signal's POS targets to param.pos.
 void AnimSignalPlayerStart(AnimSignalPlayer *p, const AnimSignal *sig,
-                           const AnimDoc *doc, float docTime);
+                           const AnimDoc *doc, float docTime,
+                           const SignalParams *params);
 void AnimSignalPlayerUpdate(AnimSignalPlayer *p, float dt);
 bool AnimSignalPlayerDone(const AnimSignalPlayer *p);
 

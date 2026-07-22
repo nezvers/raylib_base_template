@@ -66,6 +66,19 @@ static int  animCount = 0;
 static int  animCurrent = -1;       // index into animList of the loaded anim (-1 unsaved)
 static bool docDirty = false;       // `doc` has edits not written to its file
 
+// Animation open when the editor was last left, so re-entering resumes there.
+// Session-scoped by design: a static, not a file, so a fresh launch starts on
+// the default animation again. Kept by NAME - RescanAnims() shifts indices.
+static char lastOpened[ANIM_NAME_MAX] = {0};
+
+// Per-animation element selection, remembered for this run only (same
+// session-scoped, no-disk rationale as lastOpened). Keyed by anim NAME
+// (rescan shifts indices) -> element INDEX: element names are NOT unique
+// (every new shape is "shape"), so a name key would be ambiguous.
+static char lastSelAnim[ANIM_LIST_MAX][ANIM_NAME_MAX];
+static int  lastSelElem[ANIM_LIST_MAX];
+static int  lastSelCount = 0;
+
 // animation-switch dropdown (header in toolbar, list drawn as overlay like ease)
 static bool animSwitchOpen = false;
 static Rectangle animSwitchRect;
@@ -292,6 +305,44 @@ static const char *AnimPath(const char *name)
     return TextFormat("%s/%s%s", ANIM_DIR, name, ANIM_EXT);
 }
 
+// Remember `elem` as the selected element of animation `anim` (upsert). Full
+// table (>ANIM_LIST_MAX anims touched) just drops the write - the selection
+// restore is a convenience, not state anything depends on.
+static void RememberSelElem(const char *anim, int elem)
+{
+    if (!anim || !anim[0]) return;
+    for (int i = 0; i < lastSelCount; i++)
+        if (TextIsEqual(lastSelAnim[i], anim)) { lastSelElem[i] = elem; return; }
+    if (lastSelCount >= ANIM_LIST_MAX) return;
+    TextCopy(lastSelAnim[lastSelCount], anim);
+    lastSelElem[lastSelCount++] = elem;
+}
+
+// Element index remembered for `anim`, or -1 if none. Caller bounds-checks it
+// against the loaded doc: elements may have been deleted since.
+static int RecallSelElem(const char *anim)
+{
+    if (!anim || !anim[0]) return -1;
+    for (int i = 0; i < lastSelCount; i++)
+        if (TextIsEqual(lastSelAnim[i], anim)) return lastSelElem[i];
+    return -1;
+}
+
+// Drop the remembered selection for `anim` (its file is gone), so a later
+// animation reusing the name doesn't inherit a stale index.
+static void ForgetSelElem(const char *anim)
+{
+    for (int i = 0; i < lastSelCount; i++)
+        if (TextIsEqual(lastSelAnim[i], anim))
+        {
+            // order doesn't matter here: fill the hole with the last entry.
+            lastSelCount--;
+            TextCopy(lastSelAnim[i], lastSelAnim[lastSelCount]);
+            lastSelElem[i] = lastSelElem[lastSelCount];
+            return;
+        }
+}
+
 // Index of an animation in animList by name, or -1.
 static int AnimFind(const char *name)
 {
@@ -338,12 +389,17 @@ static void LoadAnimByIndex(int idx)
 {
     if (idx < 0 || idx >= animCount) return;
     UndoPush();                                 // switching is undoable
+    // stash the OUTGOING anim's selection before `doc` is overwritten.
+    if (animCurrent >= 0) RememberSelElem(animList[animCurrent], selElem);
     AnimSignalUnregister(&doc, &preview);       // bindings match the OLD doc
     if (!AnimDocLoad(&doc, AnimPath(animList[idx]))) MakeStarterDoc();
     AnimSignalRegister(&doc, &preview, &playhead);
     animCurrent = idx;
     docDirty = false;                           // freshly loaded == clean
-    selElem = doc.elemCount > 0 ? 0 : -1;
+    // restore this anim's own selection; stale/absent falls back to the first.
+    int wantSel = RecallSelElem(animList[idx]);
+    selElem = (wantSel >= 0 && wantSel < doc.elemCount) ? wantSel
+            : (doc.elemCount > 0 ? 0 : -1);
     ClearKeySelection();
     // the new doc's signals are unrelated to the old one's: close the modal and
     // reset the panel scrolls rather than pointing them at a different signal.
@@ -379,15 +435,22 @@ static void Enter()
     AnimLibraryLoad(&library, LIB_PATH);
     libScroll = 0.0f; libTargetIdx = -1;
 
-    // Open the first saved animation if any, else start on a demo.
+    // Reopen the animation last left (this run only), else the first saved one,
+    // else start on a demo. A remembered anim deleted since simply misses.
     animCurrent = -1;
-    if (animCount > 0 && AnimDocLoad(&doc, AnimPath(animList[0])) && doc.elemCount > 0)
-        animCurrent = 0;
+    int openIdx = lastOpened[0] ? AnimFind(lastOpened) : -1;
+    if (openIdx < 0) openIdx = 0;
+    if (animCount > 0 && AnimDocLoad(&doc, AnimPath(animList[openIdx])) && doc.elemCount > 0)
+        animCurrent = openIdx;
     else
         MakeStarterDoc();
     docDirty = false;
 
-    selElem  = doc.elemCount > 0 ? 0 : -1;
+    // restore the element last selected in THIS anim (bounds-checked: it may
+    // have been deleted, or the file edited on disk, since we saw it).
+    int wantSel = (animCurrent >= 0) ? RecallSelElem(animList[animCurrent]) : -1;
+    selElem  = (wantSel >= 0 && wantSel < doc.elemCount) ? wantSel
+             : (doc.elemCount > 0 ? 0 : -1);
     for (int i = 0; i < ANIM_ELEMS_MAX; i++) multiSel[i] = false;
     ClearKeySelection();
     edSigIdx = -1; sliderGestureOpen = false; edSliderActive = false;
@@ -406,6 +469,14 @@ static void Enter()
 
 static void Exit()
 {
+    // remember where the user was; unsaved scratch doc has nothing to reopen.
+    if (animCurrent >= 0)
+    {
+        TextCopy(lastOpened, animList[animCurrent]);
+        RememberSelElem(animList[animCurrent], selElem);
+    }
+    else lastOpened[0] = '\0';
+
     AnimSignalUnregister(&doc, &preview);
 }
 
@@ -1279,6 +1350,7 @@ static void DeleteAnim(int idx)
     char curName[ANIM_NAME_MAX] = {0};
     if (animCurrent >= 0) TextCopy(curName, animList[animCurrent]);
 
+    ForgetSelElem(animList[idx]);   // while animList[idx] still names it
     remove(AnimPath(animList[idx]));
     RescanAnims();
 
@@ -1514,7 +1586,7 @@ static float DrawSignalList(float x, float y, float w)
         if (i == sigModalIdx) DrawRectangleRec(openR, (Color){ 90, 140, 220, 90 });
 
         if (GuiButton((Rectangle){ x + w - 2*bw2 - 2, y, bw2, rh }, "#131#"))
-        { AudioPlayButton(); SignalEmit(sg->name); }          // fire (play icon)
+        { AudioPlayButton(); SignalEmit(sg->name, NULL); }          // fire (play icon)
         if (GuiButton((Rectangle){ x + w - bw2, y, bw2, rh }, "#143#"))
         { AudioPlayButton(); pendingDel = i; }                // trash icon
         y += rh + gap;
@@ -1580,7 +1652,7 @@ static void DrawSignalModal()
         DrawRectangleLinesEx(m, 1.0f, (Color){ 90, 94, 104, 255 });
         GuiLabel((Rectangle){ m.x+10, m.y+10, mw-140, 20 }, sg->name);
         if (GuiButton((Rectangle){ m.x+mw-116, m.y+7, 52, 26 }, "Fire"))
-        { AudioPlayButton(); SignalEmit(sg->name); }
+        { AudioPlayButton(); SignalEmit(sg->name, NULL); }
         if (GuiButton((Rectangle){ m.x+mw-60, m.y+7, 52, 26 }, "Close"))
         { AudioPlayButton(); sigModalIdx = -1; }
         return;
@@ -1795,7 +1867,7 @@ static void DrawSignalModal()
     // --- footer -----------------------------------------------------------
     float bh = 28, by = m.y + mh - bh - 12;
     if (GuiButton((Rectangle){ x, by, 70, bh }, "Fire"))
-    { AudioPlayButton(); SignalEmit(sg->name); }
+    { AudioPlayButton(); SignalEmit(sg->name, NULL); }
     GuiLabel((Rectangle){ x+80, by, mw-200, bh }, "fires from the CURRENT pose");
     if (GuiButton((Rectangle){ m.x+mw-84, by, 70, bh }, "Close"))
     { AudioPlayButton(); sigModalIdx = -1; edSigIdx = -1;

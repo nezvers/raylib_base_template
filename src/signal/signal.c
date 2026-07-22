@@ -58,7 +58,7 @@ void SignalStopListening(const char *name, SignalHandler fn, void *user)
     if (i >= 0) s_listeners[i].used = false;
 }
 
-void SignalEmit(const char *name)
+void SignalEmit(const char *name, const SignalParams *params)
 {
     if (!name) return;
     // Snapshot the count so handlers that register/unregister during dispatch
@@ -66,7 +66,7 @@ void SignalEmit(const char *name)
     int n = s_count;
     for (int i = 0; i < n; i++)
         if (s_listeners[i].used && TextIsEqual(s_listeners[i].name, name))
-            s_listeners[i].fn(name, s_listeners[i].user);
+            s_listeners[i].fn(name, s_listeners[i].user, params);
 }
 
 int SignalListenerCount(const char *name)

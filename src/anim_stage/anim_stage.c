@@ -28,6 +28,9 @@ typedef struct {
     float            docTime;    // live sample time; AnimSignalRegister holds
                                  // a POINTER to this, so a signal fired later
                                  // captures the pose actually on screen
+    float            delay;      // seconds still to wait before starting; 0 =
+                                 // running. A waiting slot is active but is
+                                 // neither advanced nor drawn (see the header).
     int              layer;
     int              generation; // bumped per start; encoded into the handle so
                                  // a stale handle can never address a new play
@@ -88,6 +91,11 @@ void AnimStageReset(void)
 
 AnimHandle AnimStagePlay(const char *name, bool loop, int layer)
 {
+    return AnimStagePlayEx(name, loop, layer, 0.0f);
+}
+
+AnimHandle AnimStagePlayEx(const char *name, bool loop, int layer, float delay)
+{
     if (!name || !name[0]) return ANIM_HANDLE_NONE;
 
     int idx = -1;
@@ -105,12 +113,15 @@ AnimHandle AnimStagePlay(const char *name, bool loop, int layer)
 
     s->layer  = layer;
     s->active = true;
+    s->delay  = (delay > 0.0f) ? delay : 0.0f;
     AnimPlayerStartAll(&s->player, &s->doc, ANIM_FWD);
     s->player.loop = loop;
     s->docTime = AnimPlayerSampleTime(&s->player);
 
     // Bind this slot's OWN signal player: a global SignalEmit then reaches
-    // every instance declaring that name, each blending from its own pose.
+    // every instance declaring that name, each blending from its own pose. This
+    // happens even while the slot is still waiting out its delay, so an emit
+    // during the wait is not silently dropped.
     AnimSignalRegister(&s->doc, &s->sigPlayer, &s->docTime);
     return MakeHandle(idx, generation);
 }
@@ -139,7 +150,7 @@ void AnimStageSetDoneCallback(AnimHandle h, void (*fn)(void *user), void *user)
     s->user   = user;
 }
 
-void AnimStageEmit(AnimHandle h, const char *name)
+void AnimStageEmit(AnimHandle h, const char *name, const SignalParams *params)
 {
     StageSlot *s = SlotOf(h);
     if (!s || !name) return;
@@ -148,7 +159,7 @@ void AnimStageEmit(AnimHandle h, const char *name)
         if (TextIsEqual(s->doc.signals[i].name, name))
         {
             AnimSignalPlayerStart(&s->sigPlayer, &s->doc.signals[i],
-                                  &s->doc, s->docTime);
+                                  &s->doc, s->docTime, params);
             return;
         }
     }
@@ -168,6 +179,19 @@ void AnimStageUpdate(float dt)
         StageSlot *s = &s_slots[i];
         if (!s->active) continue;
 
+        // Waiting out a start delay: neither the timeline nor a signal moves,
+        // and AnimStageDrawOrder skips the slot, so nothing shows. The leftover
+        // of the frame that ends the wait is spent on the animation itself, so
+        // two copies staggered 0.1s apart stay 0.1s apart at any frame rate.
+        float sdt = dt;
+        if (s->delay > 0.0f)
+        {
+            s->delay -= sdt;
+            if (s->delay > 0.0f) continue;
+            sdt      = -s->delay;
+            s->delay = 0.0f;
+        }
+
         // A signal runs on its OWN clock as an override; it does NOT move the
         // timeline, which keeps looping underneath while the signal blends its
         // targets away from it (same model as the editor preview).
@@ -178,7 +202,7 @@ void AnimStageUpdate(float dt)
         // and finishes inside its very first update - never observed as playing
         // by any later frame.
         bool sigPlaying = !AnimSignalPlayerDone(&s->sigPlayer);
-        if (sigPlaying) AnimSignalPlayerUpdate(&s->sigPlayer, dt);
+        if (sigPlaying) AnimSignalPlayerUpdate(&s->sigPlayer, sdt);
 
         // Completion EDGE of a terminal signal: this is the "end with the
         // signal's allocated time end" case - the instance stops here, having
@@ -190,7 +214,7 @@ void AnimStageUpdate(float dt)
             continue;
         }
 
-        AnimPlayerUpdate(&s->player, dt);
+        AnimPlayerUpdate(&s->player, sdt);
         s->docTime = AnimPlayerSampleTime(&s->player);
 
         // A non-looping doc that ran out ends the instance - unless a signal is
@@ -201,7 +225,9 @@ void AnimStageUpdate(float dt)
 }
 
 // Build the draw order: active slots, ascending (layer, slot index), so a
-// higher layer draws IN FRONT and equal layers keep their start order.
+// higher layer draws IN FRONT and equal layers keep their start order. A slot
+// still waiting out its start delay is omitted - it is alive but not on screen,
+// and AnimStageDraw walks exactly this order.
 // Insertion sort over <= 8 entries - no allocation. Exposed (not static) so a
 // test can assert the ordering without needing to observe actual drawing.
 int AnimStageDrawOrder(int *out, int max)
@@ -209,7 +235,7 @@ int AnimStageDrawOrder(int *out, int max)
     int n = 0;
     for (int i = 0; i < ANIM_STAGE_SLOTS_MAX && n < max; i++)
     {
-        if (!s_slots[i].active) continue;
+        if (!s_slots[i].active || s_slots[i].delay > 0.0f) continue;
         int j = n++;
         // walk the sorted prefix back while it sorts AFTER slot i
         while (j > 0 && s_slots[out[j - 1]].layer > s_slots[i].layer)

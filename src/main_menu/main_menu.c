@@ -15,8 +15,8 @@
 #include "../audio_state/audio_state.h"
 #include "../scene_anim/scene_anim.h"        // AnimText / AnimPhase / SceneAnim data model
 #include "../transition/transition_state.h"  // TransitionStateStart (generic outro player)
-#include "../anim_stage/anim_stage.h"        // editor-authored animations (anims/*.cfg)
-#include "../signal/signal.h"                // SignalEmit
+#include "../anim_stage/anim_scene.h"        // declarative editor-authored anim table
+#include "../signal/signal.h"                // SignalParams
 #include <stddef.h>
 #include <math.h>
 
@@ -79,23 +79,44 @@ static MainMenUAnimations_t menu_animations;
 static ZoomBoxes zoomBoxes = { .count = 3, .period = 5.0f };
 
 // ============================================================================
-//  EDITOR-AUTHORED ANIMATION (anim_stage.h) - the NEW model, running alongside
+//  EDITOR-AUTHORED ANIMATION (anim_scene.h) - the NEW model, running alongside
 //  the scene_anim one above rather than replacing it.
 //
-//  This one is not declared in C at all: it is authored in the ANIM EDITOR and
-//  loaded from anims/<MENU_ANIM_NAME>.cfg. It loops over the menu as an overlay
-//  on a layer above the scene's own art, and the menu ends it by emitting its
-//  authored TERMINAL signal (MENU_ANIM_END_SIGNAL) - the animation then plays
-//  that transition through to its end and stops itself, instead of being cut.
+//  These animations are not declared in C at all: they are authored in the ANIM
+//  EDITOR, saved to anims/<name>.cfg, and listed HERE as a declarative table -
+//  each row an instance with its own loop/delay/layer and the signals it answers
+//  to. The whole set plays with one AnimScenePlay call (see Enter).
 //
-//  How much of the menu shows THROUGH it is decided entirely in the editor, by
+//    * "signal_test" is the looping overlay; the menu ends it by emitting its
+//      authored TERMINAL signal MENU_END_SIGNAL, and AnimSceneEmitTerminal waits
+//      for that transition to finish before the state changes.
+//    * "zooming_box" appears THREE times, each started a little later (the
+//      .delay column), so one file gives a staggered train of ripples. It
+//      answers the "ripple" signal, which USES A POSITION PARAM (usesPos): the
+//      menu emits it at the mouse on click, so the ripple appears where clicked.
+//
+//  How much of the menu shows THROUGH the overlay is decided in the editor, by
 //  the document's global element (AP_G_BG_ALPHA 0 = fully transparent).
+//
+//  The row count must stay within ANIM_STAGE_SLOTS_MAX (each row holds a slot
+//  for its whole life, delay included).
 // ============================================================================
-#define MENU_ANIM_NAME       "signal_test"
-#define MENU_ANIM_END_SIGNAL "TV-out"
-#define MENU_ANIM_LAYER      10
+#define MENU_END_SIGNAL    "TV-out"    // terminal signal that ends the overlay
+#define MENU_RIPPLE_SIGNAL "ripple"    // placed ripple; consumes params.pos
 
-static AnimHandle menuAnim = ANIM_HANDLE_NONE;
+static const AnimStageEntry MENU_SCENE[] = {
+    { .anim="signal_test", .loop=true, .delay=0.0f, .layer=10, .tag=0,
+      .signals={ { MENU_END_SIGNAL, false } }, .signalCount=1 },
+    { .anim="zooming_box", .loop=true, .delay=0.0f, .layer=9,  .tag=1,
+      .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
+    { .anim="zooming_box", .loop=true, .delay=0.6f, .layer=9,  .tag=2,
+      .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
+    { .anim="zooming_box", .loop=true, .delay=1.2f, .layer=9,  .tag=3,
+      .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
+};
+
+// The state owns one scene object (holds the live handles + terminal bookkeeping).
+static AnimStageScene menuScene;
 
 static void DrawMenuArt(float alpha, float time);   // defined below Draw()
 
@@ -168,37 +189,30 @@ static void EnterGameTransition(void)
     AppStateTransition(&app_state_transition);
 }
 
-// Fired by anim_stage when the overlay actually stops (its terminal signal ran
-// its full length). `user` is unused - the destination is in pendingDestination.
-static void OnMenuAnimDone(void *user)
+// Fired by anim_scene once the overlay's terminal transition has finished (or
+// immediately if nothing was armed). `user` is unused - the destination is in
+// pendingDestination.
+static void OnSceneDone(void *user)
 {
     (void)user;
-    if (pendingDestination) EnterGameTransition();
+    EnterGameTransition();
 }
 
 // Leave the menu through the generic outro player (PLAY/STRATEGY and ENTER).
 //
-// If the authored overlay is playing, the menu does NOT leave right away: it
-// emits the overlay's TERMINAL signal and waits for the animation to play that
-// transition through to its own end ("end with the signal's allocated time
-// end"), handing off from the done callback. With no overlay loaded there is
-// nothing to wait for and the hand-off happens immediately, exactly as before.
+// If the authored scene is playing, the menu does NOT leave right away: it
+// emits the overlay's TERMINAL signal across the scene and waits for that
+// transition to play through to its end, handing off from OnSceneDone.
+// AnimSceneEmitTerminal fires OnSceneDone immediately when nothing arms (no
+// scene, or the signal isn't terminal), so this never hangs.
 static void StartGameTransition(AppState *destination)
 {
     pendingDestination = destination;
 
-    if (AnimStageAlive(menuAnim))
-    {
-        AnimStageSetDoneCallback(menuAnim, OnMenuAnimDone, NULL);
-        SignalEmit(MENU_ANIM_END_SIGNAL);
-        // The signal may be non-terminal (or the name may not exist in the
-        // doc), in which case nothing would ever end the animation and the menu
-        // would hang here. Only wait if the emit actually armed a shutdown.
-        if (AnimStageAlive(menuAnim) && AnimStageEndsOnCurrentSignal(menuAnim))
-            return;
-    }
-
-    EnterGameTransition();
+    if (AnimSceneAlive(&menuScene))
+        AnimSceneEmitTerminal(&menuScene, MENU_END_SIGNAL, NULL, OnSceneDone, NULL);
+    else
+        EnterGameTransition();
 }
 
 // ----------------------------------------------------------------------------
@@ -217,10 +231,11 @@ static void Enter()
     AnimationsInit();
     SceneAnimStart(&menu_animations.player, &menu_animations.menuAnim, ANIM_INTRO);
 
-    // The editor-authored overlay, looping until a terminal signal ends it.
-    // ANIM_HANDLE_NONE (a missing/unreadable .cfg) is harmless: every call
-    // below simply does nothing, so the menu still works without the file.
-    menuAnim = AnimStagePlay(MENU_ANIM_NAME, true, MENU_ANIM_LAYER);
+    // The entire editor-authored integration in one call: the looping overlay
+    // plus the staggered ripple train, from the MENU_SCENE table. A missing or
+    // unreadable .cfg is harmless - that row's handle is ANIM_HANDLE_NONE and
+    // every scene call simply skips it, so the menu still works without the file.
+    AnimScenePlay(&menuScene, MENU_SCENE, sizeof(MENU_SCENE)/sizeof(MENU_SCENE[0]));
 
     // No GUI-scale seeding needed: the wish lives in settings->gui_scale_wish, loaded
     // at startup and bound directly to the toggle below.
@@ -234,8 +249,7 @@ static void Exit()
 {
     // Nothing else loaded in this demo - but no stage slot may outlive the
     // state that started it, or it would keep drawing over the next one.
-    AnimStageStopAll();
-    menuAnim = ANIM_HANDLE_NONE;
+    AnimSceneStop(&menuScene);
 }
 
 // ----------------------------------------------------------------------------
@@ -256,6 +270,19 @@ static void Update()
     if (IsKeyPressed(KEY_ENTER))
     {
         StartGameTransition(&app_state_platformer);
+    }
+
+    // Position-parameter demo: a left click spawns a ripple WHERE it clicked.
+    // The same "ripple" signal fires across every scene row that declares it
+    // (all three zooming_box copies), each re-anchored to this canvas fraction -
+    // so the authored in-place zoom instead plays at the mouse. The GUI column
+    // owns its own clicks; this only reacts to clicks over the open game area.
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    {
+        Vector2 game = ScreenStateTargetSize();
+        Vector2 px   = Screen2Target(GetMousePosition());
+        SignalParams p = { .pos = { px.x / game.x, px.y / game.y }, .hasPos = true };
+        AnimSceneEmit(&menuScene, MENU_RIPPLE_SIGNAL, &p);
     }
 
     // ESC: on the OPTIONS page it returns to MAIN; on MAIN it quits the app.

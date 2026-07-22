@@ -44,6 +44,7 @@
 #define ANIM_STAGE_H
 
 #include <stdbool.h>
+#include "../signal/signal.h"   // SignalParams (per-emit position parameter)
 
 // How many animations can play at once. Slots are a fixed pool: each holds a
 // whole AnimDoc BY VALUE, so this is the module's entire memory footprint.
@@ -68,6 +69,15 @@ void AnimStageReset(void);
 // Returns ANIM_HANDLE_NONE if every slot is busy or the file could not be read.
 AnimHandle AnimStagePlay(const char *name, bool loop, int layer);
 
+// As AnimStagePlay, but the instance waits `delay` seconds before it starts.
+// While waiting it is ALIVE (the handle is valid, its signals are registered)
+// but draws nothing and does not advance - a true stagger, so the SAME document
+// can be played several times at different offsets without duplicating the file.
+// It occupies its slot and counts toward AnimStageActiveCount from the moment it
+// is played, so a delayed instance still costs one of the ANIM_STAGE_SLOTS_MAX.
+// delay <= 0 is identical to AnimStagePlay.
+AnimHandle AnimStagePlayEx(const char *name, bool loop, int layer, float delay);
+
 // Stop an instance NOW (an abrupt cut-off, as opposed to letting a terminal
 // signal end it). Fires its done callback. Unknown/finished handles are ignored.
 void AnimStageStop(AnimHandle h);
@@ -85,7 +95,9 @@ void AnimStageSetDoneCallback(AnimHandle h, void (*fn)(void *user), void *user);
 
 // Fire signal `name` on ONE instance only, bypassing the global bus. Use when
 // several instances share a signal name and only this one should react.
-void AnimStageEmit(AnimHandle h, const char *name);
+// `params` (may be NULL for none) carries the emit's position parameter so the
+// transition can be placed per-instance (see SignalParams in signal.h).
+void AnimStageEmit(AnimHandle h, const char *name, const SignalParams *params);
 
 // Is this instance currently running a TERMINAL signal - i.e. is it already on
 // its way out, and will it report done on its own? Use this before waiting on

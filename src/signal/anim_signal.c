@@ -28,13 +28,14 @@ static Binding s_bindings[ANIM_SIGNAL_BINDINGS_MAX];
 
 // The one handler all anim-signals share: (re)start the bound player, capturing
 // the live pose at the document's current time.
-static void StartFromBinding(const char *name, void *user)
+static void StartFromBinding(const char *name, void *user,
+                             const SignalParams *params)
 {
     (void)name;
     Binding *b = (Binding *)user;
     if (!b || !b->used || !b->player) return;
     float t = b->docTime ? *b->docTime : 0.0f;
-    AnimSignalPlayerStart(b->player, b->sig, b->doc, t);
+    AnimSignalPlayerStart(b->player, b->sig, b->doc, t, params);
 }
 
 static Binding *AllocBinding(void)
