@@ -1,6 +1,6 @@
 #include "raylib.h"
-#include "../app_state/app_state.h"
-#include "../screen_state/screen_state.h"
+#include "../../app_state/app_state.h"
+#include "../../screen_state/screen_state.h"
 #include <stddef.h> // used for NULL
 
 #define SOUND_EFFECT_IMPLEMENTATION

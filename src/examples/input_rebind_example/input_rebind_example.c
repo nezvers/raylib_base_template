@@ -1,10 +1,10 @@
 #include "raylib.h"
 #include "raygui.h"
-#include "../app_state/app_state.h"
-#include "../screen_state/screen_state.h"
+#include "../../app_state/app_state.h"
+#include "../../screen_state/screen_state.h"
 #include <stddef.h> // used for NULL
 
-#include "../input/input.h"
+#include "../../input/input.h"
 
 
 // Forward declare functions

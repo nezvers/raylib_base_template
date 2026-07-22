@@ -56,7 +56,9 @@ int main(void)
     
     // TODO: Load resources / Initialize variables at this point
     // Check app_state.h for "public" AppStates
-    AppStateTransition(&app_state_main_menu);
+    extern AppState app_post_process_shader;
+    AppStateTransition(&app_post_process_shader);
+    // AppStateTransition(&app_state_main_menu);
     
 
 #if defined(PLATFORM_WEB)

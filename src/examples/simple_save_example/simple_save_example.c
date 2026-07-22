@@ -1,7 +1,7 @@
 #include "raylib.h"
 #include "raygui.h"
-#include "../app_state/app_state.h"
-#include "../screen_state/screen_state.h"
+#include "../../app_state/app_state.h"
+#include "../../screen_state/screen_state.h"
 #include <stddef.h>
 #include "stdint.h"
 #include "stdlib.h"

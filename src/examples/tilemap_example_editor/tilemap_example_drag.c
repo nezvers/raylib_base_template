@@ -1,6 +1,6 @@
 #include "raylib.h"
-#include "../app_state/app_state.h"
-#include "../screen_state/screen_state.h"
+#include "../../app_state/app_state.h"
+#include "../../screen_state/screen_state.h"
 #include <stddef.h>
 
 #include "tilemap_example_common.h"
