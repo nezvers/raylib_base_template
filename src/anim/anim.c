@@ -97,6 +97,9 @@ void AnimElemInit(AnimElem *e, AnimElemKind kind)
     e->outlineColor = RAYWHITE;
     e->outlineFrac  = 0.0f;              // outline off by default
     e->scaleFrac    = 1.0f;              // shapes start at their authored size
+    e->rotBase      = 0.0f;              // upright by default
+    e->sizeAbsolute = false;             // sizes are canvas fractions by default
+    e->cornerMode   = false;             // center+size authoring by default
     e->trackCount   = 0;
 
     switch (kind)
@@ -489,7 +492,7 @@ static float ElemBaseProp(const AnimElem *e, int prop)
         // structs); it means "as authored", not "collapsed to nothing".
         case AP_S_SCALE:                  return e->scaleFrac > 0.0f
                                                ? e->scaleFrac : 1.0f;
-        case AP_T_ROT:   case AP_S_ROT:   return 0.0f;
+        case AP_T_ROT:   case AP_S_ROT:   return e->rotBase;
         case AP_T_CRUMBLE:                return 0.0f;
         case AP_G_FADE:                   return 0.0f;
         case AP_G_BG_ALPHA:               return (float)e->bgColor.a / 255.0f;
@@ -599,7 +602,8 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game)
     float rot   = AnimElemProp(e, AP_T_ROT,   t);
     float crumble = AnimElemProp(e, AP_T_CRUMBLE, t);
 
-    float sizePx  = fmaxf(1.0f, game.y * sizeF);
+    // absolute -> sizeF is already pixels; otherwise a fraction of game height.
+    float sizePx  = fmaxf(1.0f, e->sizeAbsolute ? sizeF : game.y * sizeF);
     float spacing = TextSpacingFor(sizePx);
     Font  font    = GetFontDefault();
 
@@ -736,7 +740,10 @@ static void DrawShapeElem(const AnimElem *e, float t, Vector2 game)
     // shape grown by scale keeps its authored rim-to-body proportion.
     float sc = AnimElemProp(e, AP_S_SCALE, t);
     if (sc < 0.0f) sc = 0.0f;
-    float thickPx = game.y * AnimElemProp(e, AP_S_OUTLINE, t) * sc;
+    // absolute -> the size props are pixels, so the canvas multiplier drops to 1.
+    float uW = e->sizeAbsolute ? 1.0f : game.x;   // width-axis reference
+    float uH = e->sizeAbsolute ? 1.0f : game.y;   // height-axis reference
+    float thickPx = uH * AnimElemProp(e, AP_S_OUTLINE, t) * sc;
     if (fillA <= 0.0f && (outA <= 0.0f || thickPx < 0.5f)) return;
 
     float cxF = AnimElemProp(e, AP_S_POS_X, t);
@@ -748,17 +755,25 @@ static void DrawShapeElem(const AnimElem *e, float t, Vector2 game)
     Color fill = Fade(AnimElemColorProp(e, AP_S_COLOR,         t), fillA);
     Color line = Fade(AnimElemColorProp(e, AP_S_OUTLINE_COLOR, t), outA);
 
+    // position is ALWAYS a fraction; only the extents switch units.
     Vector2 c  = { game.x * cxF, game.y * cyF };
-    float   hw = game.x * wF * 0.5f;
-    float   hh = game.y * hF * 0.5f;
+    float   hw = uW * wF * 0.5f;
+    float   hh = uH * hF * 0.5f;
     float   cr = cosf(rot * DEG2RAD), sr = sinf(rot * DEG2RAD);
 
     if (e->shapeKind == SHAPE_LINE)
     {
         // Segment through the center: length = w, thickness = h, fill colour.
-        float len = fmaxf(hw, 0.0f), th = fmaxf(game.y * hF, 1.0f);
-        Vector2 a = { c.x - len * cr, c.y - len * sr };
-        Vector2 b = { c.x + len * cr, c.y + len * sr };
+        // The half-length is projected per-axis (x uses the width reference, y the
+        // height reference) so in % mode the endpoints are true canvas fractions -
+        // e.g. (0,0)..(1,1) stays pinned corner-to-corner across resizes, matching
+        // how every other shape's extents scale. In px mode uW=uH=1, so the offset
+        // stays isotropic pixels.
+        float hlx = fmaxf(uW * wF * 0.5f, 0.0f);
+        float hly = fmaxf(uH * wF * 0.5f, 0.0f);
+        float th = fmaxf(uH * hF, 1.0f);
+        Vector2 a = { c.x - hlx * cr, c.y - hly * sr };
+        Vector2 b = { c.x + hlx * cr, c.y + hly * sr };
         if (fill.a == 0) return;
         DrawLineEx(a, b, th, fill);
         DrawCircleV(a, th * 0.5f, fill);        // round caps

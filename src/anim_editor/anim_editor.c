@@ -28,6 +28,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>          // remove() for deleting anim files off disk
+#include <string.h>         // strlen/strncat for group-key value summaries
 #include <math.h>
 
 // Forward declares (house pattern).
@@ -132,6 +133,7 @@ static bool  prevPlaybackUi = false;
 typedef struct {
     float scroll;       // <= 0; how far the content is pulled up
     float contentH;     // measured by the draw callback last frame
+    int   alphaMode;    // background opacity: 0 opaque, 1 semi, 2 faint
 } PanelView;
 
 static PanelView elemView, sigView, inspView;
@@ -171,6 +173,15 @@ static bool autoKey = false;
 // one UndoPush per slider drag gesture (cleared on mouse release in Gui())
 static bool sliderGestureOpen = false;
 
+// Shift-fine drag: which slider owns the current mouse press, and whether it
+// has entered sticky fine mode (relative nudging). Cleared on release in Gui().
+static Rectangle finePressRect = {0};
+static bool      finePressActive = false;
+static bool      fineSticky = false;
+
+// timeline background opacity, toggled by its own glyph (mirrors PanelView.alphaMode)
+static int timelineAlphaMode = 0;
+
 // precise slider input: double-click the value label to type an exact value,
 // or Ctrl+wheel over a slider to step it in fixed increments.
 static bool      edSliderActive = false;    // a slider textbox is open
@@ -182,6 +193,9 @@ static Rectangle lastSliderClickRect = {0};
 // dragging on the timeline
 static bool dragPlayhead = false;
 static int  dragKeyElem = -1, dragKeyTrack = -1, dragKeyIdx = -1;
+// a timeline drag now moves a whole GROUP key (all its member keys) by time.
+static int  dragKeyGroup = -1;
+static float dragKeyTime = 0.0f;
 static bool dragIntro = false, dragOutro = false;   // the trim triangles
 
 // ---------------------------------------------------------------------------
@@ -668,6 +682,26 @@ static bool EditSlider(Rectangle r, const char *label, float *v, float lo, float
         return false;
     }
 
+    // --- Shift = fine relative drag --------------------------------------------
+    // Remember which slider a fresh press landed on, so only that slider reacts.
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, r))
+    {
+        finePressRect = r; finePressActive = true; fineSticky = false;
+    }
+    bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    if (finePressActive && SameRect(finePressRect, r) &&
+        IsMouseButtonDown(MOUSE_BUTTON_LEFT) && (shift || fineSticky))
+    {
+        // Once Shift is seen during a press, stay in fine mode until release so
+        // letting go of Shift mid-drag doesn't snap the bar to the mouse x.
+        if (!fineSticky) { UndoPush(); fineSticky = true; }
+        GuiSlider(r, label, TextFormat("%.2f", *v), &(float){ *v }, lo, hi);
+        float fstep = (hi - lo) * 0.0015f;
+        float nv = ClampF(*v + GetMouseDelta().x * fstep, lo, hi);
+        if (nv != *v) { *v = nv; return true; }
+        return false;
+    }
+
     // --- normal drag -----------------------------------------------------------
     float tmp = *v;
     GuiSlider(r, label, TextFormat("%.2f", tmp), &tmp, lo, hi);
@@ -716,13 +750,111 @@ static void DrawSwatch(Rectangle r, Color c)
     DrawRectangleLinesEx(r, 1.0f, (Color){ 70, 74, 84, 255 });
 }
 
+// Panel background opacity for a given toggle mode (0 opaque, 1 semi, 2 faint).
+static unsigned char PanelAlpha(int mode)
+{
+    return mode == 0 ? 255 : mode == 1 ? 140 : 75;
+}
+
+// Draw a panel background (replacing GuiPanel) with per-panel transparency:
+// only the fill fades, so widgets/text drawn afterward stay fully readable.
+static void DrawPanelBG(Rectangle r, int mode)
+{
+    Color bg = GetColor(GuiGetStyle(DEFAULT, BACKGROUND_COLOR));
+    Color ln = GetColor(GuiGetStyle(DEFAULT, LINE_COLOR));
+    DrawRectangleRec(r, Fade(bg, PanelAlpha(mode) / 255.0f));
+    DrawRectangleLinesEx(r, 1.0f, ln);
+}
+
+// A small window-glyph toggle at a panel's top-left. Clicking cycles the given
+// alpha mode opaque -> semi -> faint. The glyph brightens as it gets more
+// transparent so the current state is legible at a glance. Returns the icon rect.
+static Rectangle DrawPanelAlphaToggle(float x, float y, int *mode, bool locked)
+{
+    Rectangle ico = { x, y, 13.0f, 13.0f };
+    if (!locked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+        CheckCollisionPointRec(GetMousePosition(), ico))
+        *mode = (*mode + 1) % 3;
+
+    // brighter frame as transparency increases; filled title-bar shows state.
+    unsigned char b = (unsigned char)(120 + 55 * (*mode));
+    Color edge = { b, b, (unsigned char)(b + 20 > 255 ? 255 : b + 20), 255 };
+    DrawRectangleLinesEx(ico, 1.0f, edge);
+    DrawRectangleRec((Rectangle){ ico.x + 1, ico.y + 1, ico.width - 2, 3 }, edge);
+    return ico;
+}
+
+// Canvas reference dimension for a SIZE property's axis (width-like -> game.x,
+// height-like -> game.y). 0 for props that are not size-in-units (position,
+// alpha, rotation, ...), which therefore never switch units.
+static float SizePropRef(int prop, Vector2 game)
+{
+    switch (prop)
+    {
+        case AP_S_W:                                    return game.x;
+        case AP_T_SIZE: case AP_S_H: case AP_S_OUTLINE: return game.y;
+        default:                                        return 0.0f;
+    }
+}
+
+// Slider [lo,hi] for a property in the element's CURRENT units: fractional
+// bounds from AnimProp{Min,Max}, scaled to pixels when the element is absolute.
+static void PropRange(const AnimElem *e, int prop, float *lo, float *hi)
+{
+    *lo = AnimPropMin(prop);
+    *hi = AnimPropMax(prop);
+    if (e->sizeAbsolute)
+    {
+        float ref = SizePropRef(prop, ScreenStateTargetSize());
+        if (ref > 0.0f) { *lo *= ref; *hi *= ref; }
+    }
+}
+
+// Rescale an element's size base fields AND every size-track key value between
+// canvas-fraction and absolute-pixel units, so toggling the unit leaves the
+// shape looking identical. toAbsolute = frac->px (multiply by the reference
+// dimension), else px->frac (divide).
+static void ConvertSizeUnits(AnimElem *e, bool toAbsolute)
+{
+    Vector2 game = ScreenStateTargetSize();
+    if (e->kind == AE_TEXT)
+        e->sizeFrac.x = toAbsolute ? e->sizeFrac.x*game.y : e->sizeFrac.x/game.y;
+    else if (e->kind == AE_SHAPE)
+    {
+        e->sizeFrac.x  = toAbsolute ? e->sizeFrac.x*game.x  : e->sizeFrac.x/game.x;
+        e->sizeFrac.y  = toAbsolute ? e->sizeFrac.y*game.y  : e->sizeFrac.y/game.y;
+        e->outlineFrac = toAbsolute ? e->outlineFrac*game.y : e->outlineFrac/game.y;
+    }
+    for (int i = 0; i < e->trackCount; i++)
+    {
+        AnimTrack *tr = &e->tracks[i];
+        float ref = SizePropRef(tr->prop, game);
+        if (ref <= 0.0f) continue;
+        for (int k = 0; k < tr->keyCount; k++)
+            tr->keys[k].value = toAbsolute ? tr->keys[k].value*ref
+                                           : tr->keys[k].value/ref;
+    }
+}
+
+// Write a scalar value to `prop` the same way PropSlider commits: keyframe it at
+// the playhead when a track exists (auto-key), otherwise set the base field.
+// Used by corner-mode editing, which drives several props from one gesture.
+static void WritePropValue(AnimElem *e, int prop, float v, float *baseField)
+{
+    AnimTrack *tr = AnimElemFindTrack(e, prop);
+    if (!tr) { *baseField = v; return; }
+    if (!autoKey) return;                    // keyed edits go via the key inspector
+    if (playhead > AUTOKEY_EPS) EnsureZeroKey(e, tr);
+    AnimTrackWriteKeyAt(tr, playhead, v, AUTOKEY_EPS);
+}
+
 // Slider for an ANIMATABLE property. No track -> edits the base field (rest
 // pose), exactly like before. With a track -> shows the value evaluated at the
 // playhead; auto-key ON writes/updates a key there, auto-key OFF disables the
 // slider (edit through the key inspector instead).
 static void PropSlider(Rectangle r, AnimElem *e, int prop, float *baseField)
 {
-    float lo = AnimPropMin(prop), hi = AnimPropMax(prop);
+    float lo, hi; PropRange(e, prop, &lo, &hi);
     AnimTrack *tr = AnimElemFindTrack(e, prop);
     if (!tr) { EditSlider(r, "", baseField, lo, hi); return; }
 
@@ -780,7 +912,7 @@ static bool IsSelected(int i)
 static float DrawElementList(float x, float y, float w)   // returns content height
 {
     float y0 = y, rh = 26.0f, gap = 4.0f;
-    GuiLabel((Rectangle){ x, y, w, 20 }, "ELEMENTS"); y += 22;
+    GuiLabel((Rectangle){ x+16, y, w-16, 20 }, "ELEMENTS"); y += 22;
 
     // reorder/duplicate are deferred past the loop: mutating doc.elems mid-draw
     // shifts the array and re-draws the next row's buttons on the same rect this
@@ -897,12 +1029,308 @@ static float DrawElementList(float x, float y, float w)   // returns content hei
 }
 
 // ---------------------------------------------------------------------------
+//  Track GROUPS: the inspector/timeline present a few logical targets (Position,
+//  Color, Outline, ...) instead of the raw per-prop tracks. These helpers keep a
+//  group's member tracks in lockstep at shared key times, so ONE group keyframe
+//  drives every member (pos_x AND pos_y, colour AND alpha, ...). Storage stays
+//  per-prop; this is purely coordinated editing over the existing tracks.
+// ---------------------------------------------------------------------------
+#define GROUP_TIMES_MAX (ANIM_KEYS_MAX * ANIM_GROUP_PROPS)
+
+// Union of a group's member key times, ascending and de-duped within eps.
+static int GroupKeyTimes(AnimElem *e, int gi, float *out)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    int n = 0;
+    if (!g) return 0;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+        for (int k = 0; k < tr->keyCount; k++)
+        {
+            float t = tr->keys[k].t;
+            bool dup = false;
+            for (int i = 0; i < n; i++)
+                if (fabsf(out[i] - t) <= AUTOKEY_EPS) { dup = true; break; }
+            if (!dup && n < GROUP_TIMES_MAX) out[n++] = t;
+        }
+    }
+    for (int i = 1; i < n; i++)          // insertion sort ascending
+    { float v = out[i]; int j = i-1; while (j>=0 && out[j]>v){out[j+1]=out[j];j--;} out[j+1]=v; }
+    return n;
+}
+
+// True if any member of the group has a track.
+static bool GroupHasTrack(AnimElem *e, int gi)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    if (!g) return false;
+    for (int m = 0; m < g->propCount; m++)
+        if (AnimElemFindTrack(e, g->props[m])) return true;
+    return false;
+}
+
+// Write a group key at time t: every member gets a key there, seeded from the
+// element's current value at t (creating member tracks + a zero key as needed).
+static void GroupWriteKey(AnimElem *e, int gi, float t)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    if (!g) return;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        int prop = g->props[m];
+        AnimTrack *tr = AnimElemFindTrack(e, prop);
+        if (!tr) tr = AnimElemAddTrack(e, prop);
+        if (!tr) continue;
+        if (AnimPropIsColor(prop))
+        {
+            Color c = AnimElemColorProp(e, prop, t);
+            if (t > AUTOKEY_EPS) EnsureZeroColorKey(e, tr);
+            AnimTrackWriteColorKeyAt(tr, t, c, AUTOKEY_EPS);
+        }
+        else
+        {
+            float v = AnimElemProp(e, prop, t);
+            if (t > AUTOKEY_EPS) EnsureZeroKey(e, tr);
+            AnimTrackWriteKeyAt(tr, t, v, AUTOKEY_EPS);
+        }
+    }
+}
+
+// Remove every member track of a group.
+static void GroupDeleteTracks(AnimElem *e, int gi)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    if (!g) return;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        for (int i = 0; i < e->trackCount; i++)
+            if (e->tracks[i].prop == g->props[m]) { AnimElemRemoveTrack(e, i); break; }
+    }
+}
+
+// Remove the group key at time t (each member's key near t).
+static void GroupDeleteKeyAt(AnimElem *e, int gi, float t)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    if (!g) return;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+        for (int k = tr->keyCount - 1; k >= 0; k--)
+            if (fabsf(tr->keys[k].t - t) <= AUTOKEY_EPS) AnimTrackRemoveKey(tr, k);
+    }
+}
+
+// Move the group key from oldT to newT across every member.
+static void GroupMoveKeyTo(AnimElem *e, int gi, float oldT, float newT)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    if (!g) return;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+        for (int k = 0; k < tr->keyCount; k++)
+            if (fabsf(tr->keys[k].t - oldT) <= AUTOKEY_EPS)
+            { AnimTrackSetKeyTime(tr, k, newT); break; }
+    }
+}
+
+// Set the segment ease of a group key at time t on every member.
+static void GroupSetEaseAt(AnimElem *e, int gi, float t, int ease)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    if (!g) return;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+        for (int k = 0; k < tr->keyCount; k++)
+            if (fabsf(tr->keys[k].t - t) <= AUTOKEY_EPS) tr->keys[k].ease = ease;
+    }
+}
+
+// Resolve a group key (group gi at time t) to a representative member (track
+// index + key index): the first member with a key near t. False if none. Used
+// to point the existing (selKeyTrack, selKeyIdx) selection at a group key.
+static bool GroupRepKey(AnimElem *e, int gi, float t, int *trackIdx, int *keyIdx)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    if (!g) return false;
+    for (int m = 0; m < g->propCount; m++)
+        for (int i = 0; i < e->trackCount; i++)
+        {
+            if (e->tracks[i].prop != g->props[m]) continue;
+            for (int k = 0; k < e->tracks[i].keyCount; k++)
+                if (fabsf(e->tracks[i].keys[k].t - t) <= AUTOKEY_EPS)
+                { *trackIdx = i; *keyIdx = k; return true; }
+        }
+    return false;
+}
+
+// The group index + time of the current key selection on element e, or gi=-1.
+static int SelectedGroup(AnimElem *e, float *tOut)
+{
+    if (selKeyElem != selElem || selKeyTrack < 0 || selKeyTrack >= e->trackCount)
+        return -1;
+    if (selKeyIdx < 0 || selKeyIdx >= e->tracks[selKeyTrack].keyCount) return -1;
+    if (tOut) *tOut = e->tracks[selKeyTrack].keys[selKeyIdx].t;
+    return AnimGroupIndexOfProp(e->kind, e->tracks[selKeyTrack].prop);
+}
+
+// Point the key selection at the group key (gi, t) via its representative member.
+static void SelectGroupKey(int elem, int gi, float t)
+{
+    AnimElem *e = &doc.elems[elem];
+    int ti, ki;
+    if (GroupRepKey(e, gi, t, &ti, &ki)) SelectKey(elem, ti, ki);
+}
+
+// Index of the key at time t on a track (within eps), or -1.
+static int TrackKeyNear(const AnimTrack *tr, float t)
+{
+    if (!tr) return -1;
+    for (int k = 0; k < tr->keyCount; k++)
+        if (fabsf(tr->keys[k].t - t) <= AUTOKEY_EPS) return k;
+    return -1;
+}
+
+// Compact one-line summary of a group key at time t: "t   v0,v1,..   ease".
+// Scalar members show their value; colour members a #RRGGBB hex.
+static const char *GroupKeyLabel(AnimElem *e, int gi, float t)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    char vals[80]; vals[0] = 0;
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        int prop = g->props[m];
+        const char *one;
+        if (AnimPropIsColor(prop))
+        {
+            Color c = AnimElemColorProp(e, prop, t);
+            one = TextFormat("#%02X%02X%02X", c.r, c.g, c.b);
+        }
+        else one = TextFormat("%.2f", AnimElemProp(e, prop, t));
+        if (m) strncat(vals, ",", sizeof(vals)-strlen(vals)-1);
+        strncat(vals, one, sizeof(vals)-strlen(vals)-1);
+    }
+    int ti, ki, ease = 0;
+    if (GroupRepKey(e, gi, t, &ti, &ki)) ease = e->tracks[ti].keys[ki].ease;
+    return TextFormat("%.2f   %s   %s", t, vals, AnimEaseName(ease));
+}
+
+// The colour member prop of a group (fill/outline/fade colour), or -1.
+static int GroupColorProp(int kind, int gi)
+{
+    const AnimPropGroup *g = AnimGroupAt(kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+        if (AnimPropIsColor(g->props[m])) return g->props[m];
+    return -1;
+}
+
+// Corner-mode geometry rows for a shape: two opposite corners (P0/P1), or for a
+// line its two endpoints (Start/End). Values are canvas FRACTIONS (like
+// position) regardless of the size units; on edit they are converted back to the
+// stored center+size (and, for a line, length + rotation) via WritePropValue, so
+// tracked props still auto-key. Returns the new y.
+static float DrawCornerRows(float x, float y, float w, float rh, float gap, AnimElem *e)
+{
+    Vector2 game = ScreenStateTargetSize();
+    float lo = -3.0f, hi = 3.0f;                 // generous off-canvas reach for endpoints
+    // Two side-by-side x/y sliders, each with room for its value label so the
+    // first slider's value/double-click region doesn't overlap the second.
+    float valW = 48.0f;                          // TEXT_PADDING(4) + 44 value slot
+    float half = (w - 44 - gap - 2*valW) * 0.5f;
+    float x2   = x + 44 + half + valW + gap;     // second slider's x origin
+    float cx = AnimElemProp(e, AP_S_POS_X, playhead);
+    float cy = AnimElemProp(e, AP_S_POS_Y, playhead);
+    float wv = AnimElemProp(e, AP_S_W,     playhead);
+    float wUnit = e->sizeAbsolute ? 1.0f : game.x;
+    // The renderer multiplies every extent by AP_S_SCALE, so the on-screen
+    // endpoints reflect the SCALED size. Show/edit those scaled positions
+    // (WYSIWYG) and divide the scale back out when storing the base size.
+    float sc = AnimElemProp(e, AP_S_SCALE, playhead);
+    float invSc = sc > 1e-6f ? 1.0f/sc : 1.0f;
+
+    // Endpoints follow the element's size units: canvas FRACTIONS in % mode
+    // (resize-invariant, like position), absolute PIXELS in px mode. Internally
+    // position is always a fraction, so we display frac*scale and divide back.
+    float sx = e->sizeAbsolute ? game.x : 1.0f;
+    float sy = e->sizeAbsolute ? game.y : 1.0f;
+    float loX = lo*sx, hiX = hi*sx, loY = lo*sy, hiY = hi*sy;
+
+    if (e->shapeKind == SHAPE_LINE)
+    {
+        // endpoints = center +/- half-length, projected per-axis (x via the width
+        // reference, y via the height reference) so they are true canvas fractions
+        // in % mode and absolute pixels in px mode - matching DrawShapeElem exactly.
+        float hUnit = e->sizeAbsolute ? 1.0f : game.y;
+        float rot = AnimElemProp(e, AP_S_ROT, playhead) * DEG2RAD;
+        float wEff = wv * sc;                                  // rendered (scaled) length
+        float ox = (wUnit * wEff * 0.5f) * cosf(rot) / game.x; // endpoint x frac offset
+        float oy = (hUnit * wEff * 0.5f) * sinf(rot) / game.y; // endpoint y frac offset
+        float ax = (cx - ox)*sx, ay = (cy - oy)*sy, bx = (cx + ox)*sx, by = (cy + oy)*sy;
+        bool ch = false;
+        GuiLabel((Rectangle){ x, y, 44, rh }, "start");
+        if (EditSlider((Rectangle){ x+44, y, half, rh }, "x", &ax, loX, hiX)) ch = true;
+        if (EditSlider((Rectangle){ x2, y, half, rh }, "y", &ay, loY, hiY)) ch = true;
+        y += rh + gap;
+        GuiLabel((Rectangle){ x, y, 44, rh }, "end");
+        if (EditSlider((Rectangle){ x+44, y, half, rh }, "x", &bx, loX, hiX)) ch = true;
+        if (EditSlider((Rectangle){ x2, y, half, rh }, "y", &by, loY, hiY)) ch = true;
+        y += rh + gap;
+        if (ch)
+        {
+            float axF = ax/sx, ayF = ay/sy, bxF = bx/sx, byF = by/sy;
+            // unit-space deltas: fractions in % mode, pixels in px mode.
+            float dux = (bxF - axF) * game.x / wUnit;
+            float duy = (byF - ayF) * game.y / hUnit;
+            float lenFull = hypotf(dux, duy);        // rendered length in element units
+            WritePropValue(e, AP_S_POS_X, (axF + bxF) * 0.5f, &e->posFrac.x);
+            WritePropValue(e, AP_S_POS_Y, (ayF + byF) * 0.5f, &e->posFrac.y);
+            WritePropValue(e, AP_S_W, lenFull * invSc, &e->sizeFrac.x);  // base = rendered / scale
+            WritePropValue(e, AP_S_ROT, atan2f(duy, dux) * RAD2DEG, &e->rotBase);
+        }
+    }
+    else
+    {
+        float hv = AnimElemProp(e, AP_S_H, playhead);
+        float hUnit = e->sizeAbsolute ? 1.0f : game.y;
+        // scaled (rendered) half-extents, so the corner handles sit on screen.
+        float hxF = (wUnit*wv*sc/game.x) * 0.5f, hyF = (hUnit*hv*sc/game.y) * 0.5f;
+        float x0 = (cx-hxF)*sx, y0 = (cy-hyF)*sy, x1 = (cx+hxF)*sx, y1 = (cy+hyF)*sy;
+        bool ch = false;
+        GuiLabel((Rectangle){ x, y, 44, rh }, "P0");
+        if (EditSlider((Rectangle){ x+44, y, half, rh }, "x", &x0, loX, hiX)) ch = true;
+        if (EditSlider((Rectangle){ x2, y, half, rh }, "y", &y0, loY, hiY)) ch = true;
+        y += rh + gap;
+        GuiLabel((Rectangle){ x, y, 44, rh }, "P1");
+        if (EditSlider((Rectangle){ x+44, y, half, rh }, "x", &x1, loX, hiX)) ch = true;
+        if (EditSlider((Rectangle){ x2, y, half, rh }, "y", &y1, loY, hiY)) ch = true;
+        y += rh + gap;
+        if (ch)
+        {
+            float x0F = x0/sx, y0F = y0/sy, x1F = x1/sx, y1F = y1/sy;
+            float wF = fabsf(x1F-x0F), hF = fabsf(y1F-y0F);
+            WritePropValue(e, AP_S_POS_X, (x0F+x1F)*0.5f, &e->posFrac.x);
+            WritePropValue(e, AP_S_POS_Y, (y0F+y1F)*0.5f, &e->posFrac.y);
+            WritePropValue(e, AP_S_W, (e->sizeAbsolute ? wF*game.x : wF) * invSc, &e->sizeFrac.x);
+            WritePropValue(e, AP_S_H, (e->sizeAbsolute ? hF*game.y : hF) * invSc, &e->sizeFrac.y);
+        }
+    }
+    return y;
+}
+
+// ---------------------------------------------------------------------------
 //  Right panel: inspector for the primary selection.
 // ---------------------------------------------------------------------------
 static float DrawInspector(float x, float y, float w)   // returns content height
 {
     float y0 = y;
-    GuiLabel((Rectangle){ x, y, w, 20 }, "INSPECTOR"); y += 24;
+    GuiLabel((Rectangle){ x+16, y, w-16, 20 }, "INSPECTOR"); y += 24;
     if (selElem < 0 || selElem >= doc.elemCount)
     {
         GuiLabel((Rectangle){ x, y, w, 20 }, "(no element selected)");
@@ -945,20 +1373,77 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
     if (e->kind != AE_GLOBAL)
     {
         bool isText = e->kind == AE_TEXT;
-        PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_POS_X : AP_S_POS_X, &e->posFrac.x);
-        GuiLabel((Rectangle){ x, y, 44, rh }, "posX"); y += rh + gap;
-        PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_POS_Y : AP_S_POS_Y, &e->posFrac.y);
-        GuiLabel((Rectangle){ x, y, 44, rh }, "posY"); y += rh + gap;
-        PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_SIZE : AP_S_W, &e->sizeFrac.x);
-        GuiLabel((Rectangle){ x, y, 44, rh }, isText ? "size" : "w"); y += rh + gap;
+
+        // units: size in canvas fractions (default) vs absolute pixels. Flipping
+        // rescales the base fields + size keys so the shape looks unchanged.
+        GuiLabel((Rectangle){ x, y, 44, rh }, "units");
+        float uw = (w - 44 - 4) / 2.0f;
+        bool wantFrac = !e->sizeAbsolute, wantAbs = e->sizeAbsolute;
+        GuiToggle((Rectangle){ x+44, y, uw, rh }, "% canvas", &wantFrac);
+        GuiToggle((Rectangle){ x+44+uw+4, y, uw, rh }, "px abs", &wantAbs);
+        if (e->sizeAbsolute && wantFrac)      // px -> fraction
+        { UndoPush(); ConvertSizeUnits(e, false); e->sizeAbsolute = false; }
+        else if (!e->sizeAbsolute && wantAbs) // fraction -> px
+        { UndoPush(); ConvertSizeUnits(e, true);  e->sizeAbsolute = true; }
+        y += rh + gap;
+
+        // anchor mode (shapes only): author by center+size or by two corners.
         if (e->kind == AE_SHAPE)
         {
+            GuiLabel((Rectangle){ x, y, 44, rh }, "anchor");
+            float aw = (w - 44 - 4) / 2.0f;
+            bool wantCtr = !e->cornerMode, wantCor = e->cornerMode;
+            GuiToggle((Rectangle){ x+44, y, aw, rh }, "center+size", &wantCtr);
+            GuiToggle((Rectangle){ x+44+aw+4, y, aw, rh }, "corners", &wantCor);
+            if (e->cornerMode && wantCtr)      { UndoPush(); e->cornerMode = false; }
+            else if (!e->cornerMode && wantCor){ UndoPush(); e->cornerMode = true; }
+            y += rh + gap;
+        }
+
+        // position + geometry: corner mode swaps the pos/size rows for the two
+        // corner (or line-endpoint) rows; storage stays center+size either way.
+        if (e->kind == AE_SHAPE && e->cornerMode)
+        {
+            y = DrawCornerRows(x, y, w, rh, gap, e);
+            if (e->shapeKind != SHAPE_LINE)
+            {
+                PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_SCALE, &e->scaleFrac);
+                GuiLabel((Rectangle){ x, y, 44, rh }, "scale"); y += rh + gap;
+            }
+        }
+        else
+        {
+            PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_POS_X : AP_S_POS_X, &e->posFrac.x);
+            GuiLabel((Rectangle){ x, y, 44, rh }, "posX"); y += rh + gap;
+            PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_POS_Y : AP_S_POS_Y, &e->posFrac.y);
+            GuiLabel((Rectangle){ x, y, 44, rh }, "posY"); y += rh + gap;
+            PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_SIZE : AP_S_W, &e->sizeFrac.x);
+            GuiLabel((Rectangle){ x, y, 44, rh }, isText ? "size" : (e->shapeKind==SHAPE_LINE?"length":"w")); y += rh + gap;
+            if (e->kind == AE_SHAPE)
+            {
+                PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_H, &e->sizeFrac.y);
+                GuiLabel((Rectangle){ x, y, 44, rh }, e->shapeKind==SHAPE_LINE?"thick":"h"); y += rh + gap;
+                // uniform multiplier over w/h: the single control for growing a
+                // shape without keeping the two axes in proportion by hand.
+                PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_SCALE, &e->scaleFrac);
+                GuiLabel((Rectangle){ x, y, 44, rh }, "scale"); y += rh + gap;
+            }
+        }
+
+        // thickness row for a line in corner mode (its 'h'), which the corner
+        // rows do not cover.
+        if (e->kind == AE_SHAPE && e->cornerMode && e->shapeKind == SHAPE_LINE)
+        {
             PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_H, &e->sizeFrac.y);
-            GuiLabel((Rectangle){ x, y, 44, rh }, "h"); y += rh + gap;
-            // uniform multiplier over w/h: the single control for growing a
-            // shape without keeping the two axes in proportion by hand.
-            PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_SCALE, &e->scaleFrac);
-            GuiLabel((Rectangle){ x, y, 44, rh }, "scale"); y += rh + gap;
+            GuiLabel((Rectangle){ x, y, 44, rh }, "thick"); y += rh + gap;
+        }
+
+        // rest-pose rotation (both text and shapes). In line corner mode the
+        // rotation is implied by the endpoints, so the row is hidden there.
+        if (!(e->kind == AE_SHAPE && e->cornerMode && e->shapeKind == SHAPE_LINE))
+        {
+            PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_ROT : AP_S_ROT, &e->rotBase);
+            GuiLabel((Rectangle){ x, y, 44, rh }, "rot"); y += rh + gap;
         }
     }
 
@@ -1002,87 +1487,52 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         y += 22;
     }
 
-    // --- tracks list: every track and ALL of its keys, always visible --------
+    // --- tracks list: one row per GROUP (Position, Color, ...) with ALL of its
+    // keys, always visible. A group key spans every member prop at that time.
     GuiLine((Rectangle){ x, y, w, 8 }, "tracks"); y += 12;
-    // deletion is deferred past the loop: removing mid-draw shifts the array
-    // and re-draws the next track's del button on the same rect this frame,
-    // which re-fires and cascade-deletes.
-    int pendingTrackDel = -1;
-    for (int j = 0; j < e->trackCount; j++)
+    // which group + time is selected (derived from the representative member key)
+    float selT = 0.0f;
+    int   selG = SelectedGroup(e, &selT);
+
+    int pendingGroupDel = -1;
+    int grpN = AnimGroupCountFor(e->kind);
+    for (int gi = 0; gi < grpN; gi++)
     {
-        AnimTrack *tr = &e->tracks[j];
-        GuiLabel((Rectangle){ x, y, w-106, rh },
-                 TextFormat("%s (%d)", AnimPropName(tr->prop), tr->keyCount));
-        // explicit keying path (works with auto-key off): key at the playhead.
+        if (!GroupHasTrack(e, gi)) continue;       // only groups that have tracks
+        const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+        float times[GROUP_TIMES_MAX];
+        int   nt = GroupKeyTimes(e, gi, times);
+
+        GuiLabel((Rectangle){ x, y, w-106, rh }, TextFormat("%s (%d)", g->name, nt));
+        // +key: one keyframe across every member of the group at the playhead.
         if (GuiButton((Rectangle){ x+w-102, y, 50, rh }, "+key"))
         {
             AudioPlayButton(); UndoPush();
-            AnimKey *k;
-            if (AnimPropIsColor(tr->prop))
-            {
-                Color c = AnimElemColorProp(e, tr->prop, playhead);
-                if (playhead > AUTOKEY_EPS) EnsureZeroColorKey(e, tr);
-                k = AnimTrackWriteColorKeyAt(tr, playhead, c, AUTOKEY_EPS);
-            }
-            else
-            {
-                float v = AnimElemProp(e, tr->prop, playhead);
-                if (playhead > AUTOKEY_EPS) EnsureZeroKey(e, tr);
-                k = AnimTrackWriteKeyAt(tr, playhead, v, AUTOKEY_EPS);
-            }
-            if (k) SelectKey(selElem, j, (int)(k - tr->keys));
+            GroupWriteKey(e, gi, playhead);
+            SelectGroupKey(selElem, gi, playhead);
         }
         if (GuiButton((Rectangle){ x+w-48, y, 48, rh }, "del"))
-        {
-            AudioPlayButton(); UndoPush();
-            pendingTrackDel = j;
-        }
+        { AudioPlayButton(); UndoPush(); pendingGroupDel = gi; }
         y += rh + 2;
 
-        // key rows: "t  value  ease" - click to select (same as the timeline).
-        // The two keys bracketing the playhead (= the ones being lerped right
-        // now) carry a warm tint so it's clear which keys are in effect.
-        int segA = -1, segB = -1;
-        AnimTrackSegment(tr, playhead, &segA, &segB);
-        for (int k = 0; k < tr->keyCount; k++)
+        int colorProp = GroupColorProp(e->kind, gi);
+        for (int i = 0; i < nt; i++)
         {
-            bool sel = (selKeyElem == selElem && selKeyTrack == j && selKeyIdx == k);
-            bool lerping = (k == segA || k == segB);
+            float t = times[i];
+            bool sel = (selG == gi && fabsf(selT - t) <= AUTOKEY_EPS);
             Rectangle kr = { x+12, y, w-12, 18 };
-            const char *label = AnimPropIsColor(tr->prop)
-                ? TextFormat("%.2f   #%02X%02X%02X   %s", tr->keys[k].t,
-                             tr->keys[k].cval.r, tr->keys[k].cval.g,
-                             tr->keys[k].cval.b,
-                             AnimEaseName(tr->keys[k].ease))
-                : TextFormat("%.2f   %.2f   %s", tr->keys[k].t,
-                             tr->keys[k].value, AnimEaseName(tr->keys[k].ease));
-            bool pressed = GuiButton(kr, label);
-            // markers AFTER the button (raygui paints its own background)
-            if (sel)     DrawRectangleRec(kr, (Color){ 60, 90, 140, 120 });
-            if (lerping)
+            bool pressed = GuiButton(kr, GroupKeyLabel(e, gi, t));
+            if (sel) DrawRectangleRec(kr, (Color){ 60, 90, 140, 120 });
+            if (colorProp >= 0)
             {
-                DrawRectangleRec(kr, (Color){ 255, 210, 90, 40 });
-                DrawRectangleRec((Rectangle){ kr.x, kr.y, 3, kr.height },
-                                 (Color){ 255, 210, 90, 255 });
-            }
-            if (AnimPropIsColor(tr->prop))
-            {
-                Color sc = tr->keys[k].cval; sc.a = 255;
+                Color sc = AnimElemColorProp(e, colorProp, t); sc.a = 255;
                 DrawSwatch((Rectangle){ kr.x + kr.width - 18, kr.y + 2, 14, 14 }, sc);
             }
-            if (pressed)
-            {
-                AudioPlayButton();
-                SelectKey(selElem, j, k);
-            }
-            // a timeline click asked to reveal this key: nudge the scroll so
-            // the row sits inside the panel (applies next frame).
+            if (pressed) { AudioPlayButton(); SelectGroupKey(selElem, gi, t); }
             if (sel && scrollToSelKey)
             {
                 float top = inspPanelRect.y + 24.0f;
                 float bot = inspPanelRect.y + inspPanelRect.height - 24.0f;
-                // nudge the OWNING view (PanelScroll re-clamps it next frame);
-                // writing a mirror copy here would just be overwritten.
                 if (kr.y < top)                    inspView.scroll += top - kr.y;
                 else if (kr.y + kr.height > bot)   inspView.scroll -= (kr.y + kr.height) - bot;
                 scrollToSelKey = false;
@@ -1091,55 +1541,28 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         }
         y += 4;
     }
-    if (pendingTrackDel >= 0)
+    if (pendingGroupDel >= 0)
     {
-        AnimElemRemoveTrack(e, pendingTrackDel);
-        // keep the key selection pointing at the same track after the shift
-        if (selKeyElem == selElem)
-        {
-            if (selKeyTrack == pendingTrackDel)     ClearKeySelection();
-            else if (selKeyTrack > pendingTrackDel) selKeyTrack--;
-        }
+        if (selG == pendingGroupDel) ClearKeySelection();
+        GroupDeleteTracks(e, pendingGroupDel);
         ClampSelection();
     }
 
-    // add-track dropdown (built from the element kind's valid props)
+    // add-track dropdown, now GROUP based: adding creates all member tracks.
     y += 4;
-    int propCount = AnimPropCountFor(e->kind);
-    if (addTrackSel >= propCount) addTrackSel = 0;   // kinds differ in count
+    int addCount = AnimGroupCountFor(e->kind);
+    if (addTrackSel >= addCount) addTrackSel = 0;   // kinds differ in count
     Rectangle addR = { x, y, w-56, rh };
     if (GuiButton((Rectangle){ x+w-52, y, 52, rh }, "+track"))
     {
         AudioPlayButton(); UndoPush();
-        int prop = AnimPropAt(e->kind, addTrackSel);
-        // seed the START key at t=0, and - when the scrubber sits later on the
-        // clock - a second key right at the playhead, ready to edit.
-        AnimTrack *tr = AnimElemAddTrack(e, prop);
-        if (tr && AnimPropIsColor(prop))
-        {
-            Color c = AnimElemColorProp(e, prop, playhead);
-            EnsureZeroColorKey(e, tr);
-            if (playhead > AUTOKEY_EPS)
-            {
-                AnimKey *k = AnimTrackWriteColorKeyAt(tr, playhead, c, AUTOKEY_EPS);
-                if (k) SelectKey(selElem, e->trackCount - 1, (int)(k - tr->keys));
-            }
-        }
-        else if (tr)
-        {
-            float v = AnimElemProp(e, prop, playhead);
-            EnsureZeroKey(e, tr);
-            if (playhead > AUTOKEY_EPS)
-            {
-                AnimKey *k = AnimTrackWriteKeyAt(tr, playhead, v, AUTOKEY_EPS);
-                if (k) SelectKey(selElem, e->trackCount - 1, (int)(k - tr->keys));
-            }
-        }
+        GroupWriteKey(e, addTrackSel, playhead);    // seeds zero + playhead keys
+        SelectGroupKey(selElem, addTrackSel, playhead);
     }
     // dropdown HEADER only - the open list is drawn last as an overlay so it
     // can flip above the header instead of being culled at the screen bottom.
-    if (GuiButton(addR, TextFormat("%s  v",
-                  AnimPropName(AnimPropAt(e->kind, addTrackSel)))))
+    const AnimPropGroup *addG = AnimGroupAt(e->kind, addTrackSel);
+    if (GuiButton(addR, TextFormat("%s  v", addG ? addG->name : "?")))
     {
         AudioPlayButton();
         addTrackDrop = (addTrackDrop == selElem) ? -1 : selElem;
@@ -1148,19 +1571,18 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
     addTrackRect = addR; addTrackVisible = true;
     y += rh + 10;
 
-    // --- key inspector: the selected timeline diamond's t / value / ease ----
+    // --- key inspector: the selected GROUP key's time / per-member values / ease
     // (skipped while the add-track dropdown is open - it would draw over us)
     keyEaseVisible = false;
-    if (addTrackDrop != selElem && selKeyElem == selElem &&
-        selKeyTrack >= 0 && selKeyTrack < e->trackCount &&
-        selKeyIdx   >= 0 && selKeyIdx   < e->tracks[selKeyTrack].keyCount)
+    float kt = 0.0f;
+    int   kg = (addTrackDrop != selElem) ? SelectedGroup(e, &kt) : -1;
+    if (kg >= 0)
     {
-        AnimTrack *tr = &e->tracks[selKeyTrack];
-        GuiLine((Rectangle){ x, y, w, 8 },
-                TextFormat("key  %s #%d", AnimPropName(tr->prop), selKeyIdx));
+        const AnimPropGroup *g = AnimGroupAt(e->kind, kg);
+        GuiLine((Rectangle){ x, y, w, 8 }, TextFormat("key  %s  @%.2f", g->name, kt));
         y += 12;
 
-        // time: textbox commits on toggle-off (parse, clamp, resort)
+        // time: moves the WHOLE group key (every member) on commit.
         GuiLabel((Rectangle){ x, y, 44, rh }, "time");
         if (GuiTextBox((Rectangle){ x+44, y, w-44, rh }, keyTimeBuf,
                        sizeof(keyTimeBuf), edKeyTime))
@@ -1171,40 +1593,45 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
                 float nt = (float)atof(keyTimeBuf);
                 if (nt < 0) nt = 0; if (nt > doc.duration) nt = doc.duration;
                 UndoPush();
-                selKeyIdx = AnimTrackSetKeyTime(tr, selKeyIdx, nt);
-                SelectKey(selKeyElem, selKeyTrack, selKeyIdx);
+                GroupMoveKeyTo(e, kg, kt, nt);
+                SelectGroupKey(selElem, kg, nt);
             }
         }
         y += rh + gap;
 
-        // value: colour keys get RGBA sliders + swatch, scalar keys one slider
-        AnimKey *k = &tr->keys[selKeyIdx];
-        if (AnimPropIsColor(tr->prop))
+        // one editor per member prop (Position -> x & y; Color -> RGB + alpha).
+        for (int m = 0; m < g->propCount; m++)
         {
-            GuiLabel((Rectangle){ x, y, w-24, rh }, "value (rgb)");
-            DrawSwatch((Rectangle){ x+w-20, y+3, 18, 18 },
-                       (Color){ k->cval.r, k->cval.g, k->cval.b, 255 });
-            y += rh;
-            float kr=k->cval.r, kg=k->cval.g, kb=k->cval.b;
-            bool ch = false;
-            if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "R", &kr, 0,255)) ch=true; y+=18;
-            if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "G", &kg, 0,255)) ch=true; y+=18;
-            if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "B", &kb, 0,255)) ch=true; y+=22;
-            if (ch) k->cval = (Color){ (unsigned char)kr,(unsigned char)kg,
-                                       (unsigned char)kb, 255 };
-        }
-        else
-        {
-            GuiLabel((Rectangle){ x, y, 44, rh }, "value");
-            float v = k->value;
-            if (EditSlider((Rectangle){ x+44, y, w-44-50, rh }, "", &v,
-                           AnimPropMin(tr->prop), AnimPropMax(tr->prop)))
-                k->value = v;
-            y += rh + gap;
+            int prop = g->props[m];
+            AnimTrack *tr = AnimElemFindTrack(e, prop);
+            int ki = TrackKeyNear(tr, kt);
+            if (ki < 0) continue;                    // ragged: member has no key here
+            AnimKey *k = &tr->keys[ki];
+            if (AnimPropIsColor(prop))
+            {
+                GuiLabel((Rectangle){ x, y, w-24, rh },
+                         TextFormat("%s (rgb)", AnimPropName(prop)));
+                DrawSwatch((Rectangle){ x+w-20, y+3, 18, 18 },
+                           (Color){ k->cval.r, k->cval.g, k->cval.b, 255 });
+                y += rh;
+                float kr=k->cval.r, kg2=k->cval.g, kb=k->cval.b; bool ch=false;
+                if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "R", &kr, 0,255)) ch=true; y+=18;
+                if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "G", &kg2,0,255)) ch=true; y+=18;
+                if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "B", &kb, 0,255)) ch=true; y+=20;
+                if (ch) k->cval = (Color){ (unsigned char)kr,(unsigned char)kg2,
+                                           (unsigned char)kb, 255 };
+            }
+            else
+            {
+                GuiLabel((Rectangle){ x, y, 44, rh }, AnimPropName(prop));
+                float v = k->value, klo, khi; PropRange(e, prop, &klo, &khi);
+                if (EditSlider((Rectangle){ x+44, y, w-44-50, rh }, "", &v, klo, khi))
+                    k->value = v;
+                y += rh + gap;
+            }
         }
 
-        // ease dropdown header; its open list is drawn last as an overlay that
-        // flips above the header when there is no room below.
+        // ease dropdown header (applies to every member); its list is an overlay.
         GuiLabel((Rectangle){ x, y, 44, rh }, "ease");
         keyEaseRect = (Rectangle){ x+44, y, w-44-54, rh };
         keyEaseVisible = true;
@@ -1217,7 +1644,7 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         if (GuiButton((Rectangle){ x+w-50, y, 50, rh }, "del"))
         {
             AudioPlayButton(); UndoPush();
-            AnimTrackRemoveKey(tr, selKeyIdx);
+            GroupDeleteKeyAt(e, kg, kt);
             ClearKeySelection();
             ClampSelection();
         }
@@ -1240,7 +1667,7 @@ static void DrawDropdownOverlays()
     ScreenState *ss = ScreenStateGet();
     float H = (float)ss->height;
     Rectangle hdr = easeMode ? keyEaseRect : addTrackRect;
-    int count = easeMode ? AnimEaseCount() : AnimPropCountFor(doc.elems[selElem].kind);
+    int count = easeMode ? AnimEaseCount() : AnimGroupCountFor(doc.elems[selElem].kind);
     int cur   = easeMode ? keyEaseSel : addTrackSel;
 
     float ih = 20.0f, listH = ih * count;
@@ -1256,8 +1683,8 @@ static void DrawDropdownOverlays()
     for (int i = 0; i < count; i++)
     {
         Rectangle rr = { bg.x, bg.y + i*ih, bg.width, ih };
-        const char *nm = easeMode ? AnimEaseName(i)
-                                  : AnimPropName(AnimPropAt(doc.elems[selElem].kind, i));
+        const AnimPropGroup *gg = easeMode ? NULL : AnimGroupAt(doc.elems[selElem].kind, i);
+        const char *nm = easeMode ? AnimEaseName(i) : (gg ? gg->name : "?");
         if (GuiButton(rr, nm)) picked = i;
         if (i == cur) DrawRectangleRec(rr, (Color){ 90, 140, 220, 60 });
     }
@@ -1269,7 +1696,10 @@ static void DrawDropdownOverlays()
         {
             UndoPush();
             keyEaseSel = picked;
-            doc.elems[selKeyElem].tracks[selKeyTrack].keys[selKeyIdx].ease = picked;
+            // apply the ease to every member of the selected group key.
+            AnimElem *se = &doc.elems[selKeyElem];
+            float et; int eg = SelectedGroup(se, &et);
+            if (eg >= 0) GroupSetEaseAt(se, eg, et, picked);
             keyEaseDropOpen = false;
         }
         else { addTrackSel = picked; addTrackDrop = -1; }
@@ -1573,7 +2003,7 @@ static void DrawLibraryModal()
 static float DrawSignalList(float x, float y, float w)
 {
     float y0 = y, rh = 26.0f, gap = 4.0f;
-    GuiLabel((Rectangle){ x, y, w, 20 }, "SIGNALS"); y += 22;
+    GuiLabel((Rectangle){ x+16, y, w-16, 20 }, "SIGNALS"); y += 22;
 
     int pendingDel = -1;
     float bw2 = 22.0f;
@@ -2026,8 +2456,10 @@ static void DrawTimeline(float x, float y, float w, float h)
 {
     bool thin = h < 60.0f;
     Rectangle bar = { x, y, w, h };
-    DrawRectangleRec(bar, (Color){ 24, 26, 30, 255 });
+    DrawRectangleRec(bar, Fade((Color){ 24, 26, 30, 255 }, PanelAlpha(timelineAlphaMode) / 255.0f));
     DrawRectangleLinesEx(bar, 1.0f, (Color){ 70, 74, 84, 255 });
+    // transparency toggle at the timeline's top-left corner
+    if (!thin) DrawPanelAlphaToggle(x + 4, y + 4, &timelineAlphaMode, guiLocked);
 
     float dur = doc.duration > 0 ? doc.duration : 1.0f;
     // left gutter holds the per-track property labels so t=0 diamonds are not
@@ -2068,45 +2500,54 @@ static void DrawTimeline(float x, float y, float w, float h)
     if (!thin && selElem >= 0 && selElem < doc.elemCount)
     {
         AnimElem *e = &doc.elems[selElem];
-        if (e->trackCount == 0)
+        // one lane per GROUP that has tracks; a diamond per union key time.
+        int vis[16], vn = 0, grpN = AnimGroupCountFor(e->kind);
+        for (int gi = 0; gi < grpN && vn < 16; gi++)
+            if (GroupHasTrack(e, gi)) vis[vn++] = gi;
+        if (vn == 0)
             DrawText("(no tracks - add one in the inspector to key frames)",
                      (int)(x + w*0.5f - 130), (int)(y + h*0.5f - 5), 10,
                      (Color){ 110, 116, 128, 255 });
-        float rowH = (h - 24) / (float)(e->trackCount > 0 ? e->trackCount : 1);
-        for (int j = 0; j < e->trackCount; j++)
+        float selT = 0.0f;
+        int   selG = SelectedGroup(e, &selT);
+        float rowH = (h - 24) / (float)(vn > 0 ? vn : 1);
+        for (int r0 = 0; r0 < vn; r0++)
         {
-            AnimTrack *tr = &e->tracks[j];
-            float ry = y + 4 + j*rowH + rowH*0.5f;
-            // alternating lane backgrounds + a baseline so tracks read as rows
-            if (j & 1)
-                DrawRectangleRec((Rectangle){ x+1, y+4 + j*rowH, w-2, rowH },
+            int gi = vis[r0];
+            const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+            float ry = y + 4 + r0*rowH + rowH*0.5f;
+            if (r0 & 1)
+                DrawRectangleRec((Rectangle){ x+1, y+4 + r0*rowH, w-2, rowH },
                                  (Color){ 255, 255, 255, 6 });
             DrawLine((int)trackLeft, (int)ry, (int)(x+w-padR), (int)ry,
                      (Color){ 45, 48, 56, 255 });
-            DrawText(AnimPropName(tr->prop), (int)x+2, (int)ry-5, 10, (Color){130,136,148,255});
-            for (int k = 0; k < tr->keyCount; k++)
+            DrawText(g ? g->name : "?", (int)x+2, (int)ry-5, 10, (Color){130,136,148,255});
+
+            int colorProp = GroupColorProp(e->kind, gi);
+            float times[GROUP_TIMES_MAX];
+            int   nt = GroupKeyTimes(e, gi, times);
+            for (int i = 0; i < nt; i++)
             {
-                float kx = T2X(tr->keys[k].t);
-                // generous hit box - diamonds are small targets otherwise.
+                float t = times[i];
+                float kx = T2X(t);
                 Rectangle hit = { kx-10, ry-10, 20, 20 };
                 bool hot = CheckCollisionPointRec(mouse, hit);
-                bool sel = (selKeyElem == selElem && selKeyTrack == j && selKeyIdx == k);
+                bool sel = (selG == gi && fabsf(selT - t) <= AUTOKEY_EPS);
                 float r = hot ? 9.0f : 7.0f;
-                // outline ring underneath: amber = selected, white = hover
                 Color ring = sel ? (Color){255,210,90,255}
                            : hot ? (Color){255,255,255,255} : (Color){15,16,20,255};
-                Color fill = AnimPropIsColor(tr->prop)
-                           ? (Color){ tr->keys[k].cval.r, tr->keys[k].cval.g,
-                                      tr->keys[k].cval.b, 255 }
-                           : sel ? (Color){255,255,255,255} : (Color){120,180,240,255};
+                Color fill;
+                if (colorProp >= 0)
+                { Color c = AnimElemColorProp(e, colorProp, t); fill = (Color){c.r,c.g,c.b,255}; }
+                else fill = sel ? (Color){255,255,255,255} : (Color){120,180,240,255};
                 DrawDiamond(kx, ry, r + 2.0f, ring);
                 DrawDiamond(kx, ry, r, fill);
 
                 if (hot && press)
                 {
                     UndoPush();                       // once per drag gesture
-                    dragKeyElem = selElem; dragKeyTrack = j; dragKeyIdx = k;
-                    SelectKey(selElem, j, k);
+                    dragKeyElem = selElem; dragKeyGroup = gi; dragKeyTime = t;
+                    SelectGroupKey(selElem, gi, t);
                     scrollToSelKey = true;            // reveal it in the inspector
                     keyHit = true;
                 }
@@ -2164,15 +2605,16 @@ static void DrawTimeline(float x, float y, float w, float h)
         ClearKeySelection();
     }
 
-    if (dragKeyElem >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+    if (dragKeyElem >= 0 && dragKeyGroup >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
     {
-        // continuous drag: the key keeps following the mouse; SetKeyTime keeps
-        // the track sorted and hands back the key's new index every frame.
-        AnimTrack *tr = &doc.elems[dragKeyElem].tracks[dragKeyTrack];
+        // continuous drag: the whole GROUP key follows the mouse - every member
+        // key moves together so pos_x/pos_y (etc.) stay locked at one time.
+        AnimElem *de = &doc.elems[dragKeyElem];
         float nt = X2T(mouse.x);
         if (nt < 0) nt = 0; if (nt > dur) nt = dur;
-        dragKeyIdx = AnimTrackSetKeyTime(tr, dragKeyIdx, nt);
-        selKeyIdx  = dragKeyIdx;
+        GroupMoveKeyTo(de, dragKeyGroup, dragKeyTime, nt);
+        dragKeyTime = nt;
+        SelectGroupKey(dragKeyElem, dragKeyGroup, nt);
         TextCopy(keyTimeBuf, TextFormat("%.2f", nt));
     }
     else if (dragPlayhead && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
@@ -2183,7 +2625,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     }
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
     { dragPlayhead = false; dragKeyElem = -1; dragKeyTrack = -1; dragKeyIdx = -1;
-      dragIntro = false; dragOutro = false; }
+      dragKeyGroup = -1; dragIntro = false; dragOutro = false; }
 
     #undef T2X
     #undef X2T
@@ -2344,12 +2786,16 @@ static void Gui()
     float pad = 10.0f;
     float toolbarH;             // set by DrawToolbar below (it can wrap)
     float leftW = 220.0f;
-    float rightW = 320.0f;
+    float rightW = 380.0f;
     float bottomH = 180.0f;
     float thinH = 26.0f;        // timeline strip height while playing
 
     // a slider drag gesture (one undo snapshot) ends when the button comes up.
-    if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) sliderGestureOpen = false;
+    if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+    {
+        sliderGestureOpen = false;
+        finePressActive = false; fineSticky = false; finePressRect = (Rectangle){0};
+    }
 
     // while a dropdown list or modal prompt is open every other widget is
     // locked; the overlay itself is drawn (unlocked) last so it sits on top.
@@ -2386,9 +2832,9 @@ static void Gui()
 
     if (!uiHidden)
     {
-        GuiPanel(elemPanel, NULL);
-        GuiPanel(sigPanel, NULL);
-        GuiPanel(rightPanel, NULL);
+        DrawPanelBG(elemPanel, elemView.alphaMode);
+        DrawPanelBG(sigPanel,  sigView.alphaMode);
+        DrawPanelBG(rightPanel, inspView.alphaMode);
 
         // Ctrl+wheel is reserved for stepping the hovered slider, not scrolling.
         elemView.contentH = PanelScroll(&elemView, elemPanel, DrawElementList);
@@ -2396,6 +2842,12 @@ static void Gui()
 
         inspPanelRect = rightPanel;                 // key-reveal scrolling uses it
         inspView.contentH = PanelScroll(&inspView, rightPanel, DrawInspector);
+
+        // transparency toggles: drawn after content, pinned to each panel's
+        // top-left corner (outside the scroll scissor) so they never scroll away.
+        DrawPanelAlphaToggle(elemPanel.x + 4,  elemPanel.y + 4,  &elemView.alphaMode, guiLocked);
+        DrawPanelAlphaToggle(sigPanel.x + 4,   sigPanel.y + 4,   &sigView.alphaMode,  guiLocked);
+        DrawPanelAlphaToggle(rightPanel.x + 4, rightPanel.y + 4, &inspView.alphaMode, guiLocked);
     }
     else keyEaseVisible = false;    // inspector skipped: no ease dropdown
 

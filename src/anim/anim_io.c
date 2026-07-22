@@ -95,6 +95,59 @@ int AnimPropAt(int elemKind, int index)
     return rows[index].prop;
 }
 
+// ---------------------------------------------------------------------------
+//  Property groups (editor UX): each groups the member AP_* props that share one
+//  logical target. Presentation only - storage/.cfg stay per-prop.
+// ---------------------------------------------------------------------------
+static const AnimPropGroup k_textGroups[] = {
+    { "position", { AP_T_POS_X, AP_T_POS_Y }, 2 },
+    { "size",     { AP_T_SIZE },              1 },
+    { "color",    { AP_T_COLOR, AP_T_ALPHA }, 2 },
+    { "rotation", { AP_T_ROT },               1 },
+    { "crumble",  { AP_T_CRUMBLE },           1 },
+};
+static const AnimPropGroup k_shapeGroups[] = {
+    { "position", { AP_S_POS_X, AP_S_POS_Y },                       2 },
+    { "size",     { AP_S_W, AP_S_H },                               2 },
+    { "scale",    { AP_S_SCALE },                                   1 },
+    { "color",    { AP_S_COLOR, AP_S_ALPHA },                       2 },
+    { "outline",  { AP_S_OUTLINE, AP_S_OUTLINE_COLOR, AP_S_OUTLINE_ALPHA }, 3 },
+    { "rotation", { AP_S_ROT },                                     1 },
+};
+static const AnimPropGroup k_globalGroups[] = {
+    { "fade",       { AP_G_FADE, AP_G_COLOR },        2 },
+    { "background", { AP_G_BG_COLOR, AP_G_BG_ALPHA }, 2 },
+};
+
+static const AnimPropGroup *GroupsFor(int elemKind, int *count)
+{
+    switch (elemKind)
+    {
+        case AE_TEXT:   *count = (int)(sizeof(k_textGroups)/sizeof(k_textGroups[0]));   return k_textGroups;
+        case AE_SHAPE:  *count = (int)(sizeof(k_shapeGroups)/sizeof(k_shapeGroups[0])); return k_shapeGroups;
+        case AE_GLOBAL: *count = (int)(sizeof(k_globalGroups)/sizeof(k_globalGroups[0]));return k_globalGroups;
+        default:        *count = 0; return NULL;
+    }
+}
+
+int AnimGroupCountFor(int elemKind) { int n; GroupsFor(elemKind, &n); return n; }
+
+const AnimPropGroup *AnimGroupAt(int elemKind, int index)
+{
+    int n; const AnimPropGroup *g = GroupsFor(elemKind, &n);
+    if (index < 0 || index >= n) return NULL;
+    return &g[index];
+}
+
+int AnimGroupIndexOfProp(int elemKind, int prop)
+{
+    int n; const AnimPropGroup *g = GroupsFor(elemKind, &n);
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < g[i].propCount; j++)
+            if (g[i].props[j] == prop) return i;
+    return -1;
+}
+
 const char *AnimElemKindName(int kind)
 {
     switch (kind)
@@ -183,6 +236,12 @@ void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind)
     fprintf(f, "%s  color %d %d %d %d\n", ind, e->color.r, e->color.g, e->color.b, e->color.a);
     fprintf(f, "%s  pos %f %f\n",  ind, e->posFrac.x,  e->posFrac.y);
     fprintf(f, "%s  size %f %f\n", ind, e->sizeFrac.x, e->sizeFrac.y);
+
+    // Authoring flags, each its own optional token so files written here still
+    // load in readers that predate them (absent -> the AnimElemInit default).
+    if (e->sizeAbsolute)     fprintf(f, "%s  unit abs\n", ind);
+    if (e->cornerMode)       fprintf(f, "%s  anchor corners\n", ind);
+    if (e->rotBase != 0.0f)  fprintf(f, "%s  rot %f\n", ind, e->rotBase);
 
     for (int j = 0; j < e->trackCount; j++)
     {
@@ -283,6 +342,26 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
         // stands in that case, so those load at their authored size.
         float s;
         if (fscanf(f, "%f", &s) == 1 && curElem) curElem->scaleFrac = s;
+    }
+    else if (TextIsEqual(key, "unit"))
+    {
+        // absent in older files - AnimElemInit's false (fraction) stands.
+        char u[8];
+        if (fscanf(f, "%7s", u) == 1 && curElem)
+            curElem->sizeAbsolute = TextIsEqual(u, "abs");
+    }
+    else if (TextIsEqual(key, "anchor"))
+    {
+        char a[16];
+        if (fscanf(f, "%15s", a) == 1 && curElem)
+            curElem->cornerMode = TextIsEqual(a, "corners");
+    }
+    else if (TextIsEqual(key, "rot"))
+    {
+        // elem-level rest-pose rotation (distinct from a `track rot` block,
+        // whose prop name only appears AFTER the `track` keyword).
+        float r;
+        if (fscanf(f, "%f", &r) == 1 && curElem) curElem->rotBase = r;
     }
     else if (TextIsEqual(key, "bg"))
     {

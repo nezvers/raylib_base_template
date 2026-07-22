@@ -49,6 +49,18 @@ int         AnimPropByName(const char *name, int elemKind);  // name -> AP_* (-1
 int         AnimPropCountFor(int elemKind);             // # props for a kind
 int         AnimPropAt(int elemKind, int index);        // the index-th AP_* prop
 
+// --- property GROUPS (editor UX: fewer, consolidated track targets) ---------
+// A group bundles the fine-grained AP_* props that belong to one logical target
+// (Position = pos_x+pos_y, Color = color+alpha, ...). Purely a presentation +
+// coordinated-editing layer: the underlying per-prop tracks and the .cfg format
+// are unchanged. `props` lists the member AP_* values (up to ANIM_GROUP_PROPS).
+#define ANIM_GROUP_PROPS 3
+typedef struct { const char *name; int props[ANIM_GROUP_PROPS]; int propCount; } AnimPropGroup;
+
+int                  AnimGroupCountFor(int elemKind);        // # groups for a kind
+const AnimPropGroup *AnimGroupAt(int elemKind, int index);   // NULL if out of range
+int                  AnimGroupIndexOfProp(int elemKind, int prop);  // -1 if none
+
 const char *AnimElemKindName(int kind);   // AE_* -> "text"/"shape"/"global"
 
 const char *AnimShapeKindName(int kind);        // SHAPE_* -> "rect" etc.

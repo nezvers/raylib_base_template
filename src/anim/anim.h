@@ -200,6 +200,10 @@ typedef struct {
     Vector2 sizeFrac;                  // x=width/size, y=height (shape height)
     float   scaleFrac;                 // AE_SHAPE: rest-pose AP_S_SCALE (1 = as
                                        // authored); multiplies sizeFrac
+    float   rotBase;                   // AE_TEXT/AE_SHAPE: rest-pose rotation in
+                                       // degrees (AP_*_ROT with no track). 0 =
+                                       // upright. Lets a static shape be rotated
+                                       // (and a line be authored by endpoints).
     int     shapeKind;                 // AnimShapeKind (AE_SHAPE only)
     Color   outlineColor;              // AE_SHAPE: outline tint (rest pose)
     float   outlineFrac;               // AE_SHAPE: outline thickness, fraction
@@ -207,6 +211,20 @@ typedef struct {
     Color   bgColor;                   // AE_GLOBAL: scene background fill; the
                                        // alpha channel is the rest-pose
                                        // AP_G_BG_ALPHA (0 = no background)
+
+    // AUTHORING FLAGS (do not change what a track stores; they change how the
+    // base geometry is interpreted at draw time / edited in the inspector).
+    bool    sizeAbsolute;              // AE_TEXT/AE_SHAPE: when true, sizeFrac
+                                       // (and text size, outline thickness) are
+                                       // ABSOLUTE PIXELS instead of canvas
+                                       // fractions - a fixed size regardless of
+                                       // how the canvas rescales. Position is
+                                       // always a fraction. Default false.
+    bool    cornerMode;               // AE_SHAPE: inspector-only editing mode.
+                                       // When true the inspector authors the
+                                       // shape by two opposite corners (line:
+                                       // two endpoints) instead of center+size;
+                                       // storage stays center+size. Default false.
 
     AnimTrack tracks[ANIM_TRACKS_MAX];
     int       trackCount;

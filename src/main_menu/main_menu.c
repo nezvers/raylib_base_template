@@ -105,14 +105,10 @@ static ZoomBoxes zoomBoxes = { .count = 3, .period = 5.0f };
 #define MENU_RIPPLE_SIGNAL "ripple"    // placed ripple; consumes params.pos
 
 static const AnimStageEntry MENU_SCENE[] = {
-    { .anim="signal_test", .loop=true, .delay=0.0f, .layer=10, .tag=0,
-      .signals={ { MENU_END_SIGNAL, false } }, .signalCount=1 },
-    { .anim="zooming_box", .loop=true, .delay=0.0f, .layer=9,  .tag=1,
-      .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
-    { .anim="zooming_box", .loop=true, .delay=0.6f, .layer=9,  .tag=2,
-      .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
-    { .anim="zooming_box", .loop=true, .delay=1.2f, .layer=9,  .tag=3,
-      .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
+    { .anim="signal_test", .loop=true, .delay=0.0f, .layer=10, .tag=0, .signals={ { MENU_END_SIGNAL, false } }, .signalCount=1 },
+    { .anim="zooming_box", .loop=true, .delay=0.0f, .layer=9,  .tag=1, .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
+    { .anim="zooming_box", .loop=true, .delay=0.6f, .layer=9,  .tag=2, .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
+    { .anim="zooming_box", .loop=true, .delay=1.2f, .layer=9,  .tag=3, .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
 };
 
 // The state owns one scene object (holds the live handles + terminal bookkeeping).

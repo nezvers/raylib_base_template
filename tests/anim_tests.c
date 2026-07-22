@@ -575,7 +575,62 @@ static void TestIOOldFormat(void)
     CHECK_NEAR(AnimDocIntroEnd(&in), 0.0f);
     CHECK_NEAR(AnimDocOutroStart(&in), 2.0f);
     CHECK_NEAR(AnimDocPlayLen(&in), 2.0f);
+    // old files predate the authoring flags -> both default off.
+    CHECK(!in.elems[0].sizeAbsolute && !in.elems[0].cornerMode);
     remove(path);
+}
+
+// The per-element authoring flags (sizeAbsolute, cornerMode) round-trip through
+// .cfg, and absolute sizing changes what a shape's extent evaluates to on screen
+// (via the draw path's unit branch, mirrored here by hand).
+static void TestAuthoringFlags(void)
+{
+    const char *path = "anim_tests_flags_tmp.cfg";
+    AnimDoc doc; AnimDocInit(&doc);
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    e->sizeAbsolute = true;
+    e->cornerMode   = true;
+    e->rotBase      = 30.0f;                          // rest-pose rotation
+    e->sizeFrac     = (Vector2){ 320.0f, 180.0f };   // pixels, since absolute
+    // rest-pose rotation with no track is now the base value AnimElemProp reads.
+    CHECK_NEAR(AnimElemProp(e, AP_S_ROT, 0.0f), 30.0f);
+    CHECK(AnimDocSave(&doc, path));
+
+    AnimDoc in;
+    CHECK(AnimDocLoad(&in, path));
+    CHECK(in.elemCount == 1);
+    CHECK(in.elems[0].sizeAbsolute && in.elems[0].cornerMode);
+    CHECK_NEAR(in.elems[0].rotBase, 30.0f);
+    CHECK_NEAR(in.elems[0].sizeFrac.x, 320.0f);
+    CHECK_NEAR(in.elems[0].sizeFrac.y, 180.0f);
+    remove(path);
+}
+
+// Every AP_* prop of each element kind belongs to exactly one group, and every
+// group member is a real prop of that kind. Guards the group tables against a
+// prop being unreachable in the grouped inspector/timeline.
+static void TestGroupCoverage(void)
+{
+    for (int kind = AE_TEXT; kind <= AE_GLOBAL; kind++)
+    {
+        // each prop maps to exactly one group
+        int propN = AnimPropCountFor(kind);
+        for (int i = 0; i < propN; i++)
+        {
+            int prop = AnimPropAt(kind, i);
+            CHECK(AnimGroupIndexOfProp(kind, prop) >= 0);
+        }
+        // each group member is a valid prop of the kind, and group membership is
+        // unique (no prop in two groups)
+        int grpN = AnimGroupCountFor(kind);
+        for (int g = 0; g < grpN; g++)
+        {
+            const AnimPropGroup *grp = AnimGroupAt(kind, g);
+            CHECK(grp && grp->propCount >= 1 && grp->propCount <= ANIM_GROUP_PROPS);
+            for (int j = 0; j < grp->propCount; j++)
+                CHECK(AnimGroupIndexOfProp(kind, grp->props[j]) == g);
+        }
+    }
 }
 
 // Intro/outro trim: accessors clamp, the section round-trips through .cfg, and
@@ -1424,6 +1479,8 @@ int main(void)
     TestMoveDuplicateElem();
     TestIO();
     TestIOOldFormat();
+    TestAuthoringFlags();
+    TestGroupCoverage();
     TestTrim();
     TestIOIdempotent();
     TestIOSignalOrphanTarget();
