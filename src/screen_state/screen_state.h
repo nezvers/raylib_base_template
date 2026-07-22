@@ -14,12 +14,14 @@ typedef struct {
     RenderTexture2D target;
     float resize_ratio;
     Color clear_color;
+    Shader *shader_target;
 } ScreenState;
 
 enum ViewportType {KEEP_ASPECT, KEEP_HEIGHT, KEEP_WIDTH};
 
 ScreenState *ScreenStateGet();
 void ScreenStateSet(ScreenState *value);
+void ScreenStateShader(Shader *shader);
 void ScreenStateReset();
 void ScreenStateLoad();     // override defaults from disk (no-op today; part of Reset->Load->Apply lifecycle)
 void ScreenStateResize();

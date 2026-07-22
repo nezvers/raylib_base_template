@@ -13,6 +13,10 @@ void ScreenStateSet(ScreenState *value) {
     state = *value;
 }
 
+void ScreenStateShader(Shader *shader) {
+    state.shader_target = shader;
+}
+
 void ScreenStateReset() {
     state.width = 1280;
     state.height = 720;
@@ -69,7 +73,13 @@ void ScreenStateCleanup() {
 }
 
 void ScreenStateDrawTarget(){
-        DrawTexturePro(state.target.texture, state.source_rect, state.dest_rect, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
+    if (state.shader_target) {
+        BeginShaderMode(*state.shader_target);
+    }
+    DrawTexturePro(state.target.texture, state.source_rect, state.dest_rect, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
+    if (state.shader_target) {
+        EndShaderMode();
+    }
 }
 
 Vector2 Screen2Target(Vector2 pos) {
