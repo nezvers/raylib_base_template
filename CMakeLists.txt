@@ -91,6 +91,14 @@ if ("${PLATFORM}" STREQUAL "Web")
         --shell-file ${CMAKE_SOURCE_DIR}/src/minshell.html)
 endif()
 
+if(WIN32)
+    # Win socket for enet
+    target_link_libraries(${PROJECT_NAME} ws2_32 winmm)
+    if(MSVC)
+        target_compile_options(enet_static PRIVATE /W3)
+    endif()
+endif()
+
 # Checks if OSX and links appropriate frameworks (Only required on MacOS)
 if (APPLE)
     target_link_libraries(${PROJECT_NAME} "-framework IOKit")
