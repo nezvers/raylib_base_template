@@ -25,7 +25,7 @@ jobs:
       PROJECT_REPO_NAME: ${{ github.event.repository.name }}
       PROJECT_BUILD_PATH: ${{ github.event.repository.name }}/build
       PROJECT_RELEASE_PATH: ${{ github.event.repository.name }}_dev_macos
-      PROJECT_RESOURCES_SRC_PATH: src/resources
+      PROJECT_RESOURCES_SRC_PATH: resources
       PROJECT_RESOURCES_DST_PATH: resources
 
     steps:
