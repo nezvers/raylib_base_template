@@ -104,7 +104,10 @@ static void Enter()
 
 static void Exit()
 {
-    // Everything is static fixed-size data - nothing to free.
+    // Everything is static fixed-size data - nothing to free, but release the
+    // pause overlay's stage slot so it can't leak into the next state (e.g. QUIT
+    // with the pause menu still up).
+    PauseMenuStop();
 }
 
 static void Update()

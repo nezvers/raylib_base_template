@@ -35,6 +35,11 @@ void PauseMenuOpen(void);
 // finished (or immediately if nothing is playing); pass NULL if not needed.
 void PauseMenuBeginClose(void (*onClosed)(void *user), void *user);
 
+// Hard-stop the overlay immediately (no outro), releasing its stage slot. Call
+// from a state's Exit() so the overlay never leaks into the next state's stage
+// pool - e.g. QUIT straight from the pause menu, with the overlay still up.
+void PauseMenuStop(void);
+
 // Pump the underlying stage pool. Call once per frame from the state's Update;
 // harmless (no-op) when the overlay is idle.
 void PauseMenuUpdate(float dt);

@@ -112,6 +112,8 @@ static void Enter(){
 
 static void Exit(){
     LevelDestroy();
+    PauseMenuStop();   // release the pause overlay's stage slot so it can't leak
+                       // into the next state (e.g. QUIT with the menu still up).
 }
 
 static void Update(){

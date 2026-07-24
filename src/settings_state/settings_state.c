@@ -38,7 +38,8 @@ void SettingsReset() {
     state.window_mode = WINDOW_MODE_WINDOWED;
     state.music_volume = 0.5f;
     state.difficulty = 0;
-    state.persist = false;
+    state.persist = true;   // persist to disk on quit by default; the options
+                            // "Persist settings on quit" checkbox can opt out.
 
     // Settings orchestrates the layer below it: reset its subsystems to defaults too.
     ScreenStateReset();

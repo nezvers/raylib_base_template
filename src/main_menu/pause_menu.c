@@ -33,6 +33,11 @@ void PauseMenuBeginClose(void (*onClosed)(void *user), void *user)
     AnimSceneEmitTerminal(&pauseScene, PAUSE_EXIT_SIGNAL, NULL, onClosed, user);
 }
 
+void PauseMenuStop(void)
+{
+    AnimSceneStop(&pauseScene);
+}
+
 void PauseMenuUpdate(float dt)
 {
     AnimStageUpdate(dt);
