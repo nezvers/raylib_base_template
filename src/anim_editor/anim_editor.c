@@ -61,6 +61,13 @@ static AnimDoc doc;                 // the working document
 // meaning what it always did, and the signal transiently drives its targets.
 static AnimSignalPlayer preview;
 
+// Which INSTANCE the preview stands in for. In game the same document is often
+// played several times at once, each with its own sequence number, and a signal
+// fans those copies apart by it (the "--sequence--" section, AnimSignal.usesSeq).
+// The editor plays exactly one copy, so the number it pretends to be is a control
+// - otherwise a fan-out could only be checked by launching the game.
+static int previewSeq = 0;
+
 // animation library (files in ANIM_DIR) + which one `doc` came from.
 static char animList[ANIM_LIST_MAX][ANIM_NAME_MAX];  // basenames, no extension
 static int  animCount = 0;
@@ -105,11 +112,34 @@ static int   libTargetIdx = -1;     // entry being renamed / deleted
 // mid-animation, which is the whole point of a signal.
 static int   sigModalIdx = -1;
 static float sigScroll = 0.0f;      // modal's target/key list scroll
-static int   sigPropDrop = -1;      // target row whose property dropdown is open
-static int   sigKeyEaseDrop = -1;   // packed target*256+key whose ease list is open
 static float sigLastU = 1.0f;       // last u the user set on ANY signal key; new
                                     // keys seed from it so placing a beat across
                                     // several tracks doesn't mean retyping it
+
+// The selected signal GROUP key: (element, group, u). Targets are authored in
+// property groups exactly like timeline tracks, so the selection names a group
+// key rather than one target's key. sigSelElem < 0 = nothing selected.
+static int   sigSelElem = -1, sigSelGroup = -1;
+static float sigSelU = 0.0f;
+
+// Selected key in the "--params--" (Mouse Position) section: which binding
+// (element + slot) and which of its keys (by u). sigPosSelElem < 0 = none.
+static int   sigPosSelElem = -1, sigPosSelSlot = 0;
+static float sigPosSelU = 0.0f;
+// Selected key in the "--sequence--" section (by u). < 0 = none.
+static float sigSeqSelU = -1.0f;
+
+// The ONE dropdown the signal modal can have open, recorded while drawing so
+// the overlay pass needs no layout maths (same pattern as addTrackRect /
+// keyEaseRect for the main inspector).
+enum { SIGDROP_NONE = 0, SIGDROP_ADD, SIGDROP_EASE };
+static int       sigDropMode = SIGDROP_NONE;
+static int       sigDropElem = -1;      // SIGDROP_ADD: element being added to
+static Rectangle sigDropHdr;            // header rect the list hangs off
+
+static void SigCloseDrops(void)  { sigDropMode = SIGDROP_NONE; sigDropElem = -1; }
+static void SigClearKeySel(void) { sigSelElem = -1; sigSelGroup = -1; sigSelU = 0.0f;
+                                   sigPosSelElem = -1; sigSeqSelU = -1.0f; }
 
 static bool guiLocked = false;      // mirrors GuiLock() for this frame: raygui
                                     // exposes no query, and PanelScroll must
@@ -245,8 +275,12 @@ static void ClampSelection()
     if (sigModalIdx >= doc.signalCount)
     {
         sigModalIdx = -1; edSigIdx = -1;
-        sigPropDrop = -1; sigKeyEaseDrop = -1;
+        SigCloseDrops(); SigClearKeySel();
     }
+
+    // the selected signal group key can vanish under an undo/redo (its targets
+    // or their keys removed) - drop the selection rather than edit a stale one.
+    if (sigSelElem >= 0 && sigSelElem >= doc.elemCount) SigClearKeySel();
 }
 
 // Bindings capture a signal's name/dir/section by value at register time, so
@@ -418,7 +452,7 @@ static void LoadAnimByIndex(int idx)
     // the new doc's signals are unrelated to the old one's: close the modal and
     // reset the panel scrolls rather than pointing them at a different signal.
     sigModalIdx = -1; edSigIdx = -1;
-    sigPropDrop = -1; sigKeyEaseDrop = -1;
+    SigCloseDrops(); SigClearKeySel();
     elemView.scroll = sigView.scroll = inspView.scroll = 0.0f;
 
     preview = (AnimSignalPlayer){0};            // bindings pointed at the OLD doc
@@ -470,7 +504,7 @@ static void Enter()
     edSigIdx = -1; sliderGestureOpen = false; edSliderActive = false;
     animSwitchOpen = false; prompt = PROMPT_NONE; edNameBuf = false;
     sigModalIdx = -1; sigScroll = 0.0f;
-    sigPropDrop = -1; sigKeyEaseDrop = -1;
+    SigCloseDrops(); SigClearKeySel();
     elemView = sigView = inspView = (PanelView){0};
     playhead = 0.0f; playing = false;
     panelAnim = 0.0f; prevPlaybackUi = false;
@@ -526,8 +560,7 @@ static void Update()
     // once nothing is (so it can't discard work behind a modal by accident).
     if (IsKeyPressed(KEY_ESCAPE))
     {
-        if (sigPropDrop != -1 || sigKeyEaseDrop >= 0)
-        { sigPropDrop = -1; sigKeyEaseDrop = -1; }
+        if (sigDropMode != SIGDROP_NONE)  SigCloseDrops();
         else if (prompt != PROMPT_NONE)   { prompt = PROMPT_NONE; edNameBuf = false; }
         else if (sigModalIdx >= 0)        { sigModalIdx = -1; edSigIdx = -1; }
         else if (animSwitchOpen)          animSwitchOpen = false;
@@ -564,7 +597,7 @@ static void Update()
         // triggered mid-playback), but its dropdowns do go away with it.
         edName = edText = edKeyTime = false; edSigIdx = -1; edSliderActive = false;
         addTrackDrop = -1; keyEaseDropOpen = false;
-        sigPropDrop = -1; sigKeyEaseDrop = -1;
+        SigCloseDrops();
     }
     prevPlaybackUi = playbackUi;
     float step = dt / 0.25f;
@@ -582,8 +615,13 @@ static void Draw()
     ClearBackground((Color){ 30, 32, 38, 255 });
     DrawRectangleLines(0, 0, (int)game.x, (int)game.y, (Color){ 70, 74, 84, 255 });
 
-    // a fired signal layers over the timeline pose (NULL override when idle)
-    AnimDocDrawEx(&doc, playhead, &preview);
+    // A fired signal layers over the timeline pose (NULL override when idle).
+    // The smooth-loop blend is shown only while the preview is ACTUALLY looping:
+    // scrubbing by hand must show the authored pose at the playhead, or the tail
+    // of the timeline could never be edited.
+    // (The gizmos below read AnimElemProp outside this call, so during the blend
+    //  window they track the authored pose rather than the blended one.)
+    AnimDocDrawLoop(&doc, playhead, &preview, playing && loopPlay);
 
     // Highlight the selected element's anchor so it's easy to see what's picked.
     if (selElem >= 0 && selElem < doc.elemCount)
@@ -836,16 +874,71 @@ static void ConvertSizeUnits(AnimElem *e, bool toAbsolute)
     }
 }
 
+// The base (rest-pose) field a scalar geometry prop writes into when it has no
+// track. NULL for props with no base field of their own.
+static float *ElemBaseField(AnimElem *e, int prop)
+{
+    switch (prop)
+    {
+        case AP_T_POS_X: case AP_S_POS_X: return &e->posFrac.x;
+        case AP_T_POS_Y: case AP_S_POS_Y: return &e->posFrac.y;
+        case AP_T_SIZE:  case AP_S_W:     return &e->sizeFrac.x;
+        case AP_S_H:                      return &e->sizeFrac.y;
+        case AP_T_ROT:   case AP_S_ROT:   return &e->rotBase;
+        case AP_S_SCALE:                  return &e->scaleFrac;
+        case AP_S_OUTLINE:                return &e->outlineFrac;
+        default:                          return NULL;
+    }
+}
+
 // Write a scalar value to `prop` the same way PropSlider commits: keyframe it at
 // the playhead when a track exists (auto-key), otherwise set the base field.
 // Used by corner-mode editing, which drives several props from one gesture.
 static void WritePropValue(AnimElem *e, int prop, float v, float *baseField)
 {
     AnimTrack *tr = AnimElemFindTrack(e, prop);
-    if (!tr) { *baseField = v; return; }
+    if (!tr) { if (baseField) *baseField = v; return; }
     if (!autoKey) return;                    // keyed edits go via the key inspector
     if (playhead > AUTOKEY_EPS) EnsureZeroKey(e, tr);
     AnimTrackWriteKeyAt(tr, playhead, v, AUTOKEY_EPS);
+}
+
+// Read/write binding for the geometry props a corner-mode gesture drives. The
+// same corner maths serves two very different stores - the element's timeline
+// (values at the playhead) and one signal group key (values at its u) - so the
+// rows below take the access, not the store.
+typedef struct {
+    float (*get)(void *ctx, int prop);
+    void  (*set)(void *ctx, int prop, float v);
+    void   *ctx;
+} PropAccess;
+
+static float ElemPropGet(void *ctx, int prop)
+{ return AnimElemProp((const AnimElem *)ctx, prop, playhead); }
+
+static void ElemPropSet(void *ctx, int prop, float v)
+{ AnimElem *e = (AnimElem *)ctx; WritePropValue(e, prop, v, ElemBaseField(e, prop)); }
+
+// PropAccess over ONE timeline group key: props with a key at t read/write it,
+// props without fall back to (and, on write, get) a key at that time - a corner
+// drag drives position AND size, so both have to land on the same key.
+typedef struct { AnimElem *e; float t; int ease; } TrackKeyCtx;
+
+static float TrackKeyPropGet(void *ctx, int prop)
+{
+    TrackKeyCtx *c = (TrackKeyCtx *)ctx;
+    return AnimElemProp(c->e, prop, c->t);
+}
+
+static void TrackKeyPropSet(void *ctx, int prop, float v)
+{
+    TrackKeyCtx *c = (TrackKeyCtx *)ctx;
+    AnimTrack *tr = AnimElemFindTrack(c->e, prop);
+    if (!tr) tr = AnimElemAddTrack(c->e, prop);
+    if (!tr) return;
+    if (c->t > AUTOKEY_EPS) EnsureZeroKey(c->e, tr);
+    AnimKey *k = AnimTrackWriteKeyAt(tr, c->t, v, AUTOKEY_EPS);
+    if (k && tr->keyCount == 1) k->ease = c->ease;   // brand-new track
 }
 
 // Slider for an ANIMATABLE property. No track -> edits the base field (rest
@@ -1231,12 +1324,460 @@ static int GroupColorProp(int kind, int gi)
     return -1;
 }
 
+// ---------------------------------------------------------------------------
+//  Signal target GROUPS: the same coordinated editing as the track groups
+//  above, applied to a signal's (element, property) targets. One authored track
+//  on a signal IS a group - picking `position` creates the pos_x and pos_y
+//  targets, and every key written afterwards lands on both at the same u.
+//  Storage (and the .cfg) stays one target per property.
+//
+//  Times here are a signal key's NORMALIZED u (0..1), a fraction of the signal
+//  length, so they need their own epsilon: AUTOKEY_EPS is a playhead tolerance
+//  in SECONDS.
+// ---------------------------------------------------------------------------
+#define SIG_U_EPS     0.001f
+#define SIG_TIMES_MAX (ANIM_SIG_KEYS_MAX * ANIM_GROUP_PROPS)
+
+static AnimSigTarget *SigFindTarget(AnimSignal *sg, int elemIdx, int prop)
+{
+    for (int i = 0; i < sg->targetCount; i++)
+        if (sg->targets[i].elemIdx == elemIdx && sg->targets[i].prop == prop)
+            return &sg->targets[i];
+    return NULL;
+}
+
+// True if any member of the group already has a target on this element.
+static bool SigGroupHasTarget(AnimSignal *sg, int elemIdx, int gi)
+{
+    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
+    if (!g) return false;
+    for (int m = 0; m < g->propCount; m++)
+        if (SigFindTarget(sg, elemIdx, g->props[m])) return true;
+    return false;
+}
+
+// Free target slots vs the members this group still needs: a 3-prop group can
+// be refused while a 1-prop one still fits.
+static bool SigGroupFits(AnimSignal *sg, int elemIdx, int gi)
+{
+    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
+    if (!g) return false;
+    int need = 0;
+    for (int m = 0; m < g->propCount; m++)
+        if (!SigFindTarget(sg, elemIdx, g->props[m])) need++;
+    return sg->targetCount + need <= ANIM_SIG_TARGETS_MAX;
+}
+
+// Union of a group's member key u values, ascending and de-duped within eps.
+static int SigGroupKeyTimes(AnimSignal *sg, int elemIdx, int gi, float *out)
+{
+    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
+    int n = 0;
+    if (!g) return 0;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        AnimSigTarget *tg = SigFindTarget(sg, elemIdx, g->props[m]);
+        if (!tg) continue;
+        for (int k = 0; k < tg->keyCount; k++)
+        {
+            float u = tg->keys[k].t;
+            bool dup = false;
+            for (int i = 0; i < n; i++)
+                if (fabsf(out[i] - u) <= SIG_U_EPS) { dup = true; break; }
+            if (!dup && n < SIG_TIMES_MAX) out[n++] = u;
+        }
+    }
+    for (int i = 1; i < n; i++)          // insertion sort ascending
+    { float v = out[i]; int j = i-1; while (j>=0 && out[j]>v){out[j+1]=out[j];j--;} out[j+1]=v; }
+    return n;
+}
+
+// Index of the key at u on a target (within eps), or -1.
+static int SigTargetKeyNear(const AnimSigTarget *tg, float u)
+{
+    if (!tg) return -1;
+    for (int k = 0; k < tg->keyCount; k++)
+        if (fabsf(tg->keys[k].t - u) <= SIG_U_EPS) return k;
+    return -1;
+}
+
+// Keys ascending in u, like AnimTrackSortKeys does for timeline tracks - the
+// player walks them in order, so an out-of-order insert would strand a segment.
+static void SigTargetSortKeys(AnimSigTarget *tg)
+{
+    for (int i = 1; i < tg->keyCount; i++)
+    {
+        AnimKey v = tg->keys[i]; int j = i-1;
+        while (j >= 0 && tg->keys[j].t > v.t) { tg->keys[j+1] = tg->keys[j]; j--; }
+        tg->keys[j+1] = v;
+    }
+}
+
+// Pick a u for a NEW key given the times (sorted ascending) already present.
+// Prefer `pref` (sigLastU - the "same beat" case); if that slot is taken, drop
+// the new key into the middle of the largest free gap in [0,1] so every +key
+// press spawns a distinct key instead of re-selecting the existing one.
+static float SigFreeU(const float *times, int nt, float pref)
+{
+    if (nt == 0) return pref;
+
+    bool taken = false;
+    for (int i = 0; i < nt; i++)
+        if (fabsf(times[i] - pref) <= SIG_U_EPS) { taken = true; break; }
+    if (!taken) return pref;                              // pref is free
+
+    // Largest gap among the endpoints [0, k0, k1, ..., 1]; return its midpoint.
+    float lo = 0.0f, hi = times[0], gap = times[0];
+    for (int i = 0; i + 1 < nt; i++)
+        if (times[i+1] - times[i] > gap)
+        { gap = times[i+1] - times[i]; lo = times[i]; hi = times[i+1]; }
+    if (1.0f - times[nt-1] > gap) { lo = times[nt-1]; hi = 1.0f; }
+    return (lo + hi) * 0.5f;
+}
+
+// Free u for a new group key across every member of the group.
+static float SigGroupFreeU(AnimSignal *sg, int elemIdx, int gi, float pref)
+{
+    float times[SIG_TIMES_MAX];
+    int nt = SigGroupKeyTimes(sg, elemIdx, gi, times);   // sorted ascending
+    return SigFreeU(times, nt, pref);
+}
+
+// Write a group key at u: every member target gets a key there (creating the
+// target as needed), seeded from the element's CURRENT pose - a signal key is
+// an absolute destination, and the pose under the playhead is what the user is
+// looking at while authoring.
+static void SigGroupWriteKey(AnimSignal *sg, int elemIdx, int gi, float u)
+{
+    const AnimElem *el = &doc.elems[elemIdx];
+    const AnimPropGroup *g = AnimGroupAt(el->kind, gi);
+    if (!g) return;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        int prop = g->props[m];
+        AnimSigTarget *tg = SigFindTarget(sg, elemIdx, prop);
+        if (!tg)
+        {
+            if (sg->targetCount >= ANIM_SIG_TARGETS_MAX) continue;
+            tg = &sg->targets[sg->targetCount++];
+            *tg = (AnimSigTarget){0};
+            tg->elemIdx = elemIdx; tg->prop = prop;
+        }
+        int k = SigTargetKeyNear(tg, u);
+        if (k < 0)
+        {
+            if (tg->keyCount >= ANIM_SIG_KEYS_MAX) continue;
+            k = tg->keyCount++;
+            tg->keys[k].ease = ANIM_EASE_SINE_OUT;
+        }
+        tg->keys[k].t     = u;
+        tg->keys[k].value = AnimElemProp(el, prop, playhead);
+        tg->keys[k].cval  = AnimElemColorProp(el, prop, playhead);
+        SigTargetSortKeys(tg);
+    }
+}
+
+// Create a group's missing member targets without keying anything (the adder).
+static void SigGroupAddTargets(AnimSignal *sg, int elemIdx, int gi)
+{
+    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
+    if (!g) return;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        if (SigFindTarget(sg, elemIdx, g->props[m])) continue;
+        if (sg->targetCount >= ANIM_SIG_TARGETS_MAX) return;
+        AnimSigTarget *tg = &sg->targets[sg->targetCount++];
+        *tg = (AnimSigTarget){0};
+        tg->elemIdx = elemIdx; tg->prop = g->props[m];
+    }
+}
+
+// Remove every member target of a group (descending, so the shift-down can't
+// skip a member).
+static void SigGroupDeleteTargets(AnimSignal *sg, int elemIdx, int gi)
+{
+    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
+    if (!g) return;
+    for (int i = sg->targetCount - 1; i >= 0; i--)
+    {
+        if (sg->targets[i].elemIdx != elemIdx) continue;
+        bool member = false;
+        for (int m = 0; m < g->propCount; m++)
+            if (sg->targets[i].prop == g->props[m]) { member = true; break; }
+        if (!member) continue;
+        for (int j = i; j < sg->targetCount - 1; j++) sg->targets[j] = sg->targets[j+1];
+        sg->targetCount--;
+    }
+}
+
+// Remove the group key at u (each member's key near u).
+static void SigGroupDeleteKeyAt(AnimSignal *sg, int elemIdx, int gi, float u)
+{
+    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
+    if (!g) return;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        AnimSigTarget *tg = SigFindTarget(sg, elemIdx, g->props[m]);
+        if (!tg) continue;
+        for (int k = tg->keyCount - 1; k >= 0; k--)
+            if (fabsf(tg->keys[k].t - u) <= SIG_U_EPS)
+            {
+                for (int j = k; j < tg->keyCount - 1; j++) tg->keys[j] = tg->keys[j+1];
+                tg->keyCount--;
+            }
+    }
+}
+
+// Move the group key from oldU to newU across every member.
+static void SigGroupMoveKeyTo(AnimSignal *sg, int elemIdx, int gi,
+                              float oldU, float newU)
+{
+    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
+    if (!g) return;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        AnimSigTarget *tg = SigFindTarget(sg, elemIdx, g->props[m]);
+        int k = SigTargetKeyNear(tg, oldU);
+        if (k < 0) continue;
+        tg->keys[k].t = newU;
+        SigTargetSortKeys(tg);
+    }
+}
+
+// Set the segment ease of a group key at u on every member.
+static void SigGroupSetEaseAt(AnimSignal *sg, int elemIdx, int gi, float u, int ease)
+{
+    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
+    if (!g) return;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        AnimSigTarget *tg = SigFindTarget(sg, elemIdx, g->props[m]);
+        int k = SigTargetKeyNear(tg, u);
+        if (k >= 0) tg->keys[k].ease = ease;
+    }
+}
+
+// Compact one-line summary of a signal group key: "u   v0,v1,..   ease".
+// Mirrors GroupKeyLabel, but reads the TARGET keys (absolute destinations)
+// rather than evaluating the element.
+static const char *SigGroupKeyLabel(AnimSignal *sg, int elemIdx, int gi, float u)
+{
+    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
+    char vals[80]; vals[0] = 0;
+    int ease = 0; bool haveEase = false;
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        AnimSigTarget *tg = SigFindTarget(sg, elemIdx, g->props[m]);
+        int k = SigTargetKeyNear(tg, u);
+        if (k < 0) continue;                     // ragged: member has no key here
+        if (!haveEase) { ease = tg->keys[k].ease; haveEase = true; }
+        const char *one = AnimPropIsColor(g->props[m])
+            ? TextFormat("#%02X%02X%02X", tg->keys[k].cval.r, tg->keys[k].cval.g,
+                                          tg->keys[k].cval.b)
+            : TextFormat("%.2f", tg->keys[k].value);
+        if (vals[0]) strncat(vals, ",", sizeof(vals)-strlen(vals)-1);
+        strncat(vals, one, sizeof(vals)-strlen(vals)-1);
+    }
+    return TextFormat("%.2f   %s   %s", u, vals, AnimEaseName(ease));
+}
+
+// ---------------------------------------------------------------------------
+//  Mouse-Position bindings ("--params--" section) authoring helpers
+// ---------------------------------------------------------------------------
+static int SigPosFind(AnimSignal *sg, int elemIdx, int slot)
+{
+    for (int i = 0; i < sg->posParamCount; i++)
+        if (sg->posParams[i].elemIdx == elemIdx && sg->posParams[i].slot == slot)
+            return i;
+    return -1;
+}
+static void SigPosSortKeys(AnimSigPosParam *pp)
+{
+    for (int i = 1; i < pp->keyCount; i++)     // insertion sort (<= 8 keys)
+    {
+        AnimPosKey k = pp->keys[i]; int j = i - 1;
+        while (j >= 0 && pp->keys[j].t > k.t) { pp->keys[j+1] = pp->keys[j]; j--; }
+        pp->keys[j+1] = k;
+    }
+}
+static AnimSigPosParam *SigPosAdd(AnimSignal *sg, int elemIdx, int slot)
+{
+    if (SigPosFind(sg, elemIdx, slot) >= 0) return NULL;
+    if (sg->posParamCount >= ANIM_SIG_POS_MAX) return NULL;
+    AnimSigPosParam *pp = &sg->posParams[sg->posParamCount++];
+    *pp = (AnimSigPosParam){0};
+    pp->elemIdx = elemIdx; pp->slot = slot;
+    // seed one key so a fresh binding does something: ease onto the mouse at u=1
+    pp->keys[0] = (AnimPosKey){ 1.0f, 0.0f, 0.0f, ANIM_EASE_SINE_OUT };
+    pp->keyCount = 1;
+    return pp;
+}
+static void SigPosRemoveAt(AnimSignal *sg, int idx)
+{
+    for (int i = idx; i < sg->posParamCount - 1; i++)
+        sg->posParams[i] = sg->posParams[i+1];
+    sg->posParamCount--;
+}
+static int SigPosKeyNear(const AnimSigPosParam *pp, float u)
+{
+    for (int i = 0; pp && i < pp->keyCount; i++)
+        if (fabsf(pp->keys[i].t - u) <= SIG_U_EPS) return i;
+    return -1;
+}
+static void SigPosWriteKey(AnimSigPosParam *pp, float u)
+{
+    if (SigPosKeyNear(pp, u) >= 0 || pp->keyCount >= ANIM_SIG_KEYS_MAX) return;
+    pp->keys[pp->keyCount++] = (AnimPosKey){ u, 0.0f, 0.0f, ANIM_EASE_SINE_OUT };
+    SigPosSortKeys(pp);
+}
+// Free u for a new key on a position slot (keys are kept sorted ascending).
+static float SigPosFreeU(const AnimSigPosParam *pp, float pref)
+{
+    float times[ANIM_SIG_KEYS_MAX];
+    for (int i = 0; i < pp->keyCount; i++) times[i] = pp->keys[i].t;
+    return SigFreeU(times, pp->keyCount, pref);
+}
+static void SigPosRemoveKeyAt(AnimSigPosParam *pp, int idx)
+{
+    for (int i = idx; i < pp->keyCount - 1; i++) pp->keys[i] = pp->keys[i+1];
+    pp->keyCount--;
+}
+
+// ---------------------------------------------------------------------------
+//  Sequence offset ("--sequence--" section) authoring helpers
+// ---------------------------------------------------------------------------
+static int SigSeqTargetFind(AnimSignal *sg, int elemIdx, int prop)
+{
+    for (int i = 0; i < sg->seqTargetCount; i++)
+        if (sg->seqTargets[i].elemIdx == elemIdx && sg->seqTargets[i].prop == prop)
+            return i;
+    return -1;
+}
+static void SigSeqTargetRemoveAt(AnimSignal *sg, int idx)
+{
+    for (int i = idx; i < sg->seqTargetCount - 1; i++)
+        sg->seqTargets[i] = sg->seqTargets[i+1];
+    sg->seqTargetCount--;
+}
+// Is EVERY scalar member of group gi (on elem) a sequence target? A group is
+// toggled as a unit so w/h fan together (a colour member is never a seq target).
+static bool SigSeqGroupOn(AnimSignal *sg, int elemIdx, int kind, int gi)
+{
+    const AnimPropGroup *g = AnimGroupAt(kind, gi);
+    int scal = 0, have = 0;
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        if (AnimPropIsColor(g->props[m])) continue;
+        scal++;
+        if (SigSeqTargetFind(sg, elemIdx, g->props[m]) >= 0) have++;
+    }
+    return scal > 0 && have == scal;
+}
+static bool SigSeqGroupHasScalar(int kind, int gi)
+{
+    const AnimPropGroup *g = AnimGroupAt(kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+        if (!AnimPropIsColor(g->props[m])) return true;
+    return false;
+}
+static void SigSeqGroupSet(AnimSignal *sg, int elemIdx, int kind, int gi, bool on)
+{
+    const AnimPropGroup *g = AnimGroupAt(kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        if (AnimPropIsColor(g->props[m])) continue;
+        int idx = SigSeqTargetFind(sg, elemIdx, g->props[m]);
+        if (on && idx < 0 && sg->seqTargetCount < ANIM_SIG_SEQ_TARGETS)
+        {
+            AnimSigSeqTarget *st = &sg->seqTargets[sg->seqTargetCount++];
+            st->elemIdx = elemIdx; st->prop = g->props[m];
+        }
+        else if (!on && idx >= 0) SigSeqTargetRemoveAt(sg, idx);
+    }
+}
+static int SigSeqKeyNear(const AnimSignal *sg, float u)
+{
+    for (int i = 0; i < sg->seqKeyCount; i++)
+        if (fabsf(sg->seqKeys[i].t - u) <= SIG_U_EPS) return i;
+    return -1;
+}
+static void SigSeqSortKeys(AnimSignal *sg)
+{
+    for (int i = 1; i < sg->seqKeyCount; i++)
+    {
+        AnimSeqKey k = sg->seqKeys[i]; int j = i - 1;
+        while (j >= 0 && sg->seqKeys[j].t > k.t) { sg->seqKeys[j+1] = sg->seqKeys[j]; j--; }
+        sg->seqKeys[j+1] = k;
+    }
+}
+static void SigSeqWriteKey(AnimSignal *sg, float u)
+{
+    if (SigSeqKeyNear(sg, u) >= 0 || sg->seqKeyCount >= ANIM_SIG_SEQ_KEYS) return;
+    sg->seqKeys[sg->seqKeyCount++] = (AnimSeqKey){ u, 1.0f, ANIM_EASE_SINE_OUT };
+    SigSeqSortKeys(sg);
+}
+// Free u for a new sequence-envelope key (seqKeys are kept sorted ascending).
+static float SigSeqFreeU(const AnimSignal *sg, float pref)
+{
+    float times[ANIM_SIG_SEQ_KEYS];
+    for (int i = 0; i < sg->seqKeyCount; i++) times[i] = sg->seqKeys[i].t;
+    return SigFreeU(times, sg->seqKeyCount, pref);
+}
+static void SigSeqRemoveKeyAt(AnimSignal *sg, int idx)
+{
+    for (int i = idx; i < sg->seqKeyCount - 1; i++) sg->seqKeys[i] = sg->seqKeys[i+1];
+    sg->seqKeyCount--;
+}
+
+// PropAccess over ONE signal group key: a prop the signal drives reads/writes
+// its key at u, and a prop it does not drive reads the element's live value
+// (which is exactly what the signal player leaves alone).
+typedef struct { AnimSignal *sg; int elemIdx; float u; int ease; } SigKeyCtx;
+
+static float SigKeyPropGet(void *ctx, int prop)
+{
+    SigKeyCtx *c = (SigKeyCtx *)ctx;
+    AnimSigTarget *tg = SigFindTarget(c->sg, c->elemIdx, prop);
+    int k = SigTargetKeyNear(tg, c->u);
+    if (k >= 0) return tg->keys[k].value;
+    return AnimElemProp(&doc.elems[c->elemIdx], prop, playhead);
+}
+
+// A corner drag moves AND resizes, so the size members have to become part of
+// the signal for the result to replay: create the target/key when it is missing
+// rather than silently dropping half the gesture.
+static void SigKeyPropSet(void *ctx, int prop, float v)
+{
+    SigKeyCtx *c = (SigKeyCtx *)ctx;
+    AnimSigTarget *tg = SigFindTarget(c->sg, c->elemIdx, prop);
+    if (!tg)
+    {
+        if (c->sg->targetCount >= ANIM_SIG_TARGETS_MAX) return;
+        tg = &c->sg->targets[c->sg->targetCount++];
+        *tg = (AnimSigTarget){0};
+        tg->elemIdx = c->elemIdx; tg->prop = prop;
+    }
+    int k = SigTargetKeyNear(tg, c->u);
+    if (k < 0)
+    {
+        if (tg->keyCount >= ANIM_SIG_KEYS_MAX) return;
+        k = tg->keyCount++;
+        tg->keys[k] = (AnimKey){ c->u, v, (Color){0,0,0,255}, c->ease };
+        SigTargetSortKeys(tg);
+        return;
+    }
+    tg->keys[k].value = v;
+}
+
 // Corner-mode geometry rows for a shape: two opposite corners (P0/P1), or for a
 // line its two endpoints (Start/End). Values are canvas FRACTIONS (like
-// position) regardless of the size units; on edit they are converted back to the
-// stored center+size (and, for a line, length + rotation) via WritePropValue, so
-// tracked props still auto-key. Returns the new y.
-static float DrawCornerRows(float x, float y, float w, float rh, float gap, AnimElem *e)
+// position) in % mode and absolute pixels in px mode; on edit they are converted
+// back to the stored center+size (and, for a line, length + rotation) through
+// `pa`, so the same four sliders serve the inspector (writing the element's
+// tracks at the playhead) and the signal key editor (writing one group key).
+// Returns the new y.
+static float DrawCornerRows(float x, float y, float w, float rh, float gap,
+                            const AnimElem *e, PropAccess pa)
 {
     Vector2 game = ScreenStateTargetSize();
     float lo = -3.0f, hi = 3.0f;                 // generous off-canvas reach for endpoints
@@ -1245,14 +1786,14 @@ static float DrawCornerRows(float x, float y, float w, float rh, float gap, Anim
     float valW = 48.0f;                          // TEXT_PADDING(4) + 44 value slot
     float half = (w - 44 - gap - 2*valW) * 0.5f;
     float x2   = x + 44 + half + valW + gap;     // second slider's x origin
-    float cx = AnimElemProp(e, AP_S_POS_X, playhead);
-    float cy = AnimElemProp(e, AP_S_POS_Y, playhead);
-    float wv = AnimElemProp(e, AP_S_W,     playhead);
+    float cx = pa.get(pa.ctx, AP_S_POS_X);
+    float cy = pa.get(pa.ctx, AP_S_POS_Y);
+    float wv = pa.get(pa.ctx, AP_S_W);
     float wUnit = e->sizeAbsolute ? 1.0f : game.x;
     // The renderer multiplies every extent by AP_S_SCALE, so the on-screen
     // endpoints reflect the SCALED size. Show/edit those scaled positions
     // (WYSIWYG) and divide the scale back out when storing the base size.
-    float sc = AnimElemProp(e, AP_S_SCALE, playhead);
+    float sc = pa.get(pa.ctx, AP_S_SCALE);
     float invSc = sc > 1e-6f ? 1.0f/sc : 1.0f;
 
     // Endpoints follow the element's size units: canvas FRACTIONS in % mode
@@ -1268,7 +1809,7 @@ static float DrawCornerRows(float x, float y, float w, float rh, float gap, Anim
         // reference, y via the height reference) so they are true canvas fractions
         // in % mode and absolute pixels in px mode - matching DrawShapeElem exactly.
         float hUnit = e->sizeAbsolute ? 1.0f : game.y;
-        float rot = AnimElemProp(e, AP_S_ROT, playhead) * DEG2RAD;
+        float rot = pa.get(pa.ctx, AP_S_ROT) * DEG2RAD;
         float wEff = wv * sc;                                  // rendered (scaled) length
         float ox = (wUnit * wEff * 0.5f) * cosf(rot) / game.x; // endpoint x frac offset
         float oy = (hUnit * wEff * 0.5f) * sinf(rot) / game.y; // endpoint y frac offset
@@ -1289,15 +1830,15 @@ static float DrawCornerRows(float x, float y, float w, float rh, float gap, Anim
             float dux = (bxF - axF) * game.x / wUnit;
             float duy = (byF - ayF) * game.y / hUnit;
             float lenFull = hypotf(dux, duy);        // rendered length in element units
-            WritePropValue(e, AP_S_POS_X, (axF + bxF) * 0.5f, &e->posFrac.x);
-            WritePropValue(e, AP_S_POS_Y, (ayF + byF) * 0.5f, &e->posFrac.y);
-            WritePropValue(e, AP_S_W, lenFull * invSc, &e->sizeFrac.x);  // base = rendered / scale
-            WritePropValue(e, AP_S_ROT, atan2f(duy, dux) * RAD2DEG, &e->rotBase);
+            pa.set(pa.ctx, AP_S_POS_X, (axF + bxF) * 0.5f);
+            pa.set(pa.ctx, AP_S_POS_Y, (ayF + byF) * 0.5f);
+            pa.set(pa.ctx, AP_S_W, lenFull * invSc);  // base = rendered / scale
+            pa.set(pa.ctx, AP_S_ROT, atan2f(duy, dux) * RAD2DEG);
         }
     }
     else
     {
-        float hv = AnimElemProp(e, AP_S_H, playhead);
+        float hv = pa.get(pa.ctx, AP_S_H);
         float hUnit = e->sizeAbsolute ? 1.0f : game.y;
         // scaled (rendered) half-extents, so the corner handles sit on screen.
         float hxF = (wUnit*wv*sc/game.x) * 0.5f, hyF = (hUnit*hv*sc/game.y) * 0.5f;
@@ -1315,10 +1856,10 @@ static float DrawCornerRows(float x, float y, float w, float rh, float gap, Anim
         {
             float x0F = x0/sx, y0F = y0/sy, x1F = x1/sx, y1F = y1/sy;
             float wF = fabsf(x1F-x0F), hF = fabsf(y1F-y0F);
-            WritePropValue(e, AP_S_POS_X, (x0F+x1F)*0.5f, &e->posFrac.x);
-            WritePropValue(e, AP_S_POS_Y, (y0F+y1F)*0.5f, &e->posFrac.y);
-            WritePropValue(e, AP_S_W, (e->sizeAbsolute ? wF*game.x : wF) * invSc, &e->sizeFrac.x);
-            WritePropValue(e, AP_S_H, (e->sizeAbsolute ? hF*game.y : hF) * invSc, &e->sizeFrac.y);
+            pa.set(pa.ctx, AP_S_POS_X, (x0F+x1F)*0.5f);
+            pa.set(pa.ctx, AP_S_POS_Y, (y0F+y1F)*0.5f);
+            pa.set(pa.ctx, AP_S_W, (e->sizeAbsolute ? wF*game.x : wF) * invSc);
+            pa.set(pa.ctx, AP_S_H, (e->sizeAbsolute ? hF*game.y : hF) * invSc);
         }
     }
     return y;
@@ -1404,7 +1945,8 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         // corner (or line-endpoint) rows; storage stays center+size either way.
         if (e->kind == AE_SHAPE && e->cornerMode)
         {
-            y = DrawCornerRows(x, y, w, rh, gap, e);
+            y = DrawCornerRows(x, y, w, rh, gap, e,
+                               (PropAccess){ ElemPropGet, ElemPropSet, e });
             if (e->shapeKind != SHAPE_LINE)
             {
                 PropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_SCALE, &e->scaleFrac);
@@ -1485,6 +2027,19 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         if (EditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "A", &oa, 0,255))
             e->outlineColor.a = (unsigned char)oa;
         y += 22;
+
+        // outline style (circle only): crisp ring vs faceted polygon ("crawling")
+        if (e->shapeKind == SHAPE_CIRCLE)
+        {
+            GuiLabel((Rectangle){ x, y, 44, rh }, "style");
+            float sw = (w - 44 - 4) / 2.0f;
+            bool wantCrawl = !e->outlineCrisp, wantCrisp = e->outlineCrisp;
+            GuiToggle((Rectangle){ x+44, y, sw, rh }, "crawling", &wantCrawl);
+            GuiToggle((Rectangle){ x+44+sw+4, y, sw, rh }, "crisp", &wantCrisp);
+            if (e->outlineCrisp && wantCrawl)      { UndoPush(); e->outlineCrisp = false; }
+            else if (!e->outlineCrisp && wantCrisp){ UndoPush(); e->outlineCrisp = true; }
+            y += rh + gap;
+        }
     }
 
     // --- tracks list: one row per GROUP (Position, Color, ...) with ALL of its
@@ -1599,8 +2154,21 @@ static float DrawInspector(float x, float y, float w)   // returns content heigh
         }
         y += rh + gap;
 
+        // A corner-mode element is AUTHORED by its two ends, so its keys are
+        // edited the same way: the position and size groups show the four
+        // endpoint sliders, writing this key's position AND size members
+        // (plus rotation for a line) instead of the raw per-prop rows.
+        int posG  = AnimGroupIndexOfProp(e->kind, AP_S_POS_X);
+        int sizeG = AnimGroupIndexOfProp(e->kind, AP_S_W);
+        bool cornerKey = (e->kind == AE_SHAPE && e->cornerMode &&
+                          (kg == posG || kg == sizeG));
+        TrackKeyCtx tkc = { e, kt, keyEaseSel };
+        if (cornerKey)
+            y = DrawCornerRows(x, y, w, rh, gap, e,
+                               (PropAccess){ TrackKeyPropGet, TrackKeyPropSet, &tkc });
+
         // one editor per member prop (Position -> x & y; Color -> RGB + alpha).
-        for (int m = 0; m < g->propCount; m++)
+        for (int m = 0; !cornerKey && m < g->propCount; m++)
         {
             int prop = g->props[m];
             AnimTrack *tr = AnimElemFindTrack(e, prop);
@@ -1994,6 +2562,24 @@ static void DrawLibraryModal()
     }
 }
 
+// Fire a signal the way the GAME would fire it. A signal authored to consume
+// the position parameter (AnimSignal.usesPos) is emitted AT THE MOUSE, in canvas
+// fractions - the same thing main_menu.c does on a click - so the re-anchoring
+// can be seen in the editor at all; one that does not is emitted bare. The
+// preview's instance number is refreshed here so a re-fire always reflects the
+// spinner without having to restart anything.
+static void FireSignal(const AnimSignal *sg)
+{
+    preview.seq = previewSeq;
+
+    if (!sg->usesPos) { SignalEmit(sg->name, NULL); return; }
+
+    Vector2 game = ScreenStateTargetSize();
+    Vector2 px   = Screen2Target(GetMousePosition());
+    SignalParams p = { .pos = { px.x/game.x, px.y/game.y }, .hasPos = true };
+    SignalEmit(sg->name, &p);
+}
+
 // ---------------------------------------------------------------------------
 //  Signals list (left panel, below the elements). Deliberately minimal: create,
 //  open, fire, delete. Everything about a signal's contents - its targets and
@@ -2012,11 +2598,12 @@ static float DrawSignalList(float x, float y, float w)
         AnimSignal *sg = &doc.signals[i];
         Rectangle openR = { x, y, w - 2*bw2 - 4, rh };
         if (GuiButton(openR, TextFormat("%s  (%d)", sg->name, sg->targetCount)))
-        { AudioPlayButton(); sigModalIdx = i; sigScroll = 0.0f; }
+        { AudioPlayButton(); sigModalIdx = i; sigScroll = 0.0f;
+          SigClearKeySel(); SigCloseDrops(); }   // selection belonged to the old one
         if (i == sigModalIdx) DrawRectangleRec(openR, (Color){ 90, 140, 220, 90 });
 
         if (GuiButton((Rectangle){ x + w - 2*bw2 - 2, y, bw2, rh }, "#131#"))
-        { AudioPlayButton(); SignalEmit(sg->name, NULL); }          // fire (play icon)
+        { AudioPlayButton(); FireSignal(sg); }          // fire (play icon)
         if (GuiButton((Rectangle){ x + w - bw2, y, bw2, rh }, "#143#"))
         { AudioPlayButton(); pendingDel = i; }                // trash icon
         y += rh + gap;
@@ -2029,8 +2616,13 @@ static float DrawSignalList(float x, float y, float w)
             AudioPlayButton(); UndoPush();
             AnimSignal *sg = &doc.signals[doc.signalCount++];
             TextCopy(sg->name, TextFormat("sig%d", doc.signalCount));
+            // every field explicitly: the slot may hold a deleted signal's data
             sg->length = 1.0f; sg->targetCount = 0;
+            sg->terminal = false; sg->usesPos = false;
+            sg->usesSeq = false; sg->seqMult = 0.0f;
+            sg->posParamCount = 0; sg->seqTargetCount = 0; sg->seqKeyCount = 0;
             sigModalIdx = doc.signalCount - 1; sigScroll = 0.0f;
+            SigClearKeySel(); SigCloseDrops();
             ReRegisterSignals();
         }
         y += rh + gap;
@@ -2043,6 +2635,7 @@ static float DrawSignalList(float x, float y, float w)
         for (int m = pendingDel; m < doc.signalCount - 1; m++)
             doc.signals[m] = doc.signals[m+1];
         doc.signalCount--;
+        SigClearKeySel(); SigCloseDrops();
         if      (sigModalIdx == pendingDel) sigModalIdx = -1;   // its modal closes
         else if (sigModalIdx >  pendingDel) sigModalIdx--;
         if      (edSigIdx == pendingDel) edSigIdx = -1;
@@ -2054,8 +2647,12 @@ static float DrawSignalList(float x, float y, float w)
 }
 
 // ---------------------------------------------------------------------------
-//  Signal modal: everything about ONE signal - its length and its targets,
-//  each an (element, property) pair with its own keyframes.
+//  Signal modal: everything about ONE signal - its length and its targets.
+//
+//  Targets are authored in property GROUPS, the same ones the inspector's
+//  tracks use (position, color, outline, ...): a group row owns the keys of all
+//  its member (element, property) targets at shared u values, and the key
+//  editor below the list edits the selected group key across every member.
 //
 //  Two forms:
 //    FULL    (editing)  the whole editor for the signal
@@ -2064,6 +2661,191 @@ static float DrawSignalList(float x, float y, float w)
 //                       it blends from the live scene. It deliberately does
 //                       NOT close on playback, unlike the PROMPT_* modals.
 // ---------------------------------------------------------------------------
+// Position slots an element exposes to a Mouse-Position binding: a text/normal
+// shape has one (its center); a corners-mode shape has two (its corners); a
+// global has none. Fills `names` with the slot labels and returns the count.
+static int SigElemSlots(const AnimElem *e, const char *names[2])
+{
+    if (e->kind == AE_GLOBAL) return 0;
+    if (e->kind == AE_SHAPE && e->cornerMode)
+    { names[0] = "P0"; names[1] = "P1"; return 2; }
+    names[0] = "center"; return 1;
+}
+
+// The "--params--" section: one row per position slot of every element. A bound
+// slot shows its keys (each easing the slot to mouse + per-key offset); an
+// unbound one shows "+ bind". Drawn inside the modal's scrolled list; returns
+// the new y.
+static float DrawSigParamsSection(AnimSignal *sg, Rectangle list, float ly,
+                                  float rh, float gap)
+{
+    DrawRectangleRec((Rectangle){ list.x, ly, list.width, rh },
+                     (Color){ 44, 52, 60, 255 });
+    GuiLabel((Rectangle){ list.x+6, ly, list.width-12, rh },
+             "params  (mouse position -> slot + offset)");
+    ly += rh + 2;
+
+    int delBind = -1, delKeyBind = -1, delKeyIdx = -1;
+
+    for (int e = 0; e < doc.elemCount; e++)
+    {
+        const char *sn[2]; int ns = SigElemSlots(&doc.elems[e], sn);
+        for (int s = 0; s < ns; s++)
+        {
+            int bi = SigPosFind(sg, e, s);
+            GuiLabel((Rectangle){ list.x+14, ly, list.width-160, rh },
+                     TextFormat("%s . %s", doc.elems[e].name, sn[s]));
+            if (bi < 0)
+            {
+                bool full = sg->posParamCount >= ANIM_SIG_POS_MAX;
+                if (full) GuiSetState(STATE_DISABLED);
+                if (GuiButton((Rectangle){ list.x+list.width-70, ly, 66, rh },
+                              full ? "full" : "+ bind") && !full)
+                { AudioPlayButton(); UndoPush(); SigPosAdd(sg, e, s);
+                  sigPosSelElem = e; sigPosSelSlot = s; sigPosSelU = 1.0f; }
+                if (full) GuiSetState(STATE_NORMAL);
+                ly += rh + 2;
+                continue;
+            }
+            AnimSigPosParam *pp = &sg->posParams[bi];
+            if (GuiButton((Rectangle){ list.x+list.width-104, ly, 50, rh }, "+key"))
+            { AudioPlayButton(); UndoPush();
+              float nu = SigPosFreeU(pp, sigLastU); SigPosWriteKey(pp, nu);
+              sigPosSelElem = e; sigPosSelSlot = s; sigPosSelU = nu; }
+            if (GuiButton((Rectangle){ list.x+list.width-50, ly, 50, rh }, "del"))
+            { AudioPlayButton(); UndoPush(); delBind = bi; }
+            ly += rh + 2;
+
+            for (int k = 0; k < pp->keyCount; k++)
+            {
+                float u = pp->keys[k].t;
+                bool sel = (sigPosSelElem == e && sigPosSelSlot == s &&
+                            fabsf(sigPosSelU - u) <= SIG_U_EPS);
+                Rectangle kr = { list.x+26, ly, list.width-26, 20 };
+                if (GuiButton(kr, TextFormat("%.2f   +(%.2f, %.2f)   %s", u,
+                              pp->keys[k].offX, pp->keys[k].offY,
+                              AnimEaseName(pp->keys[k].ease))))
+                { AudioPlayButton(); sigPosSelElem = e; sigPosSelSlot = s; sigPosSelU = u; }
+                if (sel) DrawRectangleRec(kr, (Color){ 60, 90, 140, 120 });
+                ly += 22;
+            }
+
+            if (sigPosSelElem == e && sigPosSelSlot == s)
+            {
+                int k = SigPosKeyNear(pp, sigPosSelU);
+                if (k >= 0)
+                {
+                    AnimPosKey *kk = &pp->keys[k];
+                    float u = kk->t, ox = kk->offX, oy = kk->offY;
+                    GuiLabel((Rectangle){ list.x+14, ly, 40, rh }, "u");
+                    if (EditSlider((Rectangle){ list.x+58, ly, list.width-58-56, rh },
+                                   "", &u, 0.0f, 1.0f))
+                    { kk->t = u; SigPosSortKeys(pp); sigPosSelU = u; sigLastU = u; }
+                    ly += rh + gap;
+                    GuiLabel((Rectangle){ list.x+14, ly, 40, rh }, "off x");
+                    if (EditSlider((Rectangle){ list.x+58, ly, list.width-58-56, rh },
+                                   "", &ox, -1.0f, 1.0f)) kk->offX = ox;
+                    ly += rh + gap;
+                    GuiLabel((Rectangle){ list.x+14, ly, 40, rh }, "off y");
+                    if (EditSlider((Rectangle){ list.x+58, ly, list.width-58-56, rh },
+                                   "", &oy, -1.0f, 1.0f)) kk->offY = oy;
+                    ly += rh + gap;
+                    GuiLabel((Rectangle){ list.x+14, ly, 40, rh }, "ease");
+                    if (GuiButton((Rectangle){ list.x+58, ly, 120, rh },
+                                  AnimEaseName(kk->ease)))
+                    { AudioPlayButton(); UndoPush();
+                      kk->ease = (kk->ease + 1) % AnimEaseCount(); }
+                    if (GuiButton((Rectangle){ list.x+list.width-50, ly, 50, rh }, "del"))
+                    { AudioPlayButton(); UndoPush(); delKeyBind = bi; delKeyIdx = k; }
+                    ly += rh + gap;
+                }
+            }
+        }
+    }
+    ly += gap;
+
+    if (delKeyBind >= 0)
+    { SigPosRemoveKeyAt(&sg->posParams[delKeyBind], delKeyIdx); }
+    else if (delBind >= 0)
+    { SigPosRemoveAt(sg, delBind); sigPosSelElem = -1; }
+    return ly;
+}
+
+// The "--sequence--" section: a per-instance multiplier, a checkbox per scalar
+// property GROUP marking it a sequence target, and an envelope of keys. The
+// offset added to each target is seq * mult * envelope(u). Returns the new y.
+static float DrawSigSequenceSection(AnimSignal *sg, Rectangle list, float ly,
+                                    float rh, float gap)
+{
+    DrawRectangleRec((Rectangle){ list.x, ly, list.width, rh },
+                     (Color){ 44, 52, 60, 255 });
+    GuiLabel((Rectangle){ list.x+6, ly, 200, rh }, "sequence  (seq x mult)");
+    GuiLabel((Rectangle){ list.x+list.width-210, ly, 34, rh }, "mult");
+    EditSlider((Rectangle){ list.x+list.width-172, ly+2, 168, rh-4 }, "",
+               &sg->seqMult, -30.0f, 30.0f);
+    ly += rh + 2;
+
+    // which properties the offset adds to - one checkbox per scalar group
+    for (int e = 0; e < doc.elemCount; e++)
+    {
+        int kind = doc.elems[e].kind, grpN = AnimGroupCountFor(kind);
+        for (int gi = 0; gi < grpN; gi++)
+        {
+            if (!SigSeqGroupHasScalar(kind, gi)) continue;
+            const AnimPropGroup *g = AnimGroupAt(kind, gi);
+            bool on = SigSeqGroupOn(sg, e, kind, gi), want = on;
+            GuiCheckBox((Rectangle){ list.x+20, ly+2, 16, 16 },
+                        TextFormat("%s . %s", doc.elems[e].name, g->name), &want);
+            if (want != on)
+            { AudioPlayButton(); UndoPush(); SigSeqGroupSet(sg, e, kind, gi, want); }
+            ly += rh;
+        }
+    }
+
+    // the envelope keys
+    if (GuiButton((Rectangle){ list.x+14, ly, 60, rh }, "+ key"))
+    { AudioPlayButton(); UndoPush();
+      float nu = SigSeqFreeU(sg, sigLastU); SigSeqWriteKey(sg, nu); sigSeqSelU = nu; }
+    ly += rh + 2;
+
+    int delKey = -1;
+    for (int k = 0; k < sg->seqKeyCount; k++)
+    {
+        float u = sg->seqKeys[k].t;
+        bool sel = fabsf(sigSeqSelU - u) <= SIG_U_EPS;
+        Rectangle kr = { list.x+26, ly, list.width-26, 20 };
+        if (GuiButton(kr, TextFormat("%.2f   amt %.2f   %s", u, sg->seqKeys[k].amt,
+                                     AnimEaseName(sg->seqKeys[k].ease))))
+        { AudioPlayButton(); sigSeqSelU = u; }
+        if (sel) DrawRectangleRec(kr, (Color){ 60, 90, 140, 120 });
+        ly += 22;
+    }
+    int sk = SigSeqKeyNear(sg, sigSeqSelU);
+    if (sk >= 0)
+    {
+        AnimSeqKey *kk = &sg->seqKeys[sk];
+        float u = kk->t, amt = kk->amt;
+        GuiLabel((Rectangle){ list.x+14, ly, 40, rh }, "u");
+        if (EditSlider((Rectangle){ list.x+58, ly, list.width-58-56, rh }, "",
+                       &u, 0.0f, 1.0f))
+        { kk->t = u; SigSeqSortKeys(sg); sigSeqSelU = u; sigLastU = u; }
+        ly += rh + gap;
+        GuiLabel((Rectangle){ list.x+14, ly, 40, rh }, "amt");
+        if (EditSlider((Rectangle){ list.x+58, ly, list.width-58-56, rh }, "",
+                       &amt, 0.0f, 1.0f)) kk->amt = amt;
+        ly += rh + gap;
+        GuiLabel((Rectangle){ list.x+14, ly, 40, rh }, "ease");
+        if (GuiButton((Rectangle){ list.x+58, ly, 120, rh }, AnimEaseName(kk->ease)))
+        { AudioPlayButton(); UndoPush(); kk->ease = (kk->ease + 1) % AnimEaseCount(); }
+        if (GuiButton((Rectangle){ list.x+list.width-50, ly, 50, rh }, "del"))
+        { AudioPlayButton(); UndoPush(); delKey = sk; }
+        ly += rh + gap;
+    }
+    ly += gap;
+    if (delKey >= 0) { SigSeqRemoveKeyAt(sg, delKey); sigSeqSelU = -1.0f; }
+    return ly;
+}
+
 static void DrawSignalModal()
 {
     if (sigModalIdx < 0 || sigModalIdx >= doc.signalCount) { sigModalIdx = -1; return; }
@@ -2082,14 +2864,14 @@ static void DrawSignalModal()
         DrawRectangleLinesEx(m, 1.0f, (Color){ 90, 94, 104, 255 });
         GuiLabel((Rectangle){ m.x+10, m.y+10, mw-140, 20 }, sg->name);
         if (GuiButton((Rectangle){ m.x+mw-116, m.y+7, 52, 26 }, "Fire"))
-        { AudioPlayButton(); SignalEmit(sg->name, NULL); }
+        { AudioPlayButton(); FireSignal(sg); }
         if (GuiButton((Rectangle){ m.x+mw-60, m.y+7, 52, 26 }, "Close"))
         { AudioPlayButton(); sigModalIdx = -1; }
         return;
     }
 
     // --- full form --------------------------------------------------------
-    float mw = 520, mh = 420;
+    float mw = 620, mh = 460;
     Rectangle m = { (W-mw)/2, (H-mh)/2, mw, mh };
     DrawRectangle(0, 0, (int)W, (int)H, (Color){ 0, 0, 0, 120 });
     DrawRectangleRec(m, (Color){ 40, 42, 48, 255 });
@@ -2100,9 +2882,9 @@ static void DrawSignalModal()
 
     // One of this modal's own dropdowns is expanded over these rows: lock them
     // so a click lands on the overlay list only. Without this the row widget
-    // underneath the expanded list consumes the click too (picking a target's
-    // element would fire whatever button sat beneath the list item).
-    bool sigDropOpen = sigPropDrop != -1 || sigKeyEaseDrop >= 0;
+    // underneath the expanded list consumes the click too (picking a group
+    // would fire whatever button sat beneath the list item).
+    bool sigDropOpen = sigDropMode != SIGDROP_NONE;
     if (sigDropOpen) GuiLock();
 
     GuiLabel((Rectangle){ x, y, 60, rh }, "signal");
@@ -2135,6 +2917,38 @@ static void DrawSignalModal()
         sg->terminal = terminal;
     }
     y += 20;
+
+    // Position parameter: does THIS signal consume the emit's location? Placing
+    // a transition where it fired only makes sense for some animations (a ripple
+    // at the mouse, yes; a screen wipe, no), so it is authored here rather than
+    // assumed. When on, the "--params--" section below binds mouse position to
+    // element position slots, and the Fire buttons emit at the mouse.
+    bool usesPos = sg->usesPos;
+    GuiCheckBox((Rectangle){ x+w-206, y, 16, 16 }, "uses position param (fire at mouse)",
+                &usesPos);
+    if (usesPos != sg->usesPos)
+    {
+        AudioPlayButton();
+        UndoPush();
+        sg->usesPos = usesPos;
+    }
+    // Sequence: does THIS signal consume the instance's sequence number? When on
+    // the "--sequence--" section below offsets chosen properties by seq * mult.
+    bool usesSeq = sg->usesSeq;
+    GuiCheckBox((Rectangle){ x, y, 16, 16 }, "uses sequence", &usesSeq);
+    if (usesSeq != sg->usesSeq)
+    { AudioPlayButton(); UndoPush(); sg->usesSeq = usesSeq; }
+    y += 20;
+
+    // Instance number this preview stands in for, feeding the sequence offset.
+    // Plain -/+ buttons: it is a preview control, not authored data, so it is
+    // deliberately outside undo.
+    GuiLabel((Rectangle){ x, y, 90, 18 }, TextFormat("instance %d", previewSeq));
+    if (GuiButton((Rectangle){ x+92, y, 22, 18 }, "-"))
+    { AudioPlayButton(); if (previewSeq > 0) previewSeq--; preview.seq = previewSeq; }
+    if (GuiButton((Rectangle){ x+116, y, 22, 18 }, "+"))
+    { AudioPlayButton(); previewSeq++; preview.seq = previewSeq; }
+    y += 22;
     GuiLine((Rectangle){ x, y, w, 8 }, "targets"); y += 12;
 
     // --- scrolling target list -------------------------------------------
@@ -2143,7 +2957,8 @@ static void DrawSignalModal()
     if (!ctrlDown && CheckCollisionPointRec(GetMousePosition(), list))
         sigScroll += GetMouseWheelMove() * 24.0f;
 
-    int pendingTgtDel = -1, pendingKeyDel = -1, pendingKeyTgt = -1;
+    int  pendingDelElem = -1, pendingDelGroup = -1;  // group whose targets go
+    bool pendingKeyDel = false;                      // selected group key goes
 
     // Same trap as PanelScroll: scissor hides the rows scrolled past the top of
     // `list` but leaves them clickable, so hitting the signal name/length row
@@ -2154,12 +2969,22 @@ static void DrawSignalModal()
     BeginScissorMode((int)list.x, (int)list.y, (int)list.width, (int)list.height);
     float ly = list.y + sigScroll;
 
+    // Authored parameter sections sit ABOVE the plain targets (they scroll with
+    // the list). Each is only shown when its checkbox opts the signal in.
+    if (sg->usesPos) ly = DrawSigParamsSection(sg, list, ly, rh, gap);
+    if (sg->usesSeq) ly = DrawSigSequenceSection(sg, list, ly, rh, gap);
+    if (sg->usesPos || sg->usesSeq)
+    { GuiLine((Rectangle){ list.x, ly, list.width, 8 }, "targets"); ly += 12; }
+
     // The list is driven by the DOCUMENT's elements, not by the signal's
-    // targets: every element is always shown, and its targets are the tracks
-    // nested under it. Adding a track is therefore a per-element action and
-    // the element itself never has to be picked from a dropdown.
+    // targets: every element is always shown, and its authored tracks - one row
+    // per property GROUP, exactly like the inspector's - are nested under it.
+    // Adding a track is therefore a per-element action and the element itself
+    // never has to be picked from a dropdown.
     for (int e = 0; e < doc.elemCount; e++)
     {
+        int kind = doc.elems[e].kind;
+
         // element header: name + a track adder scoped to this element
         DrawRectangleRec((Rectangle){ list.x, ly, list.width, rh },
                          (Color){ 52, 55, 62, 255 });
@@ -2168,102 +2993,175 @@ static void DrawSignalModal()
         // Show the adder greyed rather than hidden when the target pool is
         // full: a missing button read as "this element can't have tracks".
         bool sigFull = sg->targetCount >= ANIM_SIG_TARGETS_MAX;
+        Rectangle addR = { list.x+list.width-86, ly, 82, rh };
+        if (sigDropMode == SIGDROP_ADD && sigDropElem == e) sigDropHdr = addR;
         if (sigFull) GuiSetState(STATE_DISABLED);
-        bool addHit = GuiButton((Rectangle){ list.x+list.width-86, ly, 82, rh },
-                                sigFull ? "full" : "+ track");
+        bool addHit = GuiButton(addR, sigFull ? "full" : "+ track");
         if (sigFull) GuiSetState(STATE_NORMAL);
         if (!sigFull && addHit)
         {
-            // sigPropDrop identifies a target row; for the adder there is no
-            // row yet, so it is encoded as a negative element ref (-e-2) and
-            // the overlay creates the target once a property is chosen.
-            // -e-2, not -e-1: -1 is the "nothing open" sentinel, and element 0
-            // would collide with it (opening any other dropdown then resolved
-            // as "adder on element 0").
             AudioPlayButton();
-            sigPropDrop = (sigPropDrop == -e-2) ? -1 : -e-2;
-            sigKeyEaseDrop = -1;
+            if (sigDropMode == SIGDROP_ADD && sigDropElem == e) SigCloseDrops();
+            else { sigDropMode = SIGDROP_ADD; sigDropElem = e; sigDropHdr = addR; }
         }
         ly += rh + 2;
 
-        for (int t = 0; t < sg->targetCount; t++)
+        int grpN = AnimGroupCountFor(kind);
+        for (int gi = 0; gi < grpN; gi++)
         {
-        AnimSigTarget *tg = &sg->targets[t];
-        if (tg->elemIdx != e) continue;      // only this element's tracks
+            if (!SigGroupHasTarget(sg, e, gi)) continue;   // only authored ones
+            const AnimPropGroup *g = AnimGroupAt(kind, gi);
+            float times[SIG_TIMES_MAX];
+            int   nt = SigGroupKeyTimes(sg, e, gi, times);
 
-        // property picker (custom overlay dropdown, drawn later)
-        if (GuiButton((Rectangle){ list.x+14, ly, 130, rh },
-                      TextFormat("%s  v", AnimPropName(tg->prop))))
-        { AudioPlayButton(); sigPropDrop = (sigPropDrop == t) ? -1 : t; }
+            GuiLabel((Rectangle){ list.x+14, ly, list.width-160, rh },
+                     TextFormat("%s (%d)", g->name, nt));
 
-        if (GuiButton((Rectangle){ list.x+152, ly, 46, rh }, "+key"))
-        {
-            AudioPlayButton();
-            if (tg->keyCount < ANIM_SIG_KEYS_MAX)
+            // +key: one key across every member of the group. u seeds from the
+            // last one the user set on ANY signal key, not 1.0: the common case
+            // is placing the same beat across several tracks.
+            if (GuiButton((Rectangle){ list.x+list.width-104, ly, 50, rh }, "+key"))
             {
-                UndoPush();
-                // Seed u from the last one the user set on ANY signal key, not
-                // 1.0: the common case is placing the same beat across several
-                // tracks, and 1.0 forced a retype every time.
-                AnimKey *k = &tg->keys[tg->keyCount++];
-                k->t = sigLastU; k->ease = ANIM_EASE_SINE_OUT;
-                if (tg->elemIdx >= 0 && tg->elemIdx < doc.elemCount)
-                {
-                    const AnimElem *el = &doc.elems[tg->elemIdx];
-                    k->value = AnimElemProp(el, tg->prop, playhead);
-                    k->cval  = AnimElemColorProp(el, tg->prop, playhead);
-                }
-                else { k->value = 0.0f; k->cval = (Color){0,0,0,255}; }
+                AudioPlayButton(); UndoPush();
+                float nu = SigGroupFreeU(sg, e, gi, sigLastU);
+                SigGroupWriteKey(sg, e, gi, nu);
+                sigSelElem = e; sigSelGroup = gi; sigSelU = nu;
             }
-        }
-        if (GuiButton((Rectangle){ list.x+list.width-24, ly, 24, rh }, "#143#"))
-        { AudioPlayButton(); pendingTgtDel = t; }
-        ly += rh + 2;
+            if (GuiButton((Rectangle){ list.x+list.width-50, ly, 50, rh }, "del"))
+            { AudioPlayButton(); UndoPush(); pendingDelElem = e; pendingDelGroup = gi; }
+            ly += rh + 2;
 
-        // key rows: u / value / ease
-        for (int k = 0; k < tg->keyCount; k++)
-        {
-            AnimKey *kk = &tg->keys[k];
-            GuiLabel((Rectangle){ list.x+14, ly, 16, 20 }, "u");
-            float u = kk->t;
-            if (EditSlider((Rectangle){ list.x+30, ly, 96, 20 }, "", &u, 0.0f, 1.0f))
-            { kk->t = u; sigLastU = u; }    // remember for the next +key
-
-            if (AnimPropIsColor(tg->prop))
+            int colorProp = GroupColorProp(kind, gi);
+            for (int i = 0; i < nt; i++)
             {
-                float cr=kk->cval.r, cg=kk->cval.g, cb=kk->cval.b;
-                bool ch=false;
-                if (EditSlider((Rectangle){ list.x+180, ly, 60, 20 }, "R", &cr, 0,255)) ch=true;
-                if (EditSlider((Rectangle){ list.x+250, ly, 60, 20 }, "G", &cg, 0,255)) ch=true;
-                if (EditSlider((Rectangle){ list.x+320, ly, 60, 20 }, "B", &cb, 0,255)) ch=true;
-                if (ch) kk->cval = (Color){ (unsigned char)cr,(unsigned char)cg,
-                                            (unsigned char)cb, 255 };
-                DrawSwatch((Rectangle){ list.x+158, ly+2, 16, 16 },
-                           (Color){ kk->cval.r, kk->cval.g, kk->cval.b, 255 });
+                float u = times[i];
+                bool sel = (sigSelElem == e && sigSelGroup == gi &&
+                            fabsf(sigSelU - u) <= SIG_U_EPS);
+                Rectangle kr = { list.x+26, ly, list.width-26, 20 };
+                bool pressed = GuiButton(kr, SigGroupKeyLabel(sg, e, gi, u));
+                if (sel) DrawRectangleRec(kr, (Color){ 60, 90, 140, 120 });
+                if (colorProp >= 0)
+                {
+                    AnimSigTarget *ct = SigFindTarget(sg, e, colorProp);
+                    int ck = SigTargetKeyNear(ct, u);
+                    if (ck >= 0)
+                    {
+                        Color sc = ct->keys[ck].cval; sc.a = 255;
+                        DrawSwatch((Rectangle){ kr.x+kr.width-20, kr.y+2, 16, 16 }, sc);
+                    }
+                }
+                if (pressed)
+                { AudioPlayButton(); sigSelElem = e; sigSelGroup = gi; sigSelU = u; }
+                ly += 22;
+            }
+            ly += 4;
+        }
+        ly += gap;
+    }
+
+    // --- the selected group key: u / per-member values / shared ease -------
+    // Drawn inside the same scrolled content as the rows above, the way the
+    // inspector puts its key editor under the track list.
+    if (sigSelElem >= 0 && sigSelElem < doc.elemCount && sigSelGroup >= 0)
+    {
+        AnimElem *el = &doc.elems[sigSelElem];
+        const AnimPropGroup *g = AnimGroupAt(el->kind, sigSelGroup);
+        if (!g || !SigGroupHasTarget(sg, sigSelElem, sigSelGroup)) SigClearKeySel();
+        else
+        {
+            GuiLine((Rectangle){ list.x, ly, list.width, 8 },
+                    TextFormat("key  %s.%s  @%.2f", el->name, g->name, sigSelU));
+            ly += 12;
+
+            // u moves the WHOLE group key (every member) at once
+            GuiLabel((Rectangle){ list.x+14, ly, 54, rh }, "u");
+            float u = sigSelU;
+            if (EditSlider((Rectangle){ list.x+68, ly, list.width-68-56, rh }, "",
+                           &u, 0.0f, 1.0f))
+            {
+                SigGroupMoveKeyTo(sg, sigSelElem, sigSelGroup, sigSelU, u);
+                sigSelU = u; sigLastU = u;      // remember for the next +key
+            }
+            ly += rh + gap;
+
+            // ease: read off the first member that has this key, applied to all
+            int ease = 0;
+            for (int mI = 0; mI < g->propCount; mI++)
+            {
+                AnimSigTarget *rt = SigFindTarget(sg, sigSelElem, g->props[mI]);
+                int rk = SigTargetKeyNear(rt, sigSelU);
+                if (rk >= 0) { ease = rt->keys[rk].ease; break; }
+            }
+
+            // A corner-mode element is AUTHORED by its two ends, so its keys are
+            // edited the same way: the position and size groups both show the
+            // four endpoint sliders, writing this key's position AND size
+            // members (plus rotation for a line) through SigKeyPropSet.
+            int posG  = AnimGroupIndexOfProp(el->kind, AP_S_POS_X);
+            int sizeG = AnimGroupIndexOfProp(el->kind, AP_S_W);
+            SigKeyCtx skc = { sg, sigSelElem, sigSelU, ease };
+            if (el->kind == AE_SHAPE && el->cornerMode &&
+                (sigSelGroup == posG || sigSelGroup == sizeG))
+            {
+                ly = DrawCornerRows(list.x+14, ly, list.width-28, rh, gap, el,
+                                    (PropAccess){ SigKeyPropGet, SigKeyPropSet, &skc });
             }
             else
             {
-                float v = kk->value;
-                if (EditSlider((Rectangle){ list.x+180, ly, 150, 20 }, "", &v,
-                               AnimPropMin(tg->prop), AnimPropMax(tg->prop)))
-                    kk->value = v;
+                // one editor per member prop (position -> x & y; color -> RGB + alpha)
+                for (int mI = 0; mI < g->propCount; mI++)
+                {
+                    int prop = g->props[mI];
+                    AnimSigTarget *tg = SigFindTarget(sg, sigSelElem, prop);
+                    int k = SigTargetKeyNear(tg, sigSelU);
+                    if (k < 0) continue;             // ragged: member has no key here
+                    AnimKey *kk = &tg->keys[k];
+                    if (AnimPropIsColor(prop))
+                    {
+                        GuiLabel((Rectangle){ list.x+14, ly, list.width-40, rh },
+                                 TextFormat("%s (rgb)", AnimPropName(prop)));
+                        DrawSwatch((Rectangle){ list.x+list.width-24, ly+3, 18, 18 },
+                                   (Color){ kk->cval.r, kk->cval.g, kk->cval.b, 255 });
+                        ly += rh;
+                        float cr=kk->cval.r, cg=kk->cval.g, cb=kk->cval.b, sw=list.width-30-50;
+                        bool ch=false;
+                        if (EditSlider((Rectangle){ list.x+30, ly, sw, 16 }, "R", &cr, 0,255)) ch=true; ly+=18;
+                        if (EditSlider((Rectangle){ list.x+30, ly, sw, 16 }, "G", &cg, 0,255)) ch=true; ly+=18;
+                        if (EditSlider((Rectangle){ list.x+30, ly, sw, 16 }, "B", &cb, 0,255)) ch=true; ly+=20;
+                        if (ch) kk->cval = (Color){ (unsigned char)cr,(unsigned char)cg,
+                                                    (unsigned char)cb, 255 };
+                    }
+                    else
+                    {
+                        GuiLabel((Rectangle){ list.x+14, ly, 54, rh }, AnimPropName(prop));
+                        // the element's CURRENT units, not raw fractions: a
+                        // px-absolute element gets pixel bounds here too.
+                        float v = kk->value, klo, khi; PropRange(el, prop, &klo, &khi);
+                        if (EditSlider((Rectangle){ list.x+68, ly, list.width-68-56, rh },
+                                       "", &v, klo, khi))
+                            kk->value = v;
+                        ly += rh + gap;
+                    }
+                }
             }
 
-            if (GuiButton((Rectangle){ list.x+list.width-104, ly, 76, 20 },
-                          AnimEaseName(kk->ease)))
+            GuiLabel((Rectangle){ list.x+14, ly, 54, rh }, "ease");
+            Rectangle easeR = { list.x+68, ly, list.width-68-110, rh };
+            if (sigDropMode == SIGDROP_EASE) sigDropHdr = easeR;
+            if (GuiButton(easeR, TextFormat("%s  v", AnimEaseName(ease))))
             {
                 AudioPlayButton();
-                int packed = t*256 + k;
-                sigKeyEaseDrop = (sigKeyEaseDrop == packed) ? -1 : packed;
+                if (sigDropMode == SIGDROP_EASE) SigCloseDrops();
+                else { sigDropMode = SIGDROP_EASE; sigDropHdr = easeR; }
             }
-            if (GuiButton((Rectangle){ list.x+list.width-24, ly, 24, 20 }, "x"))
-            { AudioPlayButton(); pendingKeyDel = k; pendingKeyTgt = t; }
-            ly += 22;
+            if (GuiButton((Rectangle){ list.x+list.width-50, ly, 50, rh }, "del"))
+            { AudioPlayButton(); UndoPush(); pendingKeyDel = true; }
+            ly += rh + gap;
         }
-        ly += 4;
-        }       // targets of this element
-        ly += gap;
-    }           // elements
+    }
+    // the ease list hangs off the key editor: it cannot outlive the selection
+    if (sigDropMode == SIGDROP_EASE && sigSelElem < 0) SigCloseDrops();
+
     EndScissorMode();
     if (!inList && !sigDropOpen) GuiUnlock();   // footer/header stay live
 
@@ -2274,105 +3172,63 @@ static void DrawSignalModal()
     if (sigScroll < -maxScroll) sigScroll = -maxScroll;
     if (sigScroll > 0) sigScroll = 0;
 
-    // deferred deletions (same reason as everywhere else: mid-draw array
-    // shifts re-fire the next row's button on the same rect this frame)
-    if (pendingTgtDel >= 0)
+    // deferred edits (same reason as everywhere else: mid-draw array shifts
+    // re-fire the next row's button on the same rect this frame)
+    if (pendingDelGroup >= 0)
     {
-        UndoPush();
-        for (int mI = pendingTgtDel; mI < sg->targetCount - 1; mI++)
-            sg->targets[mI] = sg->targets[mI+1];
-        sg->targetCount--;
-        sigPropDrop = -1; sigKeyEaseDrop = -1;
+        SigGroupDeleteTargets(sg, pendingDelElem, pendingDelGroup);
+        if (sigSelElem == pendingDelElem && sigSelGroup == pendingDelGroup)
+            SigClearKeySel();
+        SigCloseDrops();
     }
-    else if (pendingKeyDel >= 0)
+    else if (pendingKeyDel)
     {
-        UndoPush();
-        AnimSigTarget *tg = &sg->targets[pendingKeyTgt];
-        for (int mI = pendingKeyDel; mI < tg->keyCount - 1; mI++)
-            tg->keys[mI] = tg->keys[mI+1];
-        tg->keyCount--;
-        sigKeyEaseDrop = -1;
+        SigGroupDeleteKeyAt(sg, sigSelElem, sigSelGroup, sigSelU);
+        SigClearKeySel();
+        SigCloseDrops();
     }
 
     // --- footer -----------------------------------------------------------
     float bh = 28, by = m.y + mh - bh - 12;
     if (GuiButton((Rectangle){ x, by, 70, bh }, "Fire"))
-    { AudioPlayButton(); SignalEmit(sg->name, NULL); }
+    { AudioPlayButton(); FireSignal(sg); }
     GuiLabel((Rectangle){ x+80, by, mw-200, bh }, "fires from the CURRENT pose");
     if (GuiButton((Rectangle){ m.x+mw-84, by, 70, bh }, "Close"))
     { AudioPlayButton(); sigModalIdx = -1; edSigIdx = -1;
-      sigPropDrop = -1; sigKeyEaseDrop = -1; }
+      SigCloseDrops(); SigClearKeySel(); }
 
     if (sigDropOpen) GuiUnlock();   // the overlay list itself draws unlocked
 }
 
-// The signal modal's own dropdown overlays (element / property / key ease).
-// Drawn after the modal so they sit on top of it, mirroring how
-// DrawDropdownOverlays relates to the main inspector.
+// The signal modal's own dropdown overlay (group adder or key ease). Drawn
+// after the modal so it sits on top of it, mirroring how DrawDropdownOverlays
+// relates to the main inspector. The header rect is recorded while the modal
+// draws (sigDropHdr), so nothing here has to re-derive the row layout.
 static void DrawSignalModalOverlays()
 {
     if (sigModalIdx < 0 || sigModalIdx >= doc.signalCount) return;
     if (playing || !AnimSignalPlayerDone(&preview)) return;    // shrunk: no lists
-    if (sigPropDrop == -1 && sigKeyEaseDrop < 0) return;
+    if (sigDropMode == SIGDROP_NONE) return;
 
     AnimSignal *sg = &doc.signals[sigModalIdx];
     ScreenState *ss = ScreenStateGet();
     float H = (float)ss->height;
 
-    // Recompute the row geometry the modal used (same constants).
-    float W = (float)ss->width;
-    float mw = 520, mh = 420;
-    Rectangle m = { (W-mw)/2, (H-mh)/2, mw, mh };
-    float rh = 24.0f;
-    float x = m.x + 14, w = mw - 28;
-    float y = m.y + 12 + rh + 4 + 20 + 12;
-    Rectangle list = { x, y, w, m.y + mh - 48 - y };
+    bool addMode = (sigDropMode == SIGDROP_ADD);
+    if (addMode && (sigDropElem < 0 || sigDropElem >= doc.elemCount))
+    { SigCloseDrops(); return; }
 
-    int   count = 0;
-    Rectangle hdr = {0};
-    int   mode = 0;    // 2 = property (existing row), 3 = ease, 4 = new track
-    int   tIdx = -1, kIdx = -1, addElem = -1;
+    int kind  = addMode ? doc.elems[sigDropElem].kind : 0;
+    int count = addMode ? AnimGroupCountFor(kind) : AnimEaseCount();
+    if (count <= 0) return;
 
-    // walk the rows to find the open dropdown's header rect. This MUST mirror
-    // the element-grouped layout DrawSignalModal lays out above.
-    float ly = list.y + sigScroll;
-    for (int e = 0; e < doc.elemCount && !mode; e++)
-    {
-        // element header row, carrying the "+ track" adder
-        if (sigPropDrop == -e-2)
-        { mode = 4; addElem = e;
-          hdr = (Rectangle){ list.x+list.width-86, ly, 82, rh };
-          count = AnimPropCountFor(doc.elems[e].kind); }
-        ly += rh + 2;
-
-        for (int t = 0; t < sg->targetCount && !mode; t++)
-        {
-            AnimSigTarget *tg = &sg->targets[t];
-            if (tg->elemIdx != e) continue;
-
-            if (sigPropDrop == t)
-            { mode = 2; tIdx = t; hdr = (Rectangle){ list.x+14, ly, 130, rh };
-              count = AnimPropCountFor(doc.elems[e].kind); }
-            ly += rh + 2;
-            for (int k = 0; k < tg->keyCount && !mode; k++)
-            {
-                if (sigKeyEaseDrop == t*256 + k)
-                { mode = 3; tIdx = t; kIdx = k;
-                  hdr = (Rectangle){ list.x+list.width-104, ly, 76, 20 };
-                  count = AnimEaseCount(); }
-                ly += 22;
-            }
-            if (!mode) ly += 4;
-        }
-        if (!mode) ly += 6.0f;      // == `gap` in DrawSignalModal
-    }
-    if (!mode || count <= 0) return;
-
+    Rectangle hdr = sigDropHdr;
     float ih = 20.0f, listH = ih * count;
-    float ly2 = (hdr.y + hdr.height + listH <= H - 4.0f)
-              ? hdr.y + hdr.height : hdr.y - listH;
-    if (ly2 < 4.0f) ly2 = 4.0f;
-    Rectangle bg = { hdr.x, ly2, hdr.width, listH };
+    float ly = (hdr.y + hdr.height + listH <= H - 4.0f)
+             ? hdr.y + hdr.height          // fits below
+             : hdr.y - listH;              // flip above the header
+    if (ly < 4.0f) ly = 4.0f;              // clamp to the screen top
+    Rectangle bg = { hdr.x, ly, hdr.width, listH };
     DrawRectangleRec(bg, (Color){ 32, 34, 40, 255 });
     DrawRectangleLinesEx(bg, 1.0f, (Color){ 70, 74, 84, 255 });
 
@@ -2380,42 +3236,33 @@ static void DrawSignalModalOverlays()
     for (int i = 0; i < count; i++)
     {
         Rectangle rr = { bg.x, bg.y + i*ih, bg.width, ih };
-        const char *nm = (mode == 2) ? AnimPropName(AnimPropAt(
-                             doc.elems[sg->targets[tIdx].elemIdx].kind, i))
-                       : (mode == 4) ? AnimPropName(AnimPropAt(doc.elems[addElem].kind, i))
-                       : AnimEaseName(i);
-        if (GuiButton(rr, nm)) picked = i;
+        const AnimPropGroup *g = addMode ? AnimGroupAt(kind, i) : NULL;
+        // a 3-prop group can be out of target slots while a 1-prop one still
+        // fits, so the entries grey out individually rather than the adder
+        bool fits = !addMode || SigGroupFits(sg, sigDropElem, i);
+        if (!fits) GuiSetState(STATE_DISABLED);
+        if (GuiButton(rr, addMode ? (g ? g->name : "?") : AnimEaseName(i)) && fits)
+            picked = i;
+        if (!fits) GuiSetState(STATE_NORMAL);
     }
 
     if (picked >= 0)
     {
         AudioPlayButton(); UndoPush();
-        if (mode == 2)
+        if (addMode)
         {
-            AnimSigTarget *tg = &sg->targets[tIdx];
-            int np = AnimPropAt(doc.elems[tg->elemIdx].kind, picked);
-            // scalar <-> colour keys are not interchangeable: reset on a switch
-            if (AnimPropIsColor(np) != AnimPropIsColor(tg->prop)) tg->keyCount = 0;
-            tg->prop = np;
-            sigPropDrop = -1;
+            // adding a track = creating every member target of the group; the
+            // keys come later through the group's own +key.
+            SigGroupAddTargets(sg, sigDropElem, picked);
+            sigSelElem = sigDropElem; sigSelGroup = picked; sigSelU = sigLastU;
         }
-        else if (mode == 4)
-        {
-            // adder: create the target on this element with the chosen property
-            int np = AnimPropAt(doc.elems[addElem].kind, picked);
-            if (sg->targetCount < ANIM_SIG_TARGETS_MAX)
-            {
-                AnimSigTarget *tg = &sg->targets[sg->targetCount++];
-                tg->elemIdx = addElem; tg->prop = np; tg->keyCount = 0;
-            }
-            sigPropDrop = -1;
-        }
-        else { sg->targets[tIdx].keys[kIdx].ease = picked; sigKeyEaseDrop = -1; }
+        else SigGroupSetEaseAt(sg, sigSelElem, sigSelGroup, sigSelU, picked);
+        SigCloseDrops();
     }
     else if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
              !CheckCollisionPointRec(GetMousePosition(), bg) &&
              !CheckCollisionPointRec(GetMousePosition(), hdr))
-    { sigPropDrop = -1; sigKeyEaseDrop = -1; }
+    { SigCloseDrops(); }       // click-away closes
 }
 
 // A filled diamond. DrawTriangle culls back faces: vertices must be counter-
@@ -2703,11 +3550,15 @@ static float DrawToolbar(float x, float y, float w)
     // reads as a gaping hole - the plain gap is enough separation.
     gx += cb + TextW("autokey", 4*s) + gap;
 
-    // The clock group (dur slider + length readout) is the widest block, and
-    // "Back" is pinned to the right edge. If they would collide, wrap the group
-    // onto a second row instead of letting it run under the button.
+    // The clock group (dur slider + length readout + the smooth-loop pair) is
+    // the widest block, and "Back" is pinned to the right edge. If they would
+    // collide, wrap the group onto a second row instead of letting it run under
+    // the button. Measured at its WIDEST (blend slider shown) so the row does
+    // not re-wrap the moment "smooth" is ticked.
     float dlw = TextW("dur", 6*s);
-    float clockW = dlw + gap + 120*s + valW + grp + TextW("60.00 (60.00)", 10*s);
+    float smw = cb + TextW("smooth", 6*s) + gap + 80*s + valW;
+    float clockW = dlw + gap + 120*s + valW + grp + TextW("60.00 (60.00)", 10*s)
+                 + grp + smw;
     float rows = 1.0f;
     if (gx + clockW > x + w - bw - grp)
     { gx = x; y += rh + gap; rows = 2.0f; }
@@ -2732,6 +3583,29 @@ static float DrawToolbar(float x, float y, float w)
     float lenW = TextW("60.00 (60.00)", 10*s);
     GuiLabel((Rectangle){ gx, y, lenW, rh }, lenTxt);
     gx += lenW + grp;
+
+    // SMOOTH LOOP: how the cycle wraps. With it on, the last `blend` seconds of
+    // every loop ease back into the pose at the loop start, so the last key
+    // lerps into the first one instead of cutting. Only visible in the preview
+    // while the timeline is actually playing AND looping (see Draw).
+    // Snapshot before writing, like the other authoring toggles.
+    bool smooth = doc.loopSmooth;
+    GuiCheckBox((Rectangle){ gx, y+(rh-cb)*0.5f, cb, cb }, "smooth", &smooth);
+    if (smooth != doc.loopSmooth)
+    { AudioPlayButton(); UndoPush(); doc.loopSmooth = smooth; }
+    gx += cb + TextW("smooth", 6*s) + gap;
+
+    if (doc.loopSmooth)
+    {
+        // Clamped to the cycle at draw time too, but keeping the authored value
+        // sane here means the number the user reads is the one that applies.
+        if (EditSlider((Rectangle){ gx, y, 80*s, rh }, "", &doc.loopBlend, 0.0f, 2.0f))
+        {
+            float cycle = AnimDocPlayLen(&doc);
+            if (doc.loopBlend > cycle) doc.loopBlend = cycle;
+        }
+    }
+    gx += 80*s + valW + grp;
 
     // Back to menu: pinned to the right edge of the FIRST row (y0), which the
     // wrap above deliberately keeps clear.

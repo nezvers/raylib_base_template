@@ -13,8 +13,6 @@
 #include "../screen_state/screen_state.h"
 #include "../settings_state/settings_state.h"
 #include "../audio_state/audio_state.h"
-#include "../scene_anim/scene_anim.h"        // AnimText / AnimPhase / SceneAnim data model
-#include "../transition/transition_state.h"  // TransitionStateStart (generic outro player)
 #include "../anim_stage/anim_scene.h"        // declarative editor-authored anim table
 #include "../signal/signal.h"                // SignalParams
 #include <stddef.h>
@@ -40,7 +38,6 @@ AppState app_state_main_menu = {Enter, Exit, Update, Draw, Gui, "MainMenu"};
 // Volume, difficulty AND the GUI-scale wish now all live in the Settings singleton
 // (settings->music_volume / ->difficulty / ->gui_scale_wish), so they're global and
 // persist on quit; the widgets below bind straight to them.
-static float animTime = 0.0f;           // accumulates for the animation demo
 
 // The menu shows one of two pages (contexts) at a time. MAIN has the top-level
 // buttons; OPTIONS has BACK + all the settings widgets. The OPTIONS button switches
@@ -49,38 +46,10 @@ typedef enum { MENU_PAGE_MAIN = 0, MENU_PAGE_OPTIONS } MenuPage;
 static MenuPage menuPage = MENU_PAGE_MAIN;
 
 // ============================================================================
-//  SCENE ANIMATION DATA (see scene_anim.h) - the demonstration integration.
-//
-//  This block is the SINGLE source of truth for every animated text the menu
-//  shows and for how the menu animates in (intro, played by this state) and
-//  out (outro, played by the generic transition state). There is no second
-//  DrawText for the title/sub-text anywhere - the same AnimText rows drive
-//  the idle menu, the intro and the outro, so nothing can drift apart.
-//
-//  Phase rows: { kind, start s, end s, easing } - ANY order, found by kind.
-//  A gap between rows = the old "hold" (nothing needs a row to stand still).
-// ============================================================================
-
-typedef struct {
-    AnimPhase titleIntro[1];
-    AnimPhase titleOutro[3];
-    AnimPhase descrIntro[1];
-    AnimPhase descrOutro[1];
-    AnimText menuTexts[2];
-    AnimPhase menuOutroGlobal[2];
-    AnimPhase menuOutroShape[2];
-    SceneAnim menuAnim;
-    SceneAnimPlayer player;
-} MainMenUAnimations_t;
-static MainMenUAnimations_t menu_animations;
-
-// The zoom boxes' clock lives HERE (in the scene) and the spec points at it,
-// so the outro captures the boxes exactly where the menu just drew them.
-static ZoomBoxes zoomBoxes = { .count = 3, .period = 5.0f };
-
-// ============================================================================
-//  EDITOR-AUTHORED ANIMATION (anim_scene.h) - the NEW model, running alongside
-//  the scene_anim one above rather than replacing it.
+//  EDITOR-AUTHORED ANIMATION (anim_scene.h) - the menu's ONLY animation model.
+//  The menu's entire look (title, subtitle, bar, lines, ball) plus the ripple
+//  train are authored in the ANIM EDITOR and played from the table below; there
+//  is no hand-coded animation in this state anymore.
 //
 //  These animations are not declared in C at all: they are authored in the ANIM
 //  EDITOR, saved to anims/<name>.cfg, and listed HERE as a declarative table -
@@ -94,6 +63,10 @@ static ZoomBoxes zoomBoxes = { .count = 3, .period = 5.0f };
 //      .delay column), so one file gives a staggered train of ripples. It
 //      answers the "ripple" signal, which USES A POSITION PARAM (usesPos): the
 //      menu emits it at the mouse on click, so the ripple appears where clicked.
+//      Those three rows also carry .seq 0/1/2 - their INSTANCE NUMBER. The
+//      authored TV-out transition multiplies its per-instance step by it, so on
+//      the way out the boxes fan to slightly different sizes before collapsing
+//      to a dot at the centre. One file, three visibly distinct copies.
 //
 //  How much of the menu shows THROUGH the overlay is decided in the editor, by
 //  the document's global element (AP_G_BG_ALPHA 0 = fully transparent).
@@ -105,102 +78,38 @@ static ZoomBoxes zoomBoxes = { .count = 3, .period = 5.0f };
 #define MENU_RIPPLE_SIGNAL "ripple"    // placed ripple; consumes params.pos
 
 static const AnimStageEntry MENU_SCENE[] = {
-    { .anim="signal_test", .loop=true, .delay=0.0f, .layer=10, .tag=0, .signals={ { MENU_END_SIGNAL, false } }, .signalCount=1 },
-    { .anim="zooming_box", .loop=true, .delay=0.0f, .layer=9,  .tag=1, .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
-    { .anim="zooming_box", .loop=true, .delay=0.6f, .layer=9,  .tag=2, .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
-    { .anim="zooming_box", .loop=true, .delay=1.2f, .layer=9,  .tag=3, .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
+    { .anim="MAIN_MENU", .loop=true, .delay=0.0f, .layer=10, .tag=0, .seq=0, .signals={ { MENU_END_SIGNAL, false } }, .signalCount=1 },
+    { .anim="zooming_box", .loop=true, .delay=0.0f, .layer=9,  .tag=1, .seq=0, .signals={ { MENU_RIPPLE_SIGNAL, true }, { MENU_END_SIGNAL, false } }, .signalCount=2 },
+    { .anim="zooming_box", .loop=true, .delay=1.6f, .layer=9,  .tag=2, .seq=1, .signals={ { MENU_RIPPLE_SIGNAL, true }, { MENU_END_SIGNAL, false } }, .signalCount=2 },
+    { .anim="zooming_box", .loop=true, .delay=3.2f, .layer=9,  .tag=3, .seq=2, .signals={ { MENU_RIPPLE_SIGNAL, true }, { MENU_END_SIGNAL, false } }, .signalCount=2 },
 };
 
 // The state owns one scene object (holds the live handles + terminal bookkeeping).
 static AnimStageScene menuScene;
 
-static void DrawMenuArt(float alpha, float time);   // defined below Draw()
-
-// Plays the INTRO when the menu is entered; after it finishes, the same
-// SceneAnimDrawTexts call keeps drawing the texts at their rest pose forever.
-
-static void AnimationsInit() {
-    // slides in from off-screen
-    menu_animations.titleIntro[0] = (AnimPhase){ TP_SLIDE_IN, 0.00f, 0.60f, sineEaseOutf };
-
-    // already centered -> no motion, but would center any rest pose
-    menu_animations.titleOutro[0] = (AnimPhase){ TP_CENTER_X, 0.00f, 0.55f, sineEaseOutf };
-    // drop to the vertical center
-    menu_animations.titleOutro[1] = (AnimPhase){ TP_CENTER_Y, 0.10f, 0.75f, sineEaseInOutf };
-    // then break apart and fall
-    menu_animations.titleOutro[2] = (AnimPhase){ TP_CRUMBLE,  1.05f, 2.15f, cubicEaseInf };
-
-    // NULL ease = linear
-    menu_animations.descrIntro[0] = (AnimPhase){ TP_FADE_IN,  0.20f, 0.70f, NULL };
-    // sub-text crumbles a beat later
-    menu_animations.descrOutro[0] = (AnimPhase){ TP_CRUMBLE,  1.15f, 2.25f, cubicEaseInf };
-    
-    // Every DrawText the menu owns: text, size (fraction of game height), anchor
-    // (x = text center, y = top edge; fractions of game size), color, phases.
-    menu_animations.menuTexts[0] = (AnimText){ "MAIN MENU",                0.125f, {0.5f, 0.06f}, RAYWHITE, menu_animations.titleIntro, 1,  menu_animations.titleOutro, 3 };
-    menu_animations.menuTexts[1] = (AnimText){ "place of all the buttons", 0.062f, {0.5f, 0.18f}, RAYWHITE, menu_animations.descrIntro, 1,  menu_animations.descrOutro, 1 };
-
-    // Global (whole-screen) outro beats. GP_FADE_BLACK's end is the hand-off time.
-    menu_animations.menuOutroGlobal[0] = (AnimPhase){ GP_ART_FADE,   0.15f, 1.10f, NULL };
-    menu_animations.menuOutroGlobal[1] = (AnimPhase){ GP_FADE_BLACK, 1.90f, 2.55f, NULL };
-
-    // Shape (zoom box) outro beats: keep zooming while the gaps shrink to zero
-    // (they group up mid-zoom), then the grouped stack reverses inward together.
-    menu_animations.menuOutroShape[0] = (AnimPhase){ SP_ZOOM_SETTLE_GAP1,  0.00f, 1.35f, sineEaseOutf };
-    menu_animations.menuOutroShape[1] = (AnimPhase){ SP_ZOOM_REVERSE, 1.35f, 2.45f, cubicEaseInf };
-
-    // The bundle handed to both players: our texts, global/shape outro tables,
-    // the shared zoom boxes and the decor callback. (introGlobal is NULL: this
-    // menu has no whole-screen intro beat; GP_UNFADE_BLACK would go there.)
-    menu_animations.menuAnim = (SceneAnim){
-        .texts = menu_animations.menuTexts,
-        .textCount = 2,
-
-        .introGlobal = NULL,
-        .introGlobalCount = 0,
-
-        .outroGlobal = menu_animations.menuOutroGlobal,
-        .outroGlobalCount = 2,
-
-        .outroShape = menu_animations.menuOutroShape,
-        .outroShapeCount = 2,
-
-        .boxes = &zoomBoxes,
-        .drawArt = DrawMenuArt,
-        };
-}
-
 // Where StartGameTransition is headed once the overlay has wound down. Held
 // across frames because the hand-off is deferred (see below).
 static AppState *pendingDestination = NULL;
 
-// Hand off to the outro player + destination. This is the ORIGINAL exit path,
-// now reached either immediately or from the overlay's done callback.
-static void EnterGameTransition(void)
-{
-    AppState *destination = pendingDestination ? pendingDestination
-                                               : &app_state_platformer;
-    pendingDestination = NULL;
-    TransitionStateStart(&menu_animations.menuAnim, destination);
-    AppStateTransition(&app_state_transition);
-}
-
 // Fired by anim_scene once the overlay's terminal transition has finished (or
-// immediately if nothing was armed). `user` is unused - the destination is in
-// pendingDestination.
+// immediately if nothing was armed). The destination is in pendingDestination.
 static void OnSceneDone(void *user)
 {
     (void)user;
-    EnterGameTransition();
+    AppState *destination = pendingDestination ? pendingDestination
+                                               : &app_state_platformer;
+    pendingDestination = NULL;
+    AppStateTransition(destination);
 }
 
-// Leave the menu through the generic outro player (PLAY/STRATEGY and ENTER).
+// Leave the menu (PLAY/STRATEGY and ENTER).
 //
 // If the authored scene is playing, the menu does NOT leave right away: it
 // emits the overlay's TERMINAL signal across the scene and waits for that
-// transition to play through to its end, handing off from OnSceneDone.
+// authored transition to play through to its end, handing off from OnSceneDone.
 // AnimSceneEmitTerminal fires OnSceneDone immediately when nothing arms (no
-// scene, or the signal isn't terminal), so this never hangs.
+// scene, or the signal isn't terminal - as today, until a TV-out outro is
+// authored in the editor), so this snaps straight through and never hangs.
 static void StartGameTransition(AppState *destination)
 {
     pendingDestination = destination;
@@ -208,7 +117,7 @@ static void StartGameTransition(AppState *destination)
     if (AnimSceneAlive(&menuScene))
         AnimSceneEmitTerminal(&menuScene, MENU_END_SIGNAL, NULL, OnSceneDone, NULL);
     else
-        EnterGameTransition();
+        OnSceneDone(NULL);
 }
 
 // ----------------------------------------------------------------------------
@@ -219,13 +128,7 @@ static void Enter()
 {
     ScreenState *screenState = ScreenStateGet();
     screenState->clear_color = (Color){ 25, 30, 40, 255 };  // dark blue-gray
-    animTime = 0.0f;
     menuPage = MENU_PAGE_MAIN;   // always open on the main page
-
-    // Kick off the intro: texts slide/fade IN to their rest pose. When it is
-    // done the same player simply keeps drawing the rest pose (see Draw()).
-    AnimationsInit();
-    SceneAnimStart(&menu_animations.player, &menu_animations.menuAnim, ANIM_INTRO);
 
     // The entire editor-authored integration in one call: the looping overlay
     // plus the staggered ripple train, from the MENU_SCENE table. A missing or
@@ -256,10 +159,7 @@ static void Update()
     // GetFrameTime() = seconds since last frame. Multiply movement by it so
     // speed is frame-rate independent. (GetTime() = seconds since start.)
     float dt = GetFrameTime();
-    animTime += dt;
 
-    SceneAnimUpdate(&menu_animations.player, dt);   // advance the intro (no-op once done)
-    ZoomBoxesUpdate(&zoomBoxes, dt);     // the boxes' shared loop clock
     AnimStageUpdate(dt);                 // the editor-authored overlay(s)
 
     // Keyboard input example: ENTER also starts the game.
@@ -307,21 +207,13 @@ static void Draw()
 {
     Vector2 game_size = ScreenStateTargetSize();   // {width, height} of game space
 
-    // -- Zoom boxes: staggered ambient loop off the shared clock --------------
-    ZoomBoxesDrawLoop(&zoomBoxes);
-
-    // -- Texts: title + sub-text from the menuTexts table ---------------------
-    // During the intro they animate in; afterwards this draws the rest pose.
-    SceneAnimDrawTexts(&menu_animations.player);
+    // The menu's whole look (title, subtitle, bar, lines, ball) is authored in
+    // the ANIM EDITOR and drawn by AnimStageDraw() below - there is no hand-coded
+    // menu art here anymore.
 
     // -- Mouse input in GAME space.
     Vector2 pos_mouse = Screen2Target(GetMousePosition());
     DrawCircleLines((int)pos_mouse.x, (int)pos_mouse.y, game_size.y*0.017f, LIME);
-
-    // -- Scene decor (bar, lines, bobbing circle) -----------------------------
-    // Shared with the outro: the transition state calls this same function
-    // with a fading alpha, so the art can never drift from what the menu drew.
-    DrawMenuArt(1.0f, 0.0f);
 
     Vector2 screen_size = ScreenStateSize();
 
@@ -339,44 +231,6 @@ static void Draw()
     // inside Draw(), so main.c's Gui() pass keeps the raygui column on top and
     // clickable. Nothing to draw when no animation is playing.
     AnimStageDraw();
-}
-
-// ----------------------------------------------------------------------------
-//  DrawMenuArt: the menu's non-text, non-box decor. ONE definition used by
-//  both the live menu (alpha=1) and the outro player (alpha=1-GP_ART_FADE),
-//  so the transition never has to copy these draws.
-//  `time` is ADDED to the menu's own clock: the menu passes 0, the outro
-//  passes its play clock - animTime froze when the menu exited, so the sum
-//  keeps the bobbing motion continuous across the hand-off.
-// ----------------------------------------------------------------------------
-static void DrawMenuArt(float alpha, float time)
-{
-    Vector2 game_size = ScreenStateTargetSize();
-    float cx = game_size.x*0.5f;
-    float cy = game_size.y*0.5f;
-    float t  = animTime + time;
-
-    // -- Rectangles: the header underline bar + the boxes' tiny seed outline --
-    float bar_w = game_size.x*0.31f;
-    int   bar_h = (int)fmaxf(1.0f, game_size.y*0.006f);
-    DrawRectangle((int)(cx - bar_w*0.5f), (int)(game_size.y*0.24f), (int)bar_w, bar_h,
-                  Fade(SKYBLUE, alpha));
-
-    float db_w = game_size.x * 0.05f;
-    float db_h = game_size.y * 0.05f;
-    DrawRectangleLines((int)(cx - (int)(db_w/2)), (int)(cy - (int)(db_h/2)),
-                       (int)db_w, (int)db_h, Fade(DARKGRAY, alpha));
-
-    // -- Lines ----------------------------------------------------------------
-    DrawLine(0, 0, (int)game_size.x, (int)game_size.y, Fade((Color){ 60, 70, 90, 255 }, alpha));
-    DrawLine((int)game_size.x, 0, 0, (int)game_size.y, Fade((Color){ 60, 70, 90, 255 }, alpha));
-
-    // -- Animation: a circle bobbing up/down using sinf + accumulated time ----
-    float bob = sinf(t*2.0f)*(game_size.y*0.056f);   // proportional bob
-    float bob_off = game_size.y*0.17f;               // below center
-    float bob_r   = game_size.y*0.042f;
-    DrawCircle((int)cx, (int)(cy + bob_off + bob), bob_r, Fade(ORANGE, alpha));
-    DrawCircleLines((int)cx, (int)(cy + bob_off + bob), bob_r, Fade(RAYWHITE, alpha));
 }
 
 // ----------------------------------------------------------------------------

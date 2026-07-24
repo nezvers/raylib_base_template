@@ -4,7 +4,12 @@
 //  Grammar (one token stream, whitespace separated - same reader style as
 //  settings_state.c: fscanf keys, dispatch by TextIsEqual):
 //
-//    doc      <name> <duration> [<introEnd> <outroStart>]   # trim optional
+//    doc      <name> <duration> [<introEnd> <outroStart>
+//                                [<loopBlend> <loopSmooth>]]
+//                                       # trim optional; the loop-blend pair is
+//                                       # optional too - files written before it
+//                                       # existed load as smooth with the
+//                                       # ANIM_LOOP_BLEND_DEFAULT length.
 //    elem     <kind> <name>              # kind = text|shape|global
 //      text   <quoted-single-token>      # (text elements) spaces -> '_'
 //      color  <r> <g> <b> <a>
@@ -12,14 +17,26 @@
 //      size   <xFrac> <yFrac>
 //      shape  <rect|circle|square|rhombus|triangle|line>   # (shape elements)
 //      outline <r> <g> <b> <a> <thickFrac>                 # (shape elements)
+//      outline_style crisp                 # OPTIONAL (circle): smooth DrawRing
+//                                          # outline; absent -> faceted polygon
 //      track  <prop> <keyCount>         # then keyCount x `key` lines
 //        key  <t> <value> <ease>            # scalar tracks
 //        key  <t> <r> <g> <b> <ease>        # colour tracks (RGB; no alpha)
 //      end
-//    signal   <name> <length> [terminal]  # AFTER all elems (names resolve).
-//                                       # `terminal` (0/1) is OPTIONAL: files
-//                                       # written before it existed load as 0.
+//    signal   <name> <length> [terminal [usesPos]]
+//                                       # AFTER all elems (names resolve).
+//                                       # `terminal` and `usesPos` (0/1) are
+//                                       # OPTIONAL: files written before either
+//                                       # existed load them as 0.
+//      posparam <elemName> <slot> <keyCount>   # OPTIONAL: Mouse-Position bind
+//        poskey <u> <offX> <offY> <ease>       # slot 0=center/P0, 1=P1 (corner)
+//      seq    <mult> <usesSeq> <targetCount> <keyCount>   # OPTIONAL: sequence
+//        seqtarget <elemName> <prop>           # scalar prop the offset adds to
+//        seqkey <u> <amt> <ease>               # 0..1 envelope of the offset
 //      target <elemName> <prop> <keyCount>
+//                                       # (a trailing number written by an older
+//                                       #  build - the dropped seqStep - is
+//                                       #  ignored, so old files still load.)
 //        key  <u> <value> <ease>           # u is 0..1 (fraction of length)
 //        key  <u> <r> <g> <b> <ease>       # colour targets
 //      endsig
@@ -241,6 +258,7 @@ void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind)
     // load in readers that predate them (absent -> the AnimElemInit default).
     if (e->sizeAbsolute)     fprintf(f, "%s  unit abs\n", ind);
     if (e->cornerMode)       fprintf(f, "%s  anchor corners\n", ind);
+    if (e->outlineCrisp)     fprintf(f, "%s  outline_style crisp\n", ind);
     if (e->rotBase != 0.0f)  fprintf(f, "%s  rot %f\n", ind, e->rotBase);
 
     for (int j = 0; j < e->trackCount; j++)
@@ -266,8 +284,9 @@ bool AnimDocSave(const AnimDoc *doc, const char *path)
     FILE *f = fopen(path, "w");
     if (!f) return false;
 
-    fprintf(f, "doc %s %f %f %f\n", doc->name[0] ? doc->name : "untitled",
-            doc->duration, AnimDocIntroEnd(doc), AnimDocOutroStart(doc));
+    fprintf(f, "doc %s %f %f %f %f %d\n", doc->name[0] ? doc->name : "untitled",
+            doc->duration, AnimDocIntroEnd(doc), AnimDocOutroStart(doc),
+            doc->loopBlend, doc->loopSmooth ? 1 : 0);
 
     for (int i = 0; i < doc->elemCount; i++)
         AnimElemWriteCfg(f, &doc->elems[i], "");
@@ -277,15 +296,49 @@ bool AnimDocSave(const AnimDoc *doc, const char *path)
     for (int i = 0; i < doc->signalCount; i++)
     {
         const AnimSignal *sg = &doc->signals[i];
-        fprintf(f, "signal %s %f %d\n", sg->name[0] ? sg->name : "sig", sg->length,
-                sg->terminal ? 1 : 0);
+        fprintf(f, "signal %s %f %d %d\n", sg->name[0] ? sg->name : "sig",
+                sg->length, sg->terminal ? 1 : 0, sg->usesPos ? 1 : 0);
+
+        // Mouse-Position bindings (the "--params--" section)
+        for (int j = 0; j < sg->posParamCount; j++)
+        {
+            const AnimSigPosParam *pp = &sg->posParams[j];
+            if (pp->elemIdx < 0 || pp->elemIdx >= doc->elemCount) continue;
+            const AnimElem *e = &doc->elems[pp->elemIdx];
+            fprintf(f, "  posparam %s %d %d\n",
+                    e->name[0] ? e->name : "elem", pp->slot, pp->keyCount);
+            for (int k = 0; k < pp->keyCount; k++)
+                fprintf(f, "    poskey %f %f %f %s\n", pp->keys[k].t,
+                        pp->keys[k].offX, pp->keys[k].offY,
+                        AnimEaseName(pp->keys[k].ease));
+        }
+
+        // Sequence offset (the "--sequence--" section)
+        if (sg->usesSeq || sg->seqTargetCount > 0 || sg->seqKeyCount > 0)
+        {
+            fprintf(f, "  seq %f %d %d %d\n", sg->seqMult, sg->usesSeq ? 1 : 0,
+                    sg->seqTargetCount, sg->seqKeyCount);
+            for (int j = 0; j < sg->seqTargetCount; j++)
+            {
+                const AnimSigSeqTarget *st = &sg->seqTargets[j];
+                if (st->elemIdx < 0 || st->elemIdx >= doc->elemCount) continue;
+                const AnimElem *e = &doc->elems[st->elemIdx];
+                fprintf(f, "    seqtarget %s %s\n",
+                        e->name[0] ? e->name : "elem", AnimPropName(st->prop));
+            }
+            for (int j = 0; j < sg->seqKeyCount; j++)
+                fprintf(f, "    seqkey %f %f %s\n", sg->seqKeys[j].t,
+                        sg->seqKeys[j].amt, AnimEaseName(sg->seqKeys[j].ease));
+        }
+
         for (int j = 0; j < sg->targetCount; j++)
         {
             const AnimSigTarget *tg = &sg->targets[j];
             if (tg->elemIdx < 0 || tg->elemIdx >= doc->elemCount) continue;
             const AnimElem *e = &doc->elems[tg->elemIdx];
             fprintf(f, "  target %s %s %d\n",
-                    e->name[0] ? e->name : "elem", AnimPropName(tg->prop), tg->keyCount);
+                    e->name[0] ? e->name : "elem", AnimPropName(tg->prop),
+                    tg->keyCount);
             for (int k = 0; k < tg->keyCount; k++)
             {
                 if (AnimPropIsColor(tg->prop))
@@ -355,6 +408,13 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
         char a[16];
         if (fscanf(f, "%15s", a) == 1 && curElem)
             curElem->cornerMode = TextIsEqual(a, "corners");
+    }
+    else if (TextIsEqual(key, "outline_style"))
+    {
+        // absent in older files - AnimElemInit's false (polygon) stands.
+        char s[16];
+        if (fscanf(f, "%15s", s) == 1 && curElem)
+            curElem->outlineCrisp = TextIsEqual(s, "crisp");
     }
     else if (TextIsEqual(key, "rot"))
     {
@@ -449,33 +509,43 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
     AnimTrack *curTrack = NULL;  // track currently being filled
     AnimSignal    *curSig = NULL;   // signal block currently open
     AnimSigTarget *curTgt = NULL;   // target inside it
+    AnimSigPosParam *curPos = NULL; // Mouse-Position binding inside it
 
     while (fscanf(f, "%63s", key) == 1)
     {
         if (TextIsEqual(key, "doc"))
         {
             // The trim fields are OPTIONAL (files written before intro/outro
-            // existed have only name+duration), so the rest of the LINE is
-            // taken in one go and the field count decides the defaults.
+            // existed have only name+duration), and so is the loop-blend pair
+            // after them, so the rest of the LINE is taken in one go and the
+            // field count decides the defaults.
             char nm[ANIM_NAME_MAX], rest[128];
             float dur = 0.0f, inEnd = 0.0f, outStart = 0.0f;
+            float blend = ANIM_LOOP_BLEND_DEFAULT; int smooth = 1;
             if (fscanf(f, "%31s", nm) == 1 && fgets(rest, sizeof(rest), f))
             {
-                int n = sscanf(rest, "%f %f %f", &dur, &inEnd, &outStart);
+                int n = sscanf(rest, "%f %f %f %f %d", &dur, &inEnd, &outStart,
+                               &blend, &smooth);
                 if (n >= 1)
                 {
                     TextCopy(doc->name, nm);
                     doc->duration   = dur;
                     doc->introEnd   = (n >= 3) ? inEnd : 0.0f;
                     doc->outroStart = (n >= 3) ? outStart : dur;
+                    // A file predating the pair keeps AnimDocInit's defaults
+                    // (smooth, ANIM_LOOP_BLEND_DEFAULT) - the sscanf above left
+                    // the locals holding exactly those.
+                    doc->loopBlend  = blend;
+                    doc->loopSmooth = (smooth != 0);
                 }
             }
             curElem = NULL; curTrack = NULL; curSig = NULL; curTgt = NULL;
+            curPos = NULL;
         }
         else if (TextIsEqual(key, "elem"))
         {
             char kindStr[16], nm[ANIM_NAME_MAX];
-            curSig = NULL; curTgt = NULL;
+            curSig = NULL; curTgt = NULL; curPos = NULL;
             if (fscanf(f, "%15s %31s", kindStr, nm) == 2)
             {
                 curElem  = AnimDocAddElem(doc, ElemKindByName(kindStr));
@@ -486,32 +556,122 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
         else if (TextIsEqual(key, "signal"))
         {
             // signals are written after every element, so target names resolve.
-            // `terminal` is OPTIONAL (files written before it existed end the
-            // line after the length), so the rest of the LINE is taken in one
-            // go and the field count decides the default - same as `doc` above.
+            // `terminal` and `usesPos` are OPTIONAL (files written before either
+            // existed end the line earlier), so the rest of the LINE is taken in
+            // one go and the field count decides the defaults - as `doc` above.
             char nm[ANIM_NAME_MAX], rest[64];
-            float len = 0.0f; int term = 0;
+            float len = 0.0f; int term = 0, uspos = 0;
             curElem = NULL; curTrack = NULL; curSig = NULL; curTgt = NULL;
+            curPos = NULL;
             if (fscanf(f, "%31s", nm) == 1 && fgets(rest, sizeof(rest), f))
             {
-                int n = sscanf(rest, "%f %d", &len, &term);
+                int n = sscanf(rest, "%f %d %d", &len, &term, &uspos);
                 if (n >= 1 && doc->signalCount < ANIM_SIGNALS_MAX)
                 {
                     curSig = &doc->signals[doc->signalCount++];
                     TextCopy(curSig->name, nm);
                     curSig->length      = len;
                     curSig->terminal    = (n >= 2) && (term != 0);
+                    curSig->usesPos     = (n >= 3) && (uspos != 0);
                     curSig->targetCount = 0;
+                    // new collections default empty (files may omit them)
+                    curSig->usesSeq        = false;
+                    curSig->seqMult        = 0.0f;
+                    curSig->posParamCount  = 0;
+                    curSig->seqTargetCount = 0;
+                    curSig->seqKeyCount    = 0;
                 }
+            }
+        }
+        else if (TextIsEqual(key, "posparam"))
+        {
+            // `<elemName> <slot> <keyCount>`: a Mouse-Position binding. Unknown
+            // element drops it (curPos stays NULL) but still consumes the line.
+            char en[ANIM_NAME_MAX], rest[64]; int slot = 0, kc = 0;
+            curPos = NULL; curTgt = NULL;
+            if (fscanf(f, "%31s", en) == 1 && fgets(rest, sizeof(rest), f) &&
+                sscanf(rest, "%d %d", &slot, &kc) >= 1 && curSig &&
+                curSig->posParamCount < ANIM_SIG_POS_MAX)
+            {
+                int ei = -1;
+                for (int i = 0; i < doc->elemCount; i++)
+                    if (TextIsEqual(doc->elems[i].name, en)) { ei = i; break; }
+                if (ei >= 0)
+                {
+                    curPos = &curSig->posParams[curSig->posParamCount++];
+                    curPos->elemIdx  = ei;
+                    curPos->slot     = slot;
+                    curPos->keyCount = 0;
+                }
+            }
+        }
+        else if (TextIsEqual(key, "poskey"))
+        {
+            float u, ox, oy; char easeName[32];
+            if (curPos && fscanf(f, "%f %f %f %31s", &u, &ox, &oy, easeName) == 4 &&
+                curPos->keyCount < ANIM_SIG_KEYS_MAX)
+            {
+                AnimPosKey *k = &curPos->keys[curPos->keyCount++];
+                k->t = u; k->offX = ox; k->offY = oy;
+                k->ease = AnimEaseByName(easeName);
+            }
+            else   // dropped binding (or full): swallow the rest of the line
+            { int c; while ((c = fgetc(f)) != EOF && c != '\n') { } }
+        }
+        else if (TextIsEqual(key, "seq"))
+        {
+            // `<mult> <usesSeq> <targetCount> <keyCount>`: the sequence header.
+            // Counts are informational; the seqtarget/seqkey lines fill in.
+            char rest[64]; float mult = 0.0f; int us = 0, tc = 0, kc = 0;
+            curPos = NULL; curTgt = NULL;
+            if (fgets(rest, sizeof(rest), f) &&
+                sscanf(rest, "%f %d %d %d", &mult, &us, &tc, &kc) >= 1 && curSig)
+            {
+                curSig->seqMult        = mult;
+                curSig->usesSeq        = (us != 0);
+                curSig->seqTargetCount = 0;
+                curSig->seqKeyCount    = 0;
+            }
+        }
+        else if (curSig && TextIsEqual(key, "seqtarget"))
+        {
+            char en[ANIM_NAME_MAX], pn[32];
+            if (fscanf(f, "%31s %31s", en, pn) == 2 &&
+                curSig->seqTargetCount < ANIM_SIG_SEQ_TARGETS)
+            {
+                int ei = -1;
+                for (int i = 0; i < doc->elemCount; i++)
+                    if (TextIsEqual(doc->elems[i].name, en)) { ei = i; break; }
+                int prop = (ei >= 0) ? AnimPropByName(pn, doc->elems[ei].kind) : -1;
+                if (ei >= 0 && prop >= 0)
+                {
+                    AnimSigSeqTarget *st =
+                        &curSig->seqTargets[curSig->seqTargetCount++];
+                    st->elemIdx = ei; st->prop = prop;
+                }
+            }
+        }
+        else if (curSig && TextIsEqual(key, "seqkey"))
+        {
+            float u, amt; char easeName[32];
+            if (fscanf(f, "%f %f %31s", &u, &amt, easeName) == 3 &&
+                curSig->seqKeyCount < ANIM_SIG_SEQ_KEYS)
+            {
+                AnimSeqKey *k = &curSig->seqKeys[curSig->seqKeyCount++];
+                k->t = u; k->amt = amt; k->ease = AnimEaseByName(easeName);
             }
         }
         else if (TextIsEqual(key, "target"))
         {
             // `<elemName> <prop> <keyCount>`; an unresolvable element or prop
             // drops the target (curTgt stays NULL) but still consumes the line.
-            char en[ANIM_NAME_MAX], pn[32]; int kc = 0;
-            curTgt = NULL;
-            if (fscanf(f, "%31s %31s %d", en, pn, &kc) == 3 && curSig &&
+            // A trailing number (an older build's dropped seqStep) is read into
+            // the rest of the LINE and ignored, so old files still load.
+            char en[ANIM_NAME_MAX], pn[32], rest[64];
+            int kc = 0;
+            curTgt = NULL; curPos = NULL;
+            if (fscanf(f, "%31s %31s", en, pn) == 2 && fgets(rest, sizeof(rest), f) &&
+                sscanf(rest, "%d", &kc) >= 1 && curSig &&
                 curSig->targetCount < ANIM_SIG_TARGETS_MAX)
             {
                 int ei = -1;
@@ -528,7 +688,7 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
             }
         }
         else if (TextIsEqual(key, "endsig"))
-        { curSig = NULL; curTgt = NULL; }
+        { curSig = NULL; curTgt = NULL; curPos = NULL; }
         else if (curSig && TextIsEqual(key, "key"))
         {
             // signal keys live in the signal block, NOT in an element - handle

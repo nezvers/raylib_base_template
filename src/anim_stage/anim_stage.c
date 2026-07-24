@@ -96,6 +96,12 @@ AnimHandle AnimStagePlay(const char *name, bool loop, int layer)
 
 AnimHandle AnimStagePlayEx(const char *name, bool loop, int layer, float delay)
 {
+    return AnimStagePlaySeq(name, loop, layer, delay, 0);
+}
+
+AnimHandle AnimStagePlaySeq(const char *name, bool loop, int layer, float delay,
+                            int seq)
+{
     if (!name || !name[0]) return ANIM_HANDLE_NONE;
 
     int idx = -1;
@@ -117,6 +123,11 @@ AnimHandle AnimStagePlayEx(const char *name, bool loop, int layer, float delay)
     AnimPlayerStartAll(&s->player, &s->doc, ANIM_FWD);
     s->player.loop = loop;
     s->docTime = AnimPlayerSampleTime(&s->player);
+
+    // The slot was wiped above, so this has to land AFTER it: the signal player
+    // keeps its seq across every fire (AnimSignalPlayerStart never clears it),
+    // which is what makes this instance's fan-out stable for its whole life.
+    s->sigPlayer.seq = seq;
 
     // Bind this slot's OWN signal player: a global SignalEmit then reaches
     // every instance declaring that name, each blending from its own pose. This
@@ -160,6 +171,14 @@ void AnimStageEmit(AnimHandle h, const char *name, const SignalParams *params)
         {
             AnimSignalPlayerStart(&s->sigPlayer, &s->doc.signals[i],
                                   &s->doc, s->docTime, params);
+            // A signal responds NOW, not after the slot's start stagger: an
+            // instance still waiting out its .delay (see AnimStageUpdate) would
+            // otherwise freeze the signal until the wait elapsed, making a
+            // shared emit (e.g. the menu's TV-out across three staggered boxes)
+            // arrive at additively later times. Dropping the leftover delay
+            // lets every instance lerp to the signal keys from this same frame.
+            if (!AnimSignalPlayerDone(&s->sigPlayer))
+                s->delay = 0.0f;
             return;
         }
     }
@@ -257,8 +276,11 @@ void AnimStageDraw(void)
         StageSlot *s = &s_slots[order[i]];
         // Drawn straight over whatever the scene already rendered: what shows
         // through is the document's own authored AP_G_BG_ALPHA (0 = no fill at
-        // all), never anything decided here.
-        AnimDocDrawEx(&s->doc, AnimPlayerSampleTime(&s->player), &s->sigPlayer);
+        // all), never anything decided here. The player's own loop flag decides
+        // whether the doc's smooth-loop blend applies - only a clock that wraps
+        // has a seam to hide.
+        AnimDocDrawLoop(&s->doc, AnimPlayerSampleTime(&s->player), &s->sigPlayer,
+                        s->player.loop);
     }
 }
 

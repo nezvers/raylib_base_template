@@ -20,8 +20,8 @@
 //  Rows may appear in ANY order inside a table: they are found by kind,
 //  never by array index. A missing row = "that effect stays at rest".
 //
-//  See main_menu.c for the integration example (intro embedded in the state)
-//  and transition_state.c for the generic outro player app-state.
+//  See platformer_test.c / strategy_test.c for integration examples (intro and
+//  pause animations embedded in a state).
 // ============================================================================
 
 #ifndef SCENE_ANIM_H

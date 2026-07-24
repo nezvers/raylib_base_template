@@ -575,8 +575,9 @@ static void TestIOOldFormat(void)
     CHECK_NEAR(AnimDocIntroEnd(&in), 0.0f);
     CHECK_NEAR(AnimDocOutroStart(&in), 2.0f);
     CHECK_NEAR(AnimDocPlayLen(&in), 2.0f);
-    // old files predate the authoring flags -> both default off.
-    CHECK(!in.elems[0].sizeAbsolute && !in.elems[0].cornerMode);
+    // old files predate the authoring flags -> all default off.
+    CHECK(!in.elems[0].sizeAbsolute && !in.elems[0].cornerMode
+          && !in.elems[0].outlineCrisp);
     remove(path);
 }
 
@@ -590,6 +591,7 @@ static void TestAuthoringFlags(void)
     AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
     e->sizeAbsolute = true;
     e->cornerMode   = true;
+    e->outlineCrisp = true;                           // crisp ring outline
     e->rotBase      = 30.0f;                          // rest-pose rotation
     e->sizeFrac     = (Vector2){ 320.0f, 180.0f };   // pixels, since absolute
     // rest-pose rotation with no track is now the base value AnimElemProp reads.
@@ -600,9 +602,215 @@ static void TestAuthoringFlags(void)
     CHECK(AnimDocLoad(&in, path));
     CHECK(in.elemCount == 1);
     CHECK(in.elems[0].sizeAbsolute && in.elems[0].cornerMode);
+    CHECK(in.elems[0].outlineCrisp);
     CHECK_NEAR(in.elems[0].rotBase, 30.0f);
     CHECK_NEAR(in.elems[0].sizeFrac.x, 320.0f);
     CHECK_NEAR(in.elems[0].sizeFrac.y, 180.0f);
+    remove(path);
+}
+
+// SMOOTH LOOP: the tail of a looping cycle eases back into the loop-start pose,
+// so the wrap has nothing to jump over. Exercised through AnimLoopBlendBegin,
+// which is the same window a draw installs.
+static void TestLoopBlend(void)
+{
+    AnimDoc doc; AnimDocInit(&doc);
+    doc.duration   = 5.0f;
+    doc.outroStart = 5.0f;
+    doc.introEnd   = 0.0f;
+    doc.loopSmooth = true;
+    doc.loopBlend  = 1.0f;                       // blend over [4,5]
+
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    AnimTrack *w = AnimElemAddTrack(e, AP_S_W);
+    AnimTrackAddKey(w, 0.0f, 0.1f, ANIM_EASE_LINEAR);   // loop-start pose
+    AnimTrackAddKey(w, 4.0f, 1.6f, ANIM_EASE_LINEAR);   // last key, then held
+
+    // Without the window nothing changes: the value is held to the very end and
+    // the wrap back to 0.1 is the snap this feature exists to remove.
+    CHECK_NEAR(AnimElemProp(e, AP_S_W, 5.0f), 1.6f);
+
+    AnimLoopBlendBegin(&doc, true);
+    CHECK_NEAR(AnimElemProp(e, AP_S_W, 4.0f), 1.6f);    // window opens here: as authored
+    CHECK_NEAR(AnimElemProp(e, AP_S_W, 5.0f), 0.1f);    // at the wrap: the loop-start pose
+    float mid = AnimElemProp(e, AP_S_W, 4.5f);          // and strictly between the two
+    CHECK(mid < 1.6f && mid > 0.1f);
+    AnimLoopBlendEnd();
+
+    // A one-shot play must still show its authored tail...
+    AnimLoopBlendBegin(&doc, false);
+    CHECK_NEAR(AnimElemProp(e, AP_S_W, 5.0f), 1.6f);
+    AnimLoopBlendEnd();
+
+    // ...and so must a looping one whose document opts out.
+    doc.loopSmooth = false;
+    AnimLoopBlendBegin(&doc, true);
+    CHECK_NEAR(AnimElemProp(e, AP_S_W, 5.0f), 1.6f);
+    AnimLoopBlendEnd();
+
+    // The blend can never be longer than the cycle it belongs to: an oversized
+    // value is clamped, not allowed to reach back before the loop start.
+    doc.loopSmooth = true;
+    doc.loopBlend  = 99.0f;
+    AnimLoopBlendBegin(&doc, true);
+    CHECK_NEAR(AnimElemProp(e, AP_S_W, 0.0f), 0.1f);    // loop start is untouched
+    CHECK_NEAR(AnimElemProp(e, AP_S_W, 5.0f), 0.1f);
+    AnimLoopBlendEnd();
+}
+
+// The smooth-loop pair round-trips, and a .cfg written before it existed loads
+// as smooth with the default blend (so old documents get the fix for free).
+static void TestLoopBlendIO(void)
+{
+    const char *path = "anim_tests_loop_tmp.cfg";
+    AnimDoc doc; AnimDocInit(&doc);
+    CHECK(doc.loopSmooth);                                 // default: on
+    CHECK_NEAR(doc.loopBlend, ANIM_LOOP_BLEND_DEFAULT);
+    doc.loopSmooth = false;
+    doc.loopBlend  = 0.75f;
+    CHECK(AnimDocSave(&doc, path));
+
+    AnimDoc in;
+    CHECK(AnimDocLoad(&in, path));
+    CHECK(!in.loopSmooth);
+    CHECK_NEAR(in.loopBlend, 0.75f);
+    remove(path);
+
+    // short `doc` line (pre-loop-blend file) -> the defaults
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL);
+    if (!f) return;
+    fprintf(f, "doc old 2.0 0.0 2.0\n");
+    fclose(f);
+    CHECK(AnimDocLoad(&in, path));
+    CHECK(in.loopSmooth);
+    CHECK_NEAR(in.loopBlend, ANIM_LOOP_BLEND_DEFAULT);
+    remove(path);
+}
+
+// SEQUENCE OFFSET: a signal adds seq * seqMult * envelope(u) to its seq targets,
+// eased in per the envelope keys and stacked on top of whatever else drives them.
+static void TestSignalSeqStep(void)
+{
+    AnimDoc doc; AnimDocInit(&doc);
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    e->sizeFrac = (Vector2){ 0.1f, 0.1f };
+    e->posFrac  = (Vector2){ 0.5f, 0.5f };
+
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "fan");
+    sg->length  = 1.0f;
+    sg->usesSeq = true;
+    sg->seqMult = 0.03f;                              // each instance +0.03 * seq
+    sg->seqTargetCount = 1;
+    sg->seqTargets[0] = (AnimSigSeqTarget){ 0, AP_S_W };
+    sg->seqKeyCount = 1;
+    sg->seqKeys[0] = (AnimSeqKey){ 0.55f, 1.0f, ANIM_EASE_LINEAR };  // full at 0.55
+
+    // at/after u=0.55 the envelope is full, so the offset is exactly seq*mult
+    for (int seq = 0; seq <= 2; seq++)
+    {
+        AnimSignalPlayer sp = {0};
+        sp.seq = seq;                                // owned by the instance
+        AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, NULL);
+        CHECK(sp.seq == seq);                        // Start must not clear it
+        AnimSignalPlayerUpdate(&sp, 0.55f);          // u = 0.55, envelope = 1
+        CHECK_NEAR(AnimSignalPlayerSeqOffset(&sp, 0, AP_S_W), 0.03f*(float)seq);
+        // a prop that is NOT a seq target is never offset
+        CHECK_NEAR(AnimSignalPlayerSeqOffset(&sp, 0, AP_S_H), 0.0f);
+    }
+
+    // the envelope EASES in: at half the key's u the offset is half (linear key)
+    AnimSignalPlayer sp = {0};
+    sp.seq = 2;
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, NULL);
+    AnimSignalPlayerUpdate(&sp, 0.275f);             // half of 0.55
+    CHECK_NEAR(AnimSignalPlayerSeqOffset(&sp, 0, AP_S_W), 0.03f*2.0f*0.5f);
+
+    // seq 0 never offsets, and a negative multiplier is allowed
+    sp.seq = 0;
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, NULL);
+    AnimSignalPlayerUpdate(&sp, 0.9f);
+    CHECK_NEAR(AnimSignalPlayerSeqOffset(&sp, 0, AP_S_W), 0.0f);
+    sg->seqMult = -10.0f; sp.seq = 3;
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, NULL);
+    AnimSignalPlayerUpdate(&sp, 0.9f);
+    CHECK_NEAR(AnimSignalPlayerSeqOffset(&sp, 0, AP_S_W), -30.0f);
+}
+
+// usesPos / usesSeq / seqMult, a posparam+poskey, and a seq block round-trip;
+// and a signal/target line written before any of this still loads (all the new
+// collections empty, usesSeq off), with a stray old seqStep token ignored.
+static void TestSignalSeqStepIO(void)
+{
+    const char *path = "anim_tests_seq_tmp.cfg";
+    AnimDoc doc; AnimDocInit(&doc);
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    TextCopy(e->name, "box");
+
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "fan");
+    sg->length  = 1.0f;
+    sg->usesPos = true;
+    sg->usesSeq = true;
+    sg->seqMult = -0.04f;
+    // a Mouse-Position binding on the shape's center, one key with an offset
+    sg->posParamCount = 1;
+    sg->posParams[0] = (AnimSigPosParam){0};
+    sg->posParams[0].elemIdx = 0; sg->posParams[0].slot = 1;
+    sg->posParams[0].keyCount = 1;
+    sg->posParams[0].keys[0] = (AnimPosKey){ 1.0f, 0.1f, -0.2f, ANIM_EASE_SINE_OUT };
+    // a sequence target + envelope key
+    sg->seqTargetCount = 1;
+    sg->seqTargets[0] = (AnimSigSeqTarget){ 0, AP_S_W };
+    sg->seqKeyCount = 1;
+    sg->seqKeys[0] = (AnimSeqKey){ 0.55f, 1.0f, ANIM_EASE_SINE_IN };
+    // one plain target too, to be sure the sections coexist
+    sg->targetCount = 1;
+    sg->targets[0] = (AnimSigTarget){0};
+    sg->targets[0].elemIdx = 0; sg->targets[0].prop = AP_S_H;
+    sg->targets[0].keyCount = 1;
+    sg->targets[0].keys[0] = (AnimKey){ 1.0f, 0.5f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
+    CHECK(AnimDocSave(&doc, path));
+
+    AnimDoc in;
+    CHECK(AnimDocLoad(&in, path));
+    AnimSignal *g = &in.signals[0];
+    CHECK(in.signalCount == 1 && g->targetCount == 1);
+    CHECK(g->usesPos && g->usesSeq);
+    CHECK_NEAR(g->seqMult, -0.04f);
+    CHECK(g->posParamCount == 1 && g->posParams[0].slot == 1);
+    CHECK(g->posParams[0].keyCount == 1);
+    CHECK_NEAR(g->posParams[0].keys[0].offX, 0.1f);
+    CHECK_NEAR(g->posParams[0].keys[0].offY, -0.2f);
+    CHECK(g->seqTargetCount == 1 && g->seqTargets[0].prop == AP_S_W);
+    CHECK(g->seqKeyCount == 1);
+    CHECK_NEAR(g->seqKeys[0].t, 0.55f);
+    remove(path);
+
+    // pre-change file: short signal + a target line still carrying an old
+    // seqStep column (must be ignored), no params/seq blocks at all.
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL);
+    if (!f) return;
+    fprintf(f, "doc old 2.0\n"
+               "elem shape box\n"
+               "  pos 0.5 0.5\n"
+               "  end\n"
+               "signal fan 1.0\n"
+               "  target box w 1 -0.04\n"
+               "    key 1.0 0.5 linear\n"
+               "  endsig\n");
+    fclose(f);
+    CHECK(AnimDocLoad(&in, path));
+    g = &in.signals[0];
+    CHECK(in.signalCount == 1 && g->targetCount == 1);
+    CHECK(!g->usesPos && !g->usesSeq);
+    CHECK(g->posParamCount == 0 && g->seqTargetCount == 0 && g->seqKeyCount == 0);
+    CHECK(g->targets[0].keyCount == 1);
+    CHECK_NEAR(g->targets[0].keys[0].value, 0.5f);
     remove(path);
 }
 
@@ -631,6 +839,66 @@ static void TestGroupCoverage(void)
                 CHECK(AnimGroupIndexOfProp(kind, grp->props[j]) == g);
         }
     }
+    // the editor authors SIGNAL targets in groups too: one authored track costs
+    // one target slot per member, so the budget has to hold whole groups.
+    CHECK(ANIM_SIG_TARGETS_MAX >= ANIM_GROUP_PROPS);
+    CHECK(ANIM_SIG_TARGETS_MAX >= ANIM_ELEMS_MAX);
+}
+
+// A signal whose targets were authored as GROUPS (shape outline = 3 props,
+// position = 2) survives save/load with its props, keys, u values and eases -
+// the .cfg is still per-property, so this guards the grouped editing model
+// against the storage it writes through.
+static void TestIOSignalGroupTargets(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    TextCopy(doc.name, "siggroups");
+    doc.duration = 2.0f;
+
+    AnimElem *s = AnimDocAddElem(&doc, AE_SHAPE);
+    TextCopy(s->name, "box");
+
+    // the shape `outline` group (outline, outline_color, outline_alpha) plus
+    // `position` (pos_x, pos_y): 5 targets from two authored tracks
+    const int props[] = { AP_S_OUTLINE, AP_S_OUTLINE_COLOR, AP_S_OUTLINE_ALPHA,
+                          AP_S_POS_X, AP_S_POS_Y };
+    doc.signalCount = 1;
+    TextCopy(doc.signals[0].name, "flash");
+    doc.signals[0].length      = 0.75f;
+    doc.signals[0].targetCount = 5;
+    for (int i = 0; i < 5; i++)
+    {
+        AnimSigTarget *tg = &doc.signals[0].targets[i];
+        *tg = (AnimSigTarget){0};
+        tg->elemIdx  = 0;
+        tg->prop     = props[i];
+        tg->keyCount = 2;                       // one GROUP key at each u
+        tg->keys[0] = (AnimKey){ 0.25f, 0.1f*(i+1), (Color){ 10, 20, 30, 255 },
+                                 ANIM_EASE_LINEAR };
+        tg->keys[1] = (AnimKey){ 1.00f, 0.2f*(i+1), (Color){ 40, 50, 60, 255 },
+                                 ANIM_EASE_BACK_IN };
+    }
+
+    const char *path = "anim_tests_siggroup.cfg";
+    CHECK(AnimDocSave(&doc, path));
+
+    AnimDoc in;
+    CHECK(AnimDocLoad(&in, path));
+    CHECK(in.signalCount == 1);
+    CHECK(in.signals[0].targetCount == 5);
+    for (int i = 0; i < 5; i++)
+    {
+        AnimSigTarget *tg = &in.signals[0].targets[i];
+        CHECK(tg->prop == props[i]);
+        CHECK(tg->keyCount == 2);
+        CHECK_NEAR(tg->keys[0].t, 0.25f);       // shared group key times
+        CHECK_NEAR(tg->keys[1].t, 1.00f);
+        CHECK(tg->keys[1].ease == ANIM_EASE_BACK_IN);
+        if (AnimPropIsColor(props[i])) CHECK(tg->keys[1].cval.g == 50);
+        else                           CHECK_NEAR(tg->keys[1].value, 0.2f*(i+1));
+    }
+    remove(path);
 }
 
 // Intro/outro trim: accessors clamp, the section round-trips through .cfg, and
@@ -1280,9 +1548,9 @@ static void TestMenuAnimPresent(void)
 }
 
 // ---------------------------------------------------------------------------
-//  Signal POSITION parameter: an absolute pos re-anchors a POS target so the
-//  authored transition plays out at the param location instead of its authored
-//  one; no param = byte-identical to before.
+//  Signal POSITION parameter (the "--params--" section): a Mouse-Position
+//  binding eases a position slot from the live pose to mouse + per-key offset.
+//  usesPos off, or no position emitted, drives nothing.
 // ---------------------------------------------------------------------------
 static void TestSignalPosParam(void)
 {
@@ -1292,42 +1560,107 @@ static void TestSignalPosParam(void)
     AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
     e->posFrac = (Vector2){ 0.5f, 0.5f };
 
-    // A signal whose pos_x/pos_y targets rest at the authored center (0.5,0.5).
+    // A signal that binds the shape's CENTER to the mouse, one key at u=1 with a
+    // +0.1 x offset (so the end lands on mouse.x + 0.1, mouse.y + 0).
     doc.signalCount = 1;
     AnimSignal *sg = &doc.signals[0];
     TextCopy(sg->name, "place");
-    sg->length      = 1.0f;
-    sg->targetCount = 2;
-    sg->targets[0] = (AnimSigTarget){0};
-    sg->targets[0].elemIdx = 0; sg->targets[0].prop = AP_S_POS_X;
-    sg->targets[0].keyCount = 1;
-    sg->targets[0].keys[0] = (AnimKey){ 1.0f, 0.5f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
-    sg->targets[1] = (AnimSigTarget){0};
-    sg->targets[1].elemIdx = 0; sg->targets[1].prop = AP_S_POS_Y;
-    sg->targets[1].keyCount = 1;
-    sg->targets[1].keys[0] = (AnimKey){ 1.0f, 0.5f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
+    sg->length = 1.0f;
+    sg->posParamCount = 1;
+    sg->posParams[0] = (AnimSigPosParam){0};
+    sg->posParams[0].elemIdx = 0; sg->posParams[0].slot = 0;   // center
+    sg->posParams[0].keyCount = 1;
+    sg->posParams[0].keys[0] = (AnimPosKey){ 1.0f, 0.1f, 0.0f, ANIM_EASE_LINEAR };
 
-    // --- no param: lands at the authored 0.5/0.5 (no-op proof) -------------
-    AnimSignalPlayer sp = {0};
-    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, NULL);
-    AnimSignalPlayerUpdate(&sp, 0.9f);                 // near end, still playing
     float vx = 0.0f, vy = 0.0f;
+    SignalParams pp = { .pos = { 0.3f, 0.4f }, .hasPos = true };
+
+    // --- usesPos off: an emitted position is ignored (nothing drives pos) ---
+    AnimSignalPlayer sp = {0};
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, &pp);
+    AnimSignalPlayerUpdate(&sp, 0.9f);
+    CHECK(!AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &vx, NULL));
+
+    // --- declared + given: EASED from the live pose into mouse+offset -------
+    sg->usesPos = true;
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, &pp);
+
+    // u=0 holds the live pose: firing must not teleport.
     CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &vx, NULL));
     CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_Y, &vy, NULL));
     CHECK_NEAR(vx, 0.5f);
     CHECK_NEAR(vy, 0.5f);
 
-    // --- with an absolute pos param: re-anchored to it ---------------------
-    SignalParams pp = { .pos = { 0.8f, 0.2f }, .hasPos = true };
+    // part-way: linear ease from live (0.5) toward target (mouse.x+off = 0.4).
+    AnimSignalPlayerUpdate(&sp, 0.5f);
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &vx, NULL));
+    CHECK_NEAR(vx, 0.5f + (0.4f - 0.5f)*0.5f);        // 0.45
+
+    // by the last instant it is ON mouse + offset: x = 0.3+0.1, y = 0.4+0.
     AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, &pp);
-    AnimSignalPlayerUpdate(&sp, 0.9f);
+    AnimSignalPlayerUpdate(&sp, 0.9999f);
     CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &vx, NULL));
     CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_Y, &vy, NULL));
-    CHECK_NEAR(vx, 0.8f);                              // authored 0.5 + (0.8-0.5)
-    CHECK_NEAR(vy, 0.2f);
+    CHECK_NEAR(vx, 0.4f);
+    CHECK_NEAR(vy, 0.4f);
 
-    // hasPos false leaves non-pos targets untouched: alpha param never applies.
-    // (only pos_x/pos_y are re-anchored; nothing else is.)
+    // --- usesPos on but NO position emitted: the binding does nothing -------
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, NULL);
+    AnimSignalPlayerUpdate(&sp, 0.9f);
+    CHECK(!AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &vx, NULL));
+}
+
+// A corners-mode shape exposes TWO position slots; binding the SECOND corner
+// (P1) to the mouse recomputes center+size so P1 lands on it while P0 holds.
+static void TestSignalPosCorner(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration = 2.0f;
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    e->cornerMode = true;
+    e->posFrac  = (Vector2){ 0.5f, 0.5f };
+    e->sizeFrac = (Vector2){ 0.2f, 0.2f };            // P0=(0.4,0.4) P1=(0.6,0.6)
+    e->scaleFrac = 1.0f;
+
+    // AnimGeomToCorner agrees with the base corners.
+    Vector2 p0 = AnimGeomToCorner(e, 0), p1 = AnimGeomToCorner(e, 1);
+    CHECK_NEAR(p0.x, 0.4f); CHECK_NEAR(p0.y, 0.4f);
+    CHECK_NEAR(p1.x, 0.6f); CHECK_NEAR(p1.y, 0.6f);
+
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "corner");
+    sg->length  = 1.0f;
+    sg->usesPos = true;
+    sg->posParamCount = 1;
+    sg->posParams[0] = (AnimSigPosParam){0};
+    sg->posParams[0].elemIdx = 0; sg->posParams[0].slot = 1;   // P1
+    sg->posParams[0].keyCount = 1;
+    sg->posParams[0].keys[0] = (AnimPosKey){ 1.0f, 0.0f, 0.0f, ANIM_EASE_LINEAR };
+
+    SignalParams pp = { .pos = { 0.8f, 0.9f }, .hasPos = true };
+    AnimSignalPlayer sp = {0};
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, &pp);
+
+    // u=0: the whole shape is still at its live pose (no teleport).
+    float cx, cy, w, h;
+    AnimSignalPlayerUpdate(&sp, 0.0f);
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &cx, NULL));
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_Y, &cy, NULL));
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_W, &w, NULL));
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_H, &h, NULL));
+    CHECK_NEAR(cx, 0.5f); CHECK_NEAR(cy, 0.5f);
+    CHECK_NEAR(w, 0.2f);  CHECK_NEAR(h, 0.2f);
+
+    // end: P1 -> (0.8,0.9), P0 held at (0.4,0.4). center=(0.6,0.65) w=0.4 h=0.5.
+    AnimSignalPlayerUpdate(&sp, 0.9999f);
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &cx, NULL));
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_Y, &cy, NULL));
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_W, &w, NULL));
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_H, &h, NULL));
+    CHECK_NEAR(cx, 0.6f);  CHECK_NEAR(cy, 0.65f);
+    CHECK_NEAR(w, 0.4f);   CHECK_NEAR(h, 0.5f);
 }
 
 // A signal param carried through the whole emit path (bus -> bridge -> player).
@@ -1344,11 +1677,12 @@ static void TestSignalEmitParam(void)
     AnimSignal *sg = &doc.signals[0];
     TextCopy(sg->name, "spawn");
     sg->length      = 1.0f;
-    sg->targetCount = 1;
-    sg->targets[0] = (AnimSigTarget){0};
-    sg->targets[0].elemIdx = 0; sg->targets[0].prop = AP_S_POS_X;
-    sg->targets[0].keyCount = 1;
-    sg->targets[0].keys[0] = (AnimKey){ 1.0f, 0.5f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
+    sg->usesPos     = true;      // this signal is authored to be placed
+    sg->posParamCount = 1;
+    sg->posParams[0] = (AnimSigPosParam){0};
+    sg->posParams[0].elemIdx = 0; sg->posParams[0].slot = 0;  // center
+    sg->posParams[0].keyCount = 1;
+    sg->posParams[0].keys[0] = (AnimPosKey){ 1.0f, 0.0f, 0.0f, ANIM_EASE_LINEAR };
 
     float docTime = 0.0f;
     AnimSignalPlayer sp = {0};
@@ -1358,7 +1692,7 @@ static void TestSignalEmitParam(void)
     SignalEmit("spawn", &pp);
     CHECK(sp.playing);
     CHECK(sp.param.hasPos);
-    AnimSignalPlayerUpdate(&sp, 0.9f);
+    AnimSignalPlayerUpdate(&sp, 0.9999f);
     float vx = 0.0f;
     CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &vx, NULL));
     CHECK_NEAR(vx, 0.9f);                              // emit's param reached Eval
@@ -1480,10 +1814,15 @@ int main(void)
     TestIO();
     TestIOOldFormat();
     TestAuthoringFlags();
+    TestLoopBlend();
+    TestLoopBlendIO();
+    TestSignalSeqStep();
+    TestSignalSeqStepIO();
     TestGroupCoverage();
     TestTrim();
     TestIOIdempotent();
     TestIOSignalOrphanTarget();
+    TestIOSignalGroupTargets();
     TestLibrary();
     TestSignals();
     TestSignalTargetRemap();
@@ -1491,6 +1830,7 @@ int main(void)
     TestStage();
     TestMenuAnimPresent();
     TestSignalPosParam();
+    TestSignalPosCorner();
     TestSignalEmitParam();
     TestScene();
     TestSceneEmitAll();

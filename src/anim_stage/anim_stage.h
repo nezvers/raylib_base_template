@@ -78,6 +78,14 @@ AnimHandle AnimStagePlay(const char *name, bool loop, int layer);
 // delay <= 0 is identical to AnimStagePlay.
 AnimHandle AnimStagePlayEx(const char *name, bool loop, int layer, float delay);
 
+// As AnimStagePlayEx, plus this instance's SEQUENCE NUMBER - the integer a
+// signal's sequence offset multiplies by seqMult (see AnimSignal.usesSeq in
+// anim.h). Playing the same document three times with seq 0/1/2 is what lets one
+// authored transition fan its copies apart in size or position. AnimStagePlayEx
+// is this with seq = 0.
+AnimHandle AnimStagePlaySeq(const char *name, bool loop, int layer, float delay,
+                            int seq);
+
 // Stop an instance NOW (an abrupt cut-off, as opposed to letting a terminal
 // signal end it). Fires its done callback. Unknown/finished handles are ignored.
 void AnimStageStop(AnimHandle h);

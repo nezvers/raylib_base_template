@@ -10,9 +10,9 @@
 //      static const AnimStageEntry MY_SCENE[] = {
 //          { .anim="overlay", .loop=true, .delay=0.0f, .layer=10, .tag=0,
 //            .signals={ {"end", false} }, .signalCount=1 },
-//          { .anim="ripple",  .loop=true, .delay=0.0f, .layer=9,  .tag=1,
+//          { .anim="ripple",  .loop=true, .delay=0.0f, .layer=9,  .tag=1, .seq=0,
 //            .signals={ {"spawn", true} }, .signalCount=1 },   // uses pos param
-//          { .anim="ripple",  .loop=true, .delay=0.6f, .layer=9,  .tag=2,
+//          { .anim="ripple",  .loop=true, .delay=0.6f, .layer=9,  .tag=2, .seq=1,
 //            .signals={ {"spawn", true} }, .signalCount=1 },   // same anim, later
 //      };
 //      static AnimStageScene myScene;
@@ -23,7 +23,9 @@
 //
 //  SAME ANIM, MANY TIMES. A row is a whole instance; listing "ripple" three
 //  times with different delays gives a staggered train from one .cfg - the
-//  stagger lives HERE, at the integration point, not in the file.
+//  stagger lives HERE, at the integration point, not in the file. Give those
+//  rows different `seq` numbers and a signal's "--sequence--" section can also
+//  fan them apart in size/position (AnimSignal.usesSeq), still from one file.
 //
 //  SIGNALS + PARAMS. Each row lists the signals it responds to right next to
 //  it, so which animation reacts to what - and which ones consume a position
@@ -65,6 +67,12 @@ typedef struct {
                              // (the SAME anim may appear several times, each with
                              //  its own tag). Not required to be unique, but
                              //  AnimSceneEmitTag reaches only the first match.
+    int   seq;               // this instance's SEQUENCE NUMBER: arithmetic, not
+                             // addressing (that is `tag`). A signal's sequence
+                             // offset multiplies it by seqMult (AnimSignal.usesSeq
+                             // in anim.h), so listing the same anim with seq 0/1/2
+                             // fans the three copies apart in size or position on
+                             // one shared signal. 0 (the default) = no offset.
 
     // Signals this row answers to, listed HERE so the integration point shows
     // which animation reacts to what, and which consume a position parameter.

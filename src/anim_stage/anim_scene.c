@@ -30,7 +30,8 @@ void AnimScenePlay(AnimStageScene *sc, const AnimStageEntry *entries, int count)
     for (int i = 0; i < sc->count; i++)
     {
         const AnimStageEntry *e = &entries[i];
-        sc->handles[i] = AnimStagePlayEx(e->anim, e->loop, e->layer, e->delay);
+        sc->handles[i] = AnimStagePlaySeq(e->anim, e->loop, e->layer, e->delay,
+                                          e->seq);
     }
 }
 

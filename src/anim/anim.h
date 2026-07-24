@@ -46,9 +46,9 @@
 //      AnimTrack         264 B   =  16 keys x 16 B  + prop/count
 //      AnimElem        3,312 B   =  12 tracks x 264 B + base props
 //      AnimSigTarget     140 B   =   8 keys x 16 B  + idx/prop/count
-//      AnimSignal      3,404 B   =  24 targets x 140 B + name/length/terminal
-//      AnimDoc        53,412 B   =  12 elems x 3,312 B + 4 signals x 3,404 B
-//                                =  ~52 KB
+//      AnimSignal      4,524 B   =  32 targets x 140 B + name/length/terminal
+//      AnimDoc        57,876 B   =  12 elems x 3,312 B + 4 signals x 4,524 B
+//                                =  ~57 KB
 //
 //  WHICH KNOBS COST THE MOST, per +1 of each (all else unchanged):
 //
@@ -88,6 +88,11 @@
 #define ANIM_ELEMS_MAX     12   // elements per document
 #define ANIM_SIGNALS_MAX    4   // signals per document (a signal is the single
                                 // largest sub-struct, ~3.4 KB each)
+
+// Seconds of smooth-loop blend a document gets when nothing says otherwise -
+// new documents and .cfg files written before the field existed (see
+// AnimDoc.loopSmooth / loopBlend).
+#define ANIM_LOOP_BLEND_DEFAULT 0.3f
 
 // ---------------------------------------------------------------------------
 //  Easing, as a plain id (keeps AnimKey pointer-free: memcpy/fscanf-clean).
@@ -225,6 +230,20 @@ typedef struct {
                                        // shape by two opposite corners (line:
                                        // two endpoints) instead of center+size;
                                        // storage stays center+size. Default false.
+    bool    outlineCrisp;             // AE_SHAPE + circle: draw the outline as a
+                                       // smooth ring (DrawRing) instead of the
+                                       // faceted polygon loop, giving a stable
+                                       // crisp edge. Ignored for non-circle
+                                       // shapes. Default false (polygon /
+                                       // "crawling").
+                                       // NOTE: crisp mode removes the chord/cap
+                                       // shimmer, but a residual sub-pixel crawl
+                                       // remains because shapes draw at float
+                                       // positions with MSAA off. Worth exploring
+                                       // as a different style: enable MSAA 4x
+                                       // (FLAG_MSAA_4X_HINT in main.c) to smooth
+                                       // all edges app-wide, or pixel-snap the
+                                       // crisp draw to match the baked look.
 
     AnimTrack tracks[ANIM_TRACKS_MAX];
     int       trackCount;
@@ -234,10 +253,14 @@ typedef enum { ANIM_FWD = 0, ANIM_REV } AnimPlayDir;
 
 // These two are capacities like the ones at the top of the file, and carry the
 // same cost rules - see the memory notes there before raising either.
-#define ANIM_SIG_TARGETS_MAX 24   // (element, property) pairs a signal drives
+#define ANIM_SIG_TARGETS_MAX 32   // (element, property) pairs a signal drives
                                   // (>= ANIM_ELEMS_MAX so every element can be
                                   //  driven, with several properties each)
-                                  // 140 B each; the bulk of AnimSignal's 3.4 KB
+                                  // 140 B each; the bulk of AnimSignal's 4.5 KB
+                                  // The editor authors targets in property
+                                  // GROUPS (see AnimPropGroup in anim_io.h), so
+                                  // one authored track spends up to
+                                  // ANIM_GROUP_PROPS slots - hence 32, not 24.
 #define ANIM_SIG_KEYS_MAX    8    // keyframes per target
 
 // One property a signal drives, on one element.
@@ -257,6 +280,44 @@ typedef struct {
     int     keyCount;
 } AnimSigTarget;
 
+// ---------------------------------------------------------------------------
+//  Mouse-position parameter binding (the signal modal's "--params--" section)
+// ---------------------------------------------------------------------------
+// A signal that consumes the emit's position (AnimSignal.usesPos) drives one or
+// more POSITION SLOTS from that mouse position. A slot is a point on an element:
+// the center of a text/shape, or - for a corners-mode shape, which is authored
+// by two opposite corners - either corner P0 / P1. Each binding is an authored
+// track: its keys ease the slot from the live pose to (mouse + per-key offset)
+// at the key's normalized time u, exactly like a signal target eases a value.
+//
+// Driving a corner recomputes the element's stored center+size so that corner
+// lands on the target while the OTHER corner holds its base value (see
+// AnimCornersToGeom / PosParamEval); driving the center simply translates.
+typedef struct { float t; float offX, offY; int ease; } AnimPosKey; // t = u 0..1
+
+#define ANIM_SIG_POS_MAX  4       // position bindings a signal may drive
+typedef struct {
+    int        elemIdx;                     // index into AnimDoc.elems
+    int        slot;                        // 0 = center; corners: 0 = P0, 1 = P1
+    AnimPosKey keys[ANIM_SIG_KEYS_MAX];
+    int        keyCount;
+} AnimSigPosParam;
+
+// ---------------------------------------------------------------------------
+//  Sequence offset (the signal modal's "--sequence--" section)
+// ---------------------------------------------------------------------------
+// The same document is often played several times at once (the scene table
+// lists one row per instance - see anim_scene.h) and each instance carries a
+// sequence number `seq`. When a signal opts in (AnimSignal.usesSeq), it adds
+// `seq * seqMult * env(u)` to each of its seqTargets' scalar properties, ON TOP
+// of whatever else drives them, where env(u) is the 0..1 envelope keyed by
+// seqKeys (eased, implicit 0 at u=0, held after the last key). This fans the
+// instances apart at a chosen beat - three boxes offset in size at u=0.55.
+#define ANIM_SIG_SEQ_TARGETS 8    // (elem,prop) pairs one sequence offsets
+#define ANIM_SIG_SEQ_KEYS    8
+typedef struct { int elemIdx; int prop; } AnimSigSeqTarget;  // scalar props only
+typedef struct { float t; float amt; int ease; } AnimSeqKey; // t = u; amt = 0..1
+
 // A named transition: firing signal `name` eases every target from its live
 // value into the target's keys, over `length` seconds. length <= 0 snaps
 // instantly to the final key (an "instant trigger").
@@ -270,8 +331,29 @@ typedef struct {
     char          name[ANIM_NAME_MAX];
     float         length;               // seconds; 0 = instant
     bool          terminal;             // completing this signal ends playback
-    AnimSigTarget targets[ANIM_SIG_TARGETS_MAX];
-    int           targetCount;
+
+    // Does this signal CONSUME the emit's position parameter (SignalParams.pos)?
+    // Authored per signal, because whether a placed transition makes sense is a
+    // property of the animation, not of the firing site: a ripple wants to play
+    // where the mouse clicked, a screen wipe does not. When false, an emit
+    // carrying a position is ignored and the authored motion plays in place.
+    // When true, the signal's `posParams` bindings ease their slots to the
+    // emitted mouse position (see AnimSigPosParam / PosParamEval).
+    bool          usesPos;
+
+    // Does this signal consume the instance's sequence number? When true it adds
+    // `seq * seqMult * env(u)` to each seqTarget's property (see AnimSeqKey).
+    bool          usesSeq;
+    float         seqMult;              // per-instance multiplier, -30..+30
+
+    AnimSigTarget    targets[ANIM_SIG_TARGETS_MAX];
+    int              targetCount;
+    AnimSigPosParam  posParams[ANIM_SIG_POS_MAX];
+    int              posParamCount;
+    AnimSigSeqTarget seqTargets[ANIM_SIG_SEQ_TARGETS];
+    int              seqTargetCount;
+    AnimSeqKey       seqKeys[ANIM_SIG_SEQ_KEYS];
+    int              seqKeyCount;
 } AnimSignal;
 
 // One animation document = the unit the editor edits and the .cfg stores.
@@ -286,6 +368,16 @@ typedef struct {
     // AnimDocIntroEnd/AnimDocOutroStart, which clamp and handle the unset case.
     float      introEnd;                    // 0 = no intro
     float      outroStart;                  // <= 0 means "unset" -> duration
+
+    // SMOOTH LOOP. Keyframes stop at the last key, so a looping document holds
+    // its final pose to the end of the cycle and then SNAPS back to the loop
+    // start. With loopSmooth on, the last `loopBlend` seconds of every cycle
+    // ease each property into the pose it has at the loop start, so the wrap is
+    // continuous - the loop's last key lerps into the loop's first key. Off
+    // gives the old hard restart (which a strobe or a hard cut may want).
+    // Only LOOPING playback blends: a one-shot play shows its tail as authored.
+    bool       loopSmooth;
+    float      loopBlend;                   // seconds; clamped to the cycle len
 
     AnimElem   elems[ANIM_ELEMS_MAX];
     int        elemCount;
@@ -338,6 +430,20 @@ bool AnimPropIsColor(int prop);
 // Editor slider range for a property (e.g. fractions 0..1, rotation -360..360).
 float AnimPropMin(int prop);
 float AnimPropMax(int prop);
+
+// ---------------------------------------------------------------------------
+//  Corner-mode geometry (shared by the inspector's corner sliders and the
+//  runtime, so a corner authored in the editor re-anchors identically at play)
+// ---------------------------------------------------------------------------
+// A corners-mode shape is STORED as center+size but AUTHORED by two opposite
+// corners. AnimCornersToGeom converts a corner pair back to the stored form:
+// p0/p1 are the corner points in canvas fractions, scaleFrac divides back out
+// (the renderer multiplies size by AP_S_SCALE) so w/h are the base size.
+void    AnimCornersToGeom(Vector2 p0, Vector2 p1, float scaleFrac,
+                          float *cx, float *cy, float *w, float *h);
+// The element's rest-pose corner `slot` (0 = P0 = center-halfsize, 1 = P1) in
+// canvas fractions, derived from its base center/size/scale.
+Vector2 AnimGeomToCorner(const AnimElem *e, int slot);
 
 // ---------------------------------------------------------------------------
 //  Evaluation
@@ -399,16 +505,29 @@ typedef struct {
     // value of each target at fire time (the implicit key at u=0)
     float fromValue[ANIM_SIG_TARGETS_MAX];
     Color fromColor[ANIM_SIG_TARGETS_MAX];
-    // Per-emit params captured at Start (see SignalParams). hasPos re-anchors
-    // this signal's POS_X/POS_Y targets to param.pos, so the same authored
-    // transition can be fired at a runtime location. Zeroed = no override.
+    // Per-emit params captured at Start (see SignalParams). hasPos feeds the
+    // signal's posParams bindings, so the same authored transition can be fired
+    // at a runtime location. Zeroed = no override.
     SignalParams param;
+
+    // This instance's sequence number, feeding the signal's sequence offset
+    // (AnimSignal.usesSeq / seqMult). It belongs to the OWNER of the player (the
+    // stage slot / the editor preview), not to an emit: AnimSignalPlayerStart
+    // deliberately leaves it alone, so it is set once when the player is created
+    // and survives every re-fire.
+    int seq;
+
+    // Live pose of each posParams binding's element, captured at fire time - the
+    // pose a Mouse-Position binding eases FROM (so it never teleports on fire).
+    // For a corner binding, px/py/w/h/scale reconstruct both live corners; the
+    // undriven corner is held here while the driven one eases to the mouse.
+    struct { float px, py, w, h, scale; bool corner; } fromPose[ANIM_SIG_POS_MAX];
 } AnimSignalPlayer;
 
 // Begin `sig`, capturing each target's live value from `doc` at `docTime`.
 // A NULL sig (or one with no targets) leaves the player idle. `params` (may be
 // NULL for none) is stored and applied by AnimSignalPlayerEval - a position
-// param re-anchors the signal's POS targets to param.pos.
+// param eases the signal's posParams bindings toward param.pos.
 void AnimSignalPlayerStart(AnimSignalPlayer *p, const AnimSignal *sig,
                            const AnimDoc *doc, float docTime,
                            const SignalParams *params);
@@ -421,9 +540,32 @@ bool AnimSignalPlayerDone(const AnimSignalPlayer *p);
 bool AnimSignalPlayerEval(const AnimSignalPlayer *p, int elemIdx, int prop,
                           float *outValue, Color *outColor);
 
+// The additive sequence offset this playing signal applies to (elemIdx, prop):
+// seq * seqMult * envelope(u), or 0 when the signal has no sequence, seq is 0,
+// or the prop is not a seqTarget. Stacked ON TOP of the value by AnimElemProp,
+// so it layers over a track OR another signal target. Scalar props only.
+float AnimSignalPlayerSeqOffset(const AnimSignalPlayer *p, int elemIdx, int prop);
+
 // Draw the document with an optional signal player layered on top (NULL = the
 // plain AnimDocDraw behaviour).
 void AnimDocDrawEx(const AnimDoc *doc, float t, const AnimSignalPlayer *ovr);
+
+// As AnimDocDrawEx, but tells the evaluator whether this playback LOOPS. Only a
+// looping playback wraps, so only it gets the doc's smooth-loop blend (see
+// AnimDoc.loopSmooth); AnimDocDrawEx is exactly this with looping = false.
+// Call it from anything that owns a looping clock (anim_stage, the editor's
+// preview) so the last loopBlend seconds ease back into the loop-start pose.
+void AnimDocDrawLoop(const AnimDoc *doc, float t, const AnimSignalPlayer *ovr,
+                     bool looping);
+
+// The smooth-loop window on its own, for code that reads properties instead of
+// drawing them (and for headless tests, which cannot call a draw). Between
+// Begin and End, AnimElemProp / AnimElemColorProp blend the last loopBlend
+// seconds of the cycle into the loop-start pose, exactly as during a draw.
+// Begin(doc, false) - or a NULL doc - is the same as no blend at all.
+// ALWAYS pair them: the window is file-scope state, like the signal override.
+void AnimLoopBlendBegin(const AnimDoc *doc, bool looping);
+void AnimLoopBlendEnd(void);
 
 // ---------------------------------------------------------------------------
 //  Player: plays a doc (or a section of it) in one direction on its own clock.

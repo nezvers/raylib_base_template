@@ -84,6 +84,10 @@ void AnimDocInit(AnimDoc *doc)
     doc->duration   = 2.0f;
     doc->introEnd   = 0.0f;
     doc->outroStart = doc->duration;
+    // Smooth looping is the default: a snapping wrap is the special case, and a
+    // document that never loops is unaffected by these two either way.
+    doc->loopSmooth = true;
+    doc->loopBlend  = ANIM_LOOP_BLEND_DEFAULT;
     doc->elemCount  = 0;
     doc->signalCount = 0;
 }
@@ -100,6 +104,7 @@ void AnimElemInit(AnimElem *e, AnimElemKind kind)
     e->rotBase      = 0.0f;              // upright by default
     e->sizeAbsolute = false;             // sizes are canvas fractions by default
     e->cornerMode   = false;             // center+size authoring by default
+    e->outlineCrisp = false;             // faceted polygon outline by default
     e->trackCount   = 0;
 
     switch (kind)
@@ -432,6 +437,9 @@ Color AnimTrackEvalColor(const AnimTrack *tr, float t, Color missing)
 static const AnimSignalPlayer *s_ovr    = NULL;
 static const AnimDoc          *s_ovrDoc = NULL;
 
+// AnimSignalPlayerSeqOffset (public, see anim.h) is defined below with the rest
+// of the signal-player evaluation; AnimElemProp above folds it into every read.
+
 // Index of `e` within the doc currently being drawn, or -1.
 static int OverrideElemIdx(const AnimElem *e)
 {
@@ -441,7 +449,37 @@ static int OverrideElemIdx(const AnimElem *e)
     return (int)d;
 }
 
-Color AnimElemColorProp(const AnimElem *e, int prop, float t)
+// ---------------------------------------------------------------------------
+//  Smooth-loop hook (same file-scope-context trick as the override above).
+//
+//  A looping clock wraps from the loop END back to the loop START, and keyframe
+//  evaluation clamps, so the last key's pose is held to the end of the cycle and
+//  then jumps. Over the last `s_loopBlend` seconds every property is instead
+//  eased into the pose it holds at `s_loopStart`, so by the time the clock wraps
+//  the two poses are identical and the seam disappears.
+//
+//  Installed by AnimDocDrawLoop for the duration of one draw, and only when the
+//  playback actually loops - a one-shot play must show its tail as authored.
+// ---------------------------------------------------------------------------
+static bool  s_loopOn    = false;
+static float s_loopStart = 0.0f, s_loopEnd = 0.0f, s_loopBlend = 0.0f;
+
+// Blend weight at time t: 0 outside the window, 1 exactly at the loop end.
+// Smoothstep, so the blend eases in rather than kinking the motion when it
+// starts. Returns 0 whenever the blend is inactive.
+static float LoopBlendWeight(float t)
+{
+    if (!s_loopOn || s_loopBlend <= 0.0f) return 0.0f;
+    float from = s_loopEnd - s_loopBlend;
+    if (t <= from) return 0.0f;
+    float p = (t - from) / s_loopBlend;
+    if (p > 1.0f) p = 1.0f;
+    return p * p * (3.0f - 2.0f * p);
+}
+
+// Colour of `prop` from its track if there is one, else the matching base
+// colour. The plain timeline read, with no signal override and no loop blend.
+static Color TrackOrBaseColor(const AnimElem *e, int prop, float t)
 {
     // Exact-prop lookup: a shape can carry BOTH a fill and an outline colour
     // track, so "any colour track" would alias them.
@@ -449,21 +487,37 @@ Color AnimElemColorProp(const AnimElem *e, int prop, float t)
                : (prop == AP_G_BG_COLOR)      ? e->bgColor
                                               : e->color;
 
+    for (int i = 0; i < e->trackCount; i++)
+        if (e->tracks[i].prop == prop)
+            return AnimTrackEvalColor(&e->tracks[i], t, base);
+    return base;
+}
+
+Color AnimElemColorProp(const AnimElem *e, int prop, float t)
+{
     if (s_ovr)
     {
         Color oc;
         int ei = OverrideElemIdx(e);
         if (ei >= 0 && AnimSignalPlayerEval(s_ovr, ei, prop, NULL, &oc))
         {
-            oc.a = base.a;      // colour props never carry alpha (see below)
+            // A signal owns this property outright while it plays: it already
+            // blends from the live pose, so the loop blend must not touch it.
+            oc.a = TrackOrBaseColor(e, prop, t).a;   // colour props carry no alpha
             return oc;
         }
     }
 
-    for (int i = 0; i < e->trackCount; i++)
-        if (e->tracks[i].prop == prop)
-            return AnimTrackEvalColor(&e->tracks[i], t, base);
-    return base;
+    Color c = TrackOrBaseColor(e, prop, t);
+
+    float bw = LoopBlendWeight(t);
+    if (bw > 0.0f)
+    {
+        Color c0 = TrackOrBaseColor(e, prop, s_loopStart);
+        c = (Color){ MixChannel(c.r, c0.r, bw), MixChannel(c.g, c0.g, bw),
+                     MixChannel(c.b, c0.b, bw), c.a };
+    }
+    return c;
 }
 
 Color AnimElemColor(const AnimElem *e, float t)
@@ -500,20 +554,60 @@ static float ElemBaseProp(const AnimElem *e, int prop)
     }
 }
 
-float AnimElemProp(const AnimElem *e, int prop, float t)
+// Value of `prop` from its track if there is one, else the element's base value.
+// The plain timeline read, with no signal override and no loop blend.
+static float TrackOrBase(const AnimElem *e, int prop, float t)
 {
-    if (s_ovr)
-    {
-        float ov;
-        int ei = OverrideElemIdx(e);
-        if (ei >= 0 && AnimSignalPlayerEval(s_ovr, ei, prop, &ov, NULL)) return ov;
-    }
-
     const AnimTrack *tr = NULL;
     for (int i = 0; i < e->trackCount; i++)
         if (e->tracks[i].prop == prop) { tr = &e->tracks[i]; break; }
     if (!tr) return ElemBaseProp(e, prop);
     return AnimTrackEval(tr, t, ElemBaseProp(e, prop));
+}
+
+// ---- Corner-mode geometry (see anim.h) ------------------------------------
+// A corners-mode shape is STORED center+size but AUTHORED by two corners. The
+// on-screen half-extent is size*scale/2, so a corner sits at center +/- that;
+// the inverse divides the rendered span back down by scale to recover w/h.
+void AnimCornersToGeom(Vector2 p0, Vector2 p1, float scaleFrac,
+                       float *cx, float *cy, float *w, float *h)
+{
+    float inv = (scaleFrac > 1e-6f) ? 1.0f / scaleFrac : 1.0f;
+    if (cx) *cx = (p0.x + p1.x) * 0.5f;
+    if (cy) *cy = (p0.y + p1.y) * 0.5f;
+    if (w)  *w  = fabsf(p1.x - p0.x) * inv;
+    if (h)  *h  = fabsf(p1.y - p0.y) * inv;
+}
+
+Vector2 AnimGeomToCorner(const AnimElem *e, int slot)
+{
+    float sc = (e->scaleFrac > 0.0f) ? e->scaleFrac : 1.0f;
+    float hx = e->sizeFrac.x * sc * 0.5f, hy = e->sizeFrac.y * sc * 0.5f;
+    return (slot == 0) ? (Vector2){ e->posFrac.x - hx, e->posFrac.y - hy }
+                       : (Vector2){ e->posFrac.x + hx, e->posFrac.y + hy };
+}
+
+float AnimElemProp(const AnimElem *e, int prop, float t)
+{
+    int   ei = s_ovr ? OverrideElemIdx(e) : -1;
+    float v;
+
+    // A signal owns this property outright while it plays - it already blends
+    // from the live pose, so the loop blend must not touch it. Otherwise it is
+    // the plain timeline read plus the smooth-loop blend.
+    if (ei >= 0 && AnimSignalPlayerEval(s_ovr, ei, prop, &v, NULL))
+    { /* v set by the signal */ }
+    else
+    {
+        v = TrackOrBase(e, prop, t);
+        float bw = LoopBlendWeight(t);
+        if (bw > 0.0f) v += (TrackOrBase(e, prop, s_loopStart) - v) * bw;
+    }
+
+    // The per-instance sequence offset stacks ON TOP of whatever set v, so one
+    // authored beat can fan several instances apart (see AnimSignal.usesSeq).
+    if (ei >= 0) v += AnimSignalPlayerSeqOffset(s_ovr, ei, prop);
+    return v;
 }
 
 float AnimPropMin(int prop)
@@ -792,6 +886,24 @@ static void DrawShapeElem(const AnimElem *e, float t, Vector2 game)
         case SHAPE_RECT:
         default:             n = RimRect(c, hw, hh, cr, sr, rim);          break;
     }
+
+    // crisp circle: fill via the rim fan, but stroke as a smooth annulus so the
+    // outline stays stable instead of shimmering along the faceted chords/caps.
+    // (Ellipses hw!=hh approximate with the mean radius - crisp is a circle-only
+    // authoring option, so this is acceptable.)
+    if (e->shapeKind == SHAPE_CIRCLE && e->outlineCrisp)
+    {
+        DrawPolyShape(c, rim, n, fill, BLANK, 0.0f);   // fill only
+        if (thickPx >= 0.5f && line.a > 0)
+        {
+            float radius = (hw + hh) * 0.5f;
+            float inner  = radius - thickPx;
+            if (inner < 0.0f) inner = 0.0f;
+            DrawRing(c, inner, radius, 0.0f, 360.0f, ELLIPSE_SEGS, line);
+        }
+        return;
+    }
+
     DrawPolyShape(c, rim, n, fill, line, thickPx);
 }
 
@@ -813,7 +925,24 @@ static void DrawGlobalElem(const AnimElem *e, float t, Vector2 game)
     DrawRectangle(0, 0, (int)game.x, (int)game.y, Fade(AnimElemColor(e, t), fade));
 }
 
-void AnimDocDrawEx(const AnimDoc *doc, float t, const AnimSignalPlayer *ovr)
+void AnimLoopBlendBegin(const AnimDoc *doc, bool looping)
+{
+    if (!doc) { s_loopOn = false; return; }
+    // The blend can never eat more than the cycle it belongs to.
+    s_loopStart = AnimDocIntroEnd(doc);
+    s_loopEnd   = AnimDocOutroStart(doc);
+    float cycle = s_loopEnd - s_loopStart;
+    s_loopBlend = (doc->loopBlend < cycle) ? doc->loopBlend : cycle;
+    s_loopOn    = looping && doc->loopSmooth && s_loopBlend > 0.0f;
+}
+
+void AnimLoopBlendEnd(void)
+{
+    s_loopOn = false;
+}
+
+void AnimDocDrawLoop(const AnimDoc *doc, float t, const AnimSignalPlayer *ovr,
+                     bool looping)
 {
     Vector2 game = ScreenStateTargetSize();
 
@@ -821,6 +950,8 @@ void AnimDocDrawEx(const AnimDoc *doc, float t, const AnimSignalPlayer *ovr)
     // consult it), and always tear it down so it can't leak into a later draw.
     s_ovr    = (ovr && ovr->playing) ? ovr : NULL;
     s_ovrDoc = doc;
+
+    AnimLoopBlendBegin(doc, looping);   // ...and the smooth-loop window
 
     // backgrounds first, in list order, so a global element's fill sits behind
     // every element regardless of its own index.
@@ -840,11 +971,17 @@ void AnimDocDrawEx(const AnimDoc *doc, float t, const AnimSignalPlayer *ovr)
     }
 
     s_ovr = NULL; s_ovrDoc = NULL;
+    AnimLoopBlendEnd();
+}
+
+void AnimDocDrawEx(const AnimDoc *doc, float t, const AnimSignalPlayer *ovr)
+{
+    AnimDocDrawLoop(doc, t, ovr, false);
 }
 
 void AnimDocDraw(const AnimDoc *doc, float t)
 {
-    AnimDocDrawEx(doc, t, NULL);
+    AnimDocDrawLoop(doc, t, NULL, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +994,12 @@ void AnimSignalPlayerStart(AnimSignalPlayer *p, const AnimSignal *sig,
     if (!p) return;
     p->sig = sig; p->clock = 0.0f; p->playing = false;
     p->param = params ? *params : (SignalParams){0};
-    if (!sig || sig->targetCount <= 0 || !doc) return;
+    if (!sig || !doc) return;
+    // A signal that only drives posParams / seqTargets (no plain targets) still
+    // plays - it has a live pose to ease from and a length to run.
+    if (sig->targetCount <= 0 && sig->posParamCount <= 0 &&
+        sig->seqTargetCount <= 0)
+        return;
 
     // capture the live pose: this is the implicit key at u=0, so the signal
     // eases FROM whatever is on screen right now.
@@ -880,6 +1022,26 @@ void AnimSignalPlayerStart(AnimSignalPlayer *p, const AnimSignal *sig,
             p->fromValue[i] = AnimElemProp(e, tg->prop, docTime);
         s_ovr = save;
     }
+
+    // capture the live geometry each Mouse-Position binding eases FROM. Read
+    // through the plain path (s_ovr off) for the same reason as targets above.
+    for (int i = 0; i < sig->posParamCount && i < ANIM_SIG_POS_MAX; i++)
+    {
+        const AnimSigPosParam *pp = &sig->posParams[i];
+        p->fromPose[i].px = p->fromPose[i].py = 0.0f;
+        p->fromPose[i].w  = p->fromPose[i].h  = 0.0f;
+        p->fromPose[i].scale = 1.0f; p->fromPose[i].corner = false;
+        if (pp->elemIdx < 0 || pp->elemIdx >= doc->elemCount) continue;
+        const AnimElem *e = &doc->elems[pp->elemIdx];
+        const AnimSignalPlayer *save = s_ovr; s_ovr = NULL;
+        p->fromPose[i].px    = AnimElemProp(e, AP_S_POS_X, docTime);
+        p->fromPose[i].py    = AnimElemProp(e, AP_S_POS_Y, docTime);
+        p->fromPose[i].w     = AnimElemProp(e, AP_S_W,     docTime);
+        p->fromPose[i].h     = AnimElemProp(e, AP_S_H,     docTime);
+        p->fromPose[i].scale = AnimElemProp(e, AP_S_SCALE, docTime);
+        s_ovr = save;
+        p->fromPose[i].corner = (e->kind == AE_SHAPE && e->cornerMode);
+    }
     p->playing = true;
 }
 
@@ -895,10 +1057,121 @@ bool AnimSignalPlayerDone(const AnimSignalPlayer *p)
     return !p || !p->playing;
 }
 
+// Blend a scalar from an implicit u=0 anchor `v0` through keyed points at
+// progress u: `t`/`val`/`ease` are parallel arrays of `n` keys, ascending in t.
+// Before the first key it eases from v0; past the last it holds. This is the
+// same shape as the target/color eval below, factored so the Mouse-Position
+// bindings and the sequence envelope share it.
+static float BlendKeyed(float v0, const float *t, const float *val,
+                        const int *ease, int n, float u)
+{
+    if (n == 0) return v0;
+    if (u >= t[n - 1]) return val[n - 1];        // past the end: hold
+    float at = 0.0f, av = v0;
+    int k = 0;
+    for (; k < n; k++) if (u <= t[k]) break;
+    float bt = t[k], bv = val[k]; int be = ease[k];
+    if (k > 0) { at = t[k - 1]; av = val[k - 1]; }
+    if (bt <= at) return bv;
+    float f = AnimEaseApply(be, (u - at) / (bt - at));
+    return av + (bv - av) * f;
+}
+
+// Eased point a Mouse-Position binding drives its corner/center to: each key's
+// target is (mouse + offset), blended from the live point `live` over u.
+static Vector2 PosBindingPoint(const AnimSignalPlayer *p, int i, Vector2 live,
+                               float u)
+{
+    const AnimSigPosParam *pp = &p->sig->posParams[i];
+    float t[ANIM_SIG_KEYS_MAX], vx[ANIM_SIG_KEYS_MAX], vy[ANIM_SIG_KEYS_MAX];
+    int   e[ANIM_SIG_KEYS_MAX];
+    int n = pp->keyCount; if (n > ANIM_SIG_KEYS_MAX) n = ANIM_SIG_KEYS_MAX;
+    for (int k = 0; k < n; k++)
+    {
+        t[k] = pp->keys[k].t; e[k] = pp->keys[k].ease;
+        vx[k] = p->param.pos.x + pp->keys[k].offX;
+        vy[k] = p->param.pos.y + pp->keys[k].offY;
+    }
+    return (Vector2){ BlendKeyed(live.x, t, vx, e, n, u),
+                      BlendKeyed(live.y, t, vy, e, n, u) };
+}
+
+// Mouse-Position bindings (the "--params--" section). Drives a geometry prop of
+// `elemIdx` to the emitted mouse position + per-key offset, eased from the live
+// pose captured at fire. A center binding translates POS_X/POS_Y; a corner
+// binding (corners-mode shape) drives POS_X/POS_Y/W/H, moving that corner while
+// the other holds - both corners recomputed to the stored center+size via
+// AnimCornersToGeom. Returns false (prop unhandled) when the signal does not
+// consume a position, no position was emitted, or nothing binds this prop.
+//
+// LIMITATION: uses the fire-time pose in canvas fractions (no live px-abs or
+// animated-scale tracking) - good enough for the intended "corner to cursor";
+// richer modes come later.
+static bool PosParamEval(const AnimSignalPlayer *p, int elemIdx, int prop,
+                         float *out)
+{
+    const AnimSignal *sig = p->sig;
+    if (!sig->usesPos || !p->param.hasPos) return false;
+    bool isPos  = (prop == AP_S_POS_X || prop == AP_S_POS_Y ||
+                   prop == AP_T_POS_X || prop == AP_T_POS_Y);
+    bool isSize = (prop == AP_S_W || prop == AP_S_H);
+    if (!isPos && !isSize) return false;
+
+    float u = (sig->length > 0.0f) ? (p->clock / sig->length) : 1.0f;
+    if (u < 0.0f) u = 0.0f; if (u > 1.0f) u = 1.0f;
+
+    int iCenter = -1, i0 = -1, i1 = -1;
+    for (int i = 0; i < sig->posParamCount && i < ANIM_SIG_POS_MAX; i++)
+    {
+        if (sig->posParams[i].elemIdx != elemIdx) continue;
+        if (p->fromPose[i].corner)
+        {
+            if (sig->posParams[i].slot == 0) i0 = i; else i1 = i;
+        }
+        else iCenter = i;
+    }
+
+    if (iCenter >= 0 && isPos)                    // center: plain translate
+    {
+        bool x = (prop == AP_S_POS_X || prop == AP_T_POS_X);
+        Vector2 live = { p->fromPose[iCenter].px, p->fromPose[iCenter].py };
+        Vector2 pt = PosBindingPoint(p, iCenter, live, u);
+        *out = x ? pt.x : pt.y;
+        return true;
+    }
+
+    if (i0 >= 0 || i1 >= 0)                        // corner: stretch to cursor
+    {
+        int ref = (i0 >= 0) ? i0 : i1;             // both share the element pose
+        float sc = p->fromPose[ref].scale;
+        float hx = p->fromPose[ref].w * sc * 0.5f;
+        float hy = p->fromPose[ref].h * sc * 0.5f;
+        Vector2 P0 = { p->fromPose[ref].px - hx, p->fromPose[ref].py - hy };
+        Vector2 P1 = { p->fromPose[ref].px + hx, p->fromPose[ref].py + hy };
+        if (i0 >= 0) P0 = PosBindingPoint(p, i0, P0, u);
+        if (i1 >= 0) P1 = PosBindingPoint(p, i1, P1, u);
+        float cx, cy, w, h;
+        AnimCornersToGeom(P0, P1, sc, &cx, &cy, &w, &h);
+        switch (prop)
+        {
+            case AP_S_POS_X: *out = cx; return true;
+            case AP_S_POS_Y: *out = cy; return true;
+            case AP_S_W:     *out = w;  return true;
+            case AP_S_H:     *out = h;  return true;
+            default:         return false;
+        }
+    }
+    return false;
+}
+
 bool AnimSignalPlayerEval(const AnimSignalPlayer *p, int elemIdx, int prop,
                           float *outValue, Color *outColor)
 {
     if (!p || !p->playing || !p->sig) return false;
+
+    // Mouse-Position bindings take precedence over plain targets for the
+    // geometry props they drive (they replace the authored value outright).
+    if (outValue && PosParamEval(p, elemIdx, prop, outValue)) return true;
 
     for (int i = 0; i < p->sig->targetCount && i < ANIM_SIG_TARGETS_MAX; i++)
     {
@@ -948,28 +1221,47 @@ bool AnimSignalPlayerEval(const AnimSignalPlayer *p, int elemIdx, int prop,
         }
         else if (outValue)
         {
+            // The implicit `from` key is the captured live pose, so the target
+            // eases FROM whatever is on screen INTO its authored keys.
             if (a == b) *outValue = b->value;
-            else
-            {
-                float f = SegmentFraction(a, b, u);
-                *outValue = a->value + (b->value - a->value) * f;
-            }
-
-            // ABSOLUTE position parameter: re-anchor a POS_X/POS_Y target so the
-            // transition plays out AT param.pos instead of its authored location.
-            // The authored keys describe the motion RELATIVE to their own end
-            // point (the target's intended resting position = the last key); we
-            // shift the whole blended result by (param.pos - that end point), so
-            // the eased motion is preserved but re-centered on the param. hasPos
-            // false leaves this untouched (byte-identical to the old behaviour).
-            if (p->param.hasPos && (prop == AP_S_POS_X || prop == AP_T_POS_X))
-                *outValue += p->param.pos.x - tg->keys[tg->keyCount - 1].value;
-            else if (p->param.hasPos && (prop == AP_S_POS_Y || prop == AP_T_POS_Y))
-                *outValue += p->param.pos.y - tg->keys[tg->keyCount - 1].value;
+            else *outValue = a->value + (b->value - a->value) *
+                                        SegmentFraction(a, b, u);
         }
         return true;
     }
     return false;
+}
+
+// Sequence offset (the "--sequence--" section): adds seq * seqMult * env(u) to a
+// scalar seqTarget, ON TOP of whatever else drives it, where env(u) is the 0..1
+// envelope keyed by seqKeys (eased, implicit 0 at u=0, held after the last key).
+// No keys -> a constant full offset. See AnimSignal.usesSeq.
+float AnimSignalPlayerSeqOffset(const AnimSignalPlayer *p,
+                                int elemIdx, int prop)
+{
+    if (!p || !p->playing || !p->sig) return 0.0f;
+    const AnimSignal *sig = p->sig;
+    if (!sig->usesSeq || p->seq == 0 || sig->seqMult == 0.0f) return 0.0f;
+
+    bool match = false;
+    for (int i = 0; i < sig->seqTargetCount && i < ANIM_SIG_SEQ_TARGETS; i++)
+        if (sig->seqTargets[i].elemIdx == elemIdx &&
+            sig->seqTargets[i].prop == prop) { match = true; break; }
+    if (!match) return 0.0f;
+
+    float u = (sig->length > 0.0f) ? (p->clock / sig->length) : 1.0f;
+    if (u < 0.0f) u = 0.0f; if (u > 1.0f) u = 1.0f;
+
+    float env = 1.0f;
+    int n = sig->seqKeyCount; if (n > ANIM_SIG_SEQ_KEYS) n = ANIM_SIG_SEQ_KEYS;
+    if (n > 0)
+    {
+        float t[ANIM_SIG_SEQ_KEYS], val[ANIM_SIG_SEQ_KEYS]; int e[ANIM_SIG_SEQ_KEYS];
+        for (int k = 0; k < n; k++)
+        { t[k] = sig->seqKeys[k].t; val[k] = sig->seqKeys[k].amt; e[k] = sig->seqKeys[k].ease; }
+        env = BlendKeyed(0.0f, t, val, e, n, u);
+    }
+    return (float)p->seq * sig->seqMult * env;
 }
 
 // deterministic pseudo-random in [-1,1] from an int seed (repeatable scatter);

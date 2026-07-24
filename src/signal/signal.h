@@ -9,8 +9,8 @@
 //  Intended first use: the new anim system. A loaded AnimDoc registers one
 //  listener per AnimSignal.name (see AnimSignalRegister in anim_signal.*);
 //  gameplay/UI code just calls SignalEmit("enter") / SignalEmit("button_play")
-//  and any listening animation plays. Nothing in scene_anim/transition_state
-//  changes - signals drive only the new model.
+//  and any listening animation plays. Nothing in scene_anim changes - signals
+//  drive only the new model.
 //
 //  Not a deferred queue: SignalEmit runs matching handlers synchronously, then
 //  returns (same timing model as the box2d sensor-callback drain).
