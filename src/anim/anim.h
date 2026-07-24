@@ -32,7 +32,7 @@
 #define ANIM_H
 
 #include "raylib.h"
-#include "../signal/signal.h"   // SignalParams (per-emit position parameter)
+#include "signal.h"   // SignalParams (per-emit position parameter)
 #include <stdbool.h>
 
 // ---------------------------------------------------------------------------

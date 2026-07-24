@@ -2,7 +2,7 @@
 #include "../../screen_state/screen_state.h"
 #include "../../settings_state/settings_state.h"
 #include "../../audio_state/audio_state.h"
-#include "../../scene_anim/scene_anim.h"   // AnimText / AnimPhase / SceneAnim intro player
+#include "../../anim/DEPRECATED_scene_anim/scene_anim.h"   // AnimText / AnimPhase / SceneAnim intro player
 #include <math.h>
 
 // raygui implementation is compiled ONCE in main_menu.c - plain include here.

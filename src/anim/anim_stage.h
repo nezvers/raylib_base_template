@@ -44,7 +44,7 @@
 #define ANIM_STAGE_H
 
 #include <stdbool.h>
-#include "../signal/signal.h"   // SignalParams (per-emit position parameter)
+#include "signal.h"   // SignalParams (per-emit position parameter)
 
 // How many animations can play at once. Slots are a fixed pool: each holds a
 // whole AnimDoc BY VALUE, so this is the module's entire memory footprint.

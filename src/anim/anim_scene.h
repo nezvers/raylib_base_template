@@ -48,7 +48,7 @@
 
 #include <stdbool.h>
 #include "anim_stage.h"          // AnimHandle, ANIM_STAGE_SLOTS_MAX
-#include "../signal/signal.h"    // SignalParams
+#include "signal.h"    // SignalParams
 
 // Signals one entry can respond to, listed inline in the table.
 #define ANIM_SCENE_SIG_MAX      4

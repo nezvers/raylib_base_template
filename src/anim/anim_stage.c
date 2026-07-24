@@ -10,9 +10,9 @@
 // ============================================================================
 
 #include "anim_stage.h"
-#include "../anim/anim.h"
-#include "../anim/anim_io.h"
-#include "../signal/anim_signal.h"
+#include "anim.h"
+#include "anim_io.h"
+#include "anim_signal.h"
 #include "raylib.h"     // TextFormat
 #include <stddef.h>
 

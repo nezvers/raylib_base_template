@@ -11,10 +11,10 @@
 #include "../src/anim/anim.h"
 #include "../src/anim/anim_io.h"
 #include "../src/anim/anim_library.h"
-#include "../src/signal/signal.h"
-#include "../src/signal/anim_signal.h"
-#include "../src/anim_stage/anim_stage.h"
-#include "../src/anim_stage/anim_scene.h"
+#include "../src/anim/signal.h"
+#include "../src/anim/anim_signal.h"
+#include "../src/anim/anim_stage.h"
+#include "../src/anim/anim_scene.h"
 #include <stdio.h>
 #include <math.h>
 
