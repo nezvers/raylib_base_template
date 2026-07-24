@@ -43,6 +43,7 @@ $(Your Game Description)
  - $(Game Feature 01)
  - $(Game Feature 02)
  - $(Game Feature 03)
+ - Animation Editor -- animations created via UI or via code examples at tests/anim_tests.c
 
 ### Controls
 
