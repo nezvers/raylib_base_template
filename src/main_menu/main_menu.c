@@ -13,8 +13,8 @@
 #include "../screen_state/screen_state.h"
 #include "../settings_state/settings_state.h"
 #include "../audio_state/audio_state.h"
-#include "../anim_stage/anim_scene.h"        // declarative editor-authored anim table
-#include "../signal/signal.h"                // SignalParams
+#include "../anim/anim_scene.h"        // declarative editor-authored anim table
+#include "../anim/signal.h"                // SignalParams
 #include <stddef.h>
 #include <math.h>
 

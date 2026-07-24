@@ -1,3 +1,8 @@
+// *** DEPRECATED ***  This procedural scene-animation system (ZoomBoxes /
+// crumbling text) is superseded by the editor-authored anim/ pipeline
+// (anim.*, anim_stage.*, anim_signal.*). It survives only for strategy_test /
+// platformer_test and SHOULD BE REMOVED in a future version.
+
 // ============================================================================
 //  scene_anim.h  -  data-driven scene text / global / shape animations
 //

@@ -12,7 +12,7 @@
 #include "../screen_state/screen_state.h"
 #include "../settings_state/settings_state.h"
 #include "../audio_state/audio_state.h"
-#include "../scene_anim/scene_anim.h"
+#include "../anim/DEPRECATED_scene_anim/scene_anim.h"
 #include "strategy_world.h"
 #include <math.h>
 

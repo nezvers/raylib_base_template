@@ -20,7 +20,7 @@
 #ifndef ANIM_SIGNAL_H
 #define ANIM_SIGNAL_H
 
-#include "../anim/anim.h"
+#include "anim.h"
 
 // Register listeners for every signal in `doc`; firing one starts `player` on
 // that signal, capturing the live pose sampled at *docTime.

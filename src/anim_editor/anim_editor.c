@@ -23,8 +23,8 @@
 #include "../anim/anim.h"
 #include "../anim/anim_io.h"
 #include "../anim/anim_library.h"
-#include "../signal/signal.h"
-#include "../signal/anim_signal.h"
+#include "../anim/signal.h"
+#include "../anim/anim_signal.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>          // remove() for deleting anim files off disk

@@ -10,8 +10,8 @@
 #include "settings_state/settings_state.h"
 #include "app_state/app_state.h"
 #include "audio_state/audio_state.h"
-#include "signal/signal.h"
-#include "anim_stage/anim_stage.h"
+#include "anim/signal.h"
+#include "anim/anim_stage.h"
 
 #define TEMPORARY_ALLOCATOR_IMPLEMENTATION
 #define TEMPORARY_ALLOCATOR_SIZE (1024 * 1024)
