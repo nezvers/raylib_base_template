@@ -2381,7 +2381,9 @@ static void CreateAnim(const char *name)
 // A small centered modal for the switch/delete/new flows. Drawn topmost.
 static void DrawPromptModal()
 {
-    if (prompt == PROMPT_NONE) return;
+    // PROMPT_LIBRARY is fully drawn by DrawLibraryModal (its own bigger box);
+    // falling through here would paint an empty grey box on top of it.
+    if (prompt == PROMPT_NONE || prompt == PROMPT_LIBRARY) return;
 
     ScreenState *ss = ScreenStateGet();
     float W = (float)ss->width, H = (float)ss->height;
@@ -2459,10 +2461,13 @@ static void DrawPromptModal()
         Rectangle tb = { m.x+16, m.y+44, mw-32, 26 };
         if (GuiTextBox(tb, nameBuf, ANIM_NAME_MAX, edNameBuf)) edNameBuf = !edNameBuf;
         bool valid = nameBuf[0] && AnimFind(nameBuf) < 0;
+        // ENTER commits the name just like the Create button (only when valid).
+        bool enter = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
         if (!valid) GuiDisable();
-        if (GuiButton((Rectangle){ m.x+mw-2*bw-24, by, bw, bh }, "Create"))
-        { AudioPlayButton(); CreateAnim(nameBuf); prompt = PROMPT_NONE; edNameBuf = false; }
+        bool create = GuiButton((Rectangle){ m.x+mw-2*bw-24, by, bw, bh }, "Create");
         if (!valid) GuiEnable();
+        if (create || (valid && enter))
+        { AudioPlayButton(); CreateAnim(nameBuf); prompt = PROMPT_NONE; edNameBuf = false; }
         if (GuiButton((Rectangle){ m.x+mw-bw-16, by, bw, bh }, "Cancel"))
         { AudioPlayButton(); prompt = PROMPT_NONE; edNameBuf = false; }
     }
@@ -2846,6 +2851,39 @@ static float DrawSigSequenceSection(AnimSignal *sg, Rectangle list, float ly,
     return ly;
 }
 
+// ---------------------------------------------------------------------------
+//  Playback signal panel: while ANYTHING is playing, every authored signal is
+//  listed here with its own Fire button, so any of them can be triggered live to
+//  watch how it blends from the running scene (not just the one open in the
+//  editor). Fires exactly like the list/modal buttons, via FireSignal (which
+//  handles usesPos mouse-anchoring and the preview sequence number). Idle: hidden.
+// ---------------------------------------------------------------------------
+static void DrawPlaybackSignals()
+{
+    bool playbackUi = playing || !AnimSignalPlayerDone(&preview);
+    if (!playbackUi || doc.signalCount <= 0) return;
+
+    ScreenState *ss = ScreenStateGet();
+    float W = (float)ss->width;
+    float mw = 240, rh = 26.0f, gap = 4.0f, pad = 8.0f, headH = 18.0f;
+    float mh = pad*2 + headH + 2 + doc.signalCount*(rh + gap);
+    Rectangle m = { W - mw - 12, 52, mw, mh };          // out of the preview's way
+    DrawRectangleRec(m, (Color){ 40, 42, 48, 235 });
+    DrawRectangleLinesEx(m, 1.0f, (Color){ 90, 94, 104, 255 });
+
+    GuiLabel((Rectangle){ m.x+10, m.y+pad, mw-20, headH }, "SIGNALS  (fire live)");
+    float y = m.y + pad + headH + 2;
+    for (int i = 0; i < doc.signalCount; i++)
+    {
+        AnimSignal *sg = &doc.signals[i];
+        GuiLabel((Rectangle){ m.x+12, y, mw-70, rh },
+                 TextFormat("%s%s", sg->name, sg->usesPos ? "  (@mouse)" : ""));
+        if (GuiButton((Rectangle){ m.x+mw-58, y+2, 48, rh-4 }, "Fire"))
+        { AudioPlayButton(); FireSignal(sg); }
+        y += rh + gap;
+    }
+}
+
 static void DrawSignalModal()
 {
     if (sigModalIdx < 0 || sigModalIdx >= doc.signalCount) { sigModalIdx = -1; return; }
@@ -2855,20 +2893,11 @@ static void DrawSignalModal()
     float W = (float)ss->width, H = (float)ss->height;
     bool playbackUi = playing || !AnimSignalPlayerDone(&preview);
 
-    // --- shrunk form ------------------------------------------------------
-    if (playbackUi)
-    {
-        float mw = 240, mh = 40;
-        Rectangle m = { W - mw - 12, 52, mw, mh };      // out of the preview's way
-        DrawRectangleRec(m, (Color){ 40, 42, 48, 235 });
-        DrawRectangleLinesEx(m, 1.0f, (Color){ 90, 94, 104, 255 });
-        GuiLabel((Rectangle){ m.x+10, m.y+10, mw-140, 20 }, sg->name);
-        if (GuiButton((Rectangle){ m.x+mw-116, m.y+7, 52, 26 }, "Fire"))
-        { AudioPlayButton(); FireSignal(sg); }
-        if (GuiButton((Rectangle){ m.x+mw-60, m.y+7, 52, 26 }, "Close"))
-        { AudioPlayButton(); sigModalIdx = -1; }
-        return;
-    }
+    // During playback the full editor is hidden; every signal is instead firable
+    // from the always-visible DrawPlaybackSignals() panel (drawn separately), so
+    // this modal simply steps aside. sigModalIdx is kept so the editor reopens on
+    // the same signal once playback stops.
+    if (playbackUi) return;
 
     // --- full form --------------------------------------------------------
     float mw = 620, mh = 460;
@@ -3736,7 +3765,8 @@ static void Gui()
     DrawDropdownOverlays();
     DrawAnimSwitchOverlay();    // animation list (over widgets, under the modal)
     DrawLibraryModal();         // element shelf (its own scrolling list)
-    DrawSignalModal();          // one signal's targets/keys (survives playback)
+    DrawSignalModal();          // one signal's targets/keys (edit form, when paused)
+    DrawPlaybackSignals();      // all signals as live Fire buttons, during playback
     DrawSignalModalOverlays();  // its element/prop/ease lists, over the modal
     DrawPromptModal();          // topmost: save-before-switch / delete / new / lib names
 }

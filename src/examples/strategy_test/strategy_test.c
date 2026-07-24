@@ -8,11 +8,12 @@
 //  three-way ESC priority (cancel placement > options back > pause toggle).
 // ============================================================================
 
-#include "../app_state/app_state.h"
-#include "../screen_state/screen_state.h"
-#include "../settings_state/settings_state.h"
-#include "../audio_state/audio_state.h"
-#include "../anim/DEPRECATED_scene_anim/scene_anim.h"
+#include "../../app_state/app_state.h"
+#include "../../screen_state/screen_state.h"
+#include "../../settings_state/settings_state.h"
+#include "../../audio_state/audio_state.h"
+#include "../../anim/DEPRECATED_scene_anim/scene_anim.h"   // intro text only
+#include "../../main_menu/pause_menu.h"                    // shared PAUSE_MENU.cfg overlay
 #include "strategy_world.h"
 #include <math.h>
 
@@ -42,19 +43,10 @@ typedef struct {
 static IntroAnim_t intro_animation;
 
 // ============================================================================
-//  PAUSE MENU: same in-state flag + dim + slide-in/out texts as the
-//  platformer (see the long comments there).
+//  PAUSE MENU: an in-state flag + dim layer, with the animated title/subtitle
+//  supplied by the shared pause module (anims/PAUSE_MENU.cfg via pause_menu.h).
+//  This state still owns the `paused` flag, the dim, and the GUI pages below.
 // ============================================================================
-typedef struct {
-    AnimPhase pauseTitleIntro[1];
-    AnimPhase pauseSubIntro[1];
-    AnimPhase pauseTitleOutro[1];
-    AnimPhase pauseSubOutro[1];
-    AnimText  pauseTexts[2];
-    SceneAnim pauseAnim;
-    SceneAnimPlayer player;
-} PauseAnim_t;
-static PauseAnim_t pause_animation;
 
 static void InitAnimations() {
     // Intro
@@ -72,20 +64,6 @@ static void InitAnimations() {
             .introGlobalCount = 1,
         };
     }
-
-    // Pause
-    {
-        pause_animation.pauseTitleIntro[0] = (AnimPhase){ TP_SLIDE_IN, 0.00f, 0.50f, sineEaseOutf };
-        pause_animation.pauseSubIntro[0]   = (AnimPhase){ TP_SLIDE_IN, 0.20f, 0.70f, sineEaseOutf };
-        pause_animation.pauseTitleOutro[0] = (AnimPhase){ TP_SLIDE_OUT, 0.10f, 0.55f, sineEaseInf };
-        pause_animation.pauseSubOutro[0]   = (AnimPhase){ TP_SLIDE_OUT, 0.00f, 0.45f, sineEaseInf };
-
-        pause_animation.pauseTexts[0] = (AnimText){ "PAUSE MENU",                  0.11f,  {0.5f, 0.08f}, RAYWHITE,
-                                                    pause_animation.pauseTitleIntro, 1, pause_animation.pauseTitleOutro, 1 };
-        pause_animation.pauseTexts[1] = (AnimText){ "the armies hold their ground", 0.056f, {0.5f, 0.21f}, LIGHTGRAY,
-                                                    pause_animation.pauseSubIntro,   1, pause_animation.pauseSubOutro,   1 };
-        pause_animation.pauseAnim = (SceneAnim){ .texts = pause_animation.pauseTexts, .textCount = 2 };
-    }
 }
 
 typedef enum { PAUSE_PAGE_MAIN = 0, PAUSE_PAGE_OPTIONS } PausePage;
@@ -97,13 +75,13 @@ static void PauseOpen()
 {
     paused    = true;
     pausePage = PAUSE_PAGE_MAIN;
-    SceneAnimStart(&pause_animation.player, &pause_animation.pauseAnim, ANIM_INTRO);
+    PauseMenuOpen();                 // plays anims/PAUSE_MENU.cfg (title/subtitle in)
 }
 
 static void PauseClose()
 {
     paused = false;
-    SceneAnimStart(&pause_animation.player, &pause_animation.pauseAnim, ANIM_OUTRO);   // texts slide back out
+    PauseMenuBeginClose(NULL, NULL); // fire the authored "exit" outro, then self-stop
 }
 
 static void Enter()
@@ -121,7 +99,7 @@ static void Enter()
     paused    = false;
     pausePage = PAUSE_PAGE_MAIN;
     pauseDim  = 0.0f;
-    pause_animation.player.spec = NULL;   // nothing to play/draw until the first ESC
+    // Overlay is idle until the first ESC (PauseMenuOpen); nothing to reset here.
 }
 
 static void Exit()
@@ -166,9 +144,9 @@ static void Update()
         SceneAnimUpdate(&intro_animation.player, GetFrameTime());   // advance intro text (no-op once done)
     }
 
-    // Pause texts animate on their own clock: intro while paused, outro over
-    // live gameplay right after resume (no-op once finished / never started).
-    if (pause_animation.player.spec) SceneAnimUpdate(&pause_animation.player, GetFrameTime());
+    // Pause overlay runs on its own clock (intro while paused, exit outro over
+    // live gameplay right after resume). Pump it every frame; no-op when idle.
+    PauseMenuUpdate(GetFrameTime());
 
     // Ease the dim overlay toward its target (1 when paused, 0 when playing).
     float dimTarget = paused ? 1.0f : 0.0f;
@@ -185,11 +163,11 @@ static void Draw()
     // "STRATEGY" intro text, drawn on top of the world (game space).
     SceneAnimDrawTexts(&intro_animation.player);
 
-    // Pause overlay: dim the frozen game, then the animated pause texts.
+    // Pause overlay: dim the frozen game, then the shared animated pause texts.
     if (pauseDim > 0.01f)
         DrawRectangle(0, 0, (int)game_size.x, (int)game_size.y,
                       Fade(BLACK, 0.55f*pauseDim));
-    if (pause_animation.player.spec) SceneAnimDrawTexts(&pause_animation.player);
+    PauseMenuDraw();   // anims/PAUSE_MENU.cfg overlay (no-op when idle)
 
     // Entry fade-in: GP_UNFADE_BLACK eases 0->1, so the remaining blackness is
     // 1-amount (missing row would read 1 = no overlay). Drawn last, over all.

@@ -13,8 +13,8 @@
 // ============================================================================
 
 #include "strategy_world.h"
-#include "../screen_state/screen_state.h"
-#include "../settings_state/settings_state.h"
+#include "../../screen_state/screen_state.h"
+#include "../../settings_state/settings_state.h"
 #include "raymath.h"
 #include <math.h>
 #include <stddef.h>
