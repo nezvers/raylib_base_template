@@ -35,6 +35,11 @@ typedef struct {
     int              generation; // bumped per start; encoded into the handle so
                                  // a stale handle can never address a new play
     bool             active;
+    bool             replayable;  // doc has a replay signal: a finished non-loop
+                                  // instance is HELD (not deactivated) so a later
+                                  // emit can restart it (see AnimStageEmit)
+    bool             loop;        // the caller's loop request, kept so a replay
+                                  // restart can restore it after AnimPlayerStartAll
     void (*onDone)(void *user);
     void            *user;
 } StageSlot;
@@ -119,10 +124,17 @@ AnimHandle AnimStagePlaySeq(const char *name, bool loop, int layer, float delay,
 
     s->layer  = layer;
     s->active = true;
+    s->loop   = loop;
     s->delay  = (delay > 0.0f) ? delay : 0.0f;
     AnimPlayerStartAll(&s->player, &s->doc, ANIM_FWD);
     s->player.loop = loop;
     s->docTime = AnimPlayerSampleTime(&s->player);
+
+    // A doc that carries a replay signal is kept alive when its timeline runs out
+    // (see AnimStageUpdate), so a later emit can restart it from u=0.
+    s->replayable = false;
+    for (int i = 0; i < s->doc.signalCount; i++)
+        if (s->doc.signals[i].replay) { s->replayable = true; break; }
 
     // The slot was wiped above, so this has to land AFTER it: the signal player
     // keeps its seq across every fire (AnimSignalPlayerStart never clears it),
@@ -171,6 +183,17 @@ void AnimStageEmit(AnimHandle h, const char *name, const SignalParams *params)
         {
             AnimSignalPlayerStart(&s->sigPlayer, &s->doc.signals[i],
                                   &s->doc, s->docTime, params);
+            // Restart-on-fire: replay this instance's timeline from u=0. The pose
+            // the signal just captured (fromPose, for a posAnchor) was read at the
+            // OLD docTime, so re-anchoring stays correct; the timeline is only
+            // rewound afterwards. This is what re-triggers a finished non-looping
+            // instance - a click-ripple that was parked on its last frame.
+            if (s->doc.signals[i].replay)
+            {
+                AnimPlayerStartAll(&s->player, &s->doc, ANIM_FWD);
+                s->player.loop = s->loop;
+                s->docTime = AnimPlayerSampleTime(&s->player);
+            }
             // A signal responds NOW, not after the slot's start stagger: an
             // instance still waiting out its .delay (see AnimStageUpdate) would
             // otherwise freeze the signal until the wait elapsed, making a
@@ -237,8 +260,11 @@ void AnimStageUpdate(float dt)
         s->docTime = AnimPlayerSampleTime(&s->player);
 
         // A non-looping doc that ran out ends the instance - unless a signal is
-        // still running, which is allowed to finish over the held last frame.
-        if (AnimPlayerDone(&s->player) && AnimSignalPlayerDone(&s->sigPlayer))
+        // still running, which is allowed to finish over the held last frame, or
+        // the instance is replayable, in which case it is HELD on its last frame
+        // (drawn, but static) so a later emit can restart it (see AnimStageEmit).
+        if (AnimPlayerDone(&s->player) && AnimSignalPlayerDone(&s->sigPlayer)
+            && !s->replayable)
             Deactivate(s, true);
     }
 }
@@ -288,6 +314,18 @@ int AnimStageSlotOf(AnimHandle h)
 {
     StageSlot *s = SlotOf(h);
     return s ? (int)(s - s_slots) : -1;
+}
+
+float AnimStagePlayhead(AnimHandle h)
+{
+    StageSlot *s = SlotOf(h);
+    return s ? AnimPlayerSampleTime(&s->player) : -1.0f;
+}
+
+bool AnimStageSignalPlaying(AnimHandle h)
+{
+    StageSlot *s = SlotOf(h);
+    return s && !AnimSignalPlayerDone(&s->sigPlayer);
 }
 
 int AnimStageActiveCount(void)

@@ -133,4 +133,12 @@ int AnimStageDrawOrder(int *out, int max);
 // The slot index a handle occupies, or -1 if it is not alive.
 int AnimStageSlotOf(AnimHandle h);
 
+// The instance's current timeline sample time in seconds, or -1 if not alive
+// (diagnostics / tests - e.g. to observe a restart-on-fire rewind to ~0).
+float AnimStagePlayhead(AnimHandle h);
+
+// True if the instance is currently running a signal override, terminal or not
+// (diagnostics / tests - e.g. to assert a shared emit reached every instance).
+bool AnimStageSignalPlaying(AnimHandle h);
+
 #endif // ANIM_STAGE_H

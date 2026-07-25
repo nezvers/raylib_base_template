@@ -352,6 +352,14 @@ typedef struct {
     // there. Per-key offsets are ignored in this mode (see AnimSignalPlayerPosAnchor).
     bool          posAnchor;
 
+    // Restart-on-fire (the "--params--" section's "restart on fire" checkbox).
+    // When true, emitting this signal replays the RECEIVING instance's timeline
+    // from the start (u=0), on top of whatever the signal's own targets/anchor do.
+    // This is what lets a non-looping instance (loop=false) re-trigger: a click-
+    // ripple stays parked on its held last frame and plays afresh on every emit,
+    // instead of running once at scene start and going inert (see anim_stage.c).
+    bool          replay;
+
     // Does this signal consume the instance's sequence number? When true it adds
     // `seq * seqMult * env(u)` to each seqTarget's property (see AnimSeqKey).
     bool          usesSeq;

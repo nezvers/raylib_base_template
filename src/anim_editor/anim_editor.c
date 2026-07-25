@@ -2624,6 +2624,7 @@ static float DrawSignalList(float x, float y, float w)
             // every field explicitly: the slot may hold a deleted signal's data
             sg->length = 1.0f; sg->targetCount = 0;
             sg->terminal = false; sg->usesPos = false; sg->posAnchor = false;
+            sg->replay = false;
             sg->usesSeq = false; sg->seqMult = 0.0f;
             sg->posParamCount = 0; sg->seqTargetCount = 0; sg->seqKeyCount = 0;
             sigModalIdx = doc.signalCount - 1; sigScroll = 0.0f;
@@ -2697,6 +2698,16 @@ static float DrawSigParamsSection(AnimSignal *sg, Rectangle list, float ly,
                 "blend with animation", &anchor);
     if (anchor != sg->posAnchor)
     { AudioPlayButton(); UndoPush(); sg->posAnchor = anchor; }
+    ly += rh + 2;
+
+    // Restart-on-fire: emitting the signal replays the receiving instance's
+    // timeline from u=0. Lets a non-looping instance (loop=false) re-trigger on
+    // every emit instead of running once and going inert - e.g. a click-ripple.
+    bool replay = sg->replay;
+    GuiCheckBox((Rectangle){ list.x+list.width-210, ly+4, 16, 16 },
+                "restart on fire", &replay);
+    if (replay != sg->replay)
+    { AudioPlayButton(); UndoPush(); sg->replay = replay; }
     ly += rh + 2;
 
     if (sg->posAnchor)
