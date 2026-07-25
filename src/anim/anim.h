@@ -341,6 +341,17 @@ typedef struct {
     // emitted mouse position (see AnimSigPosParam / PosParamEval).
     bool          usesPos;
 
+    // Spawn-anchor mode (the "--params--" section's "blend with animation"
+    // checkbox). Only meaningful when usesPos. When OFF, posParams REPLACE their
+    // slots with a mouse-eased path (PosParamEval) - good for a fresh, purpose-
+    // built reaction. When ON, the authored animation plays UNCHANGED except that
+    // every element with a binding is translated by a constant offset so its
+    // bound point (center, or corner slot) at u=0 lands on the emitted position:
+    //   anchor = mouse - authored_point(0);  pos(u) = authored_pos(u) + anchor
+    // i.e. the element is "born at the cursor" and plays its authored path from
+    // there. Per-key offsets are ignored in this mode (see AnimSignalPlayerPosAnchor).
+    bool          posAnchor;
+
     // Does this signal consume the instance's sequence number? When true it adds
     // `seq * seqMult * env(u)` to each seqTarget's property (see AnimSeqKey).
     bool          usesSeq;
@@ -545,6 +556,14 @@ bool AnimSignalPlayerEval(const AnimSignalPlayer *p, int elemIdx, int prop,
 // or the prop is not a seqTarget. Stacked ON TOP of the value by AnimElemProp,
 // so it layers over a track OR another signal target. Scalar props only.
 float AnimSignalPlayerSeqOffset(const AnimSignalPlayer *p, int elemIdx, int prop);
+
+// The additive spawn-anchor offset this playing signal applies to (elemIdx,
+// prop) when the signal is in posAnchor mode (see AnimSignal.posAnchor): a
+// constant translation `mouse - authored_point(0)` on AP_*_POS_X / AP_*_POS_Y,
+// or 0 for every other prop / mode / when no position was emitted. Stacked ON
+// TOP of the authored value by AnimElemProp, exactly like the sequence offset,
+// so the whole authored animation still plays - only shifted to the cursor.
+float AnimSignalPlayerPosAnchor(const AnimSignalPlayer *p, int elemIdx, int prop);
 
 // Draw the document with an optional signal player layered on top (NULL = the
 // plain AnimDocDraw behaviour).

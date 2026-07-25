@@ -754,6 +754,7 @@ static void TestSignalSeqStepIO(void)
     TextCopy(sg->name, "fan");
     sg->length  = 1.0f;
     sg->usesPos = true;
+    sg->posAnchor = true;
     sg->usesSeq = true;
     sg->seqMult = -0.04f;
     // a Mouse-Position binding on the shape's center, one key with an offset
@@ -779,7 +780,7 @@ static void TestSignalSeqStepIO(void)
     CHECK(AnimDocLoad(&in, path));
     AnimSignal *g = &in.signals[0];
     CHECK(in.signalCount == 1 && g->targetCount == 1);
-    CHECK(g->usesPos && g->usesSeq);
+    CHECK(g->usesPos && g->usesSeq && g->posAnchor);
     CHECK_NEAR(g->seqMult, -0.04f);
     CHECK(g->posParamCount == 1 && g->posParams[0].slot == 1);
     CHECK(g->posParams[0].keyCount == 1);
@@ -807,7 +808,7 @@ static void TestSignalSeqStepIO(void)
     CHECK(AnimDocLoad(&in, path));
     g = &in.signals[0];
     CHECK(in.signalCount == 1 && g->targetCount == 1);
-    CHECK(!g->usesPos && !g->usesSeq);
+    CHECK(!g->usesPos && !g->usesSeq && !g->posAnchor);
     CHECK(g->posParamCount == 0 && g->seqTargetCount == 0 && g->seqKeyCount == 0);
     CHECK(g->targets[0].keyCount == 1);
     CHECK_NEAR(g->targets[0].keys[0].value, 0.5f);
@@ -1663,6 +1664,85 @@ static void TestSignalPosCorner(void)
     CHECK_NEAR(w, 0.4f);   CHECK_NEAR(h, 0.5f);
 }
 
+// Spawn-anchor mode (AnimSignal.posAnchor): the binding no longer REPLACES the
+// slot (PosParamEval steps aside) - instead AnimSignalPlayerPosAnchor returns a
+// constant POS translation `mouse - authored_point(0)`, so the authored motion
+// plays but the element is born at the cursor.
+static void TestSignalPosAnchor(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration = 2.0f;
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    e->posFrac = (Vector2){ 0.5f, 0.5f };
+
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "anchored");
+    sg->length    = 1.0f;
+    sg->usesPos   = true;
+    sg->posAnchor = true;                                 // <-- spawn-anchor
+    sg->posParamCount = 1;
+    sg->posParams[0] = (AnimSigPosParam){0};
+    sg->posParams[0].elemIdx = 0; sg->posParams[0].slot = 0;   // center
+    sg->posParams[0].keyCount = 1;
+    // offset keys are IGNORED in anchor mode - prove it by giving a fat offset.
+    sg->posParams[0].keys[0] = (AnimPosKey){ 1.0f, 0.5f, 0.5f, ANIM_EASE_LINEAR };
+
+    SignalParams pp = { .pos = { 0.3f, 0.4f }, .hasPos = true };
+    AnimSignalPlayer sp = {0};
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, &pp);
+
+    // PosParamEval must NOT drive the slot in anchor mode (no plain target here).
+    float v = 0.0f;
+    CHECK(!AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &v, NULL));
+
+    // The additive anchor is a CONSTANT `mouse - authored_point(0)`, offset-free.
+    // authored center at fire = (0.5,0.5), mouse = (0.3,0.4).
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_POS_X), -0.2f);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_POS_Y), -0.1f);
+    // constant across the whole signal (not eased toward a key).
+    AnimSignalPlayerUpdate(&sp, 0.5f);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_POS_X), -0.2f);
+    // only POS is translated - size/other props get nothing.
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_W), 0.0f);
+
+    // usesPos on but no position emitted -> no anchor.
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, NULL);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_POS_X), 0.0f);
+
+    // posAnchor off -> falls back to replace mode, anchor contributes nothing.
+    sg->posAnchor = false;
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, &pp);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_POS_X), 0.0f);
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &v, NULL));   // replace is back
+
+    // Corner binding: the reference point is the CORNER at fire, not the center.
+    // P1 of a 0.2-size shape centered at 0.5 is (0.6,0.6); mouse (0.8,0.9) ->
+    // anchor (0.2,0.3) translating the whole element (size unchanged).
+    AnimDoc dc; AnimDocInit(&dc); dc.duration = 2.0f;
+    AnimElem *ce = AnimDocAddElem(&dc, AE_SHAPE);
+    ce->cornerMode = true;
+    ce->posFrac  = (Vector2){ 0.5f, 0.5f };
+    ce->sizeFrac = (Vector2){ 0.2f, 0.2f };
+    ce->scaleFrac = 1.0f;
+    dc.signalCount = 1;
+    AnimSignal *cs = &dc.signals[0];
+    TextCopy(cs->name, "canchor");
+    cs->length = 1.0f; cs->usesPos = true; cs->posAnchor = true;
+    cs->posParamCount = 1;
+    cs->posParams[0] = (AnimSigPosParam){0};
+    cs->posParams[0].elemIdx = 0; cs->posParams[0].slot = 1;   // P1
+    cs->posParams[0].keyCount = 1;
+    cs->posParams[0].keys[0] = (AnimPosKey){ 1.0f, 0.0f, 0.0f, ANIM_EASE_LINEAR };
+    SignalParams cp = { .pos = { 0.8f, 0.9f }, .hasPos = true };
+    AnimSignalPlayer csp = {0};
+    AnimSignalPlayerStart(&csp, cs, &dc, 0.0f, &cp);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&csp, 0, AP_S_POS_X), 0.2f);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&csp, 0, AP_S_POS_Y), 0.3f);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&csp, 0, AP_S_W), 0.0f);   // size untouched
+}
+
 // A signal param carried through the whole emit path (bus -> bridge -> player).
 static void TestSignalEmitParam(void)
 {
@@ -1831,6 +1911,7 @@ int main(void)
     TestMenuAnimPresent();
     TestSignalPosParam();
     TestSignalPosCorner();
+    TestSignalPosAnchor();
     TestSignalEmitParam();
     TestScene();
     TestSceneEmitAll();

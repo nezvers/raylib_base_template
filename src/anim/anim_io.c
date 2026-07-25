@@ -23,11 +23,11 @@
 //        key  <t> <value> <ease>            # scalar tracks
 //        key  <t> <r> <g> <b> <ease>        # colour tracks (RGB; no alpha)
 //      end
-//    signal   <name> <length> [terminal [usesPos]]
+//    signal   <name> <length> [terminal [usesPos [posAnchor]]]
 //                                       # AFTER all elems (names resolve).
-//                                       # `terminal` and `usesPos` (0/1) are
-//                                       # OPTIONAL: files written before either
-//                                       # existed load them as 0.
+//                                       # `terminal`, `usesPos`, `posAnchor`
+//                                       # (0/1) are OPTIONAL: files written
+//                                       # before each existed load them as 0.
 //      posparam <elemName> <slot> <keyCount>   # OPTIONAL: Mouse-Position bind
 //        poskey <u> <offX> <offY> <ease>       # slot 0=center/P0, 1=P1 (corner)
 //      seq    <mult> <usesSeq> <targetCount> <keyCount>   # OPTIONAL: sequence
@@ -296,8 +296,9 @@ bool AnimDocSave(const AnimDoc *doc, const char *path)
     for (int i = 0; i < doc->signalCount; i++)
     {
         const AnimSignal *sg = &doc->signals[i];
-        fprintf(f, "signal %s %f %d %d\n", sg->name[0] ? sg->name : "sig",
-                sg->length, sg->terminal ? 1 : 0, sg->usesPos ? 1 : 0);
+        fprintf(f, "signal %s %f %d %d %d\n", sg->name[0] ? sg->name : "sig",
+                sg->length, sg->terminal ? 1 : 0, sg->usesPos ? 1 : 0,
+                sg->posAnchor ? 1 : 0);
 
         // Mouse-Position bindings (the "--params--" section)
         for (int j = 0; j < sg->posParamCount; j++)
@@ -560,12 +561,12 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
             // existed end the line earlier), so the rest of the LINE is taken in
             // one go and the field count decides the defaults - as `doc` above.
             char nm[ANIM_NAME_MAX], rest[64];
-            float len = 0.0f; int term = 0, uspos = 0;
+            float len = 0.0f; int term = 0, uspos = 0, panch = 0;
             curElem = NULL; curTrack = NULL; curSig = NULL; curTgt = NULL;
             curPos = NULL;
             if (fscanf(f, "%31s", nm) == 1 && fgets(rest, sizeof(rest), f))
             {
-                int n = sscanf(rest, "%f %d %d", &len, &term, &uspos);
+                int n = sscanf(rest, "%f %d %d %d", &len, &term, &uspos, &panch);
                 if (n >= 1 && doc->signalCount < ANIM_SIGNALS_MAX)
                 {
                     curSig = &doc->signals[doc->signalCount++];
@@ -573,6 +574,7 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
                     curSig->length      = len;
                     curSig->terminal    = (n >= 2) && (term != 0);
                     curSig->usesPos     = (n >= 3) && (uspos != 0);
+                    curSig->posAnchor   = (n >= 4) && (panch != 0);
                     curSig->targetCount = 0;
                     // new collections default empty (files may omit them)
                     curSig->usesSeq        = false;

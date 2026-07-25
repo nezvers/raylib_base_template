@@ -2623,7 +2623,7 @@ static float DrawSignalList(float x, float y, float w)
             TextCopy(sg->name, TextFormat("sig%d", doc.signalCount));
             // every field explicitly: the slot may hold a deleted signal's data
             sg->length = 1.0f; sg->targetCount = 0;
-            sg->terminal = false; sg->usesPos = false;
+            sg->terminal = false; sg->usesPos = false; sg->posAnchor = false;
             sg->usesSeq = false; sg->seqMult = 0.0f;
             sg->posParamCount = 0; sg->seqTargetCount = 0; sg->seqKeyCount = 0;
             sigModalIdx = doc.signalCount - 1; sigScroll = 0.0f;
@@ -2686,9 +2686,25 @@ static float DrawSigParamsSection(AnimSignal *sg, Rectangle list, float ly,
 {
     DrawRectangleRec((Rectangle){ list.x, ly, list.width, rh },
                      (Color){ 44, 52, 60, 255 });
-    GuiLabel((Rectangle){ list.x+6, ly, list.width-12, rh },
-             "params  (mouse position -> slot + offset)");
+    GuiLabel((Rectangle){ list.x+6, ly, 220, rh },
+             sg->posAnchor ? "params  (spawn at cursor)"
+                           : "params  (mouse position -> slot + offset)");
+    // Spawn-anchor toggle: when on, the authored animation plays unchanged but is
+    // translated so each bound element is born at the cursor (per-key offsets are
+    // then ignored - the bindings only mark WHICH elements react).
+    bool anchor = sg->posAnchor;
+    GuiCheckBox((Rectangle){ list.x+list.width-210, ly+4, 16, 16 },
+                "blend with animation", &anchor);
+    if (anchor != sg->posAnchor)
+    { AudioPlayButton(); UndoPush(); sg->posAnchor = anchor; }
     ly += rh + 2;
+
+    if (sg->posAnchor)
+    {
+        GuiLabel((Rectangle){ list.x+14, ly, list.width-20, rh },
+                 "bound elements spawn at the cursor; offset keys ignored");
+        ly += rh;
+    }
 
     int delBind = -1, delKeyBind = -1, delKeyIdx = -1;
 
@@ -2871,15 +2887,20 @@ static void DrawPlaybackSignals()
     DrawRectangleRec(m, (Color){ 40, 42, 48, 235 });
     DrawRectangleLinesEx(m, 1.0f, (Color){ 90, 94, 104, 255 });
 
-    GuiLabel((Rectangle){ m.x+10, m.y+pad, mw-20, headH }, "SIGNALS  (fire live)");
+    GuiLabel((Rectangle){ m.x+10, m.y+pad, mw-20, headH }, "SIGNALS  (fire live: keys 1-4)");
     float y = m.y + pad + headH + 2;
     for (int i = 0; i < doc.signalCount; i++)
     {
         AnimSignal *sg = &doc.signals[i];
+        // The first four signals get a number-key shortcut (1..4) so they can be
+        // triggered without aiming at the Fire button mid-playback.
+        bool keyed = (i < 4);
         GuiLabel((Rectangle){ m.x+12, y, mw-70, rh },
-                 TextFormat("%s%s", sg->name, sg->usesPos ? "  (@mouse)" : ""));
-        if (GuiButton((Rectangle){ m.x+mw-58, y+2, 48, rh-4 }, "Fire"))
-        { AudioPlayButton(); FireSignal(sg); }
+                 TextFormat("%s%s%s", keyed ? TextFormat("[%d] ", i+1) : "",
+                            sg->name, sg->usesPos ? "  (@mouse)" : ""));
+        bool fire = GuiButton((Rectangle){ m.x+mw-58, y+2, 48, rh-4 }, "Fire");
+        if (keyed && IsKeyPressed(KEY_ONE + i)) fire = true;
+        if (fire) { AudioPlayButton(); FireSignal(sg); }
         y += rh + gap;
     }
 }
@@ -2970,14 +2991,19 @@ static void DrawSignalModal()
     y += 20;
 
     // Instance number this preview stands in for, feeding the sequence offset.
-    // Plain -/+ buttons: it is a preview control, not authored data, so it is
-    // deliberately outside undo.
-    GuiLabel((Rectangle){ x, y, 90, 18 }, TextFormat("instance %d", previewSeq));
-    if (GuiButton((Rectangle){ x+92, y, 22, 18 }, "-"))
-    { AudioPlayButton(); if (previewSeq > 0) previewSeq--; preview.seq = previewSeq; }
-    if (GuiButton((Rectangle){ x+116, y, 22, 18 }, "+"))
-    { AudioPlayButton(); previewSeq++; preview.seq = previewSeq; }
-    y += 22;
+    // Only meaningful when the signal consumes the sequence number, so the row
+    // is hidden otherwise. Plain -/+ buttons: it is a preview control, not
+    // authored data, so it is deliberately outside undo.
+    if (sg->usesSeq)
+    {
+        GuiLabel((Rectangle){ x, y, 100, 18 }, "preview instance");
+        if (GuiButton((Rectangle){ x+102, y, 22, 18 }, "-"))
+        { AudioPlayButton(); if (previewSeq > 0) previewSeq--; preview.seq = previewSeq; }
+        if (GuiButton((Rectangle){ x+126, y, 22, 18 }, "+"))
+        { AudioPlayButton(); previewSeq++; preview.seq = previewSeq; }
+        GuiLabel((Rectangle){ x+154, y, 40, 18 }, TextFormat("%d", previewSeq));
+        y += 22;
+    }
     GuiLine((Rectangle){ x, y, w, 8 }, "targets"); y += 12;
 
     // --- scrolling target list -------------------------------------------

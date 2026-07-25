@@ -607,6 +607,9 @@ float AnimElemProp(const AnimElem *e, int prop, float t)
     // The per-instance sequence offset stacks ON TOP of whatever set v, so one
     // authored beat can fan several instances apart (see AnimSignal.usesSeq).
     if (ei >= 0) v += AnimSignalPlayerSeqOffset(s_ovr, ei, prop);
+    // Spawn-anchor likewise stacks additively: it translates the authored motion
+    // so the element is born at the cursor (see AnimSignal.posAnchor).
+    if (ei >= 0) v += AnimSignalPlayerPosAnchor(s_ovr, ei, prop);
     return v;
 }
 
@@ -1112,6 +1115,9 @@ static bool PosParamEval(const AnimSignalPlayer *p, int elemIdx, int prop,
 {
     const AnimSignal *sig = p->sig;
     if (!sig->usesPos || !p->param.hasPos) return false;
+    // Spawn-anchor mode does NOT replace the slot; it lets the authored value
+    // through and adds a constant offset later (AnimSignalPlayerPosAnchor).
+    if (sig->posAnchor) return false;
     bool isPos  = (prop == AP_S_POS_X || prop == AP_S_POS_Y ||
                    prop == AP_T_POS_X || prop == AP_T_POS_Y);
     bool isSize = (prop == AP_S_W || prop == AP_S_H);
@@ -1262,6 +1268,42 @@ float AnimSignalPlayerSeqOffset(const AnimSignalPlayer *p,
         env = BlendKeyed(0.0f, t, val, e, n, u);
     }
     return (float)p->seq * sig->seqMult * env;
+}
+
+// Spawn-anchor offset (AnimSignal.posAnchor): a constant translation that moves
+// the element so its bound point at fire time lands on the emitted position, and
+// zero for everything else. The reference point is captured in fromPose at fire
+// (px/py = the element center; a corner binding shifts by half the fire-time
+// size for its slot), so authored_point(0) never needs re-deriving here. Only
+// the FIRST binding of the element is honoured - anchoring one element to two
+// different cursor points is contradictory. Scalar POS props only; size is left
+// to the authored animation (the element is translated whole, not stretched).
+float AnimSignalPlayerPosAnchor(const AnimSignalPlayer *p, int elemIdx, int prop)
+{
+    if (!p || !p->playing || !p->sig) return 0.0f;
+    const AnimSignal *sig = p->sig;
+    if (!sig->usesPos || !sig->posAnchor || !p->param.hasPos) return 0.0f;
+
+    bool isX = (prop == AP_S_POS_X || prop == AP_T_POS_X);
+    bool isY = (prop == AP_S_POS_Y || prop == AP_T_POS_Y);
+    if (!isX && !isY) return 0.0f;
+
+    for (int i = 0; i < sig->posParamCount && i < ANIM_SIG_POS_MAX; i++)
+    {
+        if (sig->posParams[i].elemIdx != elemIdx) continue;
+        // Bound point at fire: the center, or a corner shifted by half-size.
+        float px = p->fromPose[i].px, py = p->fromPose[i].py;
+        if (p->fromPose[i].corner)
+        {
+            float sc = p->fromPose[i].scale;
+            float hx = p->fromPose[i].w * sc * 0.5f;
+            float hy = p->fromPose[i].h * sc * 0.5f;
+            float s  = (sig->posParams[i].slot == 0) ? -1.0f : 1.0f;
+            px += s * hx; py += s * hy;
+        }
+        return isX ? (p->param.pos.x - px) : (p->param.pos.y - py);
+    }
+    return 0.0f;
 }
 
 // deterministic pseudo-random in [-1,1] from an int seed (repeatable scatter);
