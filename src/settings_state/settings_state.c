@@ -4,7 +4,27 @@
 #include "../audio_state/audio_state.h"
 #include <stdio.h>
 
-#define SETTINGS_FILE "settings.cfg"
+// Binary persistence via the project's SimpleSave system. The header is
+// header-only; its IMPLEMENTATION is already compiled into this binary by
+// examples/simple_save_example.c, so we include for DECLARATIONS ONLY here (a
+// second SIMPLE_SAVE_IMPLEMENTATION would be a duplicate-symbol link error).
+#include "simple_save.h"
+
+#define SETTINGS_FILE "settings.sav"
+
+// On-disk layout: ONLY the persisted fields, in a fixed order, behind a version
+// tag. The effective gui_scale is recomputed every frame and never stored.
+// Bump SETTINGS_SAVE_VERSION whenever this struct's layout changes - a mismatch
+// makes SettingsLoad fall back to defaults instead of reading garbage.
+#define SETTINGS_SAVE_VERSION 1
+typedef struct {
+    int   version;
+    int   gui_scale_wish;
+    int   window_mode;
+    float music_volume;
+    int   difficulty;
+    int   persist;        // stored as int for a stable, padding-free layout
+} SettingsSaveData;
 
 static Settings state;
 
@@ -18,7 +38,8 @@ void SettingsReset() {
     state.window_mode = WINDOW_MODE_WINDOWED;
     state.music_volume = 0.5f;
     state.difficulty = 0;
-    state.persist = false;
+    state.persist = true;   // persist to disk on quit by default; the options
+                            // "Persist settings on quit" checkbox can opt out.
 
     // Settings orchestrates the layer below it: reset its subsystems to defaults too.
     ScreenStateReset();
@@ -26,36 +47,31 @@ void SettingsReset() {
 }
 
 void SettingsSave() {
-    FILE *f = fopen(SETTINGS_FILE, "w");
-    if (f == NULL) return;
-    fprintf(f, "gui_scale_wish %d\n", state.gui_scale_wish);  // persist the WISH, not effective
-    fprintf(f, "window_mode %d\n",  state.window_mode);
-    fprintf(f, "music_volume %f\n", state.music_volume);
-    fprintf(f, "difficulty %d\n",   state.difficulty);
-    fprintf(f, "persist %d\n",      state.persist ? 1 : 0);
-    fclose(f);
+    SettingsSaveData data = {
+        .version        = SETTINGS_SAVE_VERSION,
+        .gui_scale_wish = state.gui_scale_wish,   // persist the WISH, not effective
+        .window_mode    = state.window_mode,
+        .music_volume   = state.music_volume,
+        .difficulty     = state.difficulty,
+        .persist        = state.persist ? 1 : 0,
+    };
+    SimpleSave(SETTINGS_FILE, (char *)&data, sizeof(data));
 }
 
 bool SettingsLoad() {
-    FILE *f = fopen(SETTINGS_FILE, "r");
-    if (f == NULL) return false;   // no file yet -> keep defaults
+    SettingsSaveData data = {0};
+    // No file / short read -> keep defaults. A version mismatch means the layout
+    // changed under an old save: ignore it rather than read garbage.
+    if (!SimpleLoad(SETTINGS_FILE, (char *)&data, sizeof(data))) return false;
+    if (data.version != SETTINGS_SAVE_VERSION) return false;
 
-    // Read known keys; anything missing/malformed just keeps its default value.
-    char key[64];
-    while (fscanf(f, "%63s", key) == 1) {
-        if      (TextIsEqual(key, "gui_scale_wish")) fscanf(f, "%d", &state.gui_scale_wish);
-        else if (TextIsEqual(key, "window_mode"))  fscanf(f, "%d", &state.window_mode);
-        else if (TextIsEqual(key, "music_volume")) fscanf(f, "%f", &state.music_volume);
-        else if (TextIsEqual(key, "difficulty"))   fscanf(f, "%d", &state.difficulty);
-        else if (TextIsEqual(key, "persist")) {
-            int v = 0;
-            if (fscanf(f, "%d", &v) == 1) state.persist = (v != 0);
-        }
-        else fscanf(f, "%*s");   // unknown key: skip its value
-    }
-    fclose(f);
+    state.gui_scale_wish = data.gui_scale_wish;
+    state.window_mode    = data.window_mode;
+    state.music_volume   = data.music_volume;
+    state.difficulty     = data.difficulty;
+    state.persist        = (data.persist != 0);
 
-    // Guard against a hand-edited/corrupt file putting us in an invalid state.
+    // Guard against a corrupt file putting us in an invalid state.
     if (state.window_mode < WINDOW_MODE_WINDOWED ||
         state.window_mode > WINDOW_MODE_BORDERLESS) {
         state.window_mode = WINDOW_MODE_WINDOWED;

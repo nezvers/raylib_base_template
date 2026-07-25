@@ -44,7 +44,8 @@ void SettingsApplyVolume();
 // resize. Call at boot (after window + audio init) and after any GUI change.
 void SettingsApply();
 
-// Disk persistence (plain-text file, one "key value" per line).
+// Disk persistence (binary file via SimpleSave; a versioned struct of the
+// persisted fields - see SettingsSaveData in settings_state.c).
 void SettingsSave();   // write the singleton to disk
 bool SettingsLoad();   // read into the singleton; false if no/invalid file (defaults kept)
 

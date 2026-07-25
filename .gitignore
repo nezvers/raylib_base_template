@@ -85,4 +85,5 @@ android.*
 *box2d/samples/
 
 settings.cfg
+*settings.sav
 build-web/*

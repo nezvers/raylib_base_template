@@ -754,6 +754,8 @@ static void TestSignalSeqStepIO(void)
     TextCopy(sg->name, "fan");
     sg->length  = 1.0f;
     sg->usesPos = true;
+    sg->posAnchor = true;
+    sg->replay = true;
     sg->usesSeq = true;
     sg->seqMult = -0.04f;
     // a Mouse-Position binding on the shape's center, one key with an offset
@@ -779,7 +781,7 @@ static void TestSignalSeqStepIO(void)
     CHECK(AnimDocLoad(&in, path));
     AnimSignal *g = &in.signals[0];
     CHECK(in.signalCount == 1 && g->targetCount == 1);
-    CHECK(g->usesPos && g->usesSeq);
+    CHECK(g->usesPos && g->usesSeq && g->posAnchor && g->replay);
     CHECK_NEAR(g->seqMult, -0.04f);
     CHECK(g->posParamCount == 1 && g->posParams[0].slot == 1);
     CHECK(g->posParams[0].keyCount == 1);
@@ -807,7 +809,7 @@ static void TestSignalSeqStepIO(void)
     CHECK(AnimDocLoad(&in, path));
     g = &in.signals[0];
     CHECK(in.signalCount == 1 && g->targetCount == 1);
-    CHECK(!g->usesPos && !g->usesSeq);
+    CHECK(!g->usesPos && !g->usesSeq && !g->posAnchor && !g->replay);
     CHECK(g->posParamCount == 0 && g->seqTargetCount == 0 && g->seqKeyCount == 0);
     CHECK(g->targets[0].keyCount == 1);
     CHECK_NEAR(g->targets[0].keys[0].value, 0.5f);
@@ -1663,6 +1665,85 @@ static void TestSignalPosCorner(void)
     CHECK_NEAR(w, 0.4f);   CHECK_NEAR(h, 0.5f);
 }
 
+// Spawn-anchor mode (AnimSignal.posAnchor): the binding no longer REPLACES the
+// slot (PosParamEval steps aside) - instead AnimSignalPlayerPosAnchor returns a
+// constant POS translation `mouse - authored_point(0)`, so the authored motion
+// plays but the element is born at the cursor.
+static void TestSignalPosAnchor(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration = 2.0f;
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    e->posFrac = (Vector2){ 0.5f, 0.5f };
+
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "anchored");
+    sg->length    = 1.0f;
+    sg->usesPos   = true;
+    sg->posAnchor = true;                                 // <-- spawn-anchor
+    sg->posParamCount = 1;
+    sg->posParams[0] = (AnimSigPosParam){0};
+    sg->posParams[0].elemIdx = 0; sg->posParams[0].slot = 0;   // center
+    sg->posParams[0].keyCount = 1;
+    // offset keys are IGNORED in anchor mode - prove it by giving a fat offset.
+    sg->posParams[0].keys[0] = (AnimPosKey){ 1.0f, 0.5f, 0.5f, ANIM_EASE_LINEAR };
+
+    SignalParams pp = { .pos = { 0.3f, 0.4f }, .hasPos = true };
+    AnimSignalPlayer sp = {0};
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, &pp);
+
+    // PosParamEval must NOT drive the slot in anchor mode (no plain target here).
+    float v = 0.0f;
+    CHECK(!AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &v, NULL));
+
+    // The additive anchor is a CONSTANT `mouse - authored_point(0)`, offset-free.
+    // authored center at fire = (0.5,0.5), mouse = (0.3,0.4).
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_POS_X), -0.2f);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_POS_Y), -0.1f);
+    // constant across the whole signal (not eased toward a key).
+    AnimSignalPlayerUpdate(&sp, 0.5f);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_POS_X), -0.2f);
+    // only POS is translated - size/other props get nothing.
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_W), 0.0f);
+
+    // usesPos on but no position emitted -> no anchor.
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, NULL);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_POS_X), 0.0f);
+
+    // posAnchor off -> falls back to replace mode, anchor contributes nothing.
+    sg->posAnchor = false;
+    AnimSignalPlayerStart(&sp, sg, &doc, 0.0f, &pp);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&sp, 0, AP_S_POS_X), 0.0f);
+    CHECK(AnimSignalPlayerEval(&sp, 0, AP_S_POS_X, &v, NULL));   // replace is back
+
+    // Corner binding: the reference point is the CORNER at fire, not the center.
+    // P1 of a 0.2-size shape centered at 0.5 is (0.6,0.6); mouse (0.8,0.9) ->
+    // anchor (0.2,0.3) translating the whole element (size unchanged).
+    AnimDoc dc; AnimDocInit(&dc); dc.duration = 2.0f;
+    AnimElem *ce = AnimDocAddElem(&dc, AE_SHAPE);
+    ce->cornerMode = true;
+    ce->posFrac  = (Vector2){ 0.5f, 0.5f };
+    ce->sizeFrac = (Vector2){ 0.2f, 0.2f };
+    ce->scaleFrac = 1.0f;
+    dc.signalCount = 1;
+    AnimSignal *cs = &dc.signals[0];
+    TextCopy(cs->name, "canchor");
+    cs->length = 1.0f; cs->usesPos = true; cs->posAnchor = true;
+    cs->posParamCount = 1;
+    cs->posParams[0] = (AnimSigPosParam){0};
+    cs->posParams[0].elemIdx = 0; cs->posParams[0].slot = 1;   // P1
+    cs->posParams[0].keyCount = 1;
+    cs->posParams[0].keys[0] = (AnimPosKey){ 1.0f, 0.0f, 0.0f, ANIM_EASE_LINEAR };
+    SignalParams cp = { .pos = { 0.8f, 0.9f }, .hasPos = true };
+    AnimSignalPlayer csp = {0};
+    AnimSignalPlayerStart(&csp, cs, &dc, 0.0f, &cp);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&csp, 0, AP_S_POS_X), 0.2f);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&csp, 0, AP_S_POS_Y), 0.3f);
+    CHECK_NEAR(AnimSignalPlayerPosAnchor(&csp, 0, AP_S_W), 0.0f);   // size untouched
+}
+
 // A signal param carried through the whole emit path (bus -> bridge -> player).
 static void TestSignalEmitParam(void)
 {
@@ -1761,6 +1842,115 @@ static void TestSceneEmitAll(void)
     AnimSceneStop(&sc);
 }
 
+// Restart-on-fire (AnimSignal.replay): a non-looping instance runs once, is then
+// HELD on its last frame (not deactivated) so a later emit rewinds its timeline
+// to u=0. Without the flag the same one-shot would have gone inert.
+static void WriteReplayAnim(const char *name, bool replay)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration = 1.0f; doc.introEnd = 0.0f; doc.outroStart = 1.0f;
+    AnimElem *e = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(e->name, "a");
+    AnimTrack *tr = AnimElemAddTrack(e, AP_T_ALPHA);
+    AnimTrackAddKey(tr, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 1.0f, 1.0f, ANIM_EASE_LINEAR);
+
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "trig");
+    sg->length = 0.2f;
+    sg->replay = replay;          // the field under test - no targets needed
+    if (!DirectoryExists("anims")) MakeDirectory("anims");
+    AnimDocSave(&doc, TextFormat("anims/%s.cfg", name));
+}
+
+static void TestStageReplay(void)
+{
+    SignalReset();
+    AnimStageReset();
+
+    // --- without replay: a one-shot deactivates when its timeline runs out ----
+    WriteReplayAnim("_test_noreplay", false);
+    AnimHandle n = AnimStagePlay("_test_noreplay", false, 0);
+    CHECK(AnimStageAlive(n));
+    for (int i = 0; i < 30; i++) AnimStageUpdate(0.05f);   // 1.5s > 1.0s duration
+    CHECK(!AnimStageAlive(n));                             // gone, as before
+    CHECK(AnimStageActiveCount() == 0);
+
+    // --- with replay: the one-shot is HELD, and an emit rewinds it to u=0 -----
+    WriteReplayAnim("_test_replay", true);
+    AnimHandle h = AnimStagePlay("_test_replay", false, 0);
+    CHECK(AnimStageAlive(h));
+    for (int i = 0; i < 30; i++) AnimStageUpdate(0.05f);   // run past the end
+    CHECK(AnimStageAlive(h));                              // HELD, not deactivated
+    CHECK(AnimStageActiveCount() == 1);
+    CHECK(AnimStagePlayhead(h) >= 0.9f);                   // parked at the end
+
+    AnimStageEmit(h, "trig", NULL);                        // restart-on-fire
+    CHECK(AnimStagePlayhead(h) <= 0.05f);                  // rewound to the start
+    for (int i = 0; i < 6; i++) AnimStageUpdate(0.05f);    // 0.3s in
+    CHECK(AnimStageAlive(h));
+    CHECK(AnimStagePlayhead(h) > 0.2f && AnimStagePlayhead(h) < 0.4f);
+
+    for (int i = 0; i < 20; i++) AnimStageUpdate(0.05f);   // run past the end again
+    CHECK(AnimStageAlive(h));                              // still HELD
+    AnimStageStopAll();
+    CHECK(AnimStageActiveCount() == 0);
+}
+
+// REPRO: a usesPos "ripple" emitted across three same-anim instances must start
+// the signal on ALL of them, not just the first.
+static void TestSceneEmitPosAll(void)
+{
+    SignalReset();
+    AnimStageReset();
+
+    // a doc with a usesPos ripple: center posparam + a w target so it plays
+    AnimDoc doc; AnimDocInit(&doc);
+    doc.duration = 5.0f; doc.introEnd = 0.0f; doc.outroStart = 5.0f;
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    TextCopy(e->name, "box");
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "ripple");
+    sg->length = 0.8f; sg->usesPos = true;
+    sg->posParamCount = 1;
+    sg->posParams[0] = (AnimSigPosParam){0};
+    sg->posParams[0].elemIdx = 0; sg->posParams[0].slot = 1;   // center
+    sg->posParams[0].keyCount = 1;
+    sg->posParams[0].keys[0] = (AnimPosKey){ 1.0f, 0.0f, 0.0f, ANIM_EASE_SINE_OUT };
+    sg->targetCount = 1;
+    sg->targets[0] = (AnimSigTarget){0};
+    sg->targets[0].elemIdx = 0; sg->targets[0].prop = AP_S_W;
+    sg->targets[0].keyCount = 1;
+    sg->targets[0].keys[0] = (AnimKey){ 0.4f, 0.7f, (Color){0,0,0,0}, ANIM_EASE_SINE_OUT };
+    if (!DirectoryExists("anims")) MakeDirectory("anims");
+    AnimDocSave(&doc, "anims/_test_ripple.cfg");
+
+    static const AnimStageEntry ENTRIES[] = {
+        { .anim="_test_ripple", .loop=true, .delay=0.0f, .layer=0, .tag=1,
+          .signals={ {"ripple", true} }, .signalCount=1 },
+        { .anim="_test_ripple", .loop=true, .delay=0.0f, .layer=0, .tag=2,
+          .signals={ {"ripple", true} }, .signalCount=1 },
+        { .anim="_test_ripple", .loop=true, .delay=0.0f, .layer=0, .tag=3,
+          .signals={ {"ripple", true} }, .signalCount=1 },
+    };
+    AnimStageScene sc;
+    AnimScenePlay(&sc, ENTRIES, 3);
+    CHECK(AnimStageActiveCount() == 3);
+
+    SignalParams p = { .pos = { 0.25f, 0.75f }, .hasPos = true };
+    AnimSceneEmit(&sc, "ripple", &p);
+
+    // every instance must now be running the ripple override
+    CHECK(AnimStageSignalPlaying(sc.handles[0]));
+    CHECK(AnimStageSignalPlaying(sc.handles[1]));
+    CHECK(AnimStageSignalPlaying(sc.handles[2]));
+
+    AnimSceneStop(&sc);
+}
+
 // Terminal emit across a scene: onDone fires exactly once after all wind down,
 // and immediately when nothing is armed.
 static int s_sceneDone = 0;
@@ -1831,9 +2021,12 @@ int main(void)
     TestMenuAnimPresent();
     TestSignalPosParam();
     TestSignalPosCorner();
+    TestSignalPosAnchor();
     TestSignalEmitParam();
     TestScene();
     TestSceneEmitAll();
+    TestStageReplay();
+    TestSceneEmitPosAll();
     TestSceneTerminal();
 
     printf("anim_tests: %d checks, %d failed\n", s_checks, s_fails);

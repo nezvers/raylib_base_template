@@ -82,6 +82,7 @@ static const AnimStageEntry MENU_SCENE[] = {
     { .anim="zooming_box", .loop=true, .delay=0.0f, .layer=9,  .tag=1, .seq=0, .signals={ { MENU_RIPPLE_SIGNAL, true }, { MENU_END_SIGNAL, false } }, .signalCount=2 },
     { .anim="zooming_box", .loop=true, .delay=1.6f, .layer=9,  .tag=2, .seq=1, .signals={ { MENU_RIPPLE_SIGNAL, true }, { MENU_END_SIGNAL, false } }, .signalCount=2 },
     { .anim="zooming_box", .loop=true, .delay=3.2f, .layer=9,  .tag=3, .seq=2, .signals={ { MENU_RIPPLE_SIGNAL, true }, { MENU_END_SIGNAL, false } }, .signalCount=2 },
+    { .anim="mouse_ripple", .loop=false, .delay=0.0f, .layer=11,  .tag=4, .seq=0, .signals={ { MENU_RIPPLE_SIGNAL, true } }, .signalCount=1 },
 };
 
 // The state owns one scene object (holds the live handles + terminal bookkeeping).
