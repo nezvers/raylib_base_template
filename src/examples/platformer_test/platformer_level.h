@@ -4,7 +4,6 @@
 #include "platformer_types.h"
 #include "platformer_constants.h"
 #include "common_types.h"
-#include "platformer_physics.h"
 #include "stddef.h"
 
 
@@ -40,28 +39,45 @@ static Actor *player; // Assigned in LevelLoad at initialization
 
 typedef void RestartFcn(void);
 static RestartFcn *restart_callback;
-void LevelSetRestartCallback(RestartFcn *callback) {
-    restart_callback = callback;
-}
 #define RESTART_FALL 200
 
-#define SIGN_F(x) ((x) > 0 ? 1 : ((x) < 0) ? -1 : 0)
+static void LevelLoad_1();
+static void LevelSetRestartCallback(RestartFcn *callback);
+static void LevelActorInit(Actor *actor);
+static void LevelPlatformInit(PlatformStatic *platform);
+static void LevelBoxInit(Box *box);
+static void LevelJumpadInit(Jumpad *jumpad);
+static void LevelCoinsInit(Coin *coin);
+static void LevelUpdate();
+static void LevelActorUpdate(float delta_time);
+static void LevelBoxesUpdate(float delta_time);
+static void LevelCoinsUpdate(float delta_time);
+static void LevelDraw();
+static void LevelDestroy();
+static void LevelSensorBegin(b2SensorBeginTouchEvent event);
+static void LevelSensorEnd(b2SensorEndTouchEvent event);
+static bool LevelPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context );
 
-void LevelActorInit(Actor *actor);
-void LevelPlatformInit(PlatformStatic *platform);
-void LevelBoxInit(Box *box);
-void LevelJumpadInit(Jumpad *jumpad);
-void LevelCoinsInit(Coin *coin);
+typedef void SensorBeginFcn( b2SensorBeginTouchEvent );
+typedef void SensorEndFcn( b2SensorEndTouchEvent );
+static void PhysicsWorldInit(WorldContext *ctx, SensorBeginFcn *begin, SensorEndFcn *end, b2PreSolveFcn *pre, void *user_data) {
+    void (*sensor_begin_callback)(b2SensorBeginTouchEvent);
+    void (*sensor_end_callback)(b2SensorEndTouchEvent);
+    WorldContextInit(
+        ctx,
+        32,                 // units per meter
+        (b2Vec2){0, 0},     // zero gravity, each object updates their velocity
+        begin,
+        end
+    );
+    b2World_SetPreSolveCallback(ctx->world, pre, user_data);
+}
 
-void LevelActorUpdate(float delta_time);
-void LevelBoxesUpdate(float delta_time);
-void LevelCoinsUpdate(float delta_time);
+static void LevelSetRestartCallback(RestartFcn *callback) {
+    restart_callback = callback;
+}
 
-void LevelSensorBegin(b2SensorBeginTouchEvent event);
-void LevelSensorEnd(b2SensorEndTouchEvent event);
-bool LevelPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context );
-
-void LevelUpdate() {
+static void LevelUpdate() {
     float delta_time = GetFrameTime(); // OPTION: turn into bullet time
     WorldContextUpdate(&level.world_ctx, delta_time);
     LevelBoxesUpdate(delta_time);
@@ -81,11 +97,11 @@ void LevelUpdate() {
     }
 }
 
-void LevelDraw() {
+static void LevelDraw() {
     WorldContextDraw(&level.world_ctx, &level.debug_draw);
 }
 
-void LevelDestroy() {
+static void LevelDestroy() {
     for (int i = 0; i < level.platform_count; i += 1) {
         ShapeDestroy(platforms[i].shape);
         BodyDestroy(platforms[i].body);
@@ -112,9 +128,7 @@ void LevelDestroy() {
     player = NULL;
 }
 
-
-// Load level
-void LevelLoad_1() {
+static void LevelLoad_1() {
     /* PHYSICS FIRST */
     PhysicsWorldInit(&level.world_ctx, LevelSensorBegin, LevelSensorEnd, LevelPreSolve, &level);
     level.debug_draw = Box2dRaylibDebugDraw();
@@ -184,8 +198,7 @@ void LevelLoad_1() {
     }
 }
 
-
-void LevelActorInit(Actor *actor) {
+static void LevelActorInit(Actor *actor) {
     b2Vec2 pos = *(b2Vec2*)& actor->state.pos;
     pos.y *= -1.f;                      // TRANSLATE to Box2D inverted Y
 
@@ -228,7 +241,7 @@ void LevelActorInit(Actor *actor) {
     actor->sensor_actor.kind = SENSOR_KIND_ACTOR;
 }
 
-void LevelPlatformInit(PlatformStatic *platform) {
+static void LevelPlatformInit(PlatformStatic *platform) {
     platform->body = BodyCreate(
         &level.world_ctx,
         *(b2Vec2*)& platform->pos,
@@ -254,7 +267,7 @@ void LevelPlatformInit(PlatformStatic *platform) {
     platform->contact.kind = ENTITY_KIND_SOLID;
 }
 
-void LevelBoxInit(Box *box) {
+static void LevelBoxInit(Box *box) {
     box->prop.body = BodyCreate(
         &level.world_ctx,
         *(b2Vec2*)& box->prop.pos,
@@ -296,7 +309,7 @@ void LevelBoxInit(Box *box) {
     box->sensor.entity = &box->prop;    // MAYBE: reference box
 }
 
-void LevelJumpadInit(Jumpad *jumpad) {
+static void LevelJumpadInit(Jumpad *jumpad) {
     jumpad->body = BodyCreate(
         &level.world_ctx,
         *(b2Vec2*)& jumpad->pos,
@@ -324,7 +337,7 @@ void LevelJumpadInit(Jumpad *jumpad) {
     jumpad->triggered = false;
 }
 
-void LevelCoinsInit(Coin *coin) {
+static void LevelCoinsInit(Coin *coin) {
     coin->body = BodyCreate(
         &level.world_ctx,
         *(b2Vec2*)& coin->pos,
@@ -352,7 +365,7 @@ void LevelCoinsInit(Coin *coin) {
     coin->triggered = false;
 }
 
-void LevelBoxesUpdate(float delta_time) {
+static void LevelBoxesUpdate(float delta_time) {
     // Reverse order to have option to remove by replacing with last
     for (int i = level.box_count -1; i > -1; i -= 1) {
         Box *box = &boxes[i];
@@ -362,7 +375,7 @@ void LevelBoxesUpdate(float delta_time) {
     }
 }
 
-void LevelCoinsUpdate(float delta_time) {
+static void LevelCoinsUpdate(float delta_time) {
     // Reverse order to have option to remove by replacing with last
     for (int i = level.coin_count -1; i > -1; i -= 1) {
         Coin *coin = &coins[i];
@@ -381,8 +394,7 @@ void LevelCoinsUpdate(float delta_time) {
     }
 }
 
-
-void LevelActorUpdate(float delta_time) {
+static void LevelActorUpdate(float delta_time) {
     // Reverse order to have option to remove by replacing with last
     for (int i = level.actor_count -1; i > -1; i -= 1) {
         Actor *actor = &actors[i];
@@ -403,7 +415,7 @@ void LevelActorUpdate(float delta_time) {
         } else {
             float abs_speed = fabsf(target_velocity.x);
             if (abs_speed > actor->values.deacceleration * delta_time) {
-                float sign_speed = SIGN_F(target_velocity.x);
+                float sign_speed = (target_velocity.x > 0) ? 1 : (target_velocity.x < 0) ? -1 : 0;
                 target_velocity.x += -sign_speed * delta_time * actor->values.deacceleration;
             } else {
                 target_velocity.x = 0;
@@ -452,7 +464,7 @@ void LevelActorUpdate(float delta_time) {
     }
 }
 
-void LevelSensorBegin(b2SensorBeginTouchEvent event) {
+static void LevelSensorBegin(b2SensorBeginTouchEvent event) {
     SensorContext *sensor = b2Shape_GetUserData(event.sensorShapeId);
     SensorContext *visitor = b2Shape_GetUserData(event.visitorShapeId);
 
@@ -488,7 +500,7 @@ void LevelSensorBegin(b2SensorBeginTouchEvent event) {
     }
 }
 
-void LevelSensorEnd(b2SensorEndTouchEvent event) {
+static void LevelSensorEnd(b2SensorEndTouchEvent event) {
     if (!b2Shape_IsValid(event.sensorShapeId)) { return; }
     SensorContext *sensor = b2Shape_GetUserData(event.sensorShapeId);
     switch(sensor->kind) {
@@ -497,7 +509,7 @@ void LevelSensorEnd(b2SensorEndTouchEvent event) {
     }
 }
 
-bool LevelPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context ) {
+static bool LevelPreSolve( b2ShapeId shapeIdA, b2ShapeId shapeIdB, b2Manifold* manifold, void* context ) {
     ContactContext *contactA = b2Shape_GetUserData(shapeIdA);
     ContactContext *contactB = b2Shape_GetUserData(shapeIdB);
 

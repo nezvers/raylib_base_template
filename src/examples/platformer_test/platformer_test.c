@@ -9,6 +9,9 @@
 // raygui implementation is compiled ONCE in main_menu.c - plain include here.
 #include "raygui.h"
 
+// Whole C script as header to bake static functions here and split scripts
+#include "platformer_level.h"
+
 // Forward declare functions
 static void Enter();
 static void Update();
@@ -73,13 +76,7 @@ static PausePage pausePage = PAUSE_PAGE_MAIN;
 static bool  paused   = false;
 static float pauseDim = 0.0f;   // 0..1 dark-overlay strength (eased toward paused)
 
-// TODO: temporary declarations
-typedef void RestartFcn(void);
-void LevelSetRestartCallback(RestartFcn *callback);
-void LevelLoad_1();
-void LevelDestroy();
-void LevelUpdate();
-void LevelDraw();
+
 
 static void PauseOpen(){
     paused    = true;
