@@ -101,6 +101,12 @@ bool AnimStageAlive(AnimHandle h);
 // that is not alive (there would be no stop left to report).
 void AnimStageSetDoneCallback(AnimHandle h, void (*fn)(void *user), void *user);
 
+// Hold (armed=true) or release (armed=false) an instance in the dormant state:
+// while armed it is alive and registered on the signal bus but is neither
+// advanced nor drawn, until the first AnimStageEmit wakes it. Set right after
+// AnimStagePlay* to suppress a scene entry's play-on-load (see AnimStageEntry).
+void AnimStageSetArmed(AnimHandle h, bool armed);
+
 // Fire signal `name` on ONE instance only, bypassing the global bus. Use when
 // several instances share a signal name and only this one should react.
 // `params` (may be NULL for none) carries the emit's position parameter so the

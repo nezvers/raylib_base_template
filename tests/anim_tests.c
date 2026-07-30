@@ -1899,6 +1899,49 @@ static void TestStageReplay(void)
     CHECK(AnimStageActiveCount() == 0);
 }
 
+// AnimStageEntry.startOnSignal: the row is spawned on load (so it is on the
+// signal bus) but held DORMANT - not advanced, not drawn, and it does NOT play
+// itself out - until the first matching AnimSceneEmit wakes it.
+static void TestSceneStartOnSignal(void)
+{
+    SignalReset();
+    AnimStageReset();
+    WriteReplayAnim("_test_sos", false);   // 1.0s one-shot, signal "trig", no replay
+
+    static const AnimStageEntry ENTRIES[] = {
+        { .anim="_test_sos", .loop=false, .layer=0, .tag=0,
+          .signals={ {"trig", false} }, .signalCount=1 },                   // auto-start
+        { .anim="_test_sos", .loop=false, .layer=1, .tag=1, .startOnSignal=true,
+          .signals={ {"trig", false} }, .signalCount=1 },                   // dormant
+    };
+    AnimStageScene sc;
+    AnimScenePlay(&sc, ENTRIES, 2);
+
+    int order[ANIM_STAGE_SLOTS_MAX];
+    CHECK(AnimStageActiveCount() == 2);                             // both spawned
+    CHECK(AnimStageDrawOrder(order, ANIM_STAGE_SLOTS_MAX) == 1);    // only the control drawn
+    CHECK(AnimStagePlayhead(sc.handles[1]) <= 0.001f);             // dormant at u=0
+
+    // Run past the 1.0s duration: the control one-shot plays out and deactivates,
+    // the armed row is NEVER advanced so it neither plays nor self-destructs.
+    for (int i = 0; i < 30; i++) AnimStageUpdate(0.05f);           // 1.5s
+    CHECK(!AnimStageAlive(sc.handles[0]));                          // control gone
+    CHECK(AnimStageAlive(sc.handles[1]));                          // armed still held
+    CHECK(AnimStageActiveCount() == 1);
+    CHECK(AnimStageDrawOrder(order, ANIM_STAGE_SLOTS_MAX) == 0);    // still not drawn
+    CHECK(AnimStagePlayhead(sc.handles[1]) <= 0.001f);            // still at u=0
+
+    // First matching emit wakes it: now drawn and advancing from the start.
+    AnimSceneEmit(&sc, "trig", NULL);
+    CHECK(AnimStageDrawOrder(order, ANIM_STAGE_SLOTS_MAX) == 1);    // now on screen
+    for (int i = 0; i < 6; i++) AnimStageUpdate(0.05f);            // 0.3s in
+    CHECK(AnimStageAlive(sc.handles[1]));
+    CHECK(AnimStagePlayhead(sc.handles[1]) > 0.2f);               // timeline advancing
+
+    AnimSceneStop(&sc);
+    CHECK(AnimStageActiveCount() == 0);
+}
+
 // REPRO: a usesPos "ripple" emitted across three same-anim instances must start
 // the signal on ALL of them, not just the first.
 static void TestSceneEmitPosAll(void)
@@ -2026,6 +2069,7 @@ int main(void)
     TestScene();
     TestSceneEmitAll();
     TestStageReplay();
+    TestSceneStartOnSignal();
     TestSceneEmitPosAll();
     TestSceneTerminal();
 

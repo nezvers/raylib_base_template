@@ -40,6 +40,9 @@ typedef struct {
                                   // emit can restart it (see AnimStageEmit)
     bool             loop;        // the caller's loop request, kept so a replay
                                   // restart can restore it after AnimPlayerStartAll
+    bool             armed;       // held dormant until the first signal fires: like
+                                  // `delay` (not advanced, not drawn) but it never
+                                  // times out - AnimStageEmit clears it (see there)
     void (*onDone)(void *user);
     void            *user;
 } StageSlot;
@@ -173,6 +176,12 @@ void AnimStageSetDoneCallback(AnimHandle h, void (*fn)(void *user), void *user)
     s->user   = user;
 }
 
+void AnimStageSetArmed(AnimHandle h, bool armed)
+{
+    StageSlot *s = SlotOf(h);
+    if (s) s->armed = armed;
+}
+
 void AnimStageEmit(AnimHandle h, const char *name, const SignalParams *params)
 {
     StageSlot *s = SlotOf(h);
@@ -194,6 +203,11 @@ void AnimStageEmit(AnimHandle h, const char *name, const SignalParams *params)
                 s->player.loop = s->loop;
                 s->docTime = AnimPlayerSampleTime(&s->player);
             }
+            // A matching emit is what starts a start-on-signal (armed) slot, so
+            // wake it here whether or not this signal produced an active override
+            // - a signal with no targets/posParams is instantly Done but must
+            // still release the hold and let the timeline run from u=0.
+            s->armed = false;
             // A signal responds NOW, not after the slot's start stagger: an
             // instance still waiting out its .delay (see AnimStageUpdate) would
             // otherwise freeze the signal until the wait elapsed, making a
@@ -220,6 +234,10 @@ void AnimStageUpdate(float dt)
     {
         StageSlot *s = &s_slots[i];
         if (!s->active) continue;
+
+        // Armed but never fired: dormant like a waiting slot, but with no clock
+        // to count down - it holds here until AnimStageEmit clears the flag.
+        if (s->armed) continue;
 
         // Waiting out a start delay: neither the timeline nor a signal moves,
         // and AnimStageDrawOrder skips the slot, so nothing shows. The leftover
@@ -280,7 +298,8 @@ int AnimStageDrawOrder(int *out, int max)
     int n = 0;
     for (int i = 0; i < ANIM_STAGE_SLOTS_MAX && n < max; i++)
     {
-        if (!s_slots[i].active || s_slots[i].delay > 0.0f) continue;
+        if (!s_slots[i].active || s_slots[i].delay > 0.0f
+            || s_slots[i].armed) continue;
         int j = n++;
         // walk the sorted prefix back while it sorts AFTER slot i
         while (j > 0 && s_slots[out[j - 1]].layer > s_slots[i].layer)

@@ -73,6 +73,11 @@ typedef struct {
                              // in anim.h), so listing the same anim with seq 0/1/2
                              // fans the three copies apart in size or position on
                              // one shared signal. 0 (the default) = no offset.
+    bool  startOnSignal;     // false (default) = play on scene load. true = stay
+                             // dormant (invisible, not advancing) until the FIRST
+                             // matching AnimSceneEmit reaches this row, which wakes
+                             // it. Pair with a `replay` signal (anim.h) for a
+                             // repeatable click effect that idles until fired.
 
     // Signals this row answers to, listed HERE so the integration point shows
     // which animation reacts to what, and which consume a position parameter.
