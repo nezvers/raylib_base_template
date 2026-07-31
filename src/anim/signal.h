@@ -58,7 +58,4 @@ void SignalStopListening(const char *name, SignalHandler fn, void *user);
 // passing `params` (may be NULL for none) to each.
 void SignalEmit(const char *name, const SignalParams *params);
 
-// Diagnostics (used by tests / editor): how many listeners match a name.
-int  SignalListenerCount(const char *name);
-
 #endif // SIGNAL_H

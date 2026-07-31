@@ -69,18 +69,6 @@ void AnimSceneEmit(AnimStageScene *sc, const char *name,
             AnimStageEmit(sc->handles[i], name, params);
 }
 
-void AnimSceneEmitTag(AnimStageScene *sc, int tag, const char *name,
-                      const SignalParams *params)
-{
-    if (!sc || !name) return;
-    for (int i = 0; i < sc->count; i++)
-        if (sc->entries[i].tag == tag)
-        {
-            AnimStageEmit(sc->handles[i], name, params);
-            return;
-        }
-}
-
 // One armed instance finished its terminal transition: count it down, and fire
 // the scene's onDone when the last one lands. `user` is the scene itself.
 static void OnOneTerminalDone(void *user)

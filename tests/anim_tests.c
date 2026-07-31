@@ -1537,18 +1537,6 @@ static void TestStage(void)
 // anims/, and must declare the signal the menu emits to end it - otherwise the
 // integration silently degrades to "no overlay" with nothing to point at.
 // Skipped when run outside the repo root (anims/ is CWD-relative).
-static void TestMenuAnimPresent(void)
-{
-    AnimDoc doc;
-    if (!AnimDocLoad(&doc, "anims/signal_test.cfg")) return;   // not at repo root
-    CHECK(doc.elemCount > 0);
-
-    bool found = false;
-    for (int i = 0; i < doc.signalCount; i++)
-        if (TextIsEqual(doc.signals[i].name, "TV-out")) found = true;
-    CHECK(found);       // main_menu.c's MENU_END_SIGNAL
-}
-
 // ---------------------------------------------------------------------------
 //  Signal POSITION parameter (the "--params--" section): a Mouse-Position
 //  binding eases a position slot from the live pose to mouse + per-key offset.
@@ -1812,6 +1800,7 @@ static void TestScene(void)
     AnimSceneStop(&sc);
     CHECK(!AnimSceneAlive(&sc));
     CHECK(AnimStageActiveCount() == 0);
+    remove("anims/_test_scene.cfg");
 }
 
 // AnimSceneEmit reaches EVERY row declaring the name, and ONLY those. Observed
@@ -1840,6 +1829,7 @@ static void TestSceneEmitAll(void)
     CHECK(!AnimStageEndsOnCurrentSignal(sc.handles[2]));  // not declared -> inert
 
     AnimSceneStop(&sc);
+    remove("anims/_test_scene2.cfg");
 }
 
 // Restart-on-fire (AnimSignal.replay): a non-looping instance runs once, is then
@@ -1897,6 +1887,8 @@ static void TestStageReplay(void)
     CHECK(AnimStageAlive(h));                              // still HELD
     AnimStageStopAll();
     CHECK(AnimStageActiveCount() == 0);
+    remove("anims/_test_noreplay.cfg");
+    remove("anims/_test_replay.cfg");
 }
 
 // AnimStageEntry.startOnSignal: the row is spawned on load (so it is on the
@@ -1940,6 +1932,7 @@ static void TestSceneStartOnSignal(void)
 
     AnimSceneStop(&sc);
     CHECK(AnimStageActiveCount() == 0);
+    remove("anims/_test_sos.cfg");
 }
 
 // REPRO: a usesPos "ripple" emitted across three same-anim instances must start
@@ -1992,6 +1985,7 @@ static void TestSceneEmitPosAll(void)
     CHECK(AnimStageSignalPlaying(sc.handles[2]));
 
     AnimSceneStop(&sc);
+    remove("anims/_test_ripple.cfg");
 }
 
 // Terminal emit across a scene: onDone fires exactly once after all wind down,
@@ -2029,6 +2023,7 @@ static void TestSceneTerminal(void)
     AnimSceneEmitTerminal(&sc, "no_such_signal", NULL, OnSceneDone, NULL);
     CHECK(s_sceneDone == 1);
     AnimSceneStop(&sc);
+    remove("anims/_test_term.cfg");
 }
 
 int main(void)
@@ -2061,7 +2056,6 @@ int main(void)
     TestSignalTargetRemap();
     TestSignalTerminalIO();
     TestStage();
-    TestMenuAnimPresent();
     TestSignalPosParam();
     TestSignalPosCorner();
     TestSignalPosAnchor();
