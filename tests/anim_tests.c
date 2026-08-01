@@ -9,6 +9,7 @@
 
 #include "raylib.h"
 #include "../src/anim/anim.h"
+#include "../src/anim/anim_ease_custom.h"
 #include "../src/anim/anim_io.h"
 #include "../src/anim/anim_library.h"
 #include "../src/anim/signal.h"
@@ -2026,6 +2027,196 @@ static void TestSceneTerminal(void)
     remove("anims/_test_term.cfg");
 }
 
+// ---------------------------------------------------------------------------
+//  Custom easings: add/eval, name resolve, hide flags, .cfg roundtrip.
+// ---------------------------------------------------------------------------
+static void TestCustomEases(void)
+{
+    const char *path = "anim_tests_ease_tmp.cfg";
+    remove(path);
+    AnimCustomEasesLoad(path);              // missing file -> empty set
+
+    // unknown name degrades to linear (the deleted-easing story).
+    CHECK(AnimEaseByName("no_such_ease") == ANIM_EASE_LINEAR);
+
+    // add: id lands in the custom range, resolves both ways.
+    AnimEasePt pts[ANIM_EASE_PTS_MAX];
+    AnimEasePtsFromCubic(pts, 0.25f, 0.1f, 0.25f, 1.0f);
+    int id = AnimCustomEaseAdd("testEase", pts, 2);
+    CHECK(id >= ANIM_EASE_COUNT);
+    CHECK(AnimEaseByName("testEase") == id);
+    CHECK(TextIsEqual(AnimEaseName(id), "testEase"));
+    CHECK(AnimEaseIdValid(id) && !AnimEaseIdValid(id + 1));
+
+    // duplicate and builtin names refuse.
+    AnimEasePt flat[ANIM_EASE_PTS_MAX];
+    AnimEasePtsFromCubic(flat, 0.0f, 0.0f, 1.0f, 1.0f);
+    CHECK(AnimCustomEaseAdd("testEase", flat, 2) == -1);
+    CHECK(AnimCustomEaseAdd("sineOut", flat, 2) == -1);
+
+    // eval: endpoints exact, midpoint eased above linear for this ease-out
+    // curve, monotone-ish interior stays in a sane band.
+    CHECK_NEAR(AnimEaseApply(id, 0.0f), 0.0f);
+    CHECK_NEAR(AnimEaseApply(id, 1.0f), 1.0f);
+    float mid = AnimEaseApply(id, 0.5f);
+    CHECK(mid > 0.5f && mid < 1.0f);
+    // the linear-handles curve IS linear.
+    AnimEasePt linPts[ANIM_EASE_PTS_MAX];
+    AnimEasePtsFromCubic(linPts, 0.25f, 0.25f, 0.75f, 0.75f);
+    int lin = AnimCustomEaseAdd("testLin", linPts, 2);
+    CHECK(fabsf(AnimEaseApply(lin, 0.3f) - 0.3f) < 0.01f);
+
+    // hidden easings still evaluate; flag reads back for builtins + customs.
+    AnimEaseSetHidden(id, true);
+    AnimEaseSetHidden(ANIM_EASE_BOUNCE_OUT, true);
+    CHECK(AnimEaseIsHidden(id) && AnimEaseIsHidden(ANIM_EASE_BOUNCE_OUT));
+    CHECK_NEAR(AnimEaseApply(id, 1.0f), 1.0f);
+
+    // roundtrip: save, wipe (load nonexistent), reload -> same values + flags.
+    CHECK(AnimCustomEasesSave(path));
+    AnimCustomEasesLoad("no_such_file.cfg");
+    CHECK(AnimEaseByName("testEase") == ANIM_EASE_LINEAR);      // wiped
+    CHECK(!AnimEaseIsHidden(ANIM_EASE_BOUNCE_OUT));
+    CHECK(AnimCustomEasesLoad(path));
+    int rid = AnimEaseByName("testEase");
+    CHECK(rid >= ANIM_EASE_COUNT);
+    CHECK_NEAR(AnimEaseApply(rid, 0.5f), mid);
+    CHECK(AnimEaseIsHidden(rid) && AnimEaseIsHidden(ANIM_EASE_BOUNCE_OUT));
+
+    // a doc key saved with a custom ease survives the trip by name.
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    AnimTrack *tr = AnimElemAddTrack(e, AP_S_POS_X);
+    AnimTrackAddKey(tr, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 1.0f, 1.0f, rid);
+    const char *dpath = "anim_tests_ease_doc_tmp.cfg";
+    CHECK(AnimDocSave(&doc, dpath));
+    AnimDoc back;
+    CHECK(AnimDocLoad(&back, dpath));
+    CHECK(back.elems[0].tracks[0].keys[1].ease == rid);
+
+    // wipe + reload the DOC only: the custom set is gone, so the name is
+    // unknown and the key degrades to linear instead of exploding.
+    AnimCustomEasesLoad("no_such_file.cfg");
+    CHECK(AnimDocLoad(&back, dpath));
+    CHECK(back.elems[0].tracks[0].keys[1].ease == ANIM_EASE_LINEAR);
+
+    remove(path);
+    remove(dpath);
+}
+
+// ---------------------------------------------------------------------------
+//  Multi-segment easings: knots, hold steps, legacy lines, roundtrip.
+// ---------------------------------------------------------------------------
+static void TestMultiSegmentEases(void)
+{
+    const char *path = "anim_tests_ease_multi_tmp.cfg";
+    remove(path);
+    AnimCustomEasesLoad(path);              // empty set
+
+    // three knots: the curve passes through every knot at its own x.
+    AnimEasePt pts[ANIM_EASE_PTS_MAX] = {
+        { 0.0f, 0.0f,  0.0f, 0.0f,   0.1f,  0.3f },
+        { 0.5f, 1.2f, -0.1f, 0.1f,   0.1f, -0.1f },
+        { 1.0f, 1.0f, -0.2f, 0.05f,  0.0f,  0.0f },
+    };
+    int id = AnimCustomEaseAdd("multiTest", pts, 3);
+    CHECK(id >= ANIM_EASE_COUNT);
+    CHECK_NEAR(AnimEaseApply(id, 0.0f), 0.0f);
+    CHECK_NEAR(AnimEaseApply(id, 1.0f), 1.0f);
+    CHECK(fabsf(AnimEaseApply(id, 0.5f) - 1.2f) < 0.02f);   // the middle knot
+    // overshoot above 1 really happens between the knots.
+    CHECK(AnimEaseApply(id, 0.45f) > 1.0f);
+
+    // knots out of order are pushed back into ascending x on store.
+    AnimEasePt bad[ANIM_EASE_PTS_MAX] = {
+        { 0.0f, 0.0f, 0,0, 0,0 },
+        { 0.8f, 0.5f, 0,0, 0,0 },
+        { 0.3f, 0.7f, 0,0, 0,0 },       // behind its neighbour
+        { 1.0f, 1.0f, 0,0, 0,0 },
+    };
+    int bid = AnimCustomEaseAdd("multiOrder", bad, 4);
+    const AnimCustomEase *bc = AnimCustomEaseGet(bid);
+    CHECK(bc && bc->ptCount == 4);
+    CHECK(bc->pts[2].x >= bc->pts[1].x);
+    CHECK_NEAR(bc->pts[0].x, 0.0f);
+    CHECK_NEAR(bc->pts[3].x, 1.0f);
+
+    // two knots at the same x = a hold: the value jumps at the seam.
+    AnimEasePt step[ANIM_EASE_PTS_MAX] = {
+        { 0.0f, 0.0f, 0,0, 0,0 },
+        { 0.5f, 0.0f, 0,0, 0,0 },
+        { 0.5f, 1.0f, 0,0, 0,0 },
+        { 1.0f, 1.0f, 0,0, 0,0 },
+    };
+    int sid = AnimCustomEaseAdd("multiStep", step, 4);
+    CHECK(fabsf(AnimEaseApply(sid, 0.25f)) < 0.01f);
+    CHECK(fabsf(AnimEaseApply(sid, 0.75f) - 1.0f) < 0.01f);
+
+    // roundtrip: save + reload keeps the shape.
+    float before = AnimEaseApply(id, 0.35f);
+    CHECK(AnimCustomEasesSave(path));
+    AnimCustomEasesLoad("no_such_file.cfg");
+    CHECK(AnimEaseByName("multiTest") == ANIM_EASE_LINEAR);
+    CHECK(AnimCustomEasesLoad(path));
+    int rid = AnimEaseByName("multiTest");
+    CHECK(rid >= ANIM_EASE_COUNT);
+    const AnimCustomEase *rc = AnimCustomEaseGet(rid);
+    CHECK(rc && rc->ptCount == 3);
+    CHECK(fabsf(AnimEaseApply(rid, 0.35f) - before) < 0.001f);
+
+    // a hand-written legacy line (4 floats) still loads as a 2-knot curve.
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL);
+    if (f)
+    {
+        fprintf(f, "ease legacyTest 0.25 0.25 0.75 0.75\n");
+        fclose(f);
+    }
+    CHECK(AnimCustomEasesLoad(path));
+    int lid = AnimEaseByName("legacyTest");
+    CHECK(lid >= ANIM_EASE_COUNT);
+    const AnimCustomEase *lc = AnimCustomEaseGet(lid);
+    CHECK(lc && lc->ptCount == 2);
+    CHECK(fabsf(AnimEaseApply(lid, 0.3f) - 0.3f) < 0.01f);   // linear handles
+
+    remove(path);
+}
+
+// ---------------------------------------------------------------------------
+//  Auto-key starting a track: the t=0 key must capture the ORIGINAL pose, so
+//  the edit animates instead of flattening the property to one value. This is
+//  the ordering the zen editor's untracked auto-key path relies on.
+// ---------------------------------------------------------------------------
+static void TestAutoKeyStartsTrack(void)
+{
+    const float EPS = 0.02f;
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    e->posFrac.x = 0.25f;                       // rest pose before the edit
+
+    float playhead = 1.0f, edited = 0.80f;
+
+    CHECK(AnimElemFindTrack(e, AP_S_POS_X) == NULL);
+    AnimTrack *tr = AnimElemAddTrack(e, AP_S_POS_X);
+    CHECK(tr != NULL);
+    // seed t=0 BEFORE the base field moves
+    if (tr->keyCount == 0)
+        AnimTrackAddKey(tr, 0.0f, AnimElemProp(e, tr->prop, 0.0f), ANIM_EASE_LINEAR);
+    e->posFrac.x = edited;
+    AnimTrackWriteKeyAt(tr, playhead, edited, EPS);
+
+    CHECK(tr->keyCount == 2);
+    CHECK_NEAR(tr->keys[0].t, 0.0f);
+    CHECK(fabsf(tr->keys[0].value - 0.25f) < 0.01f);    // original, not the edit
+    CHECK(fabsf(tr->keys[1].value - 0.80f) < 0.01f);
+    // and it genuinely animates in between
+    float mid = AnimElemProp(e, AP_S_POS_X, 0.5f);
+    CHECK(mid > 0.26f && mid < 0.79f);
+}
+
 int main(void)
 {
     TestEval();
@@ -2066,6 +2257,9 @@ int main(void)
     TestSceneStartOnSignal();
     TestSceneEmitPosAll();
     TestSceneTerminal();
+    TestCustomEases();
+    TestMultiSegmentEases();
+    TestAutoKeyStartsTrack();
 
     printf("anim_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails ? 1 : 0;

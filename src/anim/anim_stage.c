@@ -2,7 +2,7 @@
 //  anim_stage.c  -  the playback stage (see anim_stage.h)
 //
 //  One fixed pool of slots. Each slot is the exact trio the anim editor drives
-//  by hand in its Update/Draw (anim_editor.c): a document, a timeline player,
+//  by hand in its Update/Draw (anim_editor_zen/): a document, a timeline player,
 //  and a signal player that overrides the timeline for the properties it
 //  targets. The only things this module adds on top are a draw LAYER, an owned
 //  copy of the document, and the terminal-signal rule that lets a signal end
@@ -17,7 +17,7 @@
 #include <stddef.h>
 
 // Animations are read from the SAME writable dir the editor saves to, so an
-// edit is live in game without a copy step (see ANIM_DIR in anim_editor.c).
+// edit is live in game without a copy step (see ZEN_ANIM_DIR in zen_internal.h).
 #define ANIM_STAGE_DIR "anims"
 #define ANIM_STAGE_EXT ".cfg"
 

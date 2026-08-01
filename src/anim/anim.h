@@ -62,7 +62,7 @@
 //  ...but sizeof(AnimDoc) is NOT the number that matters. Docs are held by
 //  value in bulk, and those multipliers are what actually spend memory:
 //
-//      anim_editor undoBuf[UNDO_MAX=16]        16 x 52 KB = ~0.82 MB
+//      zen editor  undoBuf[ZEN_UNDO_MAX=16]    16 x 52 KB = ~0.82 MB
 //      anim_stage  slots[ANIM_STAGE_SLOTS_MAX=8] 8 x 52 KB = ~0.41 MB
 //
 //  So a change to any capacity above lands in the build multiplied by ~24.
