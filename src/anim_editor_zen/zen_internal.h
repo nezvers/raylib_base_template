@@ -110,6 +110,7 @@ typedef struct {
     bool  playPending;              // play requested, waiting on the zoom-in
     bool  loopPlay;
     bool  autoKey;
+    bool  stopOnSignal;             // a fired signal ends playback (vs. resume)
 
     // -- viewport zoom ------------------------------------------------------
     float zoomT;                    // 0 = editing (ZEN_ZOOM_EDIT) .. 1 = 1:1
@@ -189,7 +190,7 @@ typedef struct {
     Rectangle sigDropHdr;
 
     // -- tooltip of this frame (drawn topmost by ZenTipDraw) ----------------
-    char tipText[160];
+    char tipText[320];              // wrapped by ZenTipDraw, so it can be long
     Rectangle tipRect;              // widget the tip belongs to
 
     // -- undo ring (whole-doc value snapshots) ------------------------------
@@ -295,6 +296,8 @@ void  ZenSelTrack(int elem, int gi);            // select a whole track
 void  ZenSelKey(int elem, int gi, float t, bool additive);  // click / shift-click
 bool  ZenKeyIsSelected(int elem, int gi, float t);
 void  ZenSelValidate(void);                     // after undo/load/deletes
+void  ZenAutoKeyFocus(int elem, int prop, float t);  // show what auto-key wrote
+const char *ZenPropDesc(int prop);              // plain-language property help
 
 // ---------------------------------------------------------------------------
 //  zen_panels.c - the four panels

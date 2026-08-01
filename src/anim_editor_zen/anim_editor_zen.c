@@ -441,6 +441,7 @@ static void Enter()
     zen.playhead = 0.0f;
     zen.playing = false; zen.playPending = false;
     zen.loopPlay = true;
+    zen.stopOnSignal = true;
     zen.zoomT = 0.0f; zen.zoomFull = false;
     zen.undoCount = zen.redoCount = 0; zen.undoHead = 0;
 
@@ -488,9 +489,15 @@ static void Update()
 {
     float dt = GetFrameTime();
 
+    // A live signal preview freezes the doc clock: the timeline shows the
+    // signal's own track instead, and the frozen pose is what it eases off.
+    bool sigLive = !AnimSignalPlayerDone(&zen.preview);
+    if (sigLive && zen.playing && zen.stopOnSignal)
+        zen.playing = false;                // stops for good; Space resumes
+
     // Timeline playback over the TRIMMED section [0..outroStart]; looping
     // restarts at introEnd (the intro is a one-shot lead-in).
-    if (zen.playing)
+    if (zen.playing && !sigLive)
     {
         float inEnd = AnimDocIntroEnd(&zen.doc);
         float outStart = AnimDocOutroStart(&zen.doc);

@@ -27,6 +27,10 @@
 #include <math.h>
 
 #define ZEN_TIMELINE_SNAP 0.1f     // Ctrl-drag key snap grid (seconds)
+// How close the scrubbing playhead counts as "on" a key. Wider than
+// ZEN_AUTOKEY_EPS so a sweep reliably catches keys at normal mouse speed, and
+// wide enough that near-coincident keys are picked up together.
+#define ZEN_SCRUB_KEY_EPS 0.04f
 
 // ---------------------------------------------------------------------------
 //  Scrolling panel wrapper (scissor + wheel + outside-lock), classic pattern.
@@ -226,14 +230,32 @@ static float *ElemBaseField(AnimElem *e, int prop)
     }
 }
 
+// Inspector row label: the short caption the panel has room for, plus the
+// property's plain-language explanation on hover ("rot" -> what rot means).
+static void PropLabel(Rectangle r, const char *caption, int prop)
+{
+    GuiLabel(r, caption);
+    ZenTip(r, ZenPropDesc(prop));
+}
+
 // Keyframe-or-base write, same semantics as ZenPropSlider commits.
 static void WritePropValue(AnimElem *e, int prop, float v, float *baseField)
 {
     AnimTrack *tr = AnimElemFindTrack(e, prop);
+    if (!tr && zen.autoKey)
+    {
+        // auto-key starts the track here too, same as the sliders. Adding a
+        // track is structural, so it gets its own undo step; t=0 is seeded
+        // from the original pose before the base field moves.
+        ZenUndoPush();
+        tr = AnimElemAddTrack(e, prop);
+        if (tr && zen.playhead > ZEN_AUTOKEY_EPS) ZenEnsureZeroKey(e, tr);
+    }
     if (!tr) { if (baseField) *baseField = v; return; }
     if (!zen.autoKey) return;
     if (zen.playhead > ZEN_AUTOKEY_EPS) ZenEnsureZeroKey(e, tr);
     AnimTrackWriteKeyAt(tr, zen.playhead, v, ZEN_AUTOKEY_EPS);
+    ZenAutoKeyFocus(zen.selElem, prop, zen.playhead);   // inspector edits the selection
 }
 
 // Corner-mode geometry rows (shape by two corners / line by endpoints);
@@ -266,11 +288,15 @@ static float DrawCornerRows(float x, float y, float w, float rh, float gap,
         float oy = (hUnit * wEff * 0.5f) * sinf(rot) / game.y;
         float ax = (cx - ox)*sx, ay = (cy - oy)*sy, bx = (cx + ox)*sx, by = (cy + oy)*sy;
         bool ch = false;
-        GuiLabel((Rectangle){ x, y, 44, rh }, "start");
+        ZenLabelTip((Rectangle){ x, y, 44, rh }, "start",
+                    "First endpoint of the line. Moving it rewrites the line's "
+                    "center, length and rotation");
         if (ZenEditSlider((Rectangle){ x+44, y, half, rh }, "x", &ax, loX, hiX)) ch = true;
         if (ZenEditSlider((Rectangle){ x2, y, half, rh }, "y", &ay, loY, hiY)) ch = true;
         y += rh + gap;
-        GuiLabel((Rectangle){ x, y, 44, rh }, "end");
+        ZenLabelTip((Rectangle){ x, y, 44, rh }, "end",
+                    "Second endpoint of the line. Moving it rewrites the line's "
+                    "center, length and rotation");
         if (ZenEditSlider((Rectangle){ x+44, y, half, rh }, "x", &bx, loX, hiX)) ch = true;
         if (ZenEditSlider((Rectangle){ x2, y, half, rh }, "y", &by, loY, hiY)) ch = true;
         y += rh + gap;
@@ -293,11 +319,15 @@ static float DrawCornerRows(float x, float y, float w, float rh, float gap,
         float hxF = (wUnit*wv*sc/game.x) * 0.5f, hyF = (hUnit*hv*sc/game.y) * 0.5f;
         float x0 = (cx-hxF)*sx, y0 = (cy-hyF)*sy, x1 = (cx+hxF)*sx, y1 = (cy+hyF)*sy;
         bool ch = false;
-        GuiLabel((Rectangle){ x, y, 44, rh }, "P0");
+        ZenLabelTip((Rectangle){ x, y, 44, rh }, "P0",
+                    "Top-left corner. Dragging it rewrites the shape's center "
+                    "and size instead of moving the whole shape");
         if (ZenEditSlider((Rectangle){ x+44, y, half, rh }, "x", &x0, loX, hiX)) ch = true;
         if (ZenEditSlider((Rectangle){ x2, y, half, rh }, "y", &y0, loY, hiY)) ch = true;
         y += rh + gap;
-        GuiLabel((Rectangle){ x, y, 44, rh }, "P1");
+        ZenLabelTip((Rectangle){ x, y, 44, rh }, "P1",
+                    "Bottom-right corner. Dragging it rewrites the shape's "
+                    "center and size instead of moving the whole shape");
         if (ZenEditSlider((Rectangle){ x+44, y, half, rh }, "x", &x1, loX, hiX)) ch = true;
         if (ZenEditSlider((Rectangle){ x2, y, half, rh }, "y", &y1, loY, hiY)) ch = true;
         y += rh + gap;
@@ -361,7 +391,10 @@ static float DrawInspector(float x, float y, float w)
         bool isText = e->kind == AE_TEXT;
 
         // units toggle (rescales base + keys so nothing visually moves).
-        GuiLabel((Rectangle){ x, y, 44, rh }, "units");
+        ZenLabelTip((Rectangle){ x, y, 44, rh }, "units",
+                    "How sizes are stored: '% canvas' scales with the window, "
+                    "'px abs' keeps a fixed pixel size. Switching rescales the "
+                    "base pose and every key so nothing visually moves");
         float uw = (w - 44 - 4) / 2.0f;
         bool wantFrac = !e->sizeAbsolute, wantAbs = e->sizeAbsolute;
         GuiToggle((Rectangle){ x+44, y, uw, rh }, "% canvas", &wantFrac);
@@ -374,7 +407,9 @@ static float DrawInspector(float x, float y, float w)
 
         if (e->kind == AE_SHAPE)
         {
-            GuiLabel((Rectangle){ x, y, 44, rh }, "anchor");
+            ZenLabelTip((Rectangle){ x, y, 44, rh }, "anchor",
+                        "How the shape is edited: by its center plus a size, or "
+                        "by two opposite corners. Storage is the same either way");
             float aw = (w - 44 - 4) / 2.0f;
             bool wantCtr = !e->cornerMode, wantCor = e->cornerMode;
             GuiToggle((Rectangle){ x+44, y, aw, rh }, "center+size", &wantCtr);
@@ -390,43 +425,51 @@ static float DrawInspector(float x, float y, float w)
             if (e->shapeKind != SHAPE_LINE)
             {
                 ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_SCALE, &e->scaleFrac);
-                GuiLabel((Rectangle){ x, y, 44, rh }, "scale"); y += rh + gap;
+                PropLabel((Rectangle){ x, y, 44, rh }, "scale", AP_S_SCALE); y += rh + gap;
             }
         }
         else
         {
-            ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_POS_X : AP_S_POS_X, &e->posFrac.x);
-            GuiLabel((Rectangle){ x, y, 44, rh }, "posX"); y += rh + gap;
-            ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_POS_Y : AP_S_POS_Y, &e->posFrac.y);
-            GuiLabel((Rectangle){ x, y, 44, rh }, "posY"); y += rh + gap;
-            ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_SIZE : AP_S_W, &e->sizeFrac.x);
-            GuiLabel((Rectangle){ x, y, 44, rh }, isText ? "size" : (e->shapeKind==SHAPE_LINE?"length":"w")); y += rh + gap;
+            int pX = isText ? AP_T_POS_X : AP_S_POS_X;
+            int pY = isText ? AP_T_POS_Y : AP_S_POS_Y;
+            int pW = isText ? AP_T_SIZE  : AP_S_W;
+            ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, pX, &e->posFrac.x);
+            PropLabel((Rectangle){ x, y, 44, rh }, "posX", pX); y += rh + gap;
+            ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, pY, &e->posFrac.y);
+            PropLabel((Rectangle){ x, y, 44, rh }, "posY", pY); y += rh + gap;
+            ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, pW, &e->sizeFrac.x);
+            PropLabel((Rectangle){ x, y, 44, rh },
+                      isText ? "size" : (e->shapeKind==SHAPE_LINE?"length":"w"), pW); y += rh + gap;
             if (e->kind == AE_SHAPE)
             {
                 ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_H, &e->sizeFrac.y);
-                GuiLabel((Rectangle){ x, y, 44, rh }, e->shapeKind==SHAPE_LINE?"thick":"h"); y += rh + gap;
+                PropLabel((Rectangle){ x, y, 44, rh },
+                          e->shapeKind==SHAPE_LINE?"thick":"h", AP_S_H); y += rh + gap;
                 ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_SCALE, &e->scaleFrac);
-                GuiLabel((Rectangle){ x, y, 44, rh }, "scale"); y += rh + gap;
+                PropLabel((Rectangle){ x, y, 44, rh }, "scale", AP_S_SCALE); y += rh + gap;
             }
         }
 
         if (e->kind == AE_SHAPE && e->cornerMode && e->shapeKind == SHAPE_LINE)
         {
             ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_H, &e->sizeFrac.y);
-            GuiLabel((Rectangle){ x, y, 44, rh }, "thick"); y += rh + gap;
+            PropLabel((Rectangle){ x, y, 44, rh }, "thick", AP_S_H); y += rh + gap;
         }
 
         if (!(e->kind == AE_SHAPE && e->cornerMode && e->shapeKind == SHAPE_LINE))
         {
-            ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, isText ? AP_T_ROT : AP_S_ROT, &e->rotBase);
-            GuiLabel((Rectangle){ x, y, 44, rh }, "rot"); y += rh + gap;
+            int pR = isText ? AP_T_ROT : AP_S_ROT;
+            ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, pR, &e->rotBase);
+            PropLabel((Rectangle){ x, y, 44, rh }, "rot", pR); y += rh + gap;
         }
     }
 
     y = ZenColorRGBRows(x, y, w, e, ZenColorPropFor(e->kind), &e->color, "color");
     float ca = e->color.a;
-    if (ZenEditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "A", &ca, 0,255))
-        e->color.a = (unsigned char)ca;
+    Rectangle caR = { x+16, y, w-16-50, 16 };
+    if (ZenEditSlider(caR, "A", &ca, 0,255)) e->color.a = (unsigned char)ca;
+    ZenTip(caR, "Base opacity of this colour (0-255). This is the rest pose - "
+                "the 'alpha' track is what animates opacity over time");
     y += 22;
 
     if (e->kind == AE_GLOBAL)
@@ -434,8 +477,10 @@ static float DrawInspector(float x, float y, float w)
         GuiLine((Rectangle){ x, y, w, 8 }, "background"); y += 12;
         y = ZenColorRGBRows(x, y, w, e, AP_G_BG_COLOR, &e->bgColor, "background");
         float ba = e->bgColor.a;
-        if (ZenEditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "A", &ba, 0,255))
-            e->bgColor.a = (unsigned char)ba;
+        Rectangle baR = { x+16, y, w-16-50, 16 };
+        if (ZenEditSlider(baR, "A", &ba, 0,255)) e->bgColor.a = (unsigned char)ba;
+        ZenTip(baR, "Base opacity of the scene background fill (0-255). The "
+                    "'bg_alpha' track animates it over time");
         y += 22;
     }
 
@@ -443,16 +488,20 @@ static float DrawInspector(float x, float y, float w)
     {
         GuiLine((Rectangle){ x, y, w, 8 }, "outline"); y += 12;
         ZenPropSlider((Rectangle){ x+44, y, w-44-50, rh }, e, AP_S_OUTLINE, &e->outlineFrac);
-        GuiLabel((Rectangle){ x, y, 44, rh }, "thick"); y += rh + gap;
+        PropLabel((Rectangle){ x, y, 44, rh }, "thick", AP_S_OUTLINE); y += rh + gap;
         y = ZenColorRGBRows(x, y, w, e, AP_S_OUTLINE_COLOR, &e->outlineColor, "outline");
         float oa = e->outlineColor.a;
-        if (ZenEditSlider((Rectangle){ x+16, y, w-16-50, 16 }, "A", &oa, 0,255))
-            e->outlineColor.a = (unsigned char)oa;
+        Rectangle oaR = { x+16, y, w-16-50, 16 };
+        if (ZenEditSlider(oaR, "A", &oa, 0,255)) e->outlineColor.a = (unsigned char)oa;
+        ZenTip(oaR, "Base opacity of the outline (0-255), separate from the "
+                    "fill. The 'outline_alpha' track animates it");
         y += 22;
 
         if (e->shapeKind == SHAPE_CIRCLE)
         {
-            GuiLabel((Rectangle){ x, y, 44, rh }, "style");
+            ZenLabelTip((Rectangle){ x, y, 44, rh }, "style",
+                        "How the circle's outline is drawn: 'crawling' follows "
+                        "the ring smoothly, 'crisp' keeps a hard edge");
             float sw = (w - 44 - 4) / 2.0f;
             bool wantCrawl = !e->outlineCrisp, wantCrisp = e->outlineCrisp;
             GuiToggle((Rectangle){ x+44, y, sw, rh }, "crawling", &wantCrawl);
@@ -480,9 +529,13 @@ static float DrawInspector(float x, float y, float w)
         // header row: expander glyph + name + key count + [+key] [del].
         Rectangle hdrR = { x, y, w - 104, rh };
         bool hdrPressed = GuiButton(hdrR, "");
+        const char *gDesc = g->propCount > 0 ? ZenPropDesc(g->props[0]) : NULL;
         ZenLabelTip((Rectangle){ x + 22, y + 4, hdrR.width - 26, rh - 8 },
                     TextFormat("%s (%d)", g->name, nt),
-                    "Click: select track (bulk edit in the modal). Arrow expands the key list.");
+                    gDesc ? TextFormat("%s. Click selects the track for bulk "
+                                       "editing; the arrow expands its keys.", gDesc)
+                          : "Click: select track (bulk edit in the modal). "
+                            "Arrow expands the key list.");
         if (selTrack) DrawRectangleRec(hdrR, (Color){ 90, 140, 220, 70 });
 
         // expander arrow: its own small click zone on the left of the header.
@@ -629,6 +682,72 @@ static void DrawDottedV(float x, float y0, float y1, Color c)
     }
 }
 
+// While a fired signal plays, the doc timeline is frozen and this strip takes
+// over the lane area: the signal's own keys in u (0..1 of its length) with a
+// marker riding the player's clock. Read-only - editing lives in the signal
+// modal; this only answers "what is happening right now".
+static void DrawSignalOverlay(float x, float y, float w, float h,
+                              float trackLeft, float trackW)
+{
+    const AnimSignal *sg = zen.preview.sig;
+    if (!sg) return;
+
+    // dim what's frozen underneath.
+    DrawRectangleRec((Rectangle){ x+1, y+1, w-2, h-2 }, (Color){ 12, 13, 16, 170 });
+
+    float len = sg->length > 0.0f ? sg->length : 1.0f;
+    float u = ZenClampF(zen.preview.clock / len, 0.0f, 1.0f);
+
+    Rectangle strip = { x+1, y+1, w-2, h-2 };
+    DrawRectangleLinesEx(strip, 1.0f, (Color){ 150, 220, 160, 200 });
+    DrawText(TextFormat("SIGNAL  %s", sg->name), (int)x+6, (int)y+4, 10,
+             (Color){ 150, 220, 160, 255 });
+    DrawText(TextFormat("u %.2f  /  %.2fs", u, len),
+             (int)(x + w - 108), (int)y+4, 10, (Color){ 150, 220, 160, 200 });
+
+    // one lane per (element, group) the signal targets, keys at their u.
+    float laneTop = y + 18, laneBot = y + h - 6;
+    int lanes[16][2], ln = 0;                       // {elemIdx, groupIdx}
+    for (int ei = 0; ei < zen.doc.elemCount && ln < 16; ei++)
+    {
+        AnimElem *e = &zen.doc.elems[ei];
+        for (int gi = 0, gn = AnimGroupCountFor(e->kind); gi < gn && ln < 16; gi++)
+            if (ZenSigGroupHasTarget((AnimSignal *)sg, ei, gi))
+            { lanes[ln][0] = ei; lanes[ln][1] = gi; ln++; }
+    }
+
+    float rowH = ln > 0 ? (laneBot - laneTop) / (float)ln : 0.0f;
+    for (int i = 0; i < ln; i++)
+    {
+        AnimElem *e = &zen.doc.elems[lanes[i][0]];
+        const AnimPropGroup *g = AnimGroupAt(e->kind, lanes[i][1]);
+        float ry = laneTop + i*rowH + rowH*0.5f;
+        DrawText(TextFormat("%s.%s", e->name, g ? g->name : "?"),
+                 (int)x+4, (int)ry-5, 10, (Color){ 120, 170, 130, 255 });
+        DrawLine((int)trackLeft, (int)ry, (int)(x + w - 8), (int)ry,
+                 (Color){ 60, 90, 68, 255 });
+
+        float us[ZEN_GROUP_TIMES_MAX];
+        int nu = ZenSigGroupKeyTimes((AnimSignal *)sg, lanes[i][0], lanes[i][1], us);
+        for (int k = 0; k < nu; k++)
+        {
+            float kx = trackLeft + trackW * ZenClampF(us[k], 0.0f, 1.0f);
+            bool passed = us[k] <= u;
+            DrawDiamond(kx, ry, 7.0f, (Color){ 15, 16, 20, 255 });
+            DrawDiamond(kx, ry, 5.0f, passed ? (Color){ 150, 220, 160, 255 }
+                                             : (Color){ 90, 130, 100, 255 });
+        }
+    }
+    if (ln == 0)
+        DrawText("(this signal has no keyed targets)", (int)(x + w*0.5f - 90),
+                 (int)(y + h*0.5f - 5), 10, (Color){ 110, 140, 118, 255 });
+
+    // the signal's own playhead, riding its clock.
+    float sx = trackLeft + trackW * u;
+    DrawLine((int)sx, (int)(y+16), (int)sx, (int)(y+h-2), (Color){ 150, 240, 165, 255 });
+    DrawRectangleRec((Rectangle){ sx-6, y+14, 12, 8 }, (Color){ 150, 240, 165, 255 });
+}
+
 static void DrawTimeline(float x, float y, float w, float h)
 {
     bool thin = h < 60.0f;
@@ -668,6 +787,11 @@ static void DrawTimeline(float x, float y, float w, float h)
         DrawRectangleRec((Rectangle){ outX, y+1, x+w-padR-outX, h-2 },
                          (Color){ 0, 0, 0, 120 });
 
+    // lane layout, kept for the scrub handler below (which lane is the cursor
+    // in, so scrubbing can follow the swimlane it passes over).
+    int   laneVis[16], laneCount = 0;
+    float laneTop = y + 4, laneRowH = 0.0f;
+
     if (!thin && zen.selElem >= 0 && zen.selElem < zen.doc.elemCount)
     {
         AnimElem *e = &zen.doc.elems[zen.selElem];
@@ -679,6 +803,8 @@ static void DrawTimeline(float x, float y, float w, float h)
                      (int)(x + w*0.5f - 130), (int)(y + h*0.5f - 5), 10,
                      (Color){ 110, 116, 128, 255 });
         float rowH = (h - 24) / (float)(vn > 0 ? vn : 1);
+        laneCount = vn; laneRowH = rowH;
+        for (int i = 0; i < vn; i++) laneVis[i] = vis[i];
         for (int r0 = 0; r0 < vn; r0++)
         {
             int gi = vis[r0];
@@ -740,10 +866,19 @@ static void DrawTimeline(float x, float y, float w, float h)
                  (int)(x + w*0.5f - 90), (int)(y + h*0.5f - 5), 10,
                  (Color){ 110, 116, 128, 255 });
 
-    // playhead.
+    // playhead - muted with a pause glyph while a signal holds the doc clock.
+    bool sigLive = !AnimSignalPlayerDone(&zen.preview);
     float phx = T2X(zen.playhead);
-    DrawLine((int)phx, (int)y, (int)phx, (int)(y+h), (Color){255,90,90,255});
-    DrawRectangleRec((Rectangle){ phx-6, y-2, 12, 10 }, (Color){255,90,90,255});
+    Color phCol = sigLive ? (Color){ 150, 90, 90, 255 } : (Color){ 255, 90, 90, 255 };
+    DrawLine((int)phx, (int)y, (int)phx, (int)(y+h), phCol);
+    DrawRectangleRec((Rectangle){ phx-6, y-2, 12, 10 }, phCol);
+    if (sigLive)
+    {
+        DrawRectangleRec((Rectangle){ phx-3, y, 2, 6 }, (Color){ 30, 30, 34, 255 });
+        DrawRectangleRec((Rectangle){ phx+1, y, 2, 6 }, (Color){ 30, 30, 34, 255 });
+    }
+
+    if (sigLive) DrawSignalOverlay(x, y, w, h, trackLeft, trackW);
 
     // trim markers (hit-tested BEFORE the bar scrub).
     Color introCol = (Color){ 120, 190, 255, 255 };
@@ -771,12 +906,14 @@ static void DrawTimeline(float x, float y, float w, float h)
         else               zen.doc.outroStart = (nt < inEnd)    ? inEnd    : nt;
     }
 
-    // bar scrub.
+    // bar scrub. Plain scrub re-points the track modal at whatever lane the
+    // cursor is in; Shift+scrub sweeps keys into the selection as it crosses
+    // them (the quick way to grab a run of keys without clicking each).
     if (press && !keyHit &&
         CheckCollisionPointRec(mouse, (Rectangle){ x, y-4, w, h+4 }))
     {
         zen.dragPlayhead = true;
-        zen.selKeyCount = 0;                        // scrub drops key selection
+        if (!shift) zen.selKeyCount = 0;            // plain scrub drops the set
     }
 
     if (zen.dragKeyGroup >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
@@ -792,9 +929,65 @@ static void DrawTimeline(float x, float y, float w, float h)
     }
     else if (zen.dragPlayhead && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
     {
+        float prevHead = zen.playhead;
         zen.playhead = ZenClampF(X2T(mouse.x), 0.0f, dur);
         zen.playing = false; zen.playPending = false;
         zen.preview.playing = false;
+
+        // which swimlane is the cursor over?
+        int lane = -1;
+        if (laneCount > 0 && laneRowH > 0.0f)
+        {
+            int r0 = (int)((mouse.y - laneTop) / laneRowH);
+            if (r0 >= 0 && r0 < laneCount) lane = laneVis[r0];
+        }
+        if (lane >= 0)
+        {
+            AnimElem *se = &zen.doc.elems[zen.selElem];
+            float lt[ZEN_GROUP_TIMES_MAX];
+            int ln = ZenGroupKeyTimes(se, lane, lt);
+
+            // keys the playhead is sitting on, within the snap margin.
+            float hits[ZEN_GROUP_TIMES_MAX];
+            int hn = 0;
+            for (int i = 0; i < ln; i++)
+                if (fabsf(lt[i] - zen.playhead) <= ZEN_SCRUB_KEY_EPS)
+                    hits[hn++] = lt[i];
+
+            // Sweeping fast moves the playhead several keys in one frame, so a
+            // shift-sweep also takes everything in the span it just travelled.
+            float swLo = prevHead < zen.playhead ? prevHead : zen.playhead;
+            float swHi = prevHead < zen.playhead ? zen.playhead : prevHead;
+            float swept[ZEN_GROUP_TIMES_MAX];
+            int sn = 0;
+            for (int i = 0; i < ln; i++)
+                if (lt[i] >= swLo - ZEN_SCRUB_KEY_EPS &&
+                    lt[i] <= swHi + ZEN_SCRUB_KEY_EPS)
+                    swept[sn++] = lt[i];
+
+            // Open FIRST: ZenTrackModalOpen clears the key set when the group
+            // changes, so the selection has to be written after it.
+            bool laneChanged = (lane != zen.selGroup);
+            ZenTrackModalOpen(zen.selElem, lane);
+
+            if (shift)
+            {
+                // sweep-select: add every key crossed, never remove.
+                if (laneChanged) zen.selKeyCount = 0;
+                for (int i = 0; i < sn; i++)
+                    if (!ZenKeyIsSelected(zen.selElem, lane, swept[i]) &&
+                        zen.selKeyCount < ZEN_GROUP_TIMES_MAX)
+                        zen.selKeys[zen.selKeyCount++] = swept[i];
+            }
+            else
+            {
+                // follow the lane: show its overlapped key(s), else the track.
+                zen.selKeyCount = 0;
+                for (int i = 0; i < hn && zen.selKeyCount < ZEN_GROUP_TIMES_MAX; i++)
+                    zen.selKeys[zen.selKeyCount++] = hits[i];
+            }
+            ZenTrackModalSync();
+        }
     }
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
     { zen.dragPlayhead = false; zen.dragKeyGroup = -1;
@@ -883,7 +1076,10 @@ void ZenPanelsGui(void)
 
     if (zen.showTimeline)
     {
-        float by = H - bottomH - pad + k * (bottomH - thinH);
+        // a live signal keeps the timeline open: the signal overlay is the
+        // whole point, and a 26px strip can't show it.
+        float tk = AnimSignalPlayerDone(&zen.preview) ? k : 0.0f;
+        float by = H - bottomH - pad + tk * (bottomH - thinH);
         float tlH = H - pad - by;
         if (tlH < thinH) { tlH = thinH; by = H - pad - thinH; }
         if (CheckCollisionPointRec(GetMousePosition(),

@@ -99,6 +99,8 @@ static void ViewWritePosAxis(AnimElem *e, int prop, float *base, float v)
     if (!zen.autoKey) return;
     if (zen.playhead > ZEN_AUTOKEY_EPS) ZenEnsureZeroKey(e, tr);
     AnimTrackWriteKeyAt(tr, zen.playhead, v, ZEN_AUTOKEY_EPS);
+    // dragging calls this every frame; the helper no-ops once it's showing.
+    ZenAutoKeyFocus(zen.selElem, prop, zen.playhead);
 }
 
 static void ViewWritePos(AnimElem *e, float fx, float fy)

@@ -29,11 +29,52 @@ static char      edSliderBuf[16];
 static double    lastSliderClick = 0.0;
 static Rectangle lastSliderClickRect = {0};
 
+// Width of `text` AS RAYGUI DRAWS IT. raygui adds DEFAULT/TEXT_SPACING once per
+// glyph without scaling it, which MeasureTextEx's spacing argument does not
+// reproduce - measuring any other way under-reports and the text overflows
+// whatever box was sized from it (tooltips, ellipsized labels).
 float ZenTextW(const char *text)
 {
+    if (!text || !text[0]) return 0.0f;
     float fs = (float)GuiGetStyle(DEFAULT, TEXT_SIZE);
-    float sp = fs / (float)GuiGetFont().baseSize;
-    return MeasureTextEx(GuiGetFont(), text, fs, sp).x;
+    float sp = (float)GuiGetStyle(DEFAULT, TEXT_SPACING);
+    return MeasureTextEx(GuiGetFont(), text, fs, 0.0f).x +
+           sp * (float)TextLength(text);
+}
+
+// Plain-language description of an animatable property. The short .cfg names
+// (AnimPropName: "rot", "w", "fade") are the file format and stay as they are;
+// this is what the UI explains on hover.
+const char *ZenPropDesc(int prop)
+{
+    switch (prop)
+    {
+        case AP_T_POS_X: return "Horizontal position of the text's center, as a fraction of the screen width (0 = left edge, 1 = right edge)";
+        case AP_T_POS_Y: return "Vertical position of the text's center, as a fraction of the screen height (0 = top, 1 = bottom)";
+        case AP_T_SIZE:  return "Font size, as a fraction of the screen height - so text keeps its proportions on any display";
+        case AP_T_ALPHA: return "Opacity of the text: 0 is fully transparent, 1 is fully opaque";
+        case AP_T_ROT:   return "Rotation of the whole text block, in degrees (positive turns clockwise)";
+        case AP_T_CRUMBLE: return "Per-glyph crumble: 0 leaves the text intact, 1 scatters the letters apart";
+        case AP_T_COLOR: return "Text colour. Keyed as RGB, so a key blends between colours over time";
+
+        case AP_S_POS_X: return "Horizontal position of the shape's center, as a fraction of the screen width (0 = left edge, 1 = right edge)";
+        case AP_S_POS_Y: return "Vertical position of the shape's center, as a fraction of the screen height (0 = top, 1 = bottom)";
+        case AP_S_W:     return "Width of the shape, as a fraction of the screen width";
+        case AP_S_H:     return "Height of the shape, as a fraction of the screen height";
+        case AP_S_ALPHA: return "Opacity of the shape's fill: 0 is fully transparent, 1 is fully opaque";
+        case AP_S_ROT:   return "Rotation of the shape, in degrees (positive turns clockwise)";
+        case AP_S_COLOR: return "Fill colour of the shape. Keyed as RGB, so a key blends between colours over time";
+        case AP_S_OUTLINE_COLOR: return "Colour of the shape's outline. Keyed as RGB";
+        case AP_S_OUTLINE: return "Outline thickness, as a fraction of the screen height. 0 turns the outline off";
+        case AP_S_OUTLINE_ALPHA: return "Opacity of the outline alone - the fill has its own alpha";
+        case AP_S_SCALE: return "Uniform size multiplier on top of the width and height (1 = the authored size). The one-track way to grow or shrink a shape without adjusting w and h together";
+
+        case AP_G_FADE:  return "Whole-screen fade toward the fade colour: 0 shows the scene, 1 covers it completely";
+        case AP_G_COLOR: return "The colour the screen fades toward. Keyed as RGB";
+        case AP_G_BG_ALPHA: return "Opacity of the scene's background fill behind every element";
+        case AP_G_BG_COLOR: return "Colour of the scene's background fill. Keyed as RGB";
+    }
+    return NULL;
 }
 
 float ZenClampF(float v, float lo, float hi)
@@ -230,13 +271,45 @@ void ZenConvertSizeUnits(AnimElem *e, bool toAbsolute)
     }
 }
 
-// Slider for an ANIMATABLE property: no track -> edits the base field; with a
-// track -> value at the playhead, auto-key ON writes a key there, OFF locks it.
+// Index of a doc element, for the ctx-level helpers that address by index.
+static int ElemIndex(const AnimElem *e)
+{
+    for (int i = 0; i < zen.doc.elemCount; i++)
+        if (&zen.doc.elems[i] == e) return i;
+    return -1;
+}
+
+// Slider for an ANIMATABLE property: with auto-key ON the edit becomes a key at
+// the playhead (starting the track if the property had none), so keying never
+// needs a separate "add track" step. Auto-key OFF edits the untracked base
+// pose and locks anything already tracked.
 void ZenPropSlider(Rectangle r, AnimElem *e, int prop, float *baseField)
 {
     float lo, hi; ZenPropRange(e, prop, &lo, &hi);
     AnimTrack *tr = AnimElemFindTrack(e, prop);
-    if (!tr) { ZenEditSlider(r, "", baseField, lo, hi); return; }
+    if (!tr)
+    {
+        if (!zen.autoKey) { ZenEditSlider(r, "", baseField, lo, hi); return; }
+
+        // auto-key on an untracked property: start the track on first edit.
+        float bv = *baseField;
+        if (ZenEditSlider(r, "", &bv, lo, hi))
+        {
+            ZenUndoPush();
+            tr = AnimElemAddTrack(e, prop);
+            if (tr)
+            {
+                // seed t=0 from the ORIGINAL pose before the base moves, or the
+                // starting value would be the edit itself and nothing animates.
+                if (zen.playhead > ZEN_AUTOKEY_EPS) ZenEnsureZeroKey(e, tr);
+                *baseField = bv;
+                AnimTrackWriteKeyAt(tr, zen.playhead, bv, ZEN_AUTOKEY_EPS);
+                ZenAutoKeyFocus(ElemIndex(e), prop, zen.playhead);
+            }
+            else *baseField = bv;               // track cap reached: base only
+        }
+        return;
+    }
 
     float v = AnimElemProp(e, prop, zen.playhead);
     if (!zen.autoKey) GuiSetState(STATE_DISABLED);
@@ -244,6 +317,7 @@ void ZenPropSlider(Rectangle r, AnimElem *e, int prop, float *baseField)
     {
         if (zen.playhead > ZEN_AUTOKEY_EPS) ZenEnsureZeroKey(e, tr);
         AnimTrackWriteKeyAt(tr, zen.playhead, v, ZEN_AUTOKEY_EPS);
+        ZenAutoKeyFocus(ElemIndex(e), prop, zen.playhead);
     }
     if (!zen.autoKey) GuiSetState(STATE_NORMAL);
 }
@@ -262,7 +336,8 @@ float ZenColorRGBRows(float x, float y, float w, AnimElem *e, int prop,
     AnimTrack *ctr = AnimElemFindTrack(e, prop);
     Color cc = AnimElemColorProp(e, prop, zen.playhead);
     ZenLabelTip((Rectangle){ x, y, w-24, rh },
-                TextFormat(ctr ? "%s (rgb, keyed)" : "%s (rgb)", label), NULL);
+                TextFormat(ctr ? "%s (rgb, keyed)" : "%s (rgb)", label),
+                ZenPropDesc(prop));
     ZenDrawSwatch((Rectangle){ x+w-20, y+3, 18, 18 }, cc);
     y += rh;
     float cr=cc.r, cg=cc.g, cb=cc.b;
@@ -275,11 +350,20 @@ float ZenColorRGBRows(float x, float y, float w, AnimElem *e, int prop,
     if (changed)
     {
         Color nc = { (unsigned char)cr,(unsigned char)cg,(unsigned char)cb, 255 };
+        if (!ctr && zen.autoKey)
+        {
+            // auto-key on an untracked colour: start the track on first edit,
+            // seeding t=0 from the ORIGINAL colour before the base changes.
+            ZenUndoPush();
+            ctr = AnimElemAddTrack(e, prop);
+            if (ctr && zen.playhead > ZEN_AUTOKEY_EPS) ZenEnsureZeroColorKey(e, ctr);
+        }
         if (!ctr) { base->r = nc.r; base->g = nc.g; base->b = nc.b; }
         else
         {
             if (zen.playhead > ZEN_AUTOKEY_EPS) ZenEnsureZeroColorKey(e, ctr);
             AnimTrackWriteColorKeyAt(ctr, zen.playhead, nc, ZEN_AUTOKEY_EPS);
+            ZenAutoKeyFocus(ElemIndex(e), prop, zen.playhead);
         }
     }
     return y;
@@ -309,27 +393,95 @@ void ZenTip(Rectangle r, const char *text)
 {
     if (!text || !text[0]) return;
     if (!CheckCollisionPointRec(GetMousePosition(), r)) return;
-    TextCopy(zen.tipText, text);
+    // bounded: TextCopy runs to the NUL, and tips are built with TextFormat.
+    int n = (int)sizeof(zen.tipText) - 1;
+    int i = 0;
+    for (; i < n && text[i]; i++) zen.tipText[i] = text[i];
+    zen.tipText[i] = '\0';
     zen.tipRect = r;
+}
+
+#define ZEN_TIP_LINES 6
+
+// Greedy word wrap into `lines`, none wider than maxW. Returns the line count
+// and the width of the widest line through `outW`.
+static int TipWrap(const char *text, float maxW,
+                   char lines[ZEN_TIP_LINES][160], float *outW)
+{
+    int n = 0;
+    float widest = 0.0f;
+    const char *p = text;
+    lines[0][0] = '\0';                 // empty input still yields one blank line
+    while (*p && n < ZEN_TIP_LINES)
+    {
+        char cur[160] = { 0 };
+        int len = 0;
+        while (*p == ' ') p++;
+        const char *lineStart = p;
+        while (*p)
+        {
+            // take the next word, keep it if the line still fits.
+            const char *ws = p;
+            while (*p && *p != ' ') p++;
+            int wl = (int)(p - ws);
+            int sep = len ? 1 : 0;
+            if (len + sep + wl >= (int)sizeof(cur)) { p = ws; break; }
+
+            char trial[160];
+            for (int i = 0; i < len; i++) trial[i] = cur[i];
+            if (sep) trial[len] = ' ';
+            for (int i = 0; i < wl; i++) trial[len + sep + i] = ws[i];
+            trial[len + sep + wl] = '\0';
+
+            if (ZenTextW(trial) > maxW && len > 0) { p = ws; break; }
+            for (int i = 0; i <= len + sep + wl; i++) cur[i] = trial[i];
+            len += sep + wl;
+            while (*p == ' ') p++;
+        }
+        if (len == 0)                       // one unbreakable word: hard-take it
+        {
+            p = lineStart;
+            while (*p && *p != ' ' && len < (int)sizeof(cur) - 1) cur[len++] = *p++;
+            cur[len] = '\0';
+        }
+        TextCopy(lines[n], cur);
+        float lw = ZenTextW(lines[n]);
+        if (lw > widest) widest = lw;
+        n++;
+    }
+    *outW = widest;
+    return n > 0 ? n : 1;
 }
 
 void ZenTipDraw(void)
 {
     if (!zen.tipText[0]) return;
-    const char *text = zen.tipText;
     Vector2 screen = ScreenStateSize();
 
     float pad = 6.0f;
-    float w = ZenTextW(text) + 2*pad;
-    float h = (float)GuiGetStyle(DEFAULT, TEXT_SIZE) + 2*pad;
-    Vector2 m = GetMousePosition();
-    float x = m.x + 14, y = m.y + 18;
-    if (x + w > screen.x - 4) x = screen.x - 4 - w;
-    if (y + h > screen.y - 4) y = m.y - h - 6;
+    float lh = (float)GuiGetStyle(DEFAULT, TEXT_SIZE) + 4.0f;
+    float maxW = screen.x * 0.4f; if (maxW > 360.0f) maxW = 360.0f;
+
+    char lines[ZEN_TIP_LINES][160];
+    float textW = 0.0f;
+    int n = TipWrap(zen.tipText, maxW, lines, &textW);
+
+    float w = textW + 2*pad;
+    float h = n * lh + 2*pad;
+
+    // flip rather than clip: a 3% margin keeps the box off the screen edges.
+    float mx = screen.x * 0.03f, my = screen.y * 0.03f;
+    Vector2 mp = GetMousePosition();
+    float x = mp.x + 14, y = mp.y + 18;
+    if (x + w > screen.x - mx) x = mp.x - 14 - w;
+    if (y + h > screen.y - my) y = mp.y - 6 - h;
+    if (x < 4) x = 4;
+    if (y < 4) y = 4;
 
     DrawRectangleRec((Rectangle){ x, y, w, h }, (Color){ 24, 26, 31, 245 });
     DrawRectangleLinesEx((Rectangle){ x, y, w, h }, 1.0f, (Color){ 100, 104, 116, 255 });
-    GuiLabel((Rectangle){ x + pad, y + pad, w - 2*pad, h - 2*pad }, text);
+    for (int i = 0; i < n; i++)
+        GuiLabel((Rectangle){ x + pad, y + pad + i*lh, w - 2*pad, lh }, lines[i]);
 
     zen.tipText[0] = '\0';          // consumed; next frame re-records
 }
@@ -339,7 +491,7 @@ void ZenTipDraw(void)
 void ZenLabelTip(Rectangle r, const char *text, const char *desc)
 {
     bool cut = false;
-    char buf[128];
+    char buf[256];
     TextCopy(buf, text);
     int len = (int)strlen(buf);
     while (len > 1 && ZenTextW(buf) > r.width - 4)

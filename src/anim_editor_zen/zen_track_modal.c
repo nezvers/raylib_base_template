@@ -23,10 +23,22 @@
 #include <math.h>
 #include <stdlib.h>
 
-#define TM_W       300.0f
-#define TM_TITLE_H 24.0f
-#define TM_RH      24.0f
-#define TM_GAP     6.0f
+#define TM_W        300.0f
+#define TM_TITLE_H   24.0f
+#define TM_RH        24.0f
+#define TM_GAP        6.0f
+#define TM_TREE_RH   18.0f      // one key row in the tree pane
+#define TM_TREE_ROWS 5          // visible key rows before the pane scrolls
+
+// The tree pane remembers the scope it was opened with, so focusing a single
+// key from it (which shrinks the selection to one) can be undone by clicking
+// the root row again.
+static bool  s_treeCollapsed = false;
+static float s_treeScroll    = 0.0f;
+static float s_scopeTimes[ZEN_GROUP_TIMES_MAX];
+static int   s_scopeCount    = 0;
+static int   s_scopeElem     = -1;
+static int   s_scopeGroup    = -1;
 
 // The selected element/group, or NULL when the selection is stale.
 static AnimElem *ModalElem(void)
@@ -45,6 +57,21 @@ static int BulkTimes(AnimElem *e, float *out)
         return zen.selKeyCount;
     }
     return ZenGroupKeyTimes(e, zen.selGroup, out);
+}
+
+// Remember the scope the tree was built from. Focusing one key out of a bulk
+// selection must not overwrite it (that's what the root row restores), so a
+// lone selected key never counts as a new scope.
+static void ScopeCapture(void)
+{
+    if (zen.selElem == s_scopeElem && zen.selGroup == s_scopeGroup &&
+        zen.selKeyCount == 1) return;
+    s_scopeElem = zen.selElem;
+    s_scopeGroup = zen.selGroup;
+    s_scopeCount = zen.selKeyCount;
+    for (int i = 0; i < zen.selKeyCount && i < ZEN_GROUP_TIMES_MAX; i++)
+        s_scopeTimes[i] = zen.selKeys[i];
+    s_treeScroll = 0.0f;
 }
 
 // Reload the staged values from the selection (first selected key, or the
@@ -75,6 +102,7 @@ void ZenTrackModalSync(void)
     TextCopy(tm->timeBuf, TextFormat("%.2f", t));
     tm->edTime = false;
     zen.easeDropOpen = false;
+    ScopeCapture();
 }
 
 static void ModalShow(ZenTrackModal *tm)
@@ -98,6 +126,7 @@ void ZenTrackModalOpen(int elem, int gi)
     if (gi != zen.selGroup) { zen.selGroup = gi; zen.selKeyCount = 0; }
     ModalShow(tm);
     ZenTrackModalSync();
+    ScopeCapture();
 }
 
 // Signal mode: the modal edits the signal group key picked in zen.sigSel*.
@@ -145,6 +174,135 @@ static void BulkApply(AnimElem *e)
         if (tm->dEase) ZenGroupSetEaseAt(e, zen.selGroup, t, tm->ease);
     }
     ZenTrackModalSync();                            // re-baseline, clear dirty
+}
+
+// A filled scope badge - the modal's loudest signal of what an edit will hit.
+static void DrawBadge(Rectangle r, const char *text, Color c)
+{
+    DrawRectangleRec(r, c);
+    DrawRectangleLinesEx(r, 1.0f, Fade(WHITE, 0.25f));
+    int fs = GuiGetStyle(DEFAULT, TEXT_SIZE);
+    int tw = MeasureText(text, fs);
+    DrawText(text, (int)(r.x + (r.width - tw)*0.5f),
+             (int)(r.y + (r.height - fs)*0.5f), fs, (Color){ 20, 21, 25, 255 });
+}
+
+// One-line summary of a key: the first two scalar members at that time.
+static const char *KeySummary(AnimElem *e, const AnimPropGroup *g, float t)
+{
+    const char *out = "";
+    int shown = 0;
+    for (int m = 0; g && m < g->propCount && shown < 2; m++)
+    {
+        if (AnimPropIsColor(g->props[m])) continue;
+        out = TextFormat("%s%s%s %.0f", out, shown ? "  " : "",
+                         AnimPropName(g->props[m]),
+                         AnimElemProp(e, g->props[m], t));
+        shown++;
+    }
+    return out;
+}
+
+// The tree pane: a root row naming the scope, then one row per key it covers.
+// Clicking a key row focuses it (single-key live editing); clicking the root
+// restores the scope the tree was built from. Returns the height it drew.
+static float DrawKeyTree(Rectangle m, float y, AnimElem *e,
+                         const AnimPropGroup *g, float *times, int nt)
+{
+    bool single = zen.selKeyCount == 1;
+    bool track  = zen.selKeyCount == 0;
+    float x = m.x + 10, w = m.width - 20;
+
+    // ---- root row -----------------------------------------------------------
+    Rectangle root = { x, y, w, TM_TREE_RH + 4 };
+    bool rootHot = CheckCollisionPointRec(GetMousePosition(), root);
+    DrawRectangleRec(root, rootHot ? (Color){ 70, 76, 90, 255 }
+                                   : (Color){ 58, 62, 74, 255 });
+
+    const char *scope = single ? TextFormat("key @ %.2fs", zen.selKeys[0])
+                      : track  ? TextFormat("whole track (%d keys)", nt)
+                               : TextFormat("%d keys selected", zen.selKeyCount);
+    GuiLabel((Rectangle){ root.x + 16, root.y + 2, w - 90, TM_TREE_RH },
+             TextFormat("%s . %s", g ? g->name : "?", scope));
+    DrawText(s_treeCollapsed ? ">" : "v", (int)root.x + 5, (int)root.y + 5, 10,
+             (Color){ 200, 205, 215, 255 });
+
+    Rectangle badge = { root.x + w - 62, root.y + 3, 58, TM_TREE_RH - 2 };
+    DrawBadge(badge, single ? "KEY" : track ? "TRACK" : "BULK",
+              single ? (Color){ 120, 175, 255, 255 } : (Color){ 255, 200, 80, 255 });
+
+    ZenTip(root, single
+           ? "Editing one key - changes apply immediately. Click a row to "
+             "switch keys, or this row to go back to the whole selection."
+           : track
+           ? "No key picked: edits are staged and Apply writes them to every "
+             "key of this track."
+           : "Several keys picked: edits are staged and Apply writes only the "
+             "changed fields to all of them.");
+
+    if (rootHot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    {
+        AudioPlayButton();
+        if (single && s_scopeElem == zen.selElem && s_scopeGroup == zen.selGroup)
+        {
+            // back to the scope this tree was opened with.
+            zen.selKeyCount = s_scopeCount;
+            for (int i = 0; i < s_scopeCount; i++) zen.selKeys[i] = s_scopeTimes[i];
+            ZenTrackModalSync();
+        }
+        else s_treeCollapsed = !s_treeCollapsed;
+    }
+    y += TM_TREE_RH + 6;
+    if (s_treeCollapsed) return TM_TREE_RH + 6;
+
+    // ---- key rows -----------------------------------------------------------
+    int rows = nt < TM_TREE_ROWS ? nt : TM_TREE_ROWS;
+    Rectangle list = { x, y, w, rows * TM_TREE_RH };
+    if (CheckCollisionPointRec(GetMousePosition(), list))
+        s_treeScroll -= GetMouseWheelMove() * TM_TREE_RH;
+    float maxScroll = nt * TM_TREE_RH - list.height;
+    s_treeScroll = ZenClampF(s_treeScroll, 0.0f, maxScroll > 0 ? maxScroll : 0.0f);
+
+    bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    float pick = -1.0f; bool pickAdd = false;
+
+    BeginScissorMode((int)list.x, (int)list.y, (int)list.width, (int)list.height);
+    float ry = list.y - s_treeScroll;
+    for (int i = 0; i < nt; i++)
+    {
+        Rectangle r = { list.x, ry, list.width, TM_TREE_RH };
+        if (ry + TM_TREE_RH >= list.y && ry <= list.y + list.height)
+        {
+            bool cur = single && fabsf(zen.selKeys[0] - times[i]) <= ZEN_AUTOKEY_EPS;
+            bool hot = CheckCollisionPointRec(GetMousePosition(), r) &&
+                       CheckCollisionPointRec(GetMousePosition(), list);
+            if (cur) DrawRectangleRec(r, (Color){ 90, 140, 220, 70 });
+            else if (hot) DrawRectangleRec(r, (Color){ 255, 255, 255, 18 });
+            DrawText(cur ? ">" : " ", (int)r.x + 8, (int)r.y + 4, 10,
+                     (Color){ 200, 205, 215, 255 });
+            GuiLabel((Rectangle){ r.x + 20, r.y, 96, TM_TREE_RH },
+                     TextFormat("key @ %.2fs", times[i]));
+            GuiLabel((Rectangle){ r.x + 118, r.y, r.width - 122, TM_TREE_RH },
+                     KeySummary(e, g, times[i]));
+            if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            { pick = times[i]; pickAdd = ctrl; }
+        }
+        ry += TM_TREE_RH;
+    }
+    EndScissorMode();
+
+    if (pick >= 0.0f)
+    {
+        AudioPlayButton();
+        if (pickAdd) ZenSelKey(zen.selElem, zen.selGroup, pick, true);
+        else
+        {
+            zen.selKeys[0] = pick;
+            zen.selKeyCount = 1;
+            ZenTrackModalSync();
+        }
+    }
+    return TM_TREE_RH + 6 + rows * TM_TREE_RH + 4;
 }
 
 // Chrome + title-bar drag shared by both modes. Returns the modal rect.
@@ -212,8 +370,14 @@ static void SigModeGui(ZenTrackModal *tm)
 
     float x = m.x + 10, w = m.width - 20 - 50;
     float y = m.y + TM_TITLE_H + 2;
-    GuiLabel((Rectangle){ x, y, m.width - 20, 18 },
-             "edits apply immediately to this signal key");
+    Rectangle banner = { x, y, m.width - 20, 18 };
+    DrawRectangleRec(banner, (Color){ 58, 62, 74, 255 });
+    GuiLabel((Rectangle){ banner.x + 6, banner.y, banner.width - 74, 18 },
+             "live edit - no Apply needed");
+    DrawBadge((Rectangle){ banner.x + banner.width - 62, banner.y + 1, 58, 16 },
+              "SIGNAL", (Color){ 150, 220, 160, 255 });
+    ZenTip(banner, "This is a signal's own key (position in u, not seconds); "
+                   "every change lands on it immediately.");
     y += 22;
 
     // u: moves the whole group key.
@@ -297,11 +461,18 @@ void ZenTrackModalGui(void)
     bool single = zen.selKeyCount == 1;
     bool track  = zen.selKeyCount == 0;
 
-    // height: title + subtitle + time row (single) + member rows + ease + buttons
+    // the tree lists what the edits will hit, so its height comes first.
+    float treeTimes[ZEN_GROUP_TIMES_MAX];
+    int treeCount = BulkTimes(e, treeTimes);
+    int treeRows = treeCount < TM_TREE_ROWS ? treeCount : TM_TREE_ROWS;
+    float treeH = s_treeCollapsed ? TM_TREE_RH + 6
+                                  : TM_TREE_RH + 6 + treeRows * TM_TREE_RH + 4;
+
+    // height: title + tree + time row (single) + member rows + ease + buttons
     int scalarRows = 0;
     for (int m = 0; g && m < g->propCount; m++)
         if (!AnimPropIsColor(g->props[m])) scalarRows++;
-    float bodyH = TM_TITLE_H + 22 + (single ? TM_RH + TM_GAP : 0)
+    float bodyH = TM_TITLE_H + treeH + (single ? TM_RH + TM_GAP : 0)
                 + scalarRows * (TM_RH + TM_GAP)
                 + (cp >= 0 ? TM_RH + 3*18 + TM_GAP : 0)
                 + TM_RH + TM_GAP        // ease
@@ -341,17 +512,10 @@ void ZenTrackModalGui(void)
     float x = m.x + 10, w = m.width - 20 - 50;
     float y = m.y + TM_TITLE_H + 2;
 
-    // subtitle: what the edits will hit.
+    // tree: the scope banner plus a row per key the edits will hit.
     float allTimes[ZEN_GROUP_TIMES_MAX];
     int keyTotal = ZenGroupKeyTimes(e, zen.selGroup, allTimes);
-    const char *scope = single ? TextFormat("key @ %.2fs", zen.selKeys[0])
-                     : track  ? TextFormat("whole track (%d keys)", keyTotal)
-                              : TextFormat("%d keys selected", zen.selKeyCount);
-    GuiLabel((Rectangle){ x, y, m.width - 20, 18 }, scope);
-    ZenTip((Rectangle){ x, y, m.width - 20, 18 },
-           single ? "Edits apply immediately to this key"
-                  : "Edits are staged; Apply writes only the changed fields");
-    y += 22;
+    y += DrawKeyTree(m, y, e, g, treeTimes, treeCount);
 
     // --- single-key: time row -----------------------------------------------
     if (single)
@@ -386,7 +550,7 @@ void ZenTrackModalGui(void)
         float lo, hi; ZenPropRange(e, prop, &lo, &hi);
 
         ZenLabelTip((Rectangle){ x, y, 44, TM_RH }, AnimPropName(prop),
-                    AnimPropName(prop));
+                    ZenPropDesc(prop));
         if (single)
         {
             AnimTrack *tr = AnimElemFindTrack(e, prop);

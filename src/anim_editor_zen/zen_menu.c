@@ -110,6 +110,8 @@ static void ActEdAutoKey(void)   { zen.autoKey = !zen.autoKey; }
 static bool ChkEdAutoKey(void)   { return zen.autoKey; }
 static void ActEdSmooth(void)    { ZenUndoPush(); zen.doc.loopSmooth = !zen.doc.loopSmooth; }
 static bool ChkEdSmooth(void)    { return zen.doc.loopSmooth; }
+static void ActEdStopSig(void)   { zen.stopOnSignal = !zen.stopOnSignal; }
+static bool ChkEdStopSig(void)   { return zen.stopOnSignal; }
 static void ActEdDuration(void)
 {
     TextCopy(zen.nameBuf, TextFormat("%.2f", zen.doc.duration));
@@ -203,6 +205,7 @@ static void MenusInit(void)
     AddItem(m, "Loop playback",     'L', ActEdLoop,    NULL, ChkEdLoop,   "Restart playback at the loop point when the end is reached");
     AddItem(m, "Auto-key",          'A', ActEdAutoKey, NULL, ChkEdAutoKey,"Editing a tracked property writes a key at the playhead");
     AddItem(m, "Smooth loop",       'S', ActEdSmooth,  NULL, ChkEdSmooth, "Blend the loop seam so the restart doesn't pop");
+    AddItem(m, "Stop on signal",    'G', ActEdStopSig, NULL, ChkEdStopSig,"A fired signal ends playback instead of resuming it when the signal finishes. Either way the timeline freezes and shows the signal while it plays.");
     AddItem(m, "Duration...",       'D', ActEdDuration,NULL, NULL,        "Type an exact animation length in seconds");
     AddItem(m, "Panel transparency",'T', ActEdAlpha,   NULL, NULL,        "Cycle panel background opacity: opaque / semi / faint");
 
@@ -382,6 +385,7 @@ static void DrawMenuDropdown(void)
                           : TextFormat("%s%s", mark, it->label);
         if (GuiButton(r, label)) fired = it;
         if (off) GuiEnable();
+        ZenTip(r, it->desc);                        // the table already has it
         y += ZEN_MENU_ITEM_H;
     }
 
@@ -704,11 +708,16 @@ static const char *k_helpLines[] = {
     "  Every operation lives in the top menus. Press Alt to enter hotkey",
     "  navigation: each menu and item shows its letter. Alt+F+N = File > New,",
     "  Alt+E+L toggles looping. Any other key or a click leaves the mode.",
+    "  Hovering an item shows what it does.",
     "",
     "VIEWPORT",
     "  While editing, the view is zoomed out and the dotted rectangle marks",
     "  the actual screen. Pressing play first zooms to full size (0.2s),",
     "  then the animation starts. Stopping zooms back out.",
+    "  Click an element to select it; clicking the same spot again cycles",
+    "  through whatever overlaps there. Ctrl+drag moves the selection, and",
+    "  Ctrl+Shift+drag locks the move to the nearest of four axes (dotted",
+    "  guides show which). Right-click opens that element's track menu.",
     "",
     "PLAYBACK",
     "  Space          play / pause",
@@ -716,18 +725,71 @@ static const char *k_helpLines[] = {
     "  Editor > Loop  restart at the loop point when the end is reached",
     "",
     "FILES",
-    "  Animations are .cfg files in the anims/ folder. File > Open switches,",
-    "  File > Save As copies, File > Rename moves the file on disk.",
+    "  Animations are .cfg files in the anims/ folder. File > Open switches",
+    "  (it filters as you type; Enter opens the first match), File > Save As",
+    "  copies, File > Rename moves the file on disk.",
     "  Unsaved changes always prompt before they could be lost.",
     "",
     "EDITING",
     "  Ctrl+S save    Ctrl+Z undo    Ctrl+Y redo",
     "  Elements are added from the Element menu or re-used from the library.",
-    "  With auto-key on, editing a tracked property writes a key at the",
-    "  playhead.",
+    "  Every property row in the Inspector explains itself on hover - what it",
+    "  means, what its units are and how it relates to the tracks.",
     "",
-    "  (Panels, the track modal, viewport picking and custom easings arrive",
-    "   in the next phases of the rework.)",
+    "AUTO-KEY",
+    "  With auto-key ON, changing any property in the Inspector writes a key",
+    "  at the playhead and opens it in the track modal, so you always see what",
+    "  was written. If the property had no track yet, editing it starts one:",
+    "  a key holds the original pose at 0s and your edit lands at the",
+    "  playhead, so the change animates instead of just moving the element.",
+    "  With auto-key OFF, tracked properties are locked and edits only touch",
+    "  the untracked base pose.",
+    "",
+    "TIMELINE",
+    "  Click a key to select it and open it in the track modal.",
+    "  Shift+click ONLY adds or removes a key from the selection - it never",
+    "  moves the key. Dragging a key (no Shift) moves it in time; hold Ctrl",
+    "  while dragging to snap to the 0.1s grid.",
+    "  Dragging anywhere else on the bar scrubs the playhead, and scrubbing",
+    "  follows the row it passes through: the track modal switches to that",
+    "  property's track, showing the key under the playhead when there is one",
+    "  (or all of them when several sit together) and the whole track when",
+    "  there is not.",
+    "  Hold Shift while scrubbing to sweep-select: every key the playhead",
+    "  crosses joins the selection, which beats Shift+clicking them one by",
+    "  one. Release and the track modal has the whole run ready to bulk edit.",
+    "  The triangles at the top-left and bottom-right trim the intro and",
+    "  outro sections.",
+    "",
+    "TRACK MODAL",
+    "  Drag its title bar to move it; the editor stays usable underneath.",
+    "  The tree at the top says what an edit will hit: a badge reads KEY,",
+    "  BULK or TRACK, and under it sits one row per key in scope. Click a row",
+    "  to edit that key alone, Ctrl+click a row to add/remove it from the",
+    "  selection, and click the top row to go back to the whole selection.",
+    "  One key = edits land immediately. Several keys or a whole track =",
+    "  edits are staged (an amber dot marks each changed field) and Apply",
+    "  writes only those fields to every key in scope, as one undo step.",
+    "",
+    "SIGNALS",
+    "  The play glyph on a signal row fires it. A fired signal plays on its",
+    "  own clock, so the timeline freezes and shows the signal's track -",
+    "  its keys sit at u 0..1 over the signal's length, with a marker riding",
+    "  the clock. Editor > Stop on signal decides what happens afterwards:",
+    "  on, playback stays stopped; off, the animation resumes where it froze.",
+    "",
+    "EASINGS",
+    "  Easing > Browse lists every curve with a thumbnail. Hide keeps a curve",
+    "  working but drops it from the pickers; Delete frees the name, and any",
+    "  key still referencing it falls back to linear - .cfg files store",
+    "  easings by NAME, so prefer Hide.",
+    "  New... opens the curve editor: drag the knots and their handles,",
+    "  double-click the curve to add a knot, right-click one to remove it.",
+    "  Alt+drag breaks a knot's tangent, Ctrl snaps to a 0.05 grid. More",
+    "  knots is how bounce, elastic and staircase shapes are built; two knots",
+    "  at the same x hold the value, which makes a step.",
+    "  Save as new keeps the old curve intact; Overwrite changes the curve",
+    "  everywhere its name is already used.",
 };
 
 static float s_helpScroll = 0.0f;

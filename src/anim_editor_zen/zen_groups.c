@@ -478,6 +478,33 @@ void ZenSelKey(int elem, int gi, float t, bool additive)
     ZenTrackModalSync();
 }
 
+// Auto-key just wrote a key: put it on screen. Selecting it and opening the
+// track modal is what makes the write visible instead of silent. Re-entrant by
+// design (the viewport calls this every drag frame), so a no-op when the modal
+// already shows that exact key keeps it from fighting the user's edits.
+void ZenAutoKeyFocus(int elem, int prop, float t)
+{
+    if (elem < 0 || elem >= zen.doc.elemCount) return;
+    AnimElem *e = &zen.doc.elems[elem];
+
+    int gi = -1;
+    for (int i = 0, n = AnimGroupCountFor(e->kind); i < n && gi < 0; i++)
+    {
+        const AnimPropGroup *g = AnimGroupAt(e->kind, i);
+        for (int m = 0; g && m < g->propCount; m++)
+            if (g->props[m] == prop) { gi = i; break; }
+    }
+    if (gi < 0) return;
+
+    if (zen.trackModal.open && zen.trackModal.sig < 0 &&
+        zen.selElem == elem && zen.selGroup == gi &&
+        zen.selKeyCount == 1 && fabsf(zen.selKeys[0] - t) <= ZEN_AUTOKEY_EPS)
+        return;                                     // already showing it
+
+    ZenSelKey(elem, gi, t, false);
+    ZenTrackModalOpen(elem, gi);
+}
+
 // Selection must survive undo/redo/loads: drop what no longer exists.
 void ZenSelValidate(void)
 {
