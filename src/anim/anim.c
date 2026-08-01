@@ -8,6 +8,7 @@
 // ============================================================================
 
 #include "anim.h"
+#include "anim_ease_custom.h"
 #include "../include/easing.h"
 #include "../screen_state/screen_state.h"
 #include <string.h>
@@ -49,6 +50,11 @@ static void EaseTableInit(void)
 const char *AnimEaseName(int ease)
 {
     EaseTableInit();
+    if (ease >= ANIM_EASE_COUNT)
+    {
+        const char *nm = AnimCustomEaseName(ease);
+        if (nm) return nm;
+    }
     if (ease < 0 || ease >= ANIM_EASE_COUNT) return s_ease[ANIM_EASE_LINEAR].name;
     return s_ease[ease].name;
 }
@@ -58,13 +64,16 @@ int AnimEaseByName(const char *name)
     EaseTableInit();
     for (int i = 0; i < ANIM_EASE_COUNT; i++)
         if (TextIsEqual(s_ease[i].name, name)) return i;
-    return ANIM_EASE_LINEAR;
+    int custom = AnimCustomEaseByName(name);
+    if (custom >= 0) return custom;
+    return ANIM_EASE_LINEAR;    // unknown names (incl. deleted customs) degrade
 }
 
 float AnimEaseApply(int ease, float p)
 {
     EaseTableInit();
-    if (ease <= ANIM_EASE_LINEAR || ease >= ANIM_EASE_COUNT) return p;
+    if (ease >= ANIM_EASE_COUNT) return AnimCustomEaseEval(ease, p);
+    if (ease <= ANIM_EASE_LINEAR) return p;
     return s_ease[ease].fn ? s_ease[ease].fn(p) : p;
 }
 

@@ -315,6 +315,11 @@ static void Gui()
             AudioPlayButton();
             AppStateTransition(&app_state_anim_editor);
         }
+        if (GuiButton((Rectangle){ xLeft, y + h + gap, w, h }, "ANIM EDITOR ZEN"))
+        {
+            AudioPlayButton();
+            AppStateTransition(&app_state_anim_editor_zen);
+        }
 
         // -- Label: static text, no interaction ------------------------------
         GuiLabel((Rectangle){ x, y, w, h }, "--- raygui widgets ---");

@@ -9,6 +9,7 @@
 
 #include "raylib.h"
 #include "../src/anim/anim.h"
+#include "../src/anim/anim_ease_custom.h"
 #include "../src/anim/anim_io.h"
 #include "../src/anim/anim_library.h"
 #include "../src/anim/signal.h"
@@ -2026,6 +2027,79 @@ static void TestSceneTerminal(void)
     remove("anims/_test_term.cfg");
 }
 
+// ---------------------------------------------------------------------------
+//  Custom easings: add/eval, name resolve, hide flags, .cfg roundtrip.
+// ---------------------------------------------------------------------------
+static void TestCustomEases(void)
+{
+    const char *path = "anim_tests_ease_tmp.cfg";
+    remove(path);
+    AnimCustomEasesLoad(path);              // missing file -> empty set
+
+    // unknown name degrades to linear (the deleted-easing story).
+    CHECK(AnimEaseByName("no_such_ease") == ANIM_EASE_LINEAR);
+
+    // add: id lands in the custom range, resolves both ways.
+    int id = AnimCustomEaseAdd("testEase", 0.25f, 0.1f, 0.25f, 1.0f);
+    CHECK(id >= ANIM_EASE_COUNT);
+    CHECK(AnimEaseByName("testEase") == id);
+    CHECK(TextIsEqual(AnimEaseName(id), "testEase"));
+    CHECK(AnimEaseIdValid(id) && !AnimEaseIdValid(id + 1));
+
+    // duplicate and builtin names refuse.
+    CHECK(AnimCustomEaseAdd("testEase", 0, 0, 1, 1) == -1);
+    CHECK(AnimCustomEaseAdd("sineOut", 0, 0, 1, 1) == -1);
+
+    // eval: endpoints exact, midpoint eased above linear for this ease-out
+    // curve, monotone-ish interior stays in a sane band.
+    CHECK_NEAR(AnimEaseApply(id, 0.0f), 0.0f);
+    CHECK_NEAR(AnimEaseApply(id, 1.0f), 1.0f);
+    float mid = AnimEaseApply(id, 0.5f);
+    CHECK(mid > 0.5f && mid < 1.0f);
+    // the linear-handles curve IS linear.
+    int lin = AnimCustomEaseAdd("testLin", 0.25f, 0.25f, 0.75f, 0.75f);
+    CHECK(fabsf(AnimEaseApply(lin, 0.3f) - 0.3f) < 0.01f);
+
+    // hidden easings still evaluate; flag reads back for builtins + customs.
+    AnimEaseSetHidden(id, true);
+    AnimEaseSetHidden(ANIM_EASE_BOUNCE_OUT, true);
+    CHECK(AnimEaseIsHidden(id) && AnimEaseIsHidden(ANIM_EASE_BOUNCE_OUT));
+    CHECK_NEAR(AnimEaseApply(id, 1.0f), 1.0f);
+
+    // roundtrip: save, wipe (load nonexistent), reload -> same values + flags.
+    CHECK(AnimCustomEasesSave(path));
+    AnimCustomEasesLoad("no_such_file.cfg");
+    CHECK(AnimEaseByName("testEase") == ANIM_EASE_LINEAR);      // wiped
+    CHECK(!AnimEaseIsHidden(ANIM_EASE_BOUNCE_OUT));
+    CHECK(AnimCustomEasesLoad(path));
+    int rid = AnimEaseByName("testEase");
+    CHECK(rid >= ANIM_EASE_COUNT);
+    CHECK_NEAR(AnimEaseApply(rid, 0.5f), mid);
+    CHECK(AnimEaseIsHidden(rid) && AnimEaseIsHidden(ANIM_EASE_BOUNCE_OUT));
+
+    // a doc key saved with a custom ease survives the trip by name.
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    AnimTrack *tr = AnimElemAddTrack(e, AP_S_POS_X);
+    AnimTrackAddKey(tr, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 1.0f, 1.0f, rid);
+    const char *dpath = "anim_tests_ease_doc_tmp.cfg";
+    CHECK(AnimDocSave(&doc, dpath));
+    AnimDoc back;
+    CHECK(AnimDocLoad(&back, dpath));
+    CHECK(back.elems[0].tracks[0].keys[1].ease == rid);
+
+    // wipe + reload the DOC only: the custom set is gone, so the name is
+    // unknown and the key degrades to linear instead of exploding.
+    AnimCustomEasesLoad("no_such_file.cfg");
+    CHECK(AnimDocLoad(&back, dpath));
+    CHECK(back.elems[0].tracks[0].keys[1].ease == ANIM_EASE_LINEAR);
+
+    remove(path);
+    remove(dpath);
+}
+
 int main(void)
 {
     TestEval();
@@ -2066,6 +2140,7 @@ int main(void)
     TestSceneStartOnSignal();
     TestSceneEmitPosAll();
     TestSceneTerminal();
+    TestCustomEases();
 
     printf("anim_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails ? 1 : 0;

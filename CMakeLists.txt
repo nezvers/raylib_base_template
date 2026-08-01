@@ -105,6 +105,7 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
     add_executable(anim_tests
         tests/anim_tests.c
         src/anim/anim.c
+        src/anim/anim_ease_custom.c
         src/anim/anim_io.c
         src/anim/anim_library.c
         src/anim/anim_stage.c
