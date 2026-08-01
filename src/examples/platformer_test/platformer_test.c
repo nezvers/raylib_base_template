@@ -2,7 +2,7 @@
 #include "../../screen_state/screen_state.h"
 #include "../../settings_state/settings_state.h"
 #include "../../audio_state/audio_state.h"
-#include "../../anim/DEPRECATED_scene_anim/scene_anim.h"   // intro text only
+#include "../../anim/anim_scene.h"                          // editor-authored GAME_START.cfg intro
 #include "../../main_menu/pause_menu.h"                    // shared PAUSE_MENU.cfg overlay
 #include <math.h>
 
@@ -27,20 +27,16 @@ AppState app_state_platformer = {Enter, Exit, Update, Draw, Gui, "Platformer"};
 static unsigned int score;
 
 // ============================================================================
-//  INTRO TEXT: "GAME ON" appears then disappears (see scene_anim.h, and
-//  main_menu.c for the full integration example). One AnimText, played as an
-//  ANIM_INTRO on Enter. Its intro table both fades IN then fades OUT, so the
-//  text shows and then vanishes on the same intro clock (TextAlpha multiplies
-//  in * (1-out), see scene_anim.c). No boxes/art/global beats needed.
+//  INTRO: the editor-authored anims/GAME_START.cfg plays once on Enter (its own
+//  `global` element fades up from black, so no hand-coded overlay is needed).
+//  It shares the global AnimStage pool with the pause overlay, which is already
+//  pumped every frame by PauseMenuUpdate/PauseMenuDraw - so registering the scene
+//  here is all it takes; loop=false makes the pool auto-drop it when it finishes.
 // ============================================================================
-typedef struct {
-    AnimPhase introTextPhases[2];
-    AnimPhase introGlobalPhases[1];
-    AnimText introTexts[1];
-    SceneAnim introAnim;
-    SceneAnimPlayer player;
-} IntroAnim_t;
-static IntroAnim_t intro_animation;
+static const AnimStageEntry GAME_START_SCENE[] = {
+    { .anim="GAME_START", .loop=false, .delay=0.0f, .layer=10, .tag=0, .seq=0 },
+};
+static AnimStageScene introScene;
 
 // ============================================================================
 //  PAUSE MENU. ESC toggles it (the state machine has no stacking, so pause is
@@ -50,25 +46,6 @@ static IntroAnim_t intro_animation;
 //  module (anims/PAUSE_MENU.cfg via pause_menu.h): it plays IN on pause and OUT
 //  on resume (gameplay resumes immediately, the outro runs over live play).
 // ============================================================================
-
-static void InitAnimations() {
-    // Intro
-    {
-        intro_animation.introTextPhases[0] = (AnimPhase){ TP_FADE_IN,  0.30f, 1.10f, sineEaseOutf };   // fade up
-        intro_animation.introTextPhases[1] = (AnimPhase){ TP_FADE_OUT, 2.00f, 2.80f, sineEaseInf };    // then fade away
-
-        intro_animation.introGlobalPhases[0] = (AnimPhase){ GP_UNFADE_BLACK, 0.00f, 0.60f, sineEaseOutf };  // black -> level reveal
-        intro_animation.introTexts[0] = (AnimText){ "GAME ON", 0.15f, {0.5f, 0.42f}, RAYWHITE, intro_animation.introTextPhases, 2,  NULL, 0 };
-
-        intro_animation.introAnim = (SceneAnim){
-            .texts = intro_animation.introTexts,
-            .textCount = 1,
-            .introGlobal = intro_animation.introGlobalPhases,
-            .introGlobalCount = 1,
-            // no shape beats, no zoom boxes, no decor art
-        };
-    }
-}
 
 // Pause GUI shows one of two pages, mirroring main_menu's MenuPage.
 typedef enum { PAUSE_PAGE_MAIN = 0, PAUSE_PAGE_OPTIONS } PausePage;
@@ -96,9 +73,9 @@ static void Enter(){
     LevelLoad_1();
     LevelSetRestartCallback(Enter);
 
-    // Kick off the "GAME ON" intro (appears, then fades out).
-    InitAnimations();
-    SceneAnimStart(&intro_animation.player, &intro_animation.introAnim, ANIM_INTRO);
+    // Kick off the GAME_START.cfg intro (plays once, then the pool drops it).
+    AnimScenePlay(&introScene, GAME_START_SCENE,
+                  sizeof(GAME_START_SCENE)/sizeof(GAME_START_SCENE[0]));
 
     // Fresh pause state (Enter is also the KEY_R restart).
     paused    = false;
@@ -109,6 +86,7 @@ static void Enter(){
 
 static void Exit(){
     LevelDestroy();
+    AnimSceneStop(&introScene);   // drop the intro's stage slot if it's still playing
     PauseMenuStop();   // release the pause overlay's stage slot so it can't leak
                        // into the next state (e.g. QUIT with the menu still up).
 }
@@ -132,8 +110,9 @@ static void Update(){
             Enter();
         }
         LevelUpdate();
-        SceneAnimUpdate(&intro_animation.player, GetFrameTime());   // advance intro text (no-op once done)
     }
+    // The GAME_START intro shares the global AnimStage pool, which PauseMenuUpdate
+    // pumps below every frame - so it advances without a separate call here.
 
     // Pause overlay runs on its own clock (intro while paused, exit outro over
     // live gameplay right after resume). Pump it every frame; no-op when idle.
@@ -148,21 +127,15 @@ static void Draw(){
     Vector2 game_size = ScreenStateTargetSize();
     LevelDraw();
 
-    // "GAME ON" intro text, drawn on top of the level (game space).
-    SceneAnimDrawTexts(&intro_animation.player);
-
     // Pause overlay: dim the frozen game, then the shared animated pause texts.
     if (pauseDim > 0.01f)
         DrawRectangle(0, 0, (int)game_size.x, (int)game_size.y,
                       Fade(BLACK, 0.55f*pauseDim));
-    PauseMenuDraw();   // anims/PAUSE_MENU.cfg overlay (no-op when idle)
 
-    // Entry fade-in: GP_UNFADE_BLACK eases 0->1, so the remaining blackness is
-    // 1-amount (missing row would read 1 = no overlay). Drawn last, over all.
-    float black = 1.0f - SceneAnimGlobalAmount(&intro_animation.player, GP_UNFADE_BLACK);
-    if (black > 0.001f)
-        DrawRectangle(0, 0, (int)game_size.x, (int)game_size.y,
-                      Fade(BLACK, black));
+    // AnimStageDraw (via PauseMenuDraw) paints the shared pool LAST, in game
+    // space: both the GAME_START intro (with its own black-to-level reveal) and
+    // the PAUSE_MENU.cfg overlay. No-op when both are idle.
+    PauseMenuDraw();
 }
 
 // ----------------------------------------------------------------------------

@@ -68,11 +68,3 @@ void SignalEmit(const char *name, const SignalParams *params)
         if (s_listeners[i].used && TextIsEqual(s_listeners[i].name, name))
             s_listeners[i].fn(name, s_listeners[i].user, params);
 }
-
-int SignalListenerCount(const char *name)
-{
-    int c = 0;
-    for (int i = 0; i < s_count; i++)
-        if (s_listeners[i].used && TextIsEqual(s_listeners[i].name, name)) c++;
-    return c;
-}

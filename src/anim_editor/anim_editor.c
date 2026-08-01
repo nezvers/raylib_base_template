@@ -1122,6 +1122,50 @@ static float DrawElementList(float x, float y, float w)   // returns content hei
 }
 
 // ---------------------------------------------------------------------------
+//  Generic sorted-keyframe primitives. Every editable key struct
+//  (AnimKey / AnimPosKey / AnimSeqKey) begins with `float t` at offset 0, so
+//  these find / sort / remove keys on any of them by (base pointer, stride).
+//  The four keyed-track families below (element tracks, signal targets, signal
+//  position params, sequence keys) share these instead of each re-deriving the
+//  same loops.
+// ---------------------------------------------------------------------------
+#define KEY_T_AT(base, stride, i) (*(const float *)((const char *)(base) + (size_t)(i)*(stride)))
+
+// Index of the key at time t within eps, or -1.
+static int KeyIndexNear(const void *keys, int count, size_t stride, float t, float eps)
+{
+    for (int i = 0; i < count; i++)
+        if (fabsf(KEY_T_AT(keys, stride, i) - t) <= eps) return i;
+    return -1;
+}
+
+// Insertion sort ascending by t (arrays hold only a handful of keys). The
+// player walks keys in order, so an out-of-order insert would strand a segment.
+static void KeySortByT(void *keys, int count, size_t stride)
+{
+    unsigned char tmp[sizeof(AnimKey)];   // widest editable key struct
+    char *a = (char *)keys;
+    for (int i = 1; i < count; i++)
+    {
+        memcpy(tmp, a + (size_t)i*stride, stride);
+        float vt; memcpy(&vt, tmp, sizeof vt);   // pivot's t (offset 0)
+        int j = i - 1;
+        while (j >= 0 && KEY_T_AT(keys, stride, j) > vt)
+        { memcpy(a + (size_t)(j+1)*stride, a + (size_t)j*stride, stride); j--; }
+        memcpy(a + (size_t)(j+1)*stride, tmp, stride);
+    }
+}
+
+// Remove key `idx`, shifting the tail down and decrementing *count.
+static void KeyRemoveAt(void *keys, int *count, size_t stride, int idx)
+{
+    char *a = (char *)keys;
+    for (int i = idx; i < *count - 1; i++)
+        memcpy(a + (size_t)i*stride, a + (size_t)(i+1)*stride, stride);
+    (*count)--;
+}
+
+// ---------------------------------------------------------------------------
 //  Track GROUPS: the inspector/timeline present a few logical targets (Position,
 //  Color, Outline, ...) instead of the raw per-prop tracks. These helpers keep a
 //  group's member tracks in lockstep at shared key times, so ONE group keyframe
@@ -1130,28 +1174,91 @@ static float DrawElementList(float x, float y, float w)   // returns content hei
 // ---------------------------------------------------------------------------
 #define GROUP_TIMES_MAX (ANIM_KEYS_MAX * ANIM_GROUP_PROPS)
 
+// A group member's keyframe array, located per family. Element tracks and
+// signal targets both store AnimKey[], so the coordinated per-group ops
+// (gather-times / delete / move / set-ease) walk the members through this one
+// accessor instead of each family re-deriving the same loop. `keys` is NULL
+// when the member has no track/target yet; `eps` is the family's time
+// tolerance (seconds for tracks, normalized u for signal targets).
+typedef struct { AnimKey *keys; int *count; float eps; } MemberKeys;
+typedef MemberKeys (*MemberKeysFn)(void *owner, int prop);
+
+// Element-track accessor: the member's track on element `owner` (an AnimElem*).
+static MemberKeys ElemMemberKeys(void *owner, int prop)
+{
+    AnimTrack *tr = AnimElemFindTrack((AnimElem *)owner, prop);
+    return (MemberKeys){ tr ? tr->keys : NULL, tr ? &tr->keyCount : NULL, AUTOKEY_EPS };
+}
+
+// Union of a group's member key times, ascending and de-duped within eps.
+static int GroupEachKeyTimes(int kind, int gi, MemberKeysFn get, void *owner,
+                             float *out, int cap)
+{
+    const AnimPropGroup *g = AnimGroupAt(kind, gi);
+    int n = 0;
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        MemberKeys mk = get(owner, g->props[m]);
+        if (!mk.keys) continue;
+        for (int k = 0; k < *mk.count; k++)
+        {
+            float t = mk.keys[k].t;
+            bool dup = false;
+            for (int i = 0; i < n; i++)
+                if (fabsf(out[i] - t) <= mk.eps) { dup = true; break; }
+            if (!dup && n < cap) out[n++] = t;
+        }
+    }
+    KeySortByT(out, n, sizeof(float));
+    return n;
+}
+
+// Remove the group key near t on every member.
+static void GroupEachDeleteKey(int kind, int gi, MemberKeysFn get, void *owner, float t)
+{
+    const AnimPropGroup *g = AnimGroupAt(kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        MemberKeys mk = get(owner, g->props[m]);
+        if (!mk.keys) continue;
+        for (int k = *mk.count - 1; k >= 0; k--)
+            if (fabsf(mk.keys[k].t - t) <= mk.eps)
+                KeyRemoveAt(mk.keys, mk.count, sizeof(AnimKey), k);
+    }
+}
+
+// Move the group key from oldT to newT across every member (re-sorting).
+static void GroupEachMoveKey(int kind, int gi, MemberKeysFn get, void *owner,
+                             float oldT, float newT)
+{
+    const AnimPropGroup *g = AnimGroupAt(kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        MemberKeys mk = get(owner, g->props[m]);
+        int k = mk.keys ? KeyIndexNear(mk.keys, *mk.count, sizeof(AnimKey), oldT, mk.eps) : -1;
+        if (k < 0) continue;
+        mk.keys[k].t = newT;
+        KeySortByT(mk.keys, *mk.count, sizeof(AnimKey));
+    }
+}
+
+// Set the segment ease of the group key near t on every member.
+static void GroupEachSetEase(int kind, int gi, MemberKeysFn get, void *owner,
+                             float t, int ease)
+{
+    const AnimPropGroup *g = AnimGroupAt(kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        MemberKeys mk = get(owner, g->props[m]);
+        int k = mk.keys ? KeyIndexNear(mk.keys, *mk.count, sizeof(AnimKey), t, mk.eps) : -1;
+        if (k >= 0) mk.keys[k].ease = ease;
+    }
+}
+
 // Union of a group's member key times, ascending and de-duped within eps.
 static int GroupKeyTimes(AnimElem *e, int gi, float *out)
 {
-    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
-    int n = 0;
-    if (!g) return 0;
-    for (int m = 0; m < g->propCount; m++)
-    {
-        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
-        if (!tr) continue;
-        for (int k = 0; k < tr->keyCount; k++)
-        {
-            float t = tr->keys[k].t;
-            bool dup = false;
-            for (int i = 0; i < n; i++)
-                if (fabsf(out[i] - t) <= AUTOKEY_EPS) { dup = true; break; }
-            if (!dup && n < GROUP_TIMES_MAX) out[n++] = t;
-        }
-    }
-    for (int i = 1; i < n; i++)          // insertion sort ascending
-    { float v = out[i]; int j = i-1; while (j>=0 && out[j]>v){out[j+1]=out[j];j--;} out[j+1]=v; }
-    return n;
+    return GroupEachKeyTimes(e->kind, gi, ElemMemberKeys, e, out, GROUP_TIMES_MAX);
 }
 
 // True if any member of the group has a track.
@@ -1206,44 +1313,19 @@ static void GroupDeleteTracks(AnimElem *e, int gi)
 // Remove the group key at time t (each member's key near t).
 static void GroupDeleteKeyAt(AnimElem *e, int gi, float t)
 {
-    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
-    if (!g) return;
-    for (int m = 0; m < g->propCount; m++)
-    {
-        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
-        if (!tr) continue;
-        for (int k = tr->keyCount - 1; k >= 0; k--)
-            if (fabsf(tr->keys[k].t - t) <= AUTOKEY_EPS) AnimTrackRemoveKey(tr, k);
-    }
+    GroupEachDeleteKey(e->kind, gi, ElemMemberKeys, e, t);
 }
 
 // Move the group key from oldT to newT across every member.
 static void GroupMoveKeyTo(AnimElem *e, int gi, float oldT, float newT)
 {
-    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
-    if (!g) return;
-    for (int m = 0; m < g->propCount; m++)
-    {
-        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
-        if (!tr) continue;
-        for (int k = 0; k < tr->keyCount; k++)
-            if (fabsf(tr->keys[k].t - oldT) <= AUTOKEY_EPS)
-            { AnimTrackSetKeyTime(tr, k, newT); break; }
-    }
+    GroupEachMoveKey(e->kind, gi, ElemMemberKeys, e, oldT, newT);
 }
 
 // Set the segment ease of a group key at time t on every member.
 static void GroupSetEaseAt(AnimElem *e, int gi, float t, int ease)
 {
-    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
-    if (!g) return;
-    for (int m = 0; m < g->propCount; m++)
-    {
-        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
-        if (!tr) continue;
-        for (int k = 0; k < tr->keyCount; k++)
-            if (fabsf(tr->keys[k].t - t) <= AUTOKEY_EPS) tr->keys[k].ease = ease;
-    }
+    GroupEachSetEase(e->kind, gi, ElemMemberKeys, e, t, ease);
 }
 
 // Resolve a group key (group gi at time t) to a representative member (track
@@ -1285,10 +1367,7 @@ static void SelectGroupKey(int elem, int gi, float t)
 // Index of the key at time t on a track (within eps), or -1.
 static int TrackKeyNear(const AnimTrack *tr, float t)
 {
-    if (!tr) return -1;
-    for (int k = 0; k < tr->keyCount; k++)
-        if (fabsf(tr->keys[k].t - t) <= AUTOKEY_EPS) return k;
-    return -1;
+    return tr ? KeyIndexNear(tr->keys, tr->keyCount, sizeof(AnimKey), t, AUTOKEY_EPS) : -1;
 }
 
 // Compact one-line summary of a group key at time t: "t   v0,v1,..   ease".
@@ -1346,6 +1425,16 @@ static AnimSigTarget *SigFindTarget(AnimSignal *sg, int elemIdx, int prop)
     return NULL;
 }
 
+// Signal-target accessor for the shared GroupEach* walks (see MemberKeys): the
+// member's target on (owner->sg, owner->elemIdx), keyed in normalized u.
+typedef struct { AnimSignal *sg; int elemIdx; } SigOwner;
+static MemberKeys SigMemberKeys(void *owner, int prop)
+{
+    SigOwner *o = (SigOwner *)owner;
+    AnimSigTarget *tg = SigFindTarget(o->sg, o->elemIdx, prop);
+    return (MemberKeys){ tg ? tg->keys : NULL, tg ? &tg->keyCount : NULL, SIG_U_EPS };
+}
+
 // True if any member of the group already has a target on this element.
 static bool SigGroupHasTarget(AnimSignal *sg, int elemIdx, int gi)
 {
@@ -1371,46 +1460,21 @@ static bool SigGroupFits(AnimSignal *sg, int elemIdx, int gi)
 // Union of a group's member key u values, ascending and de-duped within eps.
 static int SigGroupKeyTimes(AnimSignal *sg, int elemIdx, int gi, float *out)
 {
-    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
-    int n = 0;
-    if (!g) return 0;
-    for (int m = 0; m < g->propCount; m++)
-    {
-        AnimSigTarget *tg = SigFindTarget(sg, elemIdx, g->props[m]);
-        if (!tg) continue;
-        for (int k = 0; k < tg->keyCount; k++)
-        {
-            float u = tg->keys[k].t;
-            bool dup = false;
-            for (int i = 0; i < n; i++)
-                if (fabsf(out[i] - u) <= SIG_U_EPS) { dup = true; break; }
-            if (!dup && n < SIG_TIMES_MAX) out[n++] = u;
-        }
-    }
-    for (int i = 1; i < n; i++)          // insertion sort ascending
-    { float v = out[i]; int j = i-1; while (j>=0 && out[j]>v){out[j+1]=out[j];j--;} out[j+1]=v; }
-    return n;
+    SigOwner o = { sg, elemIdx };
+    return GroupEachKeyTimes(doc.elems[elemIdx].kind, gi, SigMemberKeys, &o, out, SIG_TIMES_MAX);
 }
 
 // Index of the key at u on a target (within eps), or -1.
 static int SigTargetKeyNear(const AnimSigTarget *tg, float u)
 {
-    if (!tg) return -1;
-    for (int k = 0; k < tg->keyCount; k++)
-        if (fabsf(tg->keys[k].t - u) <= SIG_U_EPS) return k;
-    return -1;
+    return tg ? KeyIndexNear(tg->keys, tg->keyCount, sizeof(AnimKey), u, SIG_U_EPS) : -1;
 }
 
-// Keys ascending in u, like AnimTrackSortKeys does for timeline tracks - the
-// player walks them in order, so an out-of-order insert would strand a segment.
+// Keys ascending in u - the player walks them in order, so an out-of-order
+// insert would strand a segment.
 static void SigTargetSortKeys(AnimSigTarget *tg)
 {
-    for (int i = 1; i < tg->keyCount; i++)
-    {
-        AnimKey v = tg->keys[i]; int j = i-1;
-        while (j >= 0 && tg->keys[j].t > v.t) { tg->keys[j+1] = tg->keys[j]; j--; }
-        tg->keys[j+1] = v;
-    }
+    KeySortByT(tg->keys, tg->keyCount, sizeof(AnimKey));
 }
 
 // Pick a u for a NEW key given the times (sorted ascending) already present.
@@ -1513,48 +1577,23 @@ static void SigGroupDeleteTargets(AnimSignal *sg, int elemIdx, int gi)
 // Remove the group key at u (each member's key near u).
 static void SigGroupDeleteKeyAt(AnimSignal *sg, int elemIdx, int gi, float u)
 {
-    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
-    if (!g) return;
-    for (int m = 0; m < g->propCount; m++)
-    {
-        AnimSigTarget *tg = SigFindTarget(sg, elemIdx, g->props[m]);
-        if (!tg) continue;
-        for (int k = tg->keyCount - 1; k >= 0; k--)
-            if (fabsf(tg->keys[k].t - u) <= SIG_U_EPS)
-            {
-                for (int j = k; j < tg->keyCount - 1; j++) tg->keys[j] = tg->keys[j+1];
-                tg->keyCount--;
-            }
-    }
+    SigOwner o = { sg, elemIdx };
+    GroupEachDeleteKey(doc.elems[elemIdx].kind, gi, SigMemberKeys, &o, u);
 }
 
 // Move the group key from oldU to newU across every member.
 static void SigGroupMoveKeyTo(AnimSignal *sg, int elemIdx, int gi,
                               float oldU, float newU)
 {
-    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
-    if (!g) return;
-    for (int m = 0; m < g->propCount; m++)
-    {
-        AnimSigTarget *tg = SigFindTarget(sg, elemIdx, g->props[m]);
-        int k = SigTargetKeyNear(tg, oldU);
-        if (k < 0) continue;
-        tg->keys[k].t = newU;
-        SigTargetSortKeys(tg);
-    }
+    SigOwner o = { sg, elemIdx };
+    GroupEachMoveKey(doc.elems[elemIdx].kind, gi, SigMemberKeys, &o, oldU, newU);
 }
 
 // Set the segment ease of a group key at u on every member.
 static void SigGroupSetEaseAt(AnimSignal *sg, int elemIdx, int gi, float u, int ease)
 {
-    const AnimPropGroup *g = AnimGroupAt(doc.elems[elemIdx].kind, gi);
-    if (!g) return;
-    for (int m = 0; m < g->propCount; m++)
-    {
-        AnimSigTarget *tg = SigFindTarget(sg, elemIdx, g->props[m]);
-        int k = SigTargetKeyNear(tg, u);
-        if (k >= 0) tg->keys[k].ease = ease;
-    }
+    SigOwner o = { sg, elemIdx };
+    GroupEachSetEase(doc.elems[elemIdx].kind, gi, SigMemberKeys, &o, u, ease);
 }
 
 // Compact one-line summary of a signal group key: "u   v0,v1,..   ease".
@@ -1593,12 +1632,7 @@ static int SigPosFind(AnimSignal *sg, int elemIdx, int slot)
 }
 static void SigPosSortKeys(AnimSigPosParam *pp)
 {
-    for (int i = 1; i < pp->keyCount; i++)     // insertion sort (<= 8 keys)
-    {
-        AnimPosKey k = pp->keys[i]; int j = i - 1;
-        while (j >= 0 && pp->keys[j].t > k.t) { pp->keys[j+1] = pp->keys[j]; j--; }
-        pp->keys[j+1] = k;
-    }
+    KeySortByT(pp->keys, pp->keyCount, sizeof(AnimPosKey));
 }
 static AnimSigPosParam *SigPosAdd(AnimSignal *sg, int elemIdx, int slot)
 {
@@ -1620,9 +1654,7 @@ static void SigPosRemoveAt(AnimSignal *sg, int idx)
 }
 static int SigPosKeyNear(const AnimSigPosParam *pp, float u)
 {
-    for (int i = 0; pp && i < pp->keyCount; i++)
-        if (fabsf(pp->keys[i].t - u) <= SIG_U_EPS) return i;
-    return -1;
+    return pp ? KeyIndexNear(pp->keys, pp->keyCount, sizeof(AnimPosKey), u, SIG_U_EPS) : -1;
 }
 static void SigPosWriteKey(AnimSigPosParam *pp, float u)
 {
@@ -1639,8 +1671,7 @@ static float SigPosFreeU(const AnimSigPosParam *pp, float pref)
 }
 static void SigPosRemoveKeyAt(AnimSigPosParam *pp, int idx)
 {
-    for (int i = idx; i < pp->keyCount - 1; i++) pp->keys[i] = pp->keys[i+1];
-    pp->keyCount--;
+    KeyRemoveAt(pp->keys, &pp->keyCount, sizeof(AnimPosKey), idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -1697,18 +1728,11 @@ static void SigSeqGroupSet(AnimSignal *sg, int elemIdx, int kind, int gi, bool o
 }
 static int SigSeqKeyNear(const AnimSignal *sg, float u)
 {
-    for (int i = 0; i < sg->seqKeyCount; i++)
-        if (fabsf(sg->seqKeys[i].t - u) <= SIG_U_EPS) return i;
-    return -1;
+    return KeyIndexNear(sg->seqKeys, sg->seqKeyCount, sizeof(AnimSeqKey), u, SIG_U_EPS);
 }
 static void SigSeqSortKeys(AnimSignal *sg)
 {
-    for (int i = 1; i < sg->seqKeyCount; i++)
-    {
-        AnimSeqKey k = sg->seqKeys[i]; int j = i - 1;
-        while (j >= 0 && sg->seqKeys[j].t > k.t) { sg->seqKeys[j+1] = sg->seqKeys[j]; j--; }
-        sg->seqKeys[j+1] = k;
-    }
+    KeySortByT(sg->seqKeys, sg->seqKeyCount, sizeof(AnimSeqKey));
 }
 static void SigSeqWriteKey(AnimSignal *sg, float u)
 {
@@ -1725,8 +1749,7 @@ static float SigSeqFreeU(const AnimSignal *sg, float pref)
 }
 static void SigSeqRemoveKeyAt(AnimSignal *sg, int idx)
 {
-    for (int i = idx; i < sg->seqKeyCount - 1; i++) sg->seqKeys[i] = sg->seqKeys[i+1];
-    sg->seqKeyCount--;
+    KeyRemoveAt(sg->seqKeys, &sg->seqKeyCount, sizeof(AnimSeqKey), idx);
 }
 
 // PropAccess over ONE signal group key: a prop the signal drives reads/writes

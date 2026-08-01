@@ -32,6 +32,9 @@ void AnimScenePlay(AnimStageScene *sc, const AnimStageEntry *entries, int count)
         const AnimStageEntry *e = &entries[i];
         sc->handles[i] = AnimStagePlaySeq(e->anim, e->loop, e->layer, e->delay,
                                           e->seq);
+        // A start-on-signal row is spawned like any other (so it is on the
+        // signal bus) but held dormant until its first emit - see AnimStageEmit.
+        if (e->startOnSignal) AnimStageSetArmed(sc->handles[i], true);
     }
 }
 
@@ -64,18 +67,6 @@ void AnimSceneEmit(AnimStageScene *sc, const char *name,
     for (int i = 0; i < sc->count; i++)
         if (EntryHasSignal(&sc->entries[i], name))
             AnimStageEmit(sc->handles[i], name, params);
-}
-
-void AnimSceneEmitTag(AnimStageScene *sc, int tag, const char *name,
-                      const SignalParams *params)
-{
-    if (!sc || !name) return;
-    for (int i = 0; i < sc->count; i++)
-        if (sc->entries[i].tag == tag)
-        {
-            AnimStageEmit(sc->handles[i], name, params);
-            return;
-        }
 }
 
 // One armed instance finished its terminal transition: count it down, and fire

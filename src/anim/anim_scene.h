@@ -31,7 +31,7 @@
 //  it, so which animation reacts to what - and which ones consume a position
 //  parameter (usesPos) - is visible at a glance. AnimSceneEmit(name, params)
 //  fires a signal across EVERY row that declares it (all matching animations
-//  trigger), each placed by the same params. AnimSceneEmitTag targets one row.
+//  trigger), each placed by the same params.
 //
 //  TERMINAL TRANSITIONS. AnimSceneEmitTerminal fires an ending signal across
 //  the matching rows and calls onDone once every armed instance has wound down
@@ -65,14 +65,18 @@ typedef struct {
     int   layer;             // draw order, ascending; higher draws in front
     int   tag;               // caller-chosen stable id to address this row later
                              // (the SAME anim may appear several times, each with
-                             //  its own tag). Not required to be unique, but
-                             //  AnimSceneEmitTag reaches only the first match.
+                             //  its own tag). Not required to be unique.
     int   seq;               // this instance's SEQUENCE NUMBER: arithmetic, not
                              // addressing (that is `tag`). A signal's sequence
                              // offset multiplies it by seqMult (AnimSignal.usesSeq
                              // in anim.h), so listing the same anim with seq 0/1/2
                              // fans the three copies apart in size or position on
                              // one shared signal. 0 (the default) = no offset.
+    bool  startOnSignal;     // false (default) = play on scene load. true = stay
+                             // dormant (invisible, not advancing) until the FIRST
+                             // matching AnimSceneEmit reaches this row, which wakes
+                             // it. Pair with a `replay` signal (anim.h) for a
+                             // repeatable click effect that idles until fired.
 
     // Signals this row answers to, listed HERE so the integration point shows
     // which animation reacts to what, and which consume a position parameter.
@@ -114,10 +118,6 @@ bool AnimSceneAlive(const AnimStageScene *sc);
 // the "every matching animation triggers" path.
 void AnimSceneEmit(AnimStageScene *sc, const char *name,
                    const SignalParams *params);
-
-// Fire `name` on the ONE row whose `tag` matches (first match), with `params`.
-void AnimSceneEmitTag(AnimStageScene *sc, int tag, const char *name,
-                      const SignalParams *params);
 
 // Fire a TERMINAL signal `name` across matching rows and call `onDone(user)`
 // once every armed instance has finished its ending transition. If nothing arms
