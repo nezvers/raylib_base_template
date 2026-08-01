@@ -73,7 +73,17 @@ static void ActFileNew(void)
     zen.nameBuf[0] = '\0'; zen.edNameBuf = true;
     zen.prompt = ZEN_PROMPT_NEW_NAME;
 }
-static void ActFileOpen(void)    { zen.openListOpen = true; }
+static float s_openScroll     = 0.0f;                // File>Open list scroll
+static char  s_openSearch[ANIM_NAME_MAX];            // File>Open filter text
+static bool  s_openSearchEdit = false;
+
+static void ActFileOpen(void)
+{
+    zen.openListOpen = true;
+    s_openScroll = 0.0f;
+    s_openSearch[0] = '\0';
+    s_openSearchEdit = true;                         // type-to-filter right away
+}
 static void ActFileSave(void)    { ZenSaveCurrent(); }
 static void ActFileSaveAs(void)
 {
@@ -382,14 +392,27 @@ static void DrawMenuDropdown(void)
         CloseMenus();                                // click-away closes
 }
 
-// File > Open: a centered list of every saved animation.
+// File > Open: centered searchable, scrollable list of every saved animation.
+static bool StrContainsCI(const char *hay, const char *needle)
+{
+    if (!needle[0]) return true;
+    for (; *hay; hay++)
+    {
+        const char *h = hay, *n = needle;
+        while (*h && *n &&
+               (*h | 32) == (*n | 32)) { h++; n++; }   // ascii lowercase both
+        if (!*n) return true;
+    }
+    return false;
+}
+
 static void DrawOpenList(void)
 {
     if (!zen.openListOpen) return;
 
     ScreenState *ss = ScreenStateGet();
     float W = (float)ss->width, H = (float)ss->height;
-    float mw = 320, mh = 72.0f + zen.animCount * ZEN_MENU_ITEM_H;
+    float mw = 320, mh = 104.0f + zen.animCount * ZEN_MENU_ITEM_H;
     if (mh > H - 80) mh = H - 80;
     Rectangle m = { (W-mw)/2, (H-mh)/2, mw, mh };
     DrawRectangle(0, 0, (int)W, (int)H, (Color){ 0, 0, 0, 120 });
@@ -397,20 +420,52 @@ static void DrawOpenList(void)
     DrawRectangleLinesEx(m, 1.0f, (Color){ 90, 94, 104, 255 });
     GuiLabel((Rectangle){ m.x+16, m.y+10, mw-32, 20 }, "OPEN ANIMATION");
 
+    Rectangle sb = { m.x+12, m.y+34, mw-24, 24 };
+    if (GuiTextBox(sb, s_openSearch, ANIM_NAME_MAX, s_openSearchEdit))
+        s_openSearchEdit = !s_openSearchEdit;
+    if (!s_openSearch[0] && !s_openSearchEdit)
+        GuiLabel((Rectangle){ sb.x+8, sb.y, sb.width-16, sb.height }, "search...");
+
+    // filter first so scroll bounds match what's shown
+    int vis[ZEN_ANIM_LIST_MAX], nvis = 0;
+    for (int i = 0; i < zen.animCount; i++)
+        if (StrContainsCI(zen.animList[i], s_openSearch)) vis[nvis++] = i;
+
+    Rectangle list = { m.x+12, m.y+64, mw-24, mh-64-46 };
+    if (CheckCollisionPointRec(GetMousePosition(), list))
+        s_openScroll += GetMouseWheelMove() * 24.0f;
+    float maxScroll = nvis * ZEN_MENU_ITEM_H - list.height;
+    if (maxScroll < 0) maxScroll = 0;
+    if (s_openScroll < -maxScroll) s_openScroll = -maxScroll;
+    if (s_openScroll > 0) s_openScroll = 0;
+
     int req = -1;
-    float y = m.y + 36;
-    for (int i = 0; i < zen.animCount && y + ZEN_MENU_ITEM_H < m.y + mh - 36; i++)
+    BeginScissorMode((int)list.x, (int)list.y, (int)list.width, (int)list.height);
+    float y = list.y + s_openScroll;
+    for (int v = 0; v < nvis; v++)
     {
-        Rectangle r = { m.x + 12, y, mw - 24, ZEN_MENU_ITEM_H };
+        int i = vis[v];
+        Rectangle r = { list.x, y, list.width, ZEN_MENU_ITEM_H };
         if (GuiButton(r, zen.animList[i])) req = i;
         if (i == zen.animCurrent) DrawRectangleRec(r, (Color){ 90, 140, 220, 60 });
         y += ZEN_MENU_ITEM_H;
     }
+    EndScissorMode();
+    if (nvis == 0)
+        GuiLabel((Rectangle){ list.x+4, list.y+4, list.width-8, 20 }, "(no match)");
+
     if (GuiButton((Rectangle){ m.x + mw - 90, m.y + mh - 34, 78, 26 }, "Close"))
     { AudioPlayButton(); zen.openListOpen = false; }
 
+    // Enter opens the single/first match while typing in the search box
+    if (req < 0 && s_openSearchEdit && nvis > 0 &&
+        (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)))
+        req = vis[0];
+
     if (req >= 0) { AudioPlayButton(); ZenRequestSwitch(req); }
 }
+
+bool ZenMenuTyping(void) { return zen.openListOpen && s_openSearchEdit; }
 
 // The small centered prompt box (name inputs / confirmations / duration).
 static void DrawPromptModal(void)

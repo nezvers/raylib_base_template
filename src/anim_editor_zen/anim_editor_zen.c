@@ -331,7 +331,8 @@ void ZenExitEditor(void)
 bool ZenTyping(void)
 {
     return zen.edNameBuf || zen.edName || zen.edText || zen.edSigIdx >= 0
-        || zen.trackModal.edTime || ZenSliderTyping() || ZenEasingTyping();
+        || zen.trackModal.edTime || ZenSliderTyping() || ZenEasingTyping()
+        || ZenMenuTyping();
 }
 
 // ---------------------------------------------------------------------------

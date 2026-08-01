@@ -329,6 +329,7 @@ void ZenMenuUpdate(void);           // Alt mode + menu hotkeys (keyboard side)
 void ZenMenuBarGui(void);           // the bar itself (widgets)
 void ZenMenuOverlaysGui(void);      // open dropdown + modals, drawn topmost
 bool ZenMenuModalOpen(void);        // a prompt/library/help modal is up
+bool ZenMenuTyping(void);           // File>Open search box capturing keys
 
 // ---------------------------------------------------------------------------
 //  zen_view.c - main viewport (zoom, dotted screen rect, later: picking)
