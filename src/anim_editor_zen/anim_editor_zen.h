@@ -4,13 +4,11 @@
 // ============================================================================
 //  anim_editor_zen.h  -  public face of the Zen animation editor
 //
-//  A ground-up rework of the anim editor UI (menu bar, hotkey navigation,
-//  draggable modals, zoomed-out viewport). Lives NEXT TO the classic editor
-//  (app_state_anim_editor) and shares only the src/anim/* runtime with it;
-//  all editor-side logic is deliberately duplicated so the classic editor can
-//  be deleted later without untangling.
+//  THE anim editor (menu bar, hotkey navigation, draggable modals, zoomed-out
+//  viewport). It owns all editor-side logic and depends only on the src/anim/*
+//  runtime, which it shares with in-game playback (anim_stage).
 //
-//  The app state (registered in app_state.h as app_state_anim_editor_zen too).
+//  The app state (registered in app_state.h as app_state_anim_editor_zen).
 // ============================================================================
 
 #include "../app_state/app_state.h"

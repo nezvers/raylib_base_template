@@ -310,12 +310,7 @@ static void Gui()
         // left edge. It is NOT part of the auto-scaled right column, so it does
         // not count toward LAYOUT_UNITS - it stands alone on the left.
         float xLeft = vp.x + 40.0f;
-        if (GuiButton((Rectangle){ xLeft, y, w, h }, "ANIM EDITOR"))
-        {
-            AudioPlayButton();
-            AppStateTransition(&app_state_anim_editor);
-        }
-        if (GuiButton((Rectangle){ xLeft, y + h + gap, w, h }, "ANIM EDITOR ZEN"))
+        if (GuiButton((Rectangle){ xLeft, y, w, h }, "ANIM EDITOR ZEN"))
         {
             AudioPlayButton();
             AppStateTransition(&app_state_anim_editor_zen);

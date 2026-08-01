@@ -1,7 +1,7 @@
 // ============================================================================
 //  anim_stage.h  -  runtime playback of editor-authored animations in a scene
 //
-//  The anim editor (anim_editor.c) authors AnimDocs and saves them one per file
+//  The anim editor (anim_editor_zen/) authors AnimDocs and saves them one per file
 //  under anims/. This module is what PLAYS them in an actual app state: it owns
 //  a fixed set of SLOTS, each holding a loaded document, its AnimPlayer, its
 //  AnimSignalPlayer and a draw LAYER, and it drives them all from two calls a

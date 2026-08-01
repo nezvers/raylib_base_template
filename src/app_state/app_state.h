@@ -32,8 +32,7 @@ bool AppStateShouldQuit();
 extern AppState app_state_main_menu;    // learning demo: main menu
 extern AppState app_state_platformer;   // original: launch platformer
 extern AppState app_state_strategy;     // RTS test: units, resources, factions
-extern AppState app_state_anim_editor;  // signal-driven animation editor (anim.*)
-extern AppState app_state_anim_editor_zen;  // reworked editor (menu bar, zoomed viewport)
+extern AppState app_state_anim_editor_zen;  // animation editor (menu bar, zoomed viewport)
 
 
 #endif // APP_STATE_H

@@ -4,7 +4,7 @@
 //  Like scene_anim.c, evaluation is pure data: AnimTrackEval walks keyframes
 //  and eases between them. This file only knows HOW each element kind is drawn
 //  (text via DrawTextPro, shapes via DrawRectangle/Circle, global as a screen
-//  fade). See anim_io.* for load/save and anim_editor for authoring.
+//  fade). See anim_io.* for load/save and anim_editor_zen/ for authoring.
 // ============================================================================
 
 #include "anim.h"
