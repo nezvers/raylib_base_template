@@ -332,7 +332,7 @@ bool ZenTyping(void)
 {
     return zen.edNameBuf || zen.edName || zen.edText || zen.edSigIdx >= 0
         || zen.trackModal.edTime || ZenSliderTyping() || ZenEasingTyping()
-        || ZenMenuTyping();
+        || ZenMenuTyping() || ZenTextAreaTyping();
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +457,7 @@ static void Enter()
     zen.panelAnim = 0.0f; zen.prevPlaybackUi = false;
     zen.guiLocked = false;
     zen.edName = zen.edText = false; zen.edSigIdx = -1;
+    ZenTextAreaClose();          // never leave it keyed to the old element
     zen.selGroup = -1; zen.selKeyCount = 0;
     for (int i = 0; i < ANIM_ELEMS_MAX; i++) zen.trackExpand[i] = 0;
     zen.trackModal = (ZenTrackModal){0};
@@ -523,7 +524,10 @@ static void Update()
     // (a slider's precise-entry textbox consumes its own ESC in the widget)
     if (IsKeyPressed(KEY_ESCAPE) && !ZenSliderTyping())
     {
-        if (zen.helpOpen)                   zen.helpOpen = false;
+        // a text area commits and closes on its own ESC, before anything else
+        // in the chain gets a chance to close a modal or leave the editor.
+        if (ZenTextAreaTyping()) { ZenTextAreaClose(); zen.edText = false; }
+        else if (zen.helpOpen)              zen.helpOpen = false;
         else if (zen.prompt != ZEN_PROMPT_NONE)
         { zen.prompt = ZEN_PROMPT_NONE; zen.edNameBuf = false; }
         else if (ZenEasingEscClose()) { }
@@ -609,13 +613,14 @@ static void Gui()
     // Floating modals: usable while the panels stay clickable outside them.
     // Locked only under their own dropdown lists or a menu modal.
     bool floatLock = ZenMenuModalOpen() || ZenEasingModalOpen()
-                  || zen.easeDropOpen || zen.sigDropMode != 0;
+                  || zen.easeDropOpen || zen.addTrackOpen || zen.sigDropMode != 0;
     if (floatLock) GuiLock();
     ZenSignalModalGui();
     ZenTrackModalGui();
     if (floatLock) GuiUnlock();
 
     // Overlays topmost: dropdown lists, then the menu's modals, then the tip.
+    ZenPanelsOverlaysGui();
     ZenViewContextGui();
     ZenSignalOverlaysGui();
     ZenEaseDropOverlayGui();

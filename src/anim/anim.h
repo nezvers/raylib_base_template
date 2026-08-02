@@ -79,7 +79,9 @@
 //    printf("%zu\n", sizeof(AnimDoc));
 // ---------------------------------------------------------------------------
 #define ANIM_NAME_MAX      32   // element / signal / doc name buffer
-#define ANIM_TEXT_LEN_MAX  64   // a TEXT element's string buffer
+#define ANIM_TEXT_LEN_MAX 512   // a TEXT element's string buffer (multi-line:
+                                // holds ~8 lines; see the x24 note above -
+                                // this one costs ~129 KB across the build)
 #define ANIM_KEYS_MAX      16   // keyframes per track (deepest nesting: this
                                 // one multiplies by tracks AND elems)
 #define ANIM_TRACKS_MAX    12   // tracks (animated properties) per element

@@ -727,10 +727,14 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game)
         // full particle sim later if wanted.
         float scale = sizePx / (float)font.baseSize;
         float penX  = left;
+        float penY  = top;
         int   idx   = 0;
         for (const char *c = e->text; *c; c++)
         {
             int cp = (unsigned char)*c;
+            // this loop places glyphs by hand, so it owns line breaking too
+            // (DrawTextEx handles '\n' on the non-crumble paths below).
+            if (cp == '\n') { penX = left; penY += sizePx + spacing; continue; }
             GlyphInfo gi = GetGlyphInfo(font, cp);
             float advance = (gi.advanceX == 0 ? gi.image.width : gi.advanceX) * scale
                           + spacing;
@@ -741,7 +745,7 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game)
                 float drift  = sinf((float)idx * 12.9898f) * crumble * game.x * 0.05f;
                 Vector2 gsz  = MeasureTextEx(font, buf, sizePx, spacing);
                 Vector2 org  = { gsz.x * 0.5f, gsz.y * 0.5f };
-                Vector2 ctr  = { penX + org.x + drift, top + org.y + fall };
+                Vector2 ctr  = { penX + org.x + drift, penY + org.y + fall };
                 float   grot = rot + crumble * (Rand11i(idx) * 90.0f);
                 DrawTextPro(font, buf, ctr, org, grot, sizePx, spacing, col);
                 idx++;

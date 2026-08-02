@@ -366,9 +366,17 @@ static float DrawInspector(float x, float y, float w)
     if (e->kind == AE_TEXT)
     {
         GuiLabel((Rectangle){ x, y, 40, rh }, "text");
-        if (GuiTextBox((Rectangle){ x+44, y, w-44, rh }, e->text, ANIM_TEXT_LEN_MAX, zen.edText))
+        // grows with the content up to 8 rows, then scrolls inside itself -
+        // reading it all here is not the point, the viewport shows the text.
+        float th = ZenTextAreaHeight(e->text, 8);
+        if (th < rh) th = rh;
+        if (ZenEditTextArea((Rectangle){ x+44, y, w-44, th },
+                            e->text, ANIM_TEXT_LEN_MAX, zen.edText))
         { if (!zen.edText) ZenUndoPush(); zen.edText = !zen.edText; }
-        y += rh + gap;
+        ZenTip((Rectangle){ x, y, 40, rh },
+               "Shift+Enter adds a line, Enter commits. Ctrl+A/C/X/V select, "
+               "copy, cut and paste; Ctrl+arrows jump words.");
+        y += th + gap;
     }
     if (e->kind == AE_SHAPE)
     {
@@ -607,7 +615,14 @@ static float DrawInspector(float x, float y, float w)
     y += 4;
     int addCount = AnimGroupCountFor(e->kind);
     if (zen.addTrackSel >= addCount) zen.addTrackSel = 0;
+    // never sit on a group that already has a track: slide to the first free
+    // one so +track always names something it can actually create.
+    if (ZenGroupHasTrack(e, zen.addTrackSel))
+        for (int i = 0; i < addCount; i++)
+            if (!ZenGroupHasTrack(e, i)) { zen.addTrackSel = i; break; }
+    bool addTaken = ZenGroupHasTrack(e, zen.addTrackSel);   // every group tracked
     Rectangle addR = { x, y, w-56, rh };
+    if (addTaken) GuiDisable();
     if (GuiButton((Rectangle){ x+w-52, y, 52, rh }, "+track"))
     {
         AudioPlayButton(); ZenUndoPush();
@@ -615,6 +630,7 @@ static float DrawInspector(float x, float y, float w)
         ZenSelKey(zen.selElem, zen.addTrackSel, zen.playhead, false);
         ZenTrackModalOpen(zen.selElem, zen.addTrackSel);
     }
+    if (addTaken) GuiEnable();
     const AnimPropGroup *addG = AnimGroupAt(e->kind, zen.addTrackSel);
     if (GuiButton(addR, TextFormat("%s  v", addG ? addG->name : "?")))
     { AudioPlayButton(); zen.addTrackOpen = !zen.addTrackOpen; }
@@ -625,7 +641,10 @@ static float DrawInspector(float x, float y, float w)
 }
 
 // The add-track group list, drawn topmost (flips above when out of room).
-static void DrawAddTrackOverlay(void)
+// Runs in the overlay pass AFTER GuiUnlock(): opening the list is what locks
+// the base layer, so drawn from inside ZenPanelsGui() its rows never register
+// a press (raygui gates presses on !guiLocked, but still draws them).
+void ZenPanelsOverlaysGui(void)
 {
     if (!zen.addTrackOpen) return;
     if (zen.selElem < 0 || zen.selElem >= zen.doc.elemCount)
@@ -647,9 +666,31 @@ static void DrawAddTrackOverlay(void)
     {
         const AnimPropGroup *g = AnimGroupAt(e->kind, i);
         Rectangle rr = { bg.x, bg.y + i*ih, bg.width, ih };
-        if (GuiButton(rr, g ? g->name : "?"))
+        bool exists = ZenGroupHasTrack(e, i);
+
+        // highlight goes under the button so it can't paint over the label.
+        if (i == zen.addTrackSel && !exists)
+            DrawRectangleRec(rr, (Color){ 90, 140, 220, 60 });
+
+        if (exists)
+        {
+            // already tracked: dimmed, and clicking jumps to its modal rather
+            // than offering to create it again. A disabled GuiButton never
+            // reports a press, so the hit test is manual.
+            GuiDisable();
+            GuiButton(rr, TextFormat("%s  (exists)", g ? g->name : "?"));
+            GuiEnable();
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+                CheckCollisionPointRec(GetMousePosition(), rr))
+            {
+                AudioPlayButton();
+                ZenSelTrack(zen.selElem, i);
+                ZenTrackModalOpen(zen.selElem, i);
+                zen.addTrackOpen = false;
+            }
+        }
+        else if (GuiButton(rr, g ? g->name : "?"))
         { AudioPlayButton(); zen.addTrackSel = i; zen.addTrackOpen = false; }
-        if (i == zen.addTrackSel) DrawRectangleRec(rr, (Color){ 90, 140, 220, 60 });
     }
 
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
@@ -1008,6 +1049,7 @@ void ZenPanelsUpdate(float dt)
     {
         // hidden widgets must not keep capturing input.
         zen.edName = zen.edText = false; zen.edSigIdx = -1;
+        ZenTextAreaClose();          // never leave it keyed to the old element
         zen.addTrackOpen = false; zen.easeDropOpen = false;
         ZenSigCloseDrops();
     }
@@ -1087,5 +1129,4 @@ void ZenPanelsGui(void)
         DrawTimeline(pad, by, W - 2*pad, tlH);
     }
 
-    DrawAddTrackOverlay();
 }

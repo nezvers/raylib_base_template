@@ -236,6 +236,14 @@ float ZenTextW(const char *text);   // label width at the current gui font
 float ZenClampF(float v, float lo, float hi);
 bool  ZenEditSlider(Rectangle r, const char *label, float *v, float lo, float hi);
 bool  ZenSliderTyping(void);        // a slider's value textbox is open
+
+// Multi-line text field (raygui's GuiTextBox is single-line only). Same
+// contract as GuiTextBox: returns true when the caller should flip `active`.
+bool  ZenEditTextArea(Rectangle r, char *text, int cap, bool active);
+bool  ZenTextAreaTyping(void);      // a text area owns the keyboard
+void  ZenTextAreaClose(void);       // commit and release it (ESC / selection change)
+int   ZenTextAreaRows(const char *s);
+float ZenTextAreaHeight(const char *s, int maxRows);
 void  ZenWidgetsFrameEnd(void);     // close drag gestures on mouse release
 void  ZenDrawSwatch(Rectangle r, Color c);
 void  ZenDrawPanelBG(Rectangle r, int mode);
@@ -303,6 +311,7 @@ const char *ZenPropDesc(int prop);              // plain-language property help
 //  zen_panels.c - the four panels
 // ---------------------------------------------------------------------------
 void ZenPanelsGui(void);            // layout + ELEMENTS/SIGNALS/INSPECTOR/TIMELINE
+void ZenPanelsOverlaysGui(void);    // the add-track list, topmost (must run unlocked)
 void ZenPanelsUpdate(float dt);     // playback slide bookkeeping
 void ZenFireSignal(const AnimSignal *sg);
 

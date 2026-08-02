@@ -11,7 +11,8 @@
 //                                       # existed load as smooth with the
 //                                       # ANIM_LOOP_BLEND_DEFAULT length.
 //    elem     <kind> <name>              # kind = text|shape|global
-//      text   <quoted-single-token>      # (text elements) spaces -> '_'
+//      text   <escaped-single-token>     # (text elements) space -> '\s',
+//                                        # newline -> '\n', '\' -> '\\'
 //      color  <r> <g> <b> <a>
 //      pos    <xFrac> <yFrac>
 //      size   <xFrac> <yFrac>
@@ -202,20 +203,56 @@ int AnimShapeKindByName(const char *name)
 }
 
 // ---------------------------------------------------------------------------
-//  Text-token helpers: the reader is whitespace-delimited, so a text element's
-//  string is stored with spaces as '_' (and '_' as itself is fine - simplest
-//  scheme that keeps the file a single fscanf token stream).
+//  Text-token helpers. The reader is whitespace-delimited, so a text element's
+//  string has to survive as one fscanf token: space -> '\s', newline -> '\n',
+//  and a literal backslash doubles. Everything else is written as itself, so
+//  '_' finally round-trips (the older scheme stored spaces AS '_' and could
+//  not tell the two apart - see the migration note in the header comment).
+//  Encoding can double the length, hence the *2 on every `enc` buffer.
 // ---------------------------------------------------------------------------
+// fscanf wants its field width as a plain literal (the preprocessor will not
+// do the arithmetic), so it is spelled out and pinned to the capacity by a
+// static assert - raise ANIM_TEXT_LEN_MAX and this fails the build until the
+// scan width follows it.
+#define ANIM_TEXT_ENC_WIDTH   "1023"
+_Static_assert(ANIM_TEXT_LEN_MAX * 2 - 1 == 1023,
+               "ANIM_TEXT_ENC_WIDTH must stay (ANIM_TEXT_LEN_MAX * 2 - 1)");
 static void EncodeText(const char *in, char *out, int cap)
 {
-    int i = 0;
-    for (; in[i] && i < cap - 1; i++) out[i] = (in[i] == ' ') ? '_' : in[i];
-    out[i] = 0;
-    if (i == 0) { out[0] = '_'; out[1] = 0; }   // never emit an empty token
+    int o = 0;
+    for (int i = 0; in[i]; i++)
+    {
+        char esc = 0;
+        switch (in[i])
+        {
+            case '\\': esc = '\\'; break;
+            case ' ':  esc = 's';  break;
+            case '\n': esc = 'n';  break;
+            case '\r': continue;                    // CRLF pastes normalise out
+        }
+        // stop on a whole pair, never half an escape.
+        if (o + (esc ? 2 : 1) > cap - 1) break;
+        if (esc) { out[o++] = '\\'; out[o++] = esc; }
+        else       out[o++] = in[i];
+    }
+    out[o] = 0;
+    if (o == 0) { TextCopy(out, "\\s"); }           // never emit an empty token
 }
 static void DecodeText(char *s)
 {
-    for (int i = 0; s[i]; i++) if (s[i] == '_') s[i] = ' ';
+    int o = 0;
+    for (int i = 0; s[i]; i++)
+    {
+        if (s[i] != '\\' || !s[i+1]) { s[o++] = s[i]; continue; }
+        switch (s[++i])
+        {
+            case 's':  s[o++] = ' ';  break;
+            case 'n':  s[o++] = '\n'; break;
+            case '\\': s[o++] = '\\'; break;
+            default:   s[o++] = '\\'; s[o++] = s[i]; break;   // unknown: as-is
+        }
+    }
+    s[o] = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,8 +267,8 @@ void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind)
 
     if (e->kind == AE_TEXT)
     {
-        char enc[ANIM_TEXT_LEN_MAX];
-        EncodeText(e->text, enc, ANIM_TEXT_LEN_MAX);
+        char enc[ANIM_TEXT_LEN_MAX * 2];
+        EncodeText(e->text, enc, sizeof(enc));
         fprintf(f, "%s  text %s\n", ind, enc);
     }
     if (e->kind == AE_SHAPE)
@@ -370,8 +407,9 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
 {
     if (TextIsEqual(key, "text"))
     {
-        char enc[ANIM_TEXT_LEN_MAX];
-        if (fscanf(f, "%63s", enc) == 1 && curElem)
+        // width is (sizeof enc - 1) spelled out: fscanf needs it as a literal.
+        char enc[ANIM_TEXT_LEN_MAX * 2];
+        if (fscanf(f, "%" ANIM_TEXT_ENC_WIDTH "s", enc) == 1 && curElem)
         { DecodeText(enc); TextCopy(curElem->text, enc); }
     }
     else if (TextIsEqual(key, "shape"))

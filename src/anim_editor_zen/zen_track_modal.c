@@ -447,6 +447,29 @@ static void SigModeGui(ZenTrackModal *tm)
     }
 }
 
+// Overwrite the group's key at `dst` with the stored values of the key at
+// `src` (values, colour and ease), so +key duplicates a selected key instead
+// of resampling the curve at the playhead. Both keys must already exist.
+static void CopyKeyValues(AnimElem *e, int gi, float src, float dst)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+        int ks = -1, kd = -1;
+        for (int j = 0; j < tr->keyCount; j++)
+        {
+            if (fabsf(tr->keys[j].t - src) <= ZEN_AUTOKEY_EPS) ks = j;
+            if (fabsf(tr->keys[j].t - dst) <= ZEN_AUTOKEY_EPS) kd = j;
+        }
+        if (ks < 0 || kd < 0 || ks == kd) continue;
+        tr->keys[kd].value = tr->keys[ks].value;
+        tr->keys[kd].cval  = tr->keys[ks].cval;
+        tr->keys[kd].ease  = tr->keys[ks].ease;
+    }
+}
+
 void ZenTrackModalGui(void)
 {
     ZenTrackModal *tm = &zen.trackModal;
@@ -476,7 +499,8 @@ void ZenTrackModalGui(void)
                 + scalarRows * (TM_RH + TM_GAP)
                 + (cp >= 0 ? TM_RH + 3*18 + TM_GAP : 0)
                 + TM_RH + TM_GAP        // ease
-                + TM_RH + 10;           // buttons
+                + TM_RH + TM_GAP        // delete / Apply row
+                + TM_RH + 10;           // +key / reset row
     Rectangle m = { tm->pos.x, tm->pos.y, TM_W, bodyH };
 
     // clamp on screen (also after window resizes).
@@ -655,6 +679,42 @@ void ZenTrackModalGui(void)
         if (GuiButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "Apply to selected"))
         { AudioPlayButton(); BulkApply(e); }
     }
+    y += TM_RH + TM_GAP;
+
+    // --- new key at the playhead + revert staged edits ------------------------
+    // +key is offered in every mode: in bulk/track scope it is the counterpart
+    // to Apply, which only rewrites keys that already exist.
+    bool haveKey = false;
+    for (int i = 0; i < keyTotal; i++)
+        if (fabsf(allTimes[i] - zen.playhead) <= ZEN_AUTOKEY_EPS) { haveKey = true; break; }
+
+    // this row is +key alone, so it spans both slots less the reset icon.
+    float rw = 2.0f*bw + 10.0f - 34.0f;
+    if (haveKey) GuiDisable();
+    if (GuiButton((Rectangle){ x, y, rw, TM_RH },
+                  TextFormat("+key @ %.2fs", zen.playhead)))
+    {
+        AudioPlayButton(); ZenUndoPush();
+        // seed from the element's pose at the playhead, which holds the
+        // previous key's value between keys.
+        ZenGroupWriteKey(e, zen.selGroup, zen.playhead);
+        // a single selected key is the better source: copy it verbatim so
+        // +key duplicates it rather than resampling the curve.
+        if (single) CopyKeyValues(e, zen.selGroup, zen.selKeys[0], zen.playhead);
+        ZenSelKey(zen.selElem, zen.selGroup, zen.playhead, false);
+        ZenTrackModalSync();
+    }
+    if (haveKey) GuiEnable();
+    ZenTip((Rectangle){ x, y, rw, TM_RH },
+           haveKey ? "A key already exists at the playhead - scrub elsewhere to add one"
+                   : "Create a key at the playhead using the values shown above");
+
+    bool dirty = tm->dCval || tm->dEase;
+    for (int mi = 0; mi < 8 && !dirty; mi++) dirty = dirty || tm->dVals[mi];
+    if (!dirty) GuiDisable();
+    if (GuiButton((Rectangle){ x + rw + 6, y, 28, TM_RH }, "#211#"))
+    { AudioPlayButton(); ZenTrackModalSync(); }   // drops every staged edit
+    if (!dirty) GuiEnable();
 }
 
 // The ease list, drawn AFTER everything so it overlays the modal; flips above

@@ -17,6 +17,7 @@
 #include "../src/anim/anim_stage.h"
 #include "../src/anim/anim_scene.h"
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 
 // anim.c needs this for AnimDocDraw; the tests never draw, a fixed size is fine.
@@ -978,7 +979,7 @@ static void TestIOIdempotent(void)
 
     AnimElem *t = AnimDocAddElem(&doc, AE_TEXT);
     TextCopy(t->name, "title");
-    TextCopy(t->text, "TWO WORDS");                         // exercises the _ encoding
+    TextCopy(t->text, "TWO WORDS");                         // exercises the space escape
     AnimTrack *a = AnimElemAddTrack(t, AP_T_ALPHA);
     AnimTrackAddKey(a, 0.0f, 0.0f, ANIM_EASE_LINEAR);
     AnimTrackAddKey(a, 1.5f, 1.0f, ANIM_EASE_BOUNCE_OUT);
@@ -2217,6 +2218,57 @@ static void TestAutoKeyStartsTrack(void)
     CHECK(mid > 0.26f && mid < 0.79f);
 }
 
+// A text element's string is one whitespace-delimited fscanf token, so every
+// space, newline and backslash has to survive as an escape. Getting this wrong
+// does not fail loudly - it truncates the text at the first space on load.
+static void TestTextEscapeIO(void)
+{
+    const char *p = "anim_tests_text.cfg";
+    const char *nasty = "line one\nsecond_line has _ and \\ chars\nthird";
+
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    TextCopy(doc.name, "textio");
+    AnimElem *t = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(t->text, nasty);
+    CHECK(AnimDocSave(&doc, p));
+
+    // the value must still be a single token: no raw whitespace after "text ".
+    FILE *f = fopen(p, "rb");
+    CHECK(f != NULL);
+    if (f)
+    {
+        char line[ANIM_TEXT_LEN_MAX * 2 + 64];
+        bool seen = false;
+        while (fgets(line, sizeof(line), f))
+        {
+            const char *k = strstr(line, "text ");
+            if (!k) continue;
+            seen = true;
+            for (const char *c = k + 5; *c && *c != '\n'; c++)
+                CHECK(*c != ' ' && *c != '\t');     // would split the token
+        }
+        CHECK(seen);
+        fclose(f);
+    }
+
+    AnimDoc back;
+    CHECK(AnimDocLoad(&back, p));
+    CHECK(back.elemCount == 1);
+    CHECK(TextIsEqual(back.elems[0].text, nasty));  // byte-identical round trip
+
+    // '_' is data now, not an encoded space (the pre-escape format lost this).
+    AnimDocInit(&doc);
+    TextCopy(doc.name, "underscore");
+    AnimElem *u = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(u->text, "keep_me");
+    CHECK(AnimDocSave(&doc, p));
+    CHECK(AnimDocLoad(&back, p));
+    CHECK(TextIsEqual(back.elems[0].text, "keep_me"));
+
+    remove(p);
+}
+
 int main(void)
 {
     TestEval();
@@ -2260,6 +2312,7 @@ int main(void)
     TestCustomEases();
     TestMultiSegmentEases();
     TestAutoKeyStartsTrack();
+    TestTextEscapeIO();
 
     printf("anim_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails ? 1 : 0;

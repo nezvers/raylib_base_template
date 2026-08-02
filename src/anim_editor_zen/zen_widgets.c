@@ -13,6 +13,7 @@
 #include "raygui.h"
 #include "zen_internal.h"
 #include "../screen_state/screen_state.h"
+#include <ctype.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,11 @@ static bool      sliderGestureOpen = false;
 static Rectangle finePressRect = {0};
 static bool      finePressActive = false;
 static bool      fineSticky = false;
+// Fine drags move the value by hand while raygui's slider keeps mapping the
+// cursor straight onto the bar. fineBias records how far the two have drifted
+// apart, so letting Shift go mid-drag resumes from the fine-tuned value
+// instead of snapping the knob to the mouse.
+static float     fineBias = 0.0f;
 static bool      edSliderActive = false;
 static Rectangle edSliderRect = {0};
 static char      edSliderBuf[16];
@@ -104,6 +110,7 @@ void ZenWidgetsFrameEnd(void)
     {
         sliderGestureOpen = false;
         finePressActive = false; fineSticky = false; finePressRect = (Rectangle){0};
+        fineBias = 0.0f;
     }
 }
 
@@ -158,30 +165,37 @@ bool ZenEditSlider(Rectangle r, const char *label, float *v, float lo, float hi)
         lastSliderClick = GetTime(); lastSliderClickRect = r;
     }
 
-    // --- Ctrl+wheel steps the value in fixed increments ---------------------
-    bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    // --- wheel steps the value: Ctrl by increment, Shift by a tenth of it ----
+    bool ctrl  = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    bool shift = IsKeyDown(KEY_LEFT_SHIFT)   || IsKeyDown(KEY_RIGHT_SHIFT);
     float wheel = GetMouseWheelMove();
-    if (ctrl && wheel != 0.0f && CheckCollisionPointRec(mouse, r))
+    if ((ctrl || shift) && wheel != 0.0f && CheckCollisionPointRec(mouse, r))
     {
         float step = SliderStep(lo, hi);
+        if (shift) step *= 0.1f;                  // minimal increment
         float nv = ZenClampF(*v + wheel * step, lo, hi);
         if (nv != *v) { ZenUndoPush(); *v = nv; return true; }
         return false;
     }
 
-    // --- Shift = fine relative drag (sticky until release) ------------------
+    // --- Shift = fine relative drag -----------------------------------------
+    // Follows the LIVE Shift key, so a drag can move in and out of fine mode.
+    // fineSticky only latches "undo already pushed for this gesture".
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, r))
     {
         finePressRect = r; finePressActive = true; fineSticky = false;
+        fineBias = 0.0f;
     }
-    bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
     if (finePressActive && SameRect(finePressRect, r) &&
-        IsMouseButtonDown(MOUSE_BUTTON_LEFT) && (shift || fineSticky))
+        IsMouseButtonDown(MOUSE_BUTTON_LEFT) && shift)
     {
         if (!fineSticky) { ZenUndoPush(); fineSticky = true; }
-        GuiSlider(r, label, TextFormat("%.2f", *v), &(float){ *v }, lo, hi);
-        float fstep = (hi - lo) * 0.0015f;
+        // let raygui keep exclusive-drag ownership, but throw its value away.
+        float raw = *v;
+        GuiSlider(r, label, TextFormat("%.2f", *v), &raw, lo, hi);
+        float fstep = (hi - lo) * 0.0005f;
         float nv = ZenClampF(*v + GetMouseDelta().x * fstep, lo, hi);
+        fineBias = nv - raw;                      // drift vs. the cursor mapping
         if (nv != *v) { *v = nv; return true; }
         return false;
     }
@@ -189,7 +203,9 @@ bool ZenEditSlider(Rectangle r, const char *label, float *v, float lo, float hi)
     // --- normal drag ---------------------------------------------------------
     float tmp = *v;
     GuiSlider(r, label, TextFormat("%.2f", tmp), &tmp, lo, hi);
-    if (ctrl && tmp != *v)                        // Ctrl-drag snaps to increments
+    if (tmp != *v && fineBias != 0.0f)            // resume from the fine value
+        tmp = ZenClampF(tmp + fineBias, lo, hi);
+    if (ctrl && !shift && tmp != *v)              // Ctrl-drag snaps to increments
     {
         float step = SliderStep(lo, hi);
         tmp = ZenClampF(roundf(tmp / step) * step, lo, hi);
@@ -505,4 +521,369 @@ void ZenLabelTip(Rectangle r, const char *text, const char *desc)
     if (cut || desc)
         ZenTip(r, desc ? (cut ? TextFormat("%s - %s", text, desc) : desc)
                        : text);
+}
+
+// ============================================================================
+//  Multi-line text area
+//
+//  raygui 4.5 cannot do this: GuiTextBox hard-disables multiline internally,
+//  keeps one cursor index in a file-static shared by every box, tracks no
+//  cursor line at all, and its paste stops at the first newline. So the whole
+//  editor is hand-rolled here, following the same shape as the slider's
+//  precise-entry box above: file-static state, one owner at a time, and the
+//  caller toggles `active` on the returned true.
+// ============================================================================
+
+static Rectangle taRect = {0};      // which area owns the keyboard
+static int  taCur = 0;              // cursor, a byte index into the buffer
+static int  taSel = -1;             // selection anchor; <0 means no selection
+static float taScroll = 0.0f;       // vertical scroll, pixels
+static double taBlink = 0.0;
+
+// Lines are measured with the same call raygui draws with, so the caret lands
+// where the glyphs actually are.
+#define TA_PAD   4.0f
+
+static float TaLineH(void)
+{
+    return (float)GuiGetStyle(DEFAULT, TEXT_SIZE) + 4.0f;
+}
+
+// Start of the line containing byte `i`.
+static int TaLineStart(const char *s, int i)
+{
+    while (i > 0 && s[i-1] != '\n') i--;
+    return i;
+}
+static int TaLineEnd(const char *s, int i)
+{
+    while (s[i] && s[i] != '\n') i++;
+    return i;
+}
+
+// Width of the first `n` bytes of `s`, as raygui draws them.
+static float TaWidthN(const char *s, int n)
+{
+    char buf[ANIM_TEXT_LEN_MAX];
+    if (n <= 0) return 0.0f;
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    memcpy(buf, s, (size_t)n);
+    buf[n] = '\0';
+    return ZenTextW(buf);
+}
+
+static bool TaIsWordChar(char c)
+{
+    return !isspace((unsigned char)c);
+}
+
+// Next word boundary in `dir` (-1 back, +1 forward), the usual Ctrl+Arrow rule:
+// skip the run you are in, then skip the whitespace after it.
+static int TaWordJump(const char *s, int i, int dir)
+{
+    int len = (int)strlen(s);
+    if (dir < 0)
+    {
+        while (i > 0 && !TaIsWordChar(s[i-1])) i--;
+        while (i > 0 &&  TaIsWordChar(s[i-1])) i--;
+    }
+    else
+    {
+        while (i < len &&  TaIsWordChar(s[i])) i++;
+        while (i < len && !TaIsWordChar(s[i])) i++;
+    }
+    return i;
+}
+
+static void TaDeleteRange(char *s, int a, int b)
+{
+    if (a > b) { int t = a; a = b; b = t; }
+    memmove(s + a, s + b, strlen(s + b) + 1);
+    taCur = a; taSel = -1;
+}
+
+// Drop the selection (if any) and insert `ins` at the cursor, bounded by cap.
+static void TaInsert(char *s, int cap, const char *ins)
+{
+    if (taSel >= 0 && taSel != taCur) TaDeleteRange(s, taSel, taCur);
+    int len = (int)strlen(s);
+    int add = (int)strlen(ins);
+    if (len + add > cap - 1) add = cap - 1 - len;
+    if (add <= 0) return;
+    memmove(s + taCur + add, s + taCur, (size_t)(len - taCur + 1));
+    memcpy(s + taCur, ins, (size_t)add);
+    taCur += add;
+    taSel = -1;
+}
+
+bool ZenTextAreaTyping(void)      { return taRect.width > 0.0f; }
+void ZenTextAreaClose(void)       { taRect = (Rectangle){0}; taSel = -1; }
+
+// Rows the text needs, so callers can size the box to its content.
+int ZenTextAreaRows(const char *s)
+{
+    int rows = 1;
+    for (int i = 0; s[i]; i++) if (s[i] == '\n') rows++;
+    return rows;
+}
+float ZenTextAreaHeight(const char *s, int maxRows)
+{
+    int rows = ZenTextAreaRows(s);
+    if (rows > maxRows) rows = maxRows;
+    return (float)rows * TaLineH() + 2.0f*TA_PAD;
+}
+
+// Returns true when the caller should flip its `active` flag (same contract as
+// GuiTextBox): clicking in when inactive, or committing when active.
+bool ZenEditTextArea(Rectangle r, char *text, int cap, bool active)
+{
+    Vector2 mouse = GetMousePosition();
+    bool    inside = CheckCollisionPointRec(mouse, r);
+    bool    owned = active && SameRect(taRect, r);
+    float   lh = TaLineH();
+    int     len = (int)strlen(text);
+    bool    toggle = false;
+
+    // --- frame / background -------------------------------------------------
+    // GuiDrawRectangle is raygui-internal, so the frame is drawn with the
+    // public calls using the same TEXTBOX style colours a GuiTextBox would.
+    DrawRectangleRec(r, GetColor(GuiGetStyle(TEXTBOX, active ? BASE_COLOR_PRESSED
+                                                             : BASE_COLOR_NORMAL)));
+    DrawRectangleLinesEx(r, (float)GuiGetStyle(DEFAULT, BORDER_WIDTH),
+                         GetColor(GuiGetStyle(TEXTBOX, active ? BORDER_COLOR_PRESSED
+                                                              : BORDER_COLOR_NORMAL)));
+
+    if (active && !owned) { taRect = r; taCur = len; taSel = -1; taScroll = 0.0f; }
+
+    // --- input --------------------------------------------------------------
+    if (owned)
+    {
+        bool ctrl  = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+        bool shift = IsKeyDown(KEY_LEFT_SHIFT)   || IsKeyDown(KEY_RIGHT_SHIFT);
+        int  before = taCur;
+        bool moved = false;
+
+        // remember where a selection started the moment Shift+motion begins.
+        #define TA_ANCHOR() do { if (shift) { if (taSel < 0) taSel = before; } \
+                                 else taSel = -1; } while (0)
+
+        if (ctrl && IsKeyPressed(KEY_A)) { taSel = 0; taCur = len; }
+        else if (ctrl && (IsKeyPressed(KEY_C) || IsKeyPressed(KEY_X)) &&
+                 taSel >= 0 && taSel != taCur)
+        {
+            int a = taSel < taCur ? taSel : taCur;
+            int b = taSel < taCur ? taCur : taSel;
+            char buf[ANIM_TEXT_LEN_MAX];
+            int n = b - a; if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+            memcpy(buf, text + a, (size_t)n); buf[n] = '\0';
+            SetClipboardText(buf);
+            if (IsKeyPressed(KEY_X)) { ZenUndoPush(); TaDeleteRange(text, a, b); }
+        }
+        else if (ctrl && IsKeyPressed(KEY_V))
+        {
+            const char *clip = GetClipboardText();
+            if (clip && clip[0])
+            {
+                // keep newlines, normalise CRLF, drop the other control bytes -
+                // raygui's own paste would have truncated at the first newline.
+                char buf[ANIM_TEXT_LEN_MAX];
+                int o = 0;
+                for (int i = 0; clip[i] && o < (int)sizeof(buf) - 1; i++)
+                {
+                    char c = clip[i];
+                    if (c == '\r') { if (clip[i+1] == '\n') continue; c = '\n'; }
+                    if (c != '\n' && (unsigned char)c < 32) continue;
+                    buf[o++] = c;
+                }
+                buf[o] = '\0';
+                ZenUndoPush();
+                TaInsert(text, cap, buf);
+            }
+        }
+        else if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER))
+        {
+            // Shift+Enter is the newline; a bare Enter commits, matching every
+            // other field in the editor.
+            if (shift) { ZenUndoPush(); TaInsert(text, cap, "\n"); }
+            else { toggle = true; ZenTextAreaClose(); }
+        }
+        else if (IsKeyPressed(KEY_BACKSPACE))
+        {
+            ZenUndoPush();
+            if (taSel >= 0 && taSel != taCur) TaDeleteRange(text, taSel, taCur);
+            else if (taCur > 0)
+            {
+                int a = ctrl ? TaWordJump(text, taCur, -1) : taCur - 1;
+                TaDeleteRange(text, a, taCur);
+            }
+        }
+        else if (IsKeyPressed(KEY_DELETE))
+        {
+            ZenUndoPush();
+            if (taSel >= 0 && taSel != taCur) TaDeleteRange(text, taSel, taCur);
+            else if (taCur < len)
+            {
+                int b = ctrl ? TaWordJump(text, taCur, +1) : taCur + 1;
+                TaDeleteRange(text, taCur, b);
+            }
+        }
+        else if (IsKeyPressed(KEY_LEFT))
+        {
+            TA_ANCHOR();
+            taCur = ctrl ? TaWordJump(text, taCur, -1) : (taCur > 0 ? taCur-1 : 0);
+            moved = true;
+        }
+        else if (IsKeyPressed(KEY_RIGHT))
+        {
+            TA_ANCHOR();
+            taCur = ctrl ? TaWordJump(text, taCur, +1) : (taCur < len ? taCur+1 : len);
+            moved = true;
+        }
+        else if (IsKeyPressed(KEY_HOME))
+        { TA_ANCHOR(); taCur = TaLineStart(text, taCur); moved = true; }
+        else if (IsKeyPressed(KEY_END))
+        { TA_ANCHOR(); taCur = TaLineEnd(text, taCur); moved = true; }
+        else if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_DOWN))
+        {
+            TA_ANCHOR();
+            // hold the column by measured width, so the caret tracks the glyphs
+            // rather than the byte count.
+            int ls = TaLineStart(text, taCur);
+            float goalX = TaWidthN(text + ls, taCur - ls);
+            int target;
+            if (IsKeyPressed(KEY_UP))
+            {
+                if (ls == 0) target = -1;
+                else target = TaLineStart(text, ls - 1);
+            }
+            else
+            {
+                int le = TaLineEnd(text, taCur);
+                target = text[le] ? le + 1 : -1;
+            }
+            if (target >= 0)
+            {
+                int te = TaLineEnd(text, target);
+                int best = target;
+                for (int i = target; i <= te; i++)
+                    if (TaWidthN(text + target, i - target) <= goalX) best = i;
+                taCur = best;
+            }
+            moved = true;
+        }
+        else
+        {
+            int cp;
+            while ((cp = GetCharPressed()) != 0)
+            {
+                if (cp < 32 || cp > 126) continue;   // font is ASCII
+                if (!moved) { ZenUndoPush(); moved = true; }
+                char ins[2] = { (char)cp, 0 };
+                TaInsert(text, cap, ins);
+            }
+            moved = false;
+        }
+
+        if (moved && !shift) taSel = -1;
+        if (taCur != before) taBlink = GetTime();
+        #undef TA_ANCHOR
+
+        len = (int)strlen(text);
+        if (taCur > len) taCur = len;
+    }
+
+    // --- click to place the caret / take focus ------------------------------
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    {
+        if (inside)
+        {
+            if (!active) toggle = true;
+            taRect = r; taSel = -1; taBlink = GetTime();
+            int line = (int)((mouse.y - r.y - TA_PAD - taScroll) / lh);
+            if (line < 0) line = 0;
+            int i = 0, ln = 0;
+            while (ln < line && text[i]) { i = TaLineEnd(text, i); if (text[i]) i++; ln++; }
+            int ls = i, le = TaLineEnd(text, i);
+            float goalX = mouse.x - r.x - TA_PAD;
+            int best = ls;
+            for (int k = ls; k <= le; k++)
+                if (TaWidthN(text + ls, k - ls) <= goalX) best = k;
+            taCur = best;
+        }
+        else if (owned) { toggle = true; ZenTextAreaClose(); }
+    }
+
+    // --- scroll the caret into view -----------------------------------------
+    float contentH = (float)ZenTextAreaRows(text) * lh;
+    float viewH = r.height - 2.0f*TA_PAD;
+    if (owned)
+    {
+        int caretLine = 0;
+        for (int i = 0; i < taCur; i++) if (text[i] == '\n') caretLine++;
+        float top = (float)caretLine * lh;
+        if (top + taScroll < 0.0f)        taScroll = -top;
+        if (top + lh + taScroll > viewH)  taScroll = viewH - top - lh;
+    }
+    if (contentH <= viewH) taScroll = 0.0f;
+    else if (taScroll < viewH - contentH) taScroll = viewH - contentH;
+    if (taScroll > 0.0f) taScroll = 0.0f;
+
+    // --- draw ---------------------------------------------------------------
+    BeginScissorMode((int)r.x + 1, (int)r.y + 1,
+                     (int)r.width - 2, (int)r.height - 2);
+    {
+        Color fg = GetColor(GuiGetStyle(TEXTBOX, active ? TEXT_COLOR_PRESSED
+                                                        : TEXT_COLOR_NORMAL));
+        int selA = -1, selB = -1;
+        if (owned && taSel >= 0 && taSel != taCur)
+        { selA = taSel < taCur ? taSel : taCur; selB = taSel < taCur ? taCur : taSel; }
+
+        int i = 0, line = 0;
+        for (;;)
+        {
+            int le = TaLineEnd(text, i);
+            float ly = r.y + TA_PAD + (float)line*lh + taScroll;
+
+            if (ly + lh >= r.y && ly <= r.y + r.height)
+            {
+                // selection band for the part of this line inside the range
+                if (selA >= 0 && selB > i - 1 && selA <= le)
+                {
+                    int a = selA > i ? selA : i;
+                    int b = selB < le ? selB : le;
+                    if (b > a)
+                    {
+                        float ax = TaWidthN(text + i, a - i);
+                        float bx = TaWidthN(text + i, b - i);
+                        DrawRectangleRec((Rectangle){ r.x + TA_PAD + ax, ly,
+                                                      bx - ax, lh },
+                                         Fade(GetColor(GuiGetStyle(TEXTBOX,
+                                              BORDER_COLOR_PRESSED)), 0.4f));
+                    }
+                }
+
+                char buf[ANIM_TEXT_LEN_MAX];
+                int n = le - i;
+                if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+                memcpy(buf, text + i, (size_t)n); buf[n] = '\0';
+                DrawTextEx(GuiGetFont(), buf, (Vector2){ r.x + TA_PAD, ly },
+                           (float)GuiGetStyle(DEFAULT, TEXT_SIZE),
+                           (float)GuiGetStyle(DEFAULT, TEXT_SPACING), fg);
+
+                // caret
+                if (owned && taCur >= i && taCur <= le &&
+                    fmod(GetTime() - taBlink, 1.0) < 0.5)
+                {
+                    float cx = r.x + TA_PAD + TaWidthN(text + i, taCur - i);
+                    DrawRectangleRec((Rectangle){ cx, ly, 1.0f, lh }, fg);
+                }
+            }
+
+            if (!text[le]) break;
+            i = le + 1; line++;
+        }
+    }
+    EndScissorMode();
+
+    return toggle;
 }
