@@ -43,6 +43,14 @@ typedef struct {
     bool             armed;       // held dormant until the first signal fires: like
                                   // `delay` (not advanced, not drawn) but it never
                                   // times out - AnimStageEmit clears it (see there)
+
+    // Pause markers (AnimDoc.pauses). The hold lives HERE, per slot, which is
+    // what makes it local: a paused instance freezes only its own timeline, and
+    // every other slot keeps updating in the same loop.
+    bool             paused;      // parked on a marker, waiting for a keypress
+    int              pauseIdx;    // which marker (index into doc.pauses)
+    unsigned         firedMask;   // bit i set = marker i already served; only
+                                  // consulted for `once` markers
     void (*onDone)(void *user);
     void            *user;
 } StageSlot;
@@ -168,6 +176,12 @@ bool AnimStageAlive(AnimHandle h)
     return SlotOf(h) != NULL;
 }
 
+bool AnimStagePaused(AnimHandle h)
+{
+    StageSlot *s = SlotOf(h);
+    return s && s->paused;
+}
+
 void AnimStageSetDoneCallback(AnimHandle h, void (*fn)(void *user), void *user)
 {
     StageSlot *s = SlotOf(h);
@@ -202,6 +216,11 @@ void AnimStageEmit(AnimHandle h, const char *name, const SignalParams *params)
                 AnimPlayerStartAll(&s->player, &s->doc, ANIM_FWD);
                 s->player.loop = s->loop;
                 s->docTime = AnimPlayerSampleTime(&s->player);
+                // A fresh run from u=0 gets its pause markers back: a `once`
+                // hold belongs to the playthrough, not to the slot's lifetime.
+                // Any hold in progress is released too - the replay overrides it.
+                s->paused = false;
+                s->firedMask = 0;
             }
             // A matching emit is what starts a start-on-signal (armed) slot, so
             // wake it here whether or not this signal produced an active override
@@ -228,8 +247,42 @@ bool AnimStageEndsOnCurrentSignal(AnimHandle h)
              && s->sigPlayer.sig && s->sigPlayer.sig->terminal;
 }
 
+// Should a paused instance resume this frame? Read ONCE per AnimStageUpdate and
+// shared by every slot, so several staggered copies release on the SAME frame.
+//
+// IsKeyPressed over the key range rather than GetKeyPressed(): that call POPS
+// the input queue, which would swallow the keypress from whatever else reads it
+// this frame (a menu's hotkey navigation, a text field). A pause must OBSERVE
+// the key, not consume it.
+static bool PauseReleaseFrame(void)
+{
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) ||
+        IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) return true;
+    for (int k = KEY_SPACE; k <= KEY_KB_MENU; k++)
+        if (IsKeyPressed(k)) return true;
+    return false;
+}
+
+// Did this step cross a pause marker, and if so which? `t0`->`t1` is one frame
+// of doc time. A looping player wraps (t1 < t0), which is two ranges: the tail
+// of the cycle and the head of the next - checking only (t0,t1] would silently
+// skip a marker sitting near the loop end.
+static int CrossedPause(const StageSlot *s, float t0, float t1)
+{
+    if (t1 >= t0) return AnimDocNextPause(&s->doc, t0, t1);
+
+    float outro = AnimDocOutroStart(&s->doc);
+    int idx = AnimDocNextPause(&s->doc, t0, outro);
+    if (idx >= 0) return idx;
+    // The head of the new cycle starts just BEFORE the loop point, so a marker
+    // exactly at introEnd is not missed.
+    return AnimDocNextPause(&s->doc, AnimDocIntroEnd(&s->doc) - 1e-4f, t1);
+}
+
 void AnimStageUpdate(float dt)
 {
+    bool released = PauseReleaseFrame();
+
     for (int i = 0; i < ANIM_STAGE_SLOTS_MAX; i++)
     {
         StageSlot *s = &s_slots[i];
@@ -274,8 +327,36 @@ void AnimStageUpdate(float dt)
             continue;
         }
 
+        // PAUSE GATE. Deliberately AFTER the signal block above: a pause holds
+        // the DOC CLOCK only. A signal runs on its own clock as an override, so
+        // one already in flight keeps playing (and can still end the instance if
+        // it is terminal) over the held pose. The two are independent by design.
+        //
+        // Only this slot is affected - every other animation on screen is a
+        // different iteration of this loop and never sees the hold.
+        if (s->paused)
+        {
+            if (!released) continue;                 // still holding: clock frozen
+            s->paused = false;
+            s->firedMask |= (1u << s->pauseIdx);     // served (matters for `once`)
+        }
+
+        float t0 = s->docTime;
         AnimPlayerUpdate(&s->player, sdt);
         s->docTime = AnimPlayerSampleTime(&s->player);
+
+        // Did this frame step over a marker? Park the clock exactly ON it, so
+        // the held pose is the authored one rather than a fraction of a frame
+        // late, and hold there until the next keypress.
+        int pi = CrossedPause(s, t0, s->docTime);
+        if (pi >= 0 && !(s->doc.pauses[pi].once && (s->firedMask & (1u << pi))))
+        {
+            AnimPlayerSeek(&s->player, s->doc.pauses[pi].t);
+            s->docTime  = AnimPlayerSampleTime(&s->player);
+            s->paused   = true;
+            s->pauseIdx = pi;
+            continue;      // the end-of-doc check below must not fire mid-hold
+        }
 
         // A non-looping doc that ran out ends the instance - unless a signal is
         // still running, which is allowed to finish over the held last frame, or

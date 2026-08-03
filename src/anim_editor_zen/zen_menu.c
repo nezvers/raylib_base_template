@@ -37,7 +37,7 @@ static float TextWpx(const char *text)
 
 #define ZEN_MENU_ITEM_H   24.0f
 #define ZEN_MENUS_MAX     6
-#define ZEN_MENU_ITEMS_MAX 14
+#define ZEN_MENU_ITEMS_MAX 16
 
 typedef struct {
     const char *label;
@@ -119,6 +119,23 @@ static void ActEdDuration(void)
     zen.prompt = ZEN_PROMPT_DURATION;
 }
 static void ActEdAlpha(void)     { zen.panelAlphaMode = (zen.panelAlphaMode + 1) % 3; }
+static void ActEdStrings(void)   { ZenStringPoolShow(); }
+static void ActEdPause(void)
+{
+    ZenUndoPush();
+    if (AnimDocAddPause(&zen.doc, zen.playhead, ZEN_PAUSE_EPS))
+    {
+        zen.selPause = AnimDocPauseAt(&zen.doc, zen.playhead, ZEN_PAUSE_EPS);
+        zen.docDirty = true;
+    }
+}
+// Greyed out when the playhead already carries a marker (one hold per instant)
+// or the document is at its marker limit.
+static bool EnNoPauseHere(void)
+{
+    return (zen.doc.pauseCount < ANIM_PAUSES_MAX)
+        && (AnimDocPauseAt(&zen.doc, zen.playhead, ZEN_PAUSE_EPS) < 0);
+}
 
 // -- Element ----------------------------------------------------------------
 static void ActElNewText(void)   { ZenElemAdd(AE_TEXT); }
@@ -134,6 +151,7 @@ static void ActElToLib(void)
     zen.edNameBuf = true; zen.libTargetIdx = -1;
     zen.prompt = ZEN_PROMPT_LIB_SAVE_NAME;
 }
+static void ActElClone(void)     { ZenCloneShow(); }
 static void ActElLibrary(void)   { zen.libOpen = true; zen.libScroll = 0.0f; }
 static void ActElUnits(void)
 {
@@ -152,6 +170,15 @@ static bool EnSelUp(void)    { return EnSel() && zen.selElem > 0; }
 static bool EnSelDown(void)  { return EnSel() && zen.selElem < zen.doc.elemCount - 1; }
 static bool EnSelShape(void) { return EnSel() && zen.doc.elems[zen.selElem].kind == AE_SHAPE; }
 static bool EnRoom(void)     { return zen.doc.elemCount < ANIM_ELEMS_MAX; }
+// Clone needs something to clone FROM: a second element of the same kind.
+static bool EnCloneSrc(void)
+{
+    if (!EnSel()) return false;
+    int kind = zen.doc.elems[zen.selElem].kind;
+    for (int i = 0; i < zen.doc.elemCount; i++)
+        if ((i != zen.selElem) && (zen.doc.elems[i].kind == kind)) return true;
+    return false;
+}
 static bool EnSelRoom(void)  { return EnSel() && EnRoom(); }
 static bool ChkElUnits(void) { return EnSel() && zen.doc.elems[zen.selElem].sizeAbsolute; }
 static bool ChkElAnchor(void){ return EnSel() && zen.doc.elems[zen.selElem].cornerMode; }
@@ -206,6 +233,8 @@ static void MenusInit(void)
     AddItem(m, "Auto-key",          'A', ActEdAutoKey, NULL, ChkEdAutoKey,"Editing a tracked property writes a key at the playhead");
     AddItem(m, "Smooth loop",       'S', ActEdSmooth,  NULL, ChkEdSmooth, "Blend the loop seam so the restart doesn't pop");
     AddItem(m, "Stop on signal",    'G', ActEdStopSig, NULL, ChkEdStopSig,"A fired signal ends playback instead of resuming it when the signal finishes. Either way the timeline freezes and shows the signal while it plays.");
+    AddItem(m, "String pool...",    'R', ActEdStrings, NULL, NULL,        "The document's shared text strings - assign, edit and reuse them, and animate which one a text element shows");
+    AddItem(m, "Add pause marker",  'P', ActEdPause,   EnNoPauseHere, NULL, "Hold playback at the playhead until the viewer presses a key. Greyed out when this position already has one.");
     AddItem(m, "Duration...",       'D', ActEdDuration,NULL, NULL,        "Type an exact animation length in seconds");
     AddItem(m, "Panel transparency",'T', ActEdAlpha,   NULL, NULL,        "Cycle panel background opacity: opaque / semi / faint");
 
@@ -214,7 +243,8 @@ static void MenusInit(void)
     AddItem(m, "New shape",      'S', ActElNewShape,  EnRoom,    NULL, "Add a shape element (rect/circle/line/...)");
     AddItem(m, "New global",     'G', ActElNewGlobal, EnRoom,    NULL, "Add a global element (screen fade / background)");
     AddItem(m, "-",              0,   NULL,           NULL,      NULL, NULL);
-    AddItem(m, "Duplicate",      'C', ActElDup,       EnSelRoom, NULL, "Clone the selected element with all its tracks");
+    AddItem(m, "Duplicate",      'C', ActElDup,       EnSelRoom, NULL, "Copy the selected element into a new slot with all its tracks");
+    AddItem(m, "Clone from...",  'O', ActElClone,     EnCloneSrc,NULL, "Write another element's look at the playhead onto THIS element as keys at a time you pick - reuse an expired block instead of spending a new element slot");
     AddItem(m, "Delete",         'X', ActElDelete,    EnSel,     NULL, "Delete every selected element");
     AddItem(m, "Move up",        'U', ActElUp,        EnSelUp,   NULL, "Draw the selected element earlier (further back)");
     AddItem(m, "Move down",      'D', ActElDown,      EnSelDown, NULL, "Draw the selected element later (further front)");
@@ -767,6 +797,99 @@ static const char *k_helpLines[] = {
     "  With auto-key OFF, tracked properties are locked and edits only touch",
     "  the untracked base pose.",
     "",
+    "TEXT AND THE STRING POOL",
+    "  A text element can show either its OWN words, typed straight into the",
+    "  Inspector, or a string from the document's shared STRING POOL. Anything",
+    "  you type is added to the pool automatically (identical text is reused,",
+    "  never duplicated), so strings are always available to share.",
+    "  Editor > String pool... opens it, and so does DOUBLE-CLICKING the small",
+    "  'text' label to the left of the Inspector's text box. When an element",
+    "  is showing a pooled string the label turns blue and shows the entry",
+    "  number; editing the box then edits THAT POOL ENTRY.",
+    "  The pool modal has two tabs. STRINGS lists every pool entry with how",
+    "  many keys use it, and below them, under IN ELEMENTS ONLY, the words of",
+    "  any text element that has not been pooled yet - press 'pool it' on such",
+    "  a row to make them a shared entry. Clicking a row only SELECTS it;",
+    "  DOUBLE-CLICKING opens it for editing (this works on element rows too,",
+    "  where it edits that element's own words rather than the pool).",
+    "  ASSIGNING takes two clicks on purpose. Press 'assign' on a string: it",
+    "  is armed, the modal jumps to the ELEMENTS tab and a banner says which",
+    "  string is about to be set. Then press 'set' on the element you want it",
+    "  on. Nothing is written until that second press, so browsing the element",
+    "  list is safe; 'Cancel set' disarms it. The words are set AT THE PLAYHEAD,",
+    "  so park it where you want them to change (at 0 for the whole animation).",
+    "  New, Edit and Delete sit at the bottom. An entry still in use cannot be",
+    "  deleted - repoint the keys first.",
+    "  Sharing is the point: two elements on the same entry both follow an",
+    "  edit to it. Empty strings nobody uses are cleaned up on their own.",
+    "",
+    "  ANIMATING TEXT. Give a text element a 'string' track and its keys hold",
+    "  POOL ENTRY NUMBERS, so the words CHANGE during the animation.",
+    "  The whole workflow lives in the track modal. Add the 'string' track and",
+    "  its first key carries the words the element ALREADY shows - a key never",
+    "  starts out pointing at nothing. Scrub to where the text should change,",
+    "  press +key, then CLICK THE WORDS on the modal's 'str' row: a list of",
+    "  every pool entry drops down and picking one changes THAT KEY ONLY, at",
+    "  that time. '+ new string...' at the bottom opens the pool to write words",
+    "  that do not exist yet, then come back and pick them.",
+    "  A string track SNAPS: the entry at a key holds until the next key, with",
+    "  no in-between (there is no half-way point between two strings), so the",
+    "  'ease' row reads 'steps - no easing' and cannot be opened. Do any fading",
+    "  or movement with the other properties.",
+    "  Text is pooled rather than stored per key because a key is 16 bytes and",
+    "  there are thousands of them - a string on every key would cost the",
+    "  build about 28 MB instead of a fraction of one.",
+    "",
+    "CLONING ELEMENTS",
+    "  An animation has a FIXED budget: 12 elements and 4 signals. Both are",
+    "  shown live in the ELEMENTS and SIGNALS panel titles (5/12, and FULL when",
+    "  there is no room left), so you can see what is left before you run out.",
+    "  When a text or shape block has finished its part, do NOT spend another",
+    "  element on something similar - bring the expired one back instead.",
+    "  Element > Clone from... does exactly that. The SELECTED element is the",
+    "  one that receives; you pick another element from the list, and it is",
+    "  read as it looks AT THE PLAYHEAD (so scrub to the moment you want",
+    "  first). Type the time the result should appear at and press Clone.",
+    "  Only properties that actually DIFFER become keys, so a clone costs the",
+    "  minimum of the 16-keys-per-track budget - re-cloning the same look",
+    "  writes nothing at all.",
+    "  The WORDS are cloned as a key too, not as a replacement: the element",
+    "  keeps saying its old text up to the clone time and the new text from",
+    "  there on.",
+    "  THE OLD PROPERTY IS ALWAYS KEPT. When a cloned property had no track",
+    "  yet, a key holding what the element already showed is written at 0s.",
+    "  Without it that single new key would override the element's value",
+    "  across the WHOLE timeline instead of changing it at the chosen time.",
+    "  The \"hold the old pose\" checkbox goes one step further: it also writes",
+    "  that old pose just BEFORE the clone, so the element snaps to the new",
+    "  look rather than sliding into it from whatever key came before. Turn",
+    "  it off when you want a smooth transition into the cloned look.",
+    "  THE ELEMENT ITSELF is in the list. Cloning from itself copies its own",
+    "  look at the playhead onto another time, which is how a pose is brought",
+    "  back later without spending an element or retyping anything. The two",
+    "  times must differ.",
+    "  One checkbox copies a thing that has no track: a shape's kind. Because",
+    "  it is untracked it changes the element for the WHOLE timeline, not",
+    "  just at the chosen time.",
+    "  Only elements of the same kind can be cloned; the rest are greyed out.",
+    "  Ctrl+Z undoes the whole clone as one step.",
+    "",
+    "PAUSE MARKERS",
+    "  A green dashed line on the timeline is a PAUSE MARKER: playback holds",
+    "  there and the pose freezes until the viewer presses any key. It is",
+    "  shaped like the playhead on purpose - it is the second cursor, the one",
+    "  playback parks on.",
+    "  Add one by right-clicking the timeline and choosing Insert pause marker,",
+    "  or with Editor > Add pause marker, which drops one at the playhead and",
+    "  greys out when this position already has a marker. The count sits in the",
+    "  bottom-left of the timeline (12 markers max).",
+    "  Drag a marker by the tab at its top to retime it; hold Ctrl to snap to",
+    "  the 0.1s grid. Right-click a marker to delete it.",
+    "  A hold is LOCAL to its own animation: anything else playing on screen",
+    "  keeps running, and a signal already in flight on the same animation",
+    "  keeps running too and can still end it. A held animation is still",
+    "  alive - it is waiting, not finished.",
+    "",
     "TIMELINE",
     "  Click a key to select it and open it in the track modal.",
     "  Shift+click ONLY adds or removes a key from the selection - it never",
@@ -782,6 +905,8 @@ static const char *k_helpLines[] = {
     "  one. Release and the track modal has the whole run ready to bulk edit.",
     "  The triangles at the top-left and bottom-right trim the intro and",
     "  outro sections.",
+    "  Right-click anywhere on the bar to add or remove a pause marker, and",
+    "  see the marker count in the bottom-left (see PAUSE MARKERS).",
     "",
     "TRACK MODAL",
     "  Drag its title bar to move it; the editor stays usable underneath.",
@@ -798,6 +923,13 @@ static const char *k_helpLines[] = {
     "  when a key is already sitting at the playhead. With one key selected",
     "  the new key copies its values; otherwise it takes the pose the",
     "  element actually has at that moment.",
+    "  With exactly ONE key selected, Apply's slot becomes \"duplicate key\":",
+    "  it copies that key's values to a new key at the playhead. Apply is not",
+    "  offered there because a single key is edited directly anyway.",
+    "  A string row shows the WORDS the key switches to rather than a slider -",
+    "  a string key holds a pool index, which is not a quantity you can drag",
+    "  through. Click it to pick another entry for that one key; it is greyed",
+    "  out when there is no key at this time (see TEXT AND THE STRING POOL).",
     "",
     "SIGNALS",
     "  The play glyph on a signal row fires it. A fired signal plays on its",
@@ -805,6 +937,9 @@ static const char *k_helpLines[] = {
     "  its keys sit at u 0..1 over the signal's length, with a marker riding",
     "  the clock. Editor > Stop on signal decides what happens afterwards:",
     "  on, playback stays stopped; off, the animation resumes where it froze.",
+    "  The panel title counts the signals in use (4 max). A signal is a",
+    "  reaction to an event; to hold playback at a fixed MOMENT use a pause",
+    "  marker instead - it costs no signal slot (see PAUSE MARKERS).",
     "",
     "EASINGS",
     "  Easing > Browse lists every curve with a thumbnail. Hide keeps a curve",

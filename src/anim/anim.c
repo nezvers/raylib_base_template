@@ -99,6 +99,8 @@ void AnimDocInit(AnimDoc *doc)
     doc->loopBlend  = ANIM_LOOP_BLEND_DEFAULT;
     doc->elemCount  = 0;
     doc->signalCount = 0;
+    doc->pauseCount = 0;
+    doc->stringCount = 0;
 }
 
 void AnimElemInit(AnimElem *e, AnimElemKind kind)
@@ -346,6 +348,11 @@ AnimKey *AnimTrackWriteColorKeyAt(AnimTrack *tr, float t, Color c, float eps)
     return AnimTrackAddColorKey(tr, t, c, ANIM_EASE_LINEAR);
 }
 
+bool AnimPropIsStepped(int prop)
+{
+    return prop == AP_T_STRING;
+}
+
 bool AnimPropIsColor(int prop)
 {
     return prop == AP_T_COLOR || prop == AP_S_COLOR ||
@@ -400,6 +407,12 @@ float AnimTrackEval(const AnimTrack *tr, float t, float missing)
     if (!AnimTrackSegment(tr, t, &i0, &i1)) return missing;
     const AnimKey *a = &tr->keys[i0], *b = &tr->keys[i1];
     if (i0 == i1) return a->value;
+    // A stepped property never blends: the left key's value holds across the
+    // segment and the right key SNAPS in AT its own time - landing exactly on a
+    // key must show that key's value, not still the previous one. Without this
+    // an AP_T_STRING track would sample index 1.5 and truncate to the wrong
+    // entry.
+    if (AnimPropIsStepped(tr->prop)) return (t >= b->t) ? b->value : a->value;
     float p = SegmentFraction(a, b, t);
     return a->value + (b->value - a->value) * p;
 }
@@ -557,6 +570,9 @@ static float ElemBaseProp(const AnimElem *e, int prop)
                                                ? e->scaleFrac : 1.0f;
         case AP_T_ROT:   case AP_S_ROT:   return e->rotBase;
         case AP_T_CRUMBLE:                return 0.0f;
+        // No string track -> the element shows its own text, which
+        // AnimElemTextAt expresses as the fallback. -1 = "no pool entry".
+        case AP_T_STRING:                 return -1.0f;
         case AP_G_FADE:                   return 0.0f;
         case AP_G_BG_ALPHA:               return (float)e->bgColor.a / 255.0f;
         default:                          return 0.0f;
@@ -604,6 +620,11 @@ float AnimElemProp(const AnimElem *e, int prop, float t)
     // A signal owns this property outright while it plays - it already blends
     // from the live pose, so the loop blend must not touch it. Otherwise it is
     // the plain timeline read plus the smooth-loop blend.
+    // A STEPPED property is an identity, not a quantity: blending it, offsetting
+    // it or easing it toward the loop start would all land between two entries
+    // and resolve to the wrong one. It is the plain timeline read, full stop.
+    if (AnimPropIsStepped(prop)) return TrackOrBase(e, prop, t);
+
     if (ei >= 0 && AnimSignalPlayerEval(s_ovr, ei, prop, &v, NULL))
     { /* v set by the signal */ }
     else
@@ -647,8 +668,384 @@ float AnimPropMax(int prop)
         case AP_T_SIZE:  case AP_S_W:
         case AP_S_H:                      return 3.0f;    // allow off-screen sizes
         case AP_S_SCALE:                  return 10.0f;   // multiplier, 1 = rest
+        // a pool INDEX, not a quantity: the whole pool must be reachable
+        case AP_T_STRING:                 return (float)(ANIM_STRINGS_MAX - 1);
         default:                          return 1.0f;
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Clone: make one element look like another at a chosen time (see anim.h)
+// ---------------------------------------------------------------------------
+// The animatable properties of each element kind, in storage order. Kept here
+// rather than borrowed from anim_io's table because anim.c is the LOWER layer -
+// anim_io includes anim.h, not the other way round.
+static const int k_textProps[] = {
+    AP_T_POS_X, AP_T_POS_Y, AP_T_SIZE, AP_T_ALPHA, AP_T_ROT, AP_T_CRUMBLE,
+    AP_T_COLOR, AP_T_STRING,
+};
+static const int k_shapeProps[] = {
+    AP_S_POS_X, AP_S_POS_Y, AP_S_W, AP_S_H, AP_S_ALPHA, AP_S_ROT, AP_S_COLOR,
+    AP_S_OUTLINE_COLOR, AP_S_OUTLINE, AP_S_OUTLINE_ALPHA, AP_S_SCALE,
+};
+static const int k_globalProps[] = {
+    AP_G_FADE, AP_G_COLOR, AP_G_BG_ALPHA, AP_G_BG_COLOR,
+};
+
+static const int *PropsOfKind(int kind, int *count)
+{
+    switch (kind)
+    {
+        case AE_TEXT:   *count = (int)(sizeof(k_textProps)/sizeof(k_textProps[0]));
+                        return k_textProps;
+        case AE_SHAPE:  *count = (int)(sizeof(k_shapeProps)/sizeof(k_shapeProps[0]));
+                        return k_shapeProps;
+        case AE_GLOBAL: *count = (int)(sizeof(k_globalProps)/sizeof(k_globalProps[0]));
+                        return k_globalProps;
+        default:        *count = 0; return NULL;
+    }
+}
+
+int AnimDocCloneElemState(AnimDoc *doc, int dstIdx, float dstT,
+                          int srcIdx, float srcT, float eps, bool holdBefore)
+{
+    if (!doc) return 0;
+    if (dstIdx < 0 || dstIdx >= doc->elemCount) return 0;
+    if (srcIdx < 0 || srcIdx >= doc->elemCount) return 0;
+
+    // Cloning from SELF is legitimate and useful: it copies the element's own
+    // pose at one time onto another time, which is how a look is brought back
+    // later without hand-retyping it. The two times must differ, or there is
+    // nothing to say.
+    if (dstIdx == srcIdx && fabsf(dstT - srcT) <= eps) return 0;
+
+    AnimElem       *dst = &doc->elems[dstIdx];
+    const AnimElem *src = &doc->elems[srcIdx];
+
+    // A hold key sits just BEFORE the clone so the destination keeps its
+    // current pose right up to dstT and then changes. Without it an
+    // interpolated property drifts across the whole span from the previous
+    // key. Nudged back by eps*2 so the write cannot land inside the clone
+    // key's own epsilon window and overwrite it.
+    float holdT = dstT - eps*2.0f;
+    if (holdT < 0.0f) holdT = 0.0f;
+    if (holdBefore && holdT >= dstT) holdBefore = false;    // no room before 0
+
+    // Only the destination's own kind is cloneable: the AP_* ranges are disjoint
+    // per kind, so a shape property on a text element would be dead storage.
+    // A cross-kind clone therefore copies only what the two kinds share - which
+    // is nothing, so it is a no-op rather than a corruption.
+    int propCount = 0;
+    const int *props = PropsOfKind(dst->kind, &propCount);
+    if (!props || dst->kind != src->kind) return 0;
+
+    int written = 0;
+    for (int i = 0; i < propCount; i++)
+    {
+        int prop = props[i];
+        bool isColor = AnimPropIsColor(prop);
+
+        // The pure authored reads: no signal override, no loop blend, so what
+        // gets cloned is what was authored - not what a live preview happens to
+        // be showing.
+        bool differs = false;
+        float sv = 0.0f;
+        Color sc = { 0, 0, 0, 0 };
+        if (prop == AP_T_STRING)
+        {
+            // Compare the WORDS, not the index. An element with no string track
+            // still shows text (its base e->text), and that is exactly the case
+            // the clone exists for - reusing an expired block's wording. Working
+            // off the raw index would read -1 for both and conclude "identical".
+            const char *ss = AnimElemTextAt(src, doc, srcT);
+            const char *ds = AnimElemTextAt(dst, doc, dstT);
+            if (TextIsEqual(ss, ds)) continue;
+
+            // The source's words must exist in the pool to be keyed at all; a
+            // second element wanting the same string shares the entry.
+            int at = AnimDocAddString(doc, ss);
+            if (at < 0) return -1;              // ANIM_STRINGS_MAX reached
+            sv = (float)at;
+            differs = true;
+        }
+        else if (isColor)
+        {
+            sc = TrackOrBaseColor(src, prop, srcT);
+            Color dc = TrackOrBaseColor(dst, prop, dstT);
+            differs = (sc.r != dc.r) || (sc.g != dc.g) || (sc.b != dc.b);
+        }
+        else
+        {
+            sv = TrackOrBase(src, prop, srcT);
+            float dv = TrackOrBase(dst, prop, dstT);
+            differs = (fabsf(sv - dv) > 1e-4f);
+        }
+        if (!differs) continue;             // delta keys only: nothing to say here
+
+        // What the destination shows just before the clone lands. Read BEFORE
+        // any track is created, because creating one changes what is sampled.
+        float dvHold = 0.0f;
+        Color dcHold = { 0, 0, 0, 255 };
+        int   dsHold = -1;
+        if (isColor)              dcHold = TrackOrBaseColor(dst, prop, holdT);
+        else if (prop == AP_T_STRING) dsHold = AnimDocAddString(doc,
+                                          AnimElemTextAt(dst, doc, holdT));
+        else                      dvHold = TrackOrBase(dst, prop, holdT);
+
+        AnimTrack *tr = AnimElemFindTrack(dst, prop);
+        bool fresh = (tr == NULL);
+        if (!tr) tr = AnimElemAddTrack(dst, prop);
+        if (!tr) return -1;                 // ANIM_TRACKS_MAX reached
+
+        // A brand-new track needs a key at 0 holding what the element already
+        // showed, or the clone key becomes the ONLY key and its value applies
+        // to the whole timeline - the "changes at T" promise broken. This is
+        // not just a string problem: a lone numeric key overrides the base
+        // value everywhere too, so the element's original property is lost.
+        if (fresh && dstT > 0.0f)
+        {
+            if (isColor)
+                AnimTrackAddColorKey(tr, 0.0f, TrackOrBaseColor(dst, prop, 0.0f),
+                                     ANIM_EASE_LINEAR);
+            else if (prop == AP_T_STRING)
+            {
+                int pat = AnimDocAddString(doc, AnimElemTextAt(dst, doc, 0.0f));
+                if (pat >= 0) AnimTrackAddKey(tr, 0.0f, (float)pat, ANIM_EASE_LINEAR);
+            }
+            else
+                AnimTrackAddKey(tr, 0.0f, TrackOrBase(dst, prop, 0.0f),
+                                ANIM_EASE_LINEAR);
+        }
+
+        // The hold key pins the old pose right up against the clone, so the
+        // change is a step rather than a slide from whatever came before.
+        if (holdBefore)
+        {
+            if (isColor) AnimTrackWriteColorKeyAt(tr, holdT, dcHold, eps);
+            else if (prop == AP_T_STRING)
+            { if (dsHold >= 0) AnimTrackWriteKeyAt(tr, holdT, (float)dsHold, eps); }
+            else AnimTrackWriteKeyAt(tr, holdT, dvHold, eps);
+        }
+
+        AnimKey *k = isColor ? AnimTrackWriteColorKeyAt(tr, dstT, sc, eps)
+                             : AnimTrackWriteKeyAt(tr, dstT, sv, eps);
+        if (!k) return -1;                  // ANIM_KEYS_MAX reached
+        written++;
+    }
+    return written;
+}
+
+// ---------------------------------------------------------------------------
+//  String pool (see AnimString in anim.h). Indices are STABLE: a removed entry
+//  leaves a hole rather than shifting its neighbours, because AP_T_STRING keys
+//  all over the document store those indices.
+// ---------------------------------------------------------------------------
+int AnimDocFindString(const AnimDoc *doc, const char *text)
+{
+    if (!doc || !text) return -1;
+    for (int i = 0; i < doc->stringCount; i++)
+        if (doc->strings[i].used && TextIsEqual(doc->strings[i].text, text))
+            return i;
+    return -1;
+}
+
+const char *AnimDocStringAt(const AnimDoc *doc, int idx)
+{
+    if (!doc || idx < 0 || idx >= doc->stringCount) return NULL;
+    if (!doc->strings[idx].used) return NULL;       // a hole left by a delete
+    return doc->strings[idx].text;
+}
+
+int AnimDocAddString(AnimDoc *doc, const char *text)
+{
+    if (!doc || !text) return -1;
+
+    // An identical entry is REUSED: typing the same words twice must not eat two
+    // slots, which is what makes the inspector's auto-add idempotent.
+    int found = AnimDocFindString(doc, text);
+    if (found >= 0) return found;
+
+    // Prefer a hole over growing: slots are scarce and a delete leaves gaps.
+    for (int i = 0; i < doc->stringCount; i++)
+        if (!doc->strings[i].used)
+        {
+            TextCopy(doc->strings[i].text, text);
+            doc->strings[i].used = true;
+            return i;
+        }
+
+    if (doc->stringCount >= ANIM_STRINGS_MAX) return -1;
+    int at = doc->stringCount++;
+    TextCopy(doc->strings[at].text, text);
+    doc->strings[at].used = true;
+    return at;
+}
+
+int AnimDocStringUsers(const AnimDoc *doc, int idx)
+{
+    if (!doc || idx < 0) return 0;
+    int n = 0;
+    for (int i = 0; i < doc->elemCount; i++)
+    {
+        const AnimElem *e = &doc->elems[i];
+        if (e->kind != AE_TEXT) continue;
+        for (int j = 0; j < e->trackCount; j++)
+        {
+            if (e->tracks[j].prop != AP_T_STRING) continue;
+            for (int k = 0; k < e->tracks[j].keyCount; k++)
+                if ((int)(e->tracks[j].keys[k].value + 0.5f) == idx) n++;
+        }
+    }
+    return n;
+}
+
+bool AnimDocRemoveString(AnimDoc *doc, int idx)
+{
+    if (!doc || idx < 0 || idx >= doc->stringCount) return false;
+    if (!doc->strings[idx].used) return false;
+    if (AnimDocStringUsers(doc, idx) > 0) return false;   // still referenced
+
+    doc->strings[idx].used = false;
+    doc->strings[idx].text[0] = '\0';
+
+    // Shrink the high-water mark when the tail is now empty, so a pool that is
+    // filled and cleared does not stay "full" forever.
+    while (doc->stringCount > 0 && !doc->strings[doc->stringCount - 1].used)
+        doc->stringCount--;
+    return true;
+}
+
+int AnimDocGCStrings(AnimDoc *doc)
+{
+    if (!doc) return 0;
+    int freed = 0;
+    // An EMPTY entry nobody points at is noise in the pool list - reclaim it.
+    // A non-empty entry is the user's text and is never touched, referenced or
+    // not; a referenced entry is never touched even when empty.
+    for (int i = 0; i < doc->stringCount; i++)
+    {
+        if (!doc->strings[i].used) continue;
+        if (doc->strings[i].text[0] != '\0') continue;
+        if (AnimDocStringUsers(doc, i) > 0) continue;
+        doc->strings[i].used = false;
+        freed++;
+    }
+    while (doc->stringCount > 0 && !doc->strings[doc->stringCount - 1].used)
+        doc->stringCount--;
+    return freed;
+}
+
+const char *AnimElemTextAt(const AnimElem *e, const AnimDoc *doc, float t)
+{
+    if (!e) return "";
+    if (e->kind != AE_TEXT) return e->text;
+
+    const AnimTrack *tr = NULL;
+    for (int i = 0; i < e->trackCount; i++)
+        if (e->tracks[i].prop == AP_T_STRING) { tr = &e->tracks[i]; break; }
+
+    if (tr && tr->keyCount > 0 && doc)
+    {
+        // Stepped: AnimTrackEval already holds the left key's value across the
+        // segment, so this is an exact index, never a blend of two.
+        int idx = (int)(AnimTrackEval(tr, t, -1.0f) + 0.5f);
+        const char *s = AnimDocStringAt(doc, idx);
+        if (s) return s;
+        // Stale reference (entry deleted, or an index from another document):
+        // fall back rather than blanking the element.
+    }
+    return e->text;
+}
+
+int AnimDocStringIdxAt(AnimDoc *doc, AnimElem *e, float t)
+{
+    if (!doc || !e || e->kind != AE_TEXT) return -1;
+
+    const AnimTrack *tr = NULL;
+    for (int i = 0; i < e->trackCount; i++)
+        if (e->tracks[i].prop == AP_T_STRING) { tr = &e->tracks[i]; break; }
+
+    if (tr && tr->keyCount > 0)
+    {
+        int idx = (int)(AnimTrackEval(tr, t, -1.0f) + 0.5f);
+        if (AnimDocStringAt(doc, idx)) return idx;
+        // A stale index resolves to nothing, so fall through and pool the words
+        // the element is actually showing - the same fallback AnimElemTextAt
+        // makes, expressed as an index.
+    }
+    return AnimDocAddString(doc, e->text);
+}
+
+// ---------------------------------------------------------------------------
+//  Pause markers (see AnimPause in anim.h). The array is kept ascending in t.
+// ---------------------------------------------------------------------------
+int AnimDocPauseAt(const AnimDoc *doc, float t, float eps)
+{
+    if (!doc) return -1;
+    for (int i = 0; i < doc->pauseCount; i++)
+        if (fabsf(doc->pauses[i].t - t) <= eps) return i;
+    return -1;
+}
+
+AnimPause *AnimDocAddPause(AnimDoc *doc, float t, float eps)
+{
+    if (!doc) return NULL;
+    if (doc->pauseCount >= ANIM_PAUSES_MAX) return NULL;
+    if (t < 0.0f) t = 0.0f;
+    // Two holds at the same instant would read as one and could not be deleted
+    // apart, so an existing marker here wins.
+    if (AnimDocPauseAt(doc, t, eps) >= 0) return NULL;
+
+    int at = doc->pauseCount;
+    while (at > 0 && doc->pauses[at - 1].t > t)
+    {
+        doc->pauses[at] = doc->pauses[at - 1];
+        at--;
+    }
+    doc->pauseCount++;
+    doc->pauses[at] = (AnimPause){ t, false };   // holds every cycle by default
+    return &doc->pauses[at];
+}
+
+void AnimDocRemovePause(AnimDoc *doc, int idx)
+{
+    if (!doc || idx < 0 || idx >= doc->pauseCount) return;
+    for (int i = idx; i < doc->pauseCount - 1; i++) doc->pauses[i] = doc->pauses[i + 1];
+    doc->pauseCount--;
+}
+
+int AnimDocSetPauseTime(AnimDoc *doc, int idx, float t)
+{
+    if (!doc || idx < 0 || idx >= doc->pauseCount) return -1;
+    if (t < 0.0f) t = 0.0f;
+
+    AnimPause p = doc->pauses[idx];
+    p.t = t;
+    AnimDocRemovePause(doc, idx);
+
+    // Re-insert at the sorted slot; cannot fail, a slot was just freed.
+    int at = doc->pauseCount;
+    while (at > 0 && doc->pauses[at - 1].t > t)
+    {
+        doc->pauses[at] = doc->pauses[at - 1];
+        at--;
+    }
+    doc->pauseCount++;
+    doc->pauses[at] = p;
+    return at;
+}
+
+int AnimDocNextPause(const AnimDoc *doc, float from, float to)
+{
+    if (!doc || to <= from) return -1;
+    // Half-open (from, to]: a marker exactly AT `from` was already served on the
+    // frame that stopped there, so it must not re-fire the instant it resumes.
+    for (int i = 0; i < doc->pauseCount; i++)
+    {
+        float t = doc->pauses[i].t;
+        if (t > from && t <= to) return i;       // ascending: the first is the earliest
+    }
+    return -1;
 }
 
 float AnimDocMaxKeyTime(const AnimDoc *doc)
@@ -697,7 +1094,10 @@ static float TextSpacingFor(float sizePx)
     return sizePx / (float)GetFontDefault().baseSize;
 }
 
-static void DrawTextElem(const AnimElem *e, float t, Vector2 game)
+// `str` is the string to draw, already resolved through the document's pool by
+// the caller (AnimElemTextAt). Passed in rather than looked up here so the
+// renderer stays ignorant of the pool and needs no document pointer.
+static void DrawTextElem(const AnimElem *e, float t, Vector2 game, const char *str)
 {
     float alpha = AnimElemProp(e, AP_T_ALPHA, t);
     if (alpha <= 0.0f) return;
@@ -713,7 +1113,7 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game)
     float spacing = TextSpacingFor(sizePx);
     Font  font    = GetFontDefault();
 
-    Vector2 box   = MeasureTextEx(font, e->text, sizePx, spacing);
+    Vector2 box   = MeasureTextEx(font, str, sizePx, spacing);
     float left    = game.x * cxF - box.x * 0.5f;   // pos = text center
     float top     = game.y * cyF - box.y * 0.5f;
     Color col     = Fade(AnimElemColor(e, t), alpha * (1.0f - crumble));
@@ -729,7 +1129,7 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game)
         float penX  = left;
         float penY  = top;
         int   idx   = 0;
-        for (const char *c = e->text; *c; c++)
+        for (const char *c = str; *c; c++)
         {
             int cp = (unsigned char)*c;
             // this loop places glyphs by hand, so it owns line breaking too
@@ -759,11 +1159,11 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game)
     {
         Vector2 org = { box.x * 0.5f, box.y * 0.5f };
         Vector2 ctr = { left + org.x, top + org.y };
-        DrawTextPro(font, e->text, ctr, org, rot, sizePx, spacing, col);
+        DrawTextPro(font, str, ctr, org, rot, sizePx, spacing, col);
     }
     else
     {
-        DrawTextEx(font, e->text, (Vector2){ left, top }, sizePx, spacing, col);
+        DrawTextEx(font, str, (Vector2){ left, top }, sizePx, spacing, col);
     }
 }
 
@@ -980,7 +1380,7 @@ void AnimDocDrawLoop(const AnimDoc *doc, float t, const AnimSignalPlayer *ovr,
         const AnimElem *e = &doc->elems[i];
         switch (e->kind)
         {
-            case AE_TEXT:   DrawTextElem(e, t, game);   break;
+            case AE_TEXT:   DrawTextElem(e, t, game, AnimElemTextAt(e, doc, t)); break;
             case AE_SHAPE:  DrawShapeElem(e, t, game);  break;
             case AE_GLOBAL: DrawGlobalElem(e, t, game); break;
         }
@@ -1383,6 +1783,18 @@ void AnimPlayerUpdate(AnimPlayer *p, float dt)
 bool AnimPlayerDone(const AnimPlayer *p)
 {
     return !p->playing;
+}
+
+void AnimPlayerSeek(AnimPlayer *p, float t)
+{
+    if (!p->doc) return;
+    // Inverse of AnimPlayerSampleTime: reverse playback runs the doc backwards,
+    // so the clock is measured from the far end of the section.
+    float c = (p->dir == ANIM_REV) ? (p->secEnd - t) : (t - p->secStart);
+    float len = SectionLen(p);
+    if (c < 0.0f) c = 0.0f;
+    if (c > len)  c = len;
+    p->clock = c;
 }
 
 float AnimPlayerSampleTime(const AnimPlayer *p)

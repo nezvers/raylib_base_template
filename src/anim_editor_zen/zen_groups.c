@@ -100,6 +100,22 @@ void ZenGroupWriteKey(AnimElem *e, int gi, float t)
             if (t > ZEN_AUTOKEY_EPS) ZenEnsureZeroColorKey(e, tr);
             AnimTrackWriteColorKeyAt(tr, t, c, ZEN_AUTOKEY_EPS);
         }
+        else if (AnimPropIsStepped(prop))
+        {
+            // A string key holds a POOL INDEX, not a quantity. Seeding it the
+            // way the branch below does would write the -1 "no pool entry" base
+            // value and the key would resolve to nothing; carry the words the
+            // element actually shows instead. Both indices are read BEFORE any
+            // key is added, since adding one changes what is sampled.
+            int idx = AnimDocStringIdxAt(&zen.doc, e, t);
+            int zero = (t > ZEN_AUTOKEY_EPS && tr->keyCount == 0)
+                     ? AnimDocStringIdxAt(&zen.doc, e, 0.0f) : -1;
+            if (idx < 0) continue;              // pool full - leave the track be
+            // ZenEnsureZeroKey cannot serve here: it seeds through AnimElemProp,
+            // which is exactly the sentinel this branch exists to avoid.
+            if (zero >= 0) AnimTrackAddKey(tr, 0.0f, (float)zero, ANIM_EASE_LINEAR);
+            AnimTrackWriteKeyAt(tr, t, (float)idx, ZEN_AUTOKEY_EPS);
+        }
         else
         {
             float v = AnimElemProp(e, prop, t);
@@ -179,6 +195,18 @@ int ZenGroupColorProp(int kind, int gi)
     return -1;
 }
 
+// True when EVERY member of the group snaps rather than blends. Such a group
+// has no easing to speak of, so the UI must not offer one - AnimTrackEval
+// ignores what it would store.
+bool ZenGroupIsStepped(int kind, int gi)
+{
+    const AnimPropGroup *g = AnimGroupAt(kind, gi);
+    if (!g || g->propCount == 0) return false;
+    for (int m = 0; m < g->propCount; m++)
+        if (!AnimPropIsStepped(g->props[m])) return false;
+    return true;
+}
+
 // Compact one-line summary of a group key: "t   v0,v1,..   ease".
 const char *ZenGroupKeyLabel(AnimElem *e, int gi, float t)
 {
@@ -193,10 +221,21 @@ const char *ZenGroupKeyLabel(AnimElem *e, int gi, float t)
             Color c = AnimElemColorProp(e, prop, t);
             one = TextFormat("#%02X%02X%02X", c.r, c.g, c.b);
         }
+        else if (AnimPropIsStepped(prop))
+        {
+            // A pool index says nothing to read; show the words it resolves to.
+            const char *s = AnimDocStringAt(&zen.doc,
+                                (int)(AnimElemProp(e, prop, t) + 0.5f));
+            one = ZenTextPreview(s ? s : "(none)", 16);
+        }
         else one = TextFormat("%.2f", AnimElemProp(e, prop, t));
         if (m) strncat(vals, ",", sizeof(vals)-strlen(vals)-1);
         strncat(vals, one, sizeof(vals)-strlen(vals)-1);
     }
+    // A stepped group's ease is never applied, so naming one here would be a
+    // lie the user could not act on.
+    if (ZenGroupIsStepped(e->kind, gi))
+        return TextFormat("%.2f   %s", t, vals);
     return TextFormat("%.2f   %s   %s", t, vals,
                       AnimEaseName(ZenGroupEase(e, gi, t)));
 }

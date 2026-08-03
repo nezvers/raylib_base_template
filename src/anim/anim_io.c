@@ -10,6 +10,11 @@
 //                                       # optional too - files written before it
 //                                       # existed load as smooth with the
 //                                       # ANIM_LOOP_BLEND_DEFAULT length.
+//    string   <idx> <escaped-single-token>  # shared text pool entry, BEFORE the
+//                                        # elements: a `string` track keys these
+//                                        # INDICES. The index is explicit
+//                                        # because a deleted entry leaves a hole
+//                                        # and the rest must not shift.
 //    elem     <kind> <name>              # kind = text|shape|global
 //      text   <escaped-single-token>     # (text elements) space -> '\s',
 //                                        # newline -> '\n', '\' -> '\\'
@@ -24,6 +29,10 @@
 //        key  <t> <value> <ease>            # scalar tracks
 //        key  <t> <r> <g> <b> <ease>        # colour tracks (RGB; no alpha)
 //      end
+//    pause    <t> [<once>]              # doc-clock hold; playback stops here
+//                                       # until a key is pressed. `once` (0/1)
+//                                       # is OPTIONAL and defaults to 0 = holds
+//                                       # on every loop cycle.
 //    signal   <name> <length> [terminal [usesPos [posAnchor [replay]]]]
 //                                       # AFTER all elems (names resolve).
 //                                       # `terminal`, `usesPos`, `posAnchor`, `replay`
@@ -59,7 +68,7 @@ typedef struct { int prop; const char *name; } PropRow;
 static const PropRow k_textProps[] = {
     { AP_T_POS_X, "pos_x" }, { AP_T_POS_Y, "pos_y" }, { AP_T_SIZE, "size" },
     { AP_T_ALPHA, "alpha" }, { AP_T_ROT, "rot" },     { AP_T_CRUMBLE, "crumble" },
-    { AP_T_COLOR, "color" },
+    { AP_T_COLOR, "color" }, { AP_T_STRING, "string" },
 };
 static const PropRow k_shapeProps[] = {
     { AP_S_POS_X, "pos_x" }, { AP_S_POS_Y, "pos_y" }, { AP_S_W, "w" },
@@ -123,6 +132,7 @@ static const AnimPropGroup k_textGroups[] = {
     { "color",    { AP_T_COLOR, AP_T_ALPHA }, 2 },
     { "rotation", { AP_T_ROT },               1 },
     { "crumble",  { AP_T_CRUMBLE },           1 },
+    { "string",   { AP_T_STRING },            1 },
 };
 static const AnimPropGroup k_shapeGroups[] = {
     { "position", { AP_S_POS_X, AP_S_POS_Y },                       2 },
@@ -325,8 +335,26 @@ bool AnimDocSave(const AnimDoc *doc, const char *path)
             doc->duration, AnimDocIntroEnd(doc), AnimDocOutroStart(doc),
             doc->loopBlend, doc->loopSmooth ? 1 : 0);
 
+    // The string pool comes BEFORE the elements: an element's `string` track
+    // keys pool INDICES, so the entries must exist by the time they are read.
+    // The index is written explicitly because a deleted entry leaves a hole and
+    // the surviving indices must not shift (see AnimString).
+    for (int i = 0; i < doc->stringCount; i++)
+    {
+        if (!doc->strings[i].used) continue;
+        char enc[ANIM_TEXT_LEN_MAX * 2];
+        EncodeText(doc->strings[i].text, enc, sizeof(enc));
+        fprintf(f, "string %d %s\n", i, enc);
+    }
+
     for (int i = 0; i < doc->elemCount; i++)
         AnimElemWriteCfg(f, &doc->elems[i], "");
+
+    // Pause markers are doc-level and reference nothing, so they can sit
+    // anywhere; after the elements keeps the file reading top-down in time.
+    for (int i = 0; i < doc->pauseCount; i++)
+        fprintf(f, "pause %f %d\n", doc->pauses[i].t,
+                doc->pauses[i].once ? 1 : 0);
 
     // Signals come AFTER every element: their targets name elements, so a
     // single forward pass can resolve those names on load.
@@ -590,6 +618,47 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
                 curElem  = AnimDocAddElem(doc, ElemKindByName(kindStr));
                 curTrack = NULL;
                 if (curElem) TextCopy(curElem->name, nm);
+            }
+        }
+        else if (TextIsEqual(key, "string"))
+        {
+            // Doc-level and written before the elements, so a `string` track's
+            // indices resolve on this single forward pass.
+            curElem = NULL; curTrack = NULL;
+            curSig = NULL; curTgt = NULL; curPos = NULL;
+
+            int idx = -1;
+            char enc[ANIM_TEXT_LEN_MAX * 2];
+            if (fscanf(f, "%d %" ANIM_TEXT_ENC_WIDTH "s", &idx, enc) == 2 &&
+                idx >= 0 && idx < ANIM_STRINGS_MAX)
+            {
+                DecodeText(enc);
+                // Placed AT its stored index, holes and all - the indices are
+                // what the tracks reference and must survive a round-trip.
+                TextCopy(doc->strings[idx].text, enc);
+                doc->strings[idx].used = true;
+                if (idx >= doc->stringCount) doc->stringCount = idx + 1;
+            }
+        }
+        else if (TextIsEqual(key, "pause"))
+        {
+            // Doc-level, like `doc`: close any open element/signal context so a
+            // marker written between blocks cannot be read as part of one.
+            curElem = NULL; curTrack = NULL;
+            curSig = NULL; curTgt = NULL; curPos = NULL;
+
+            // `once` is OPTIONAL (as with `doc` and `signal`): take the rest of
+            // the LINE and let the field count decide the default.
+            char rest[64];
+            float t = 0.0f; int once = 0;
+            if (fgets(rest, sizeof(rest), f))
+            {
+                int n = sscanf(rest, "%f %d", &t, &once);
+                if (n >= 1 && doc->pauseCount < ANIM_PAUSES_MAX)
+                {
+                    AnimPause *p = AnimDocAddPause(doc, t, 1e-4f);
+                    if (p) p->once = (n >= 2) && (once != 0);
+                }
             }
         }
         else if (TextIsEqual(key, "signal"))

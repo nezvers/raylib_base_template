@@ -332,7 +332,8 @@ bool ZenTyping(void)
 {
     return zen.edNameBuf || zen.edName || zen.edText || zen.edSigIdx >= 0
         || zen.trackModal.edTime || ZenSliderTyping() || ZenEasingTyping()
-        || ZenMenuTyping() || ZenTextAreaTyping();
+        || ZenMenuTyping() || ZenTextAreaTyping() || ZenCloneTyping()
+        || ZenStringPoolTyping();
 }
 
 // ---------------------------------------------------------------------------
@@ -463,8 +464,12 @@ static void Enter()
     zen.trackModal = (ZenTrackModal){0};
     zen.trackModal.sig = -1;
     zen.easeDropOpen = false; zen.addTrackOpen = false; zen.addTrackSel = 0;
+    zen.strDropOpen = false;
     zen.dragPlayhead = false; zen.dragKeyGroup = -1;
     zen.dragIntro = zen.dragOutro = false;
+    zen.dragPause = -1; zen.selPause = -1;
+    zen.pausedOnMarker = false; zen.heldPause = -1;
+    ZenTimelineCtxClose();
     zen.sigModalIdx = -1; zen.sigModalPos = (Vector2){0};
     zen.sigDragging = false; zen.sigScroll = 0.0f; zen.sigLastU = 1.0f;
     ZenSigClearKeySel(); ZenSigCloseDrops();
@@ -496,12 +501,27 @@ static void Update()
     if (sigLive && zen.playing && zen.stopOnSignal)
         zen.playing = false;                // stops for good; Space resumes
 
+    // A pause marker holds the preview the same way it holds a runtime instance
+    // (see AnimStageUpdate): the clock stops ON the marker until a key arrives.
+    // Space is exempt - it is the editor's stop/start and must keep working.
+    if (zen.pausedOnMarker)
+    {
+        // IsKeyPressed over the range rather than GetKeyPressed(): that call
+        // POPS the queue, and zen_menu.c's Alt-navigation reads the same queue.
+        bool released = IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
+                     || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT);
+        for (int k = KEY_SPACE; !released && k <= KEY_KB_MENU; k++)
+            if (IsKeyPressed(k)) released = true;
+        if (released || !zen.playing) zen.pausedOnMarker = false;
+    }
+
     // Timeline playback over the TRIMMED section [0..outroStart]; looping
     // restarts at introEnd (the intro is a one-shot lead-in).
-    if (zen.playing && !sigLive)
+    if (zen.playing && !sigLive && !zen.pausedOnMarker)
     {
         float inEnd = AnimDocIntroEnd(&zen.doc);
         float outStart = AnimDocOutroStart(&zen.doc);
+        float prevHead = zen.playhead;
         zen.playhead += dt;
         if (zen.playhead >= outStart)
         {
@@ -513,6 +533,21 @@ static void Update()
                              : inEnd;
             }
             else zen.playhead = outStart;
+        }
+
+        // Did this frame step over a marker? Park exactly on it and hold, so
+        // the editor previews what the runtime will actually do. The wrap case
+        // is two ranges, as in AnimStageUpdate.
+        int pi = (zen.playhead >= prevHead)
+               ? AnimDocNextPause(&zen.doc, prevHead, zen.playhead)
+               : AnimDocNextPause(&zen.doc, prevHead, outStart);
+        if (pi < 0 && zen.playhead < prevHead)
+            pi = AnimDocNextPause(&zen.doc, inEnd - 1e-4f, zen.playhead);
+        if (pi >= 0)
+        {
+            zen.playhead       = zen.doc.pauses[pi].t;
+            zen.pausedOnMarker = true;
+            zen.heldPause      = pi;
         }
     }
 
@@ -530,11 +565,16 @@ static void Update()
         else if (zen.helpOpen)              zen.helpOpen = false;
         else if (zen.prompt != ZEN_PROMPT_NONE)
         { zen.prompt = ZEN_PROMPT_NONE; zen.edNameBuf = false; }
+        else if (ZenStringPoolEscClose()) { }
+        else if (ZenCloneEscClose()) { }
         else if (ZenEasingEscClose()) { }
         else if (zen.libOpen)               zen.libOpen = false;
         else if (zen.openListOpen)          zen.openListOpen = false;
-        else if (zen.easeDropOpen || zen.addTrackOpen || zen.sigDropMode != 0)
-        { zen.easeDropOpen = false; zen.addTrackOpen = false; ZenSigCloseDrops(); }
+        else if (zen.easeDropOpen || zen.addTrackOpen || zen.strDropOpen ||
+                 zen.sigDropMode != 0)
+        { zen.easeDropOpen = false; zen.addTrackOpen = false;
+          zen.strDropOpen = false; ZenSigCloseDrops(); }
+        else if (ZenTimelineCtxOpen())      ZenTimelineCtxClose();
         else if (ZenViewCtxOpen())          ZenViewCtxClose();
         else if (zen.trackModal.open)       zen.trackModal.open = false;
         else if (zen.sigModalIdx >= 0)
@@ -597,8 +637,10 @@ static void Gui()
         (zen.sigModalIdx >= 0 &&
          CheckCollisionPointRec(mouse, zen.sigModalRect));
     bool dropOpen = zen.menuOpen >= 0 || zen.easeDropOpen || zen.addTrackOpen
-                 || zen.sigDropMode != 0 || ZenViewCtxOpen();
-    zen.guiLocked = ZenMenuModalOpen() || ZenEasingModalOpen() || dropOpen || overFloat;
+                 || zen.strDropOpen
+                 || zen.sigDropMode != 0 || ZenViewCtxOpen() || ZenTimelineCtxOpen();
+    zen.guiLocked = ZenMenuModalOpen() || ZenEasingModalOpen() || ZenCloneOpen()
+                 || ZenStringPoolOpen() || dropOpen || overFloat;
     if (zen.guiLocked) GuiLock();
 
     // uiHover keeps the viewport's hands off the mouse while it's on chrome;
@@ -612,8 +654,10 @@ static void Gui()
 
     // Floating modals: usable while the panels stay clickable outside them.
     // Locked only under their own dropdown lists or a menu modal.
-    bool floatLock = ZenMenuModalOpen() || ZenEasingModalOpen()
-                  || zen.easeDropOpen || zen.addTrackOpen || zen.sigDropMode != 0;
+    bool floatLock = ZenMenuModalOpen() || ZenEasingModalOpen() || ZenCloneOpen()
+                  || ZenStringPoolOpen()
+                  || zen.easeDropOpen || zen.addTrackOpen || zen.strDropOpen
+                  || zen.sigDropMode != 0;
     if (floatLock) GuiLock();
     ZenSignalModalGui();
     ZenTrackModalGui();
@@ -622,9 +666,13 @@ static void Gui()
     // Overlays topmost: dropdown lists, then the menu's modals, then the tip.
     ZenPanelsOverlaysGui();
     ZenViewContextGui();
+    ZenTimelineCtxGui();
     ZenSignalOverlaysGui();
     ZenEaseDropOverlayGui();
+    ZenStringDropOverlayGui();
     ZenMenuOverlaysGui();
     ZenEasingGui();
+    ZenCloneGui();
+    ZenStringPoolGui();
     ZenTipDraw();
 }

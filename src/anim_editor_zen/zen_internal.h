@@ -30,6 +30,8 @@
 #define ZEN_LIB_PATH      ZEN_ANIM_DIR "/_library" ZEN_ANIM_EXT
 #define ZEN_UNDO_MAX      16
 #define ZEN_AUTOKEY_EPS   0.02f   // playhead-to-key snap when auto-keying (s)
+#define ZEN_PAUSE_EPS     0.02f   // marker-to-time snap: how close counts as
+                                  // "there is already a pause here" (s)
 
 // Viewport: while EDITING the doc is shown zoomed out so elements can fly in
 // from off-screen and still be seen/grabbed; the real screen is the dotted
@@ -164,6 +166,8 @@ typedef struct {
 
     // ease dropdown of the track modal (list drawn topmost as an overlay)
     bool easeDropOpen; Rectangle easeDropRect;
+    // string-pick dropdown of the track modal (same overlay treatment)
+    bool strDropOpen; Rectangle strDropRect;
     // add-track dropdown of the inspector
     bool addTrackOpen; int addTrackSel; Rectangle addTrackRect;
 
@@ -172,6 +176,14 @@ typedef struct {
     int   dragKeyGroup;             // group being dragged (-1 = none)
     float dragKeyTime;
     bool  dragIntro, dragOutro;
+    int   dragPause;                // pause marker being dragged (-1 = none)
+
+    // -- pause markers ------------------------------------------------------
+    int   selPause;                 // marker the timeline highlights (-1 = none)
+    bool  pausedOnMarker;           // preview playback is HELD on selPause's
+                                    // marker, waiting for a key (mirrors the
+                                    // runtime hold in anim_stage.c)
+    int   heldPause;                // which marker the preview is held on
 
     // -- signal modal -------------------------------------------------------
     int   sigModalIdx;              // open signal (-1 = none); survives playback
@@ -278,6 +290,10 @@ int   ZenGroupEase(AnimElem *e, int gi, float t);         // representative ease
 int   ZenGroupColorProp(int kind, int gi);                // colour member or -1
 const char *ZenGroupKeyLabel(AnimElem *e, int gi, float t);
 
+// True when every member property snaps instead of blending (the "string"
+// group). Such a group has no meaningful easing, so the UI must not offer one.
+bool ZenGroupIsStepped(int kind, int gi);
+
 // -- signal-target groups (same coordinated editing, keys in normalized u) --
 #define ZEN_SIG_U_EPS     0.001f
 #define ZEN_SIG_TIMES_MAX (ANIM_SIG_KEYS_MAX * ANIM_GROUP_PROPS)
@@ -324,6 +340,7 @@ void ZenTrackModalOpenSig(int sigIdx);          // signal mode: edits the key
 void ZenTrackModalSync(void);                   // reload staged values
 void ZenTrackModalGui(void);                    // drawn above the panels
 void ZenEaseDropOverlayGui(void);               // its ease list, topmost
+void ZenStringDropOverlayGui(void);             // its string-pool list, topmost
 
 // ---------------------------------------------------------------------------
 //  zen_signal_modal.c - the draggable signal modal
@@ -358,6 +375,36 @@ bool ZenEasingModalOpen(void);      // browser or graph editor showing
 bool ZenEasingEscClose(void);       // close topmost easing modal; false if none
 bool ZenEasingTyping(void);         // its name textbox captures the keyboard
 void ZenEasingGui(void);
+
+// -- zen_clone_modal.c ------------------------------------------------------
+// Element > Clone from...: write another element's look at the playhead onto
+// the SELECTED element as keys at a chosen time. Saves element slots by reusing
+// an expired block instead of adding a new one.
+void ZenCloneShow(void);            // Element > Clone from...
+bool ZenCloneOpen(void);            // the modal is showing
+bool ZenCloneEscClose(void);        // close it; false if it was not open
+bool ZenCloneTyping(void);          // its time textbox captures the keyboard
+void ZenCloneGui(void);
+
+// -- zen_string_pool.c ------------------------------------------------------
+// The document's shared text strings. Text elements point at entries here, and
+// an AP_T_STRING track keys the index, which is what lets text CHANGE mid-
+// animation (see AnimString in anim.h for why it cannot live on the key).
+// One-line preview of a possibly multi-line string, ellipsised at maxChars.
+// Returns a shared static buffer - use it before the next call.
+const char *ZenTextPreview(const char *s, int maxChars);
+
+void ZenStringPoolShow(void);
+bool ZenStringPoolOpen(void);
+bool ZenStringPoolEscClose(void);
+bool ZenStringPoolTyping(void);
+void ZenStringPoolGui(void);
+
+// timeline right-click menu (insert / delete a pause marker)
+void ZenTimelineCtxGui(void);
+bool ZenTimelineCtxOpen(void);
+void ZenTimelineCtxClose(void);
+
 Vector2 ZenScreenToDoc(Vector2 screenPos);  // raw mouse -> doc/game space
 void ZenDrawDottedRect(Rectangle r, Color c);
 void ZenDrawDottedLine(Vector2 a, Vector2 b, Color c);

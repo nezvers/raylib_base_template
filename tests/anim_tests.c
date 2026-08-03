@@ -340,6 +340,397 @@ static void TestRemoveTrack(void)
 // ---------------------------------------------------------------------------
 //  Element reorder / duplicate (element order == draw order)
 // ---------------------------------------------------------------------------
+// The string pool: shared text with STABLE indices, and the AP_T_STRING track
+// that keys them. The stepping rule is the one genuinely new sampling behaviour.
+static void TestStringPool(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    CHECK(doc.stringCount == 0);
+
+    int a = AnimDocAddString(&doc, "HELLO");
+    int b = AnimDocAddString(&doc, "GOODBYE");
+    CHECK(a == 0 && b == 1 && doc.stringCount == 2);
+
+    // an identical string is REUSED, not duplicated (auto-add is idempotent)
+    CHECK(AnimDocAddString(&doc, "HELLO") == 0);
+    CHECK(doc.stringCount == 2);
+    CHECK(AnimDocFindString(&doc, "GOODBYE") == 1);
+    CHECK(AnimDocFindString(&doc, "nope") == -1);
+
+    CHECK(TextIsEqual(AnimDocStringAt(&doc, 0), "HELLO"));
+    CHECK(AnimDocStringAt(&doc, 99) == NULL);           // out of range
+    CHECK(AnimDocStringAt(&doc, -1) == NULL);
+
+    // --- the track keys INDICES, and they SNAP ---------------------------
+    AnimElem *e = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(e->name, "t");
+    TextCopy(e->text, "BASE");
+    AnimTrack *tr = AnimElemAddTrack(e, AP_T_STRING);
+    AnimTrackAddKey(tr, 0.0f, 0.0f, ANIM_EASE_LINEAR);   // -> "HELLO"
+    AnimTrackAddKey(tr, 2.0f, 1.0f, ANIM_EASE_LINEAR);   // -> "GOODBYE"
+
+    CHECK(AnimPropIsStepped(AP_T_STRING));
+    CHECK(!AnimPropIsStepped(AP_T_POS_X) && !AnimPropIsStepped(AP_T_COLOR));
+
+    // mid-segment must NOT be 0.5: a blended index resolves to the wrong entry
+    CHECK_NEAR(AnimTrackEval(tr, 1.0f, -1.0f), 0.0f);
+    CHECK_NEAR(AnimTrackEval(tr, 1.999f, -1.0f), 0.0f);
+    CHECK_NEAR(AnimTrackEval(tr, 2.0f, -1.0f), 1.0f);   // snaps AT the key
+    CHECK_NEAR(AnimElemProp(e, AP_T_STRING, 1.0f), 0.0f);
+
+    CHECK(TextIsEqual(AnimElemTextAt(e, &doc, 0.0f), "HELLO"));
+    CHECK(TextIsEqual(AnimElemTextAt(e, &doc, 1.9f), "HELLO"));   // holds
+    CHECK(TextIsEqual(AnimElemTextAt(e, &doc, 2.0f), "GOODBYE")); // snaps
+    CHECK(TextIsEqual(AnimElemTextAt(e, &doc, 9.0f), "GOODBYE")); // after last
+
+    // --- resolver fallbacks ----------------------------------------------
+    // no doc -> the element's own text; no track -> likewise
+    CHECK(TextIsEqual(AnimElemTextAt(e, NULL, 0.0f), "BASE"));
+    AnimElem *plain = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(plain->text, "PLAIN");
+    CHECK(TextIsEqual(AnimElemTextAt(plain, &doc, 0.0f), "PLAIN"));
+
+    // a stale index degrades to the element's own text, never blank
+    AnimTrackAddKey(tr, 3.0f, 77.0f, ANIM_EASE_LINEAR);
+    CHECK(TextIsEqual(AnimElemTextAt(e, &doc, 3.0f), "BASE"));
+    AnimTrackRemoveKey(tr, 2);
+
+    // --- usage counting and guarded delete --------------------------------
+    CHECK(AnimDocStringUsers(&doc, 0) == 1);
+    CHECK(AnimDocStringUsers(&doc, 1) == 1);
+    CHECK(!AnimDocRemoveString(&doc, 0));               // in use: refused
+    CHECK(doc.strings[0].used);
+
+    int c = AnimDocAddString(&doc, "UNUSED");
+    CHECK(AnimDocStringUsers(&doc, c) == 0);
+    CHECK(AnimDocRemoveString(&doc, c));                // unused: removed
+    CHECK(doc.stringCount == 2);                        // tail shrank back
+
+    // --- indices are STABLE across a delete -------------------------------
+    int keep = AnimDocAddString(&doc, "KEEP");          // idx 2
+    int gone = AnimDocAddString(&doc, "GONE");          // idx 3
+    CHECK(keep == 2 && gone == 3);
+    CHECK(AnimDocRemoveString(&doc, 2));                // remove the MIDDLE one
+    CHECK(TextIsEqual(AnimDocStringAt(&doc, 3), "GONE"));  // 3 did NOT shift
+    CHECK(AnimDocStringAt(&doc, 2) == NULL);               // 2 is a hole
+    // a new add reuses the hole rather than growing
+    CHECK(AnimDocAddString(&doc, "REUSED") == 2);
+
+    // --- GC drops unassigned EMPTY entries only ---------------------------
+    int empty = AnimDocAddString(&doc, "");
+    CHECK(empty >= 0);
+    CHECK(AnimDocGCStrings(&doc) == 1);
+    CHECK(AnimDocStringAt(&doc, empty) == NULL);
+    CHECK(TextIsEqual(AnimDocStringAt(&doc, 0), "HELLO"));  // non-empty untouched
+    CHECK(AnimDocGCStrings(&doc) == 0);                     // idempotent
+
+    // --- capacity ---------------------------------------------------------
+    AnimDoc full;
+    AnimDocInit(&full);
+    for (int i = 0; i < ANIM_STRINGS_MAX; i++)
+        CHECK(AnimDocAddString(&full, TextFormat("s%d", i)) == i);
+    CHECK(AnimDocAddString(&full, "overflow") == -1);
+}
+
+// The pool and a string track survive a .cfg round-trip, holes included.
+static void TestStringPoolIO(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration = 4.0f;
+
+    AnimDocAddString(&doc, "FIRST LINE");
+    AnimDocAddString(&doc, "second  with  spaces");
+    int hole = AnimDocAddString(&doc, "DOOMED");
+    AnimDocAddString(&doc, "multi\nline\ntext");
+    CHECK(AnimDocRemoveString(&doc, hole));         // leaves a hole at idx 2
+
+    AnimElem *e = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(e->name, "cap");
+    TextCopy(e->text, "FALLBACK");
+    AnimTrack *tr = AnimElemAddTrack(e, AP_T_STRING);
+    AnimTrackAddKey(tr, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 2.0f, 3.0f, ANIM_EASE_LINEAR);   // index 3, past the hole
+
+    const char *path = "anim_tests_strpool_tmp.cfg";
+    CHECK(AnimDocSave(&doc, path));
+    AnimDoc in;
+    CHECK(AnimDocLoad(&in, path));
+
+    CHECK(in.stringCount == 4);
+    CHECK(TextIsEqual(AnimDocStringAt(&in, 0), "FIRST LINE"));
+    CHECK(TextIsEqual(AnimDocStringAt(&in, 1), "second  with  spaces"));
+    CHECK(AnimDocStringAt(&in, 2) == NULL);              // the hole survived
+    CHECK(TextIsEqual(AnimDocStringAt(&in, 3), "multi\nline\ntext"));
+
+    // and the track still resolves to the right entries
+    CHECK(in.elemCount == 1);
+    CHECK(TextIsEqual(AnimElemTextAt(&in.elems[0], &in, 0.0f), "FIRST LINE"));
+    CHECK(TextIsEqual(AnimElemTextAt(&in.elems[0], &in, 2.0f), "multi\nline\ntext"));
+
+    // a second save is byte-identical (the pool does not churn, holes and all)
+    const char *path2 = "anim_tests_strpool_tmp2.cfg";
+    CHECK(AnimDocSave(&in, path2));
+    FILE *f1 = fopen(path, "rb"), *f2 = fopen(path2, "rb");
+    CHECK(f1 && f2);
+    if (f1 && f2)
+    {
+        int c1, c2, same = 1;
+        do { c1 = fgetc(f1); c2 = fgetc(f2); if (c1 != c2) { same = 0; break; } }
+        while (c1 != EOF);
+        CHECK(same);
+    }
+    if (f1) fclose(f1);
+    if (f2) fclose(f2);
+
+    remove(path); remove(path2);
+
+    // a document with NO pool loads exactly as before
+    AnimDoc old;
+    AnimDocInit(&old);
+    AnimElem *oe = AnimDocAddElem(&old, AE_TEXT);
+    TextCopy(oe->text, "PLAIN OLD");
+    const char *p3 = "anim_tests_strpool_tmp3.cfg";
+    CHECK(AnimDocSave(&old, p3));
+    AnimDoc back;
+    CHECK(AnimDocLoad(&back, p3));
+    CHECK(back.stringCount == 0);
+    CHECK(TextIsEqual(AnimElemTextAt(&back.elems[0], &back, 0.0f), "PLAIN OLD"));
+    remove(p3);
+}
+
+// Clone writes DELTA keys only: an expired element is brought back by copying
+// just the properties that actually differ, which is the whole point (it saves
+// the 16-key / 12-track / 12-element budgets).
+static void TestCloneElemState(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    AnimElem *a = AnimDocAddElem(&doc, AE_TEXT);   // destination
+    AnimElem *b = AnimDocAddElem(&doc, AE_TEXT);   // source
+    TextCopy(a->name, "a"); TextCopy(b->name, "b");
+
+    // Identical rest poses -> nothing differs -> no keys written at all.
+    CHECK(AnimDocCloneElemState(&doc, 0, 2.0f, 1, 0.0f, 0.02f, false) == 0);
+    CHECK(a->trackCount == 0);
+
+    // Give the source a distinct look at t=0: position and colour differ,
+    // size does not.
+    b->posFrac = (Vector2){ 0.75f, 0.25f };
+    b->color   = (Color){ 10, 20, 30, 255 };
+    a->posFrac = (Vector2){ 0.10f, 0.10f };
+    a->color   = (Color){ 99, 99, 99, 255 };
+    a->sizeFrac = b->sizeFrac;                              // same -> no key
+
+    int n = AnimDocCloneElemState(&doc, 0, 2.0f, 1, 0.0f, 0.02f, false);
+    CHECK(n == 3);                                          // pos_x, pos_y, color
+    CHECK(AnimElemFindTrack(a, AP_T_POS_X) != NULL);
+    CHECK(AnimElemFindTrack(a, AP_T_POS_Y) != NULL);
+    CHECK(AnimElemFindTrack(a, AP_T_COLOR) != NULL);
+    CHECK(AnimElemFindTrack(a, AP_T_SIZE)  == NULL);        // unchanged -> untouched
+
+    // The destination now LOOKS like the source did, at the chosen time.
+    CHECK_NEAR(AnimElemProp(a, AP_T_POS_X, 2.0f), 0.75f);
+    CHECK_NEAR(AnimElemProp(a, AP_T_POS_Y, 2.0f), 0.25f);
+    Color ac = AnimElemColorProp(a, AP_T_COLOR, 2.0f);
+    CHECK(ac.r == 10 && ac.g == 20 && ac.b == 30);
+
+    // Re-cloning at the same time is idempotent: keys within eps are OVERWRITTEN
+    // rather than doubled, so repeated use cannot exhaust the key budget.
+    int before = AnimElemFindTrack(a, AP_T_POS_X)->keyCount;
+    CHECK(AnimDocCloneElemState(&doc, 0, 2.0f, 1, 0.0f, 0.02f, false) == 0);  // now equal
+    CHECK(AnimElemFindTrack(a, AP_T_POS_X)->keyCount == before);
+
+    // Cross-kind is a no-op, never corruption.
+    AnimDocAddElem(&doc, AE_SHAPE);
+    CHECK(AnimDocCloneElemState(&doc, 0, 1.0f, 2, 0.0f, 0.02f, false) == 0);
+    CHECK(AnimElemFindTrack(a, AP_S_POS_X) == NULL);        // no shape prop leaked
+
+    // Self-clone onto the SAME instant says nothing and is refused.
+    CHECK(AnimDocCloneElemState(&doc, 0, 2.0f, 0, 2.0f, 0.02f, false) == 0);
+
+    // Onto a different time it copies the element's own pose there. `a` sits at
+    // 0.10 before its t=2 key and 0.75 from it on, so cloning the EARLY pose
+    // forward is a real change and brings the old look back.
+    CHECK(AnimDocCloneElemState(&doc, 0, 5.0f, 0, 0.0f, 0.02f, false) > 0);
+    CHECK_NEAR(AnimElemProp(a, AP_T_POS_X, 5.0f), 0.10f);   // its own t=0 pose
+    CHECK_NEAR(AnimElemProp(a, AP_T_POS_X, 2.0f), 0.75f);   // the t=2 key survived
+}
+
+// A property with no track must keep what it already showed. A lone key would
+// override the element's base value across the WHOLE timeline, so a fresh track
+// is anchored at 0 - this is not a string-only concern.
+static void TestClonePreservesBase(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    AnimElem *a = AnimDocAddElem(&doc, AE_TEXT);            // destination
+    AnimElem *b = AnimDocAddElem(&doc, AE_TEXT);            // source
+    a->posFrac = (Vector2){ 0.10f, 0.50f };
+    b->posFrac = (Vector2){ 0.90f, 0.50f };
+    a->color = b->color; a->sizeFrac = b->sizeFrac;
+
+    CHECK(AnimDocCloneElemState(&doc, 0, 4.0f, 1, 0.0f, 0.02f, false) == 1);
+
+    // The original property survives at the start rather than being replaced.
+    CHECK_NEAR(AnimElemProp(a, AP_T_POS_X, 0.0f), 0.10f);
+    CHECK_NEAR(AnimElemProp(a, AP_T_POS_X, 4.0f), 0.90f);
+    CHECK_NEAR(AnimElemProp(a, AP_T_POS_X, 2.0f), 0.50f);   // interpolated between
+
+    // With holdBefore the old pose is pinned right up to the clone, so the
+    // change is a step: mid-way still reads the ORIGINAL value.
+    AnimDoc d2;
+    AnimDocInit(&d2);
+    AnimElem *c = AnimDocAddElem(&d2, AE_TEXT);
+    AnimElem *d = AnimDocAddElem(&d2, AE_TEXT);
+    c->posFrac = (Vector2){ 0.10f, 0.50f };
+    d->posFrac = (Vector2){ 0.90f, 0.50f };
+    c->color = d->color; c->sizeFrac = d->sizeFrac;
+
+    CHECK(AnimDocCloneElemState(&d2, 0, 4.0f, 1, 0.0f, 0.02f, true) == 1);
+    CHECK_NEAR(AnimElemProp(c, AP_T_POS_X, 2.0f), 0.10f);   // held, not sliding
+    CHECK_NEAR(AnimElemProp(c, AP_T_POS_X, 4.0f), 0.90f);   // and the clone landed
+    CHECK(AnimElemFindTrack(c, AP_T_POS_X)->keyCount == 3); // anchor + hold + clone
+}
+
+// Cloning TEXT must write a string KEY, never overwrite the element's words for
+// the whole timeline: the destination says its old thing before the clone time
+// and the source's thing from it onwards. This is the whole point of the words
+// being a tracked property.
+static void TestCloneText(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    AnimElem *a = AnimDocAddElem(&doc, AE_TEXT);            // destination
+    AnimElem *b = AnimDocAddElem(&doc, AE_TEXT);            // source
+    TextCopy(a->text, "BEFORE");
+    TextCopy(b->text, "AFTER");
+    a->posFrac = b->posFrac; a->color = b->color;           // only words differ
+
+    int n = AnimDocCloneElemState(&doc, 0, 1.0f, 1, 0.0f, 0.02f, false);
+    CHECK(n == 1);                                          // exactly the string key
+    CHECK(AnimElemFindTrack(a, AP_T_STRING) != NULL);
+
+    // The source's words were pooled so a key could point at them.
+    CHECK(AnimDocFindString(&doc, "AFTER") >= 0);
+
+    // Before the key the element keeps its own words; from the key on, the
+    // cloned ones. The base text is NOT clobbered.
+    CHECK(TextIsEqual(AnimElemTextAt(a, &doc, 0.5f), "BEFORE"));
+    CHECK(TextIsEqual(AnimElemTextAt(a, &doc, 1.0f), "AFTER"));
+    CHECK(TextIsEqual(AnimElemTextAt(a, &doc, 9.0f), "AFTER"));
+    CHECK(TextIsEqual(a->text, "BEFORE"));
+
+    // Stepped, so mid-segment is a whole string, never a blend of two indices.
+    int at2 = AnimDocAddString(&doc, "THIRD");
+    AnimTrackAddKey(AnimElemFindTrack(a, AP_T_STRING), 3.0f, (float)at2,
+                    ANIM_EASE_LINEAR);
+    CHECK(TextIsEqual(AnimElemTextAt(a, &doc, 2.0f), "AFTER"));
+    CHECK(TextIsEqual(AnimElemTextAt(a, &doc, 3.0f), "THIRD"));
+
+    // Re-cloning is a no-op now that the words already match at that time.
+    CHECK(AnimDocCloneElemState(&doc, 0, 1.0f, 1, 0.0f, 0.02f, false) == 0);
+
+    // Two elements wanting the same words SHARE one pool entry rather than
+    // spending a second slot - the pool is 24 wide and the point is reuse.
+    AnimElem *c = AnimDocAddElem(&doc, AE_TEXT);
+    c->posFrac = b->posFrac; c->color = b->color;
+    TextCopy(c->text, "OTHER");
+    int shared = AnimDocFindString(&doc, "AFTER");
+    int usersBefore = AnimDocStringUsers(&doc, shared);
+    CHECK(AnimDocCloneElemState(&doc, 2, 1.0f, 1, 0.0f, 0.02f, false) == 1);
+    CHECK(AnimDocStringUsers(&doc, shared) == usersBefore + 1);  // shared, not copied
+    CHECK(TextIsEqual(AnimElemTextAt(c, &doc, 1.0f), "AFTER"));
+    CHECK(TextIsEqual(AnimElemTextAt(c, &doc, 0.5f), "OTHER"));  // its own words held
+}
+
+// A NEW string key must carry the words the element already shows. Seeding it
+// the way every other property is seeded writes the -1 "no pool entry" base
+// value, and the key then resolves to nothing - the editor's "(missing string)".
+static void TestStringIdxAt(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    AnimElem *a = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(a->text, "HELLO");
+
+    // No track yet: the element's own words join the pool and that index is it.
+    int i0 = AnimDocStringIdxAt(&doc, a, 0.0f);
+    CHECK(i0 >= 0);
+    CHECK(TextIsEqual(AnimDocStringAt(&doc, i0), "HELLO"));
+
+    // Idempotent - asking twice must not spend a second slot.
+    int used = doc.stringCount;
+    CHECK(AnimDocStringIdxAt(&doc, a, 2.0f) == i0);
+    CHECK(doc.stringCount == used);
+
+    // With a track it resolves THROUGH it, per time, not from keys[0].
+    AnimTrack *tr = AnimElemAddTrack(a, AP_T_STRING);
+    int i1 = AnimDocAddString(&doc, "WORLD");
+    AnimTrackAddKey(tr, 0.0f, (float)i0, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 5.0f, (float)i1, ANIM_EASE_LINEAR);
+    CHECK(AnimDocStringIdxAt(&doc, a, 1.0f) == i0);
+    CHECK(AnimDocStringIdxAt(&doc, a, 5.0f) == i1);
+    CHECK(AnimDocStringIdxAt(&doc, a, 9.0f) == i1);     // holds past the last key
+
+    // A stale index (its entry deleted) degrades to the element's own words
+    // rather than resolving to nothing.
+    AnimElem *b = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(b->text, "OWN");
+    AnimTrack *bt = AnimElemAddTrack(b, AP_T_STRING);
+    AnimTrackAddKey(bt, 0.0f, 999.0f, ANIM_EASE_LINEAR);   // points nowhere
+    int ib = AnimDocStringIdxAt(&doc, b, 0.0f);
+    CHECK(TextIsEqual(AnimDocStringAt(&doc, ib), "OWN"));
+
+    // A non-text element has no words to pool.
+    AnimElem *s = AnimDocAddElem(&doc, AE_SHAPE);
+    CHECK(AnimDocStringIdxAt(&doc, s, 0.0f) == -1);
+}
+
+// Two string keys at different times: the words SNAP at each key and hold, with
+// no blend between two pool indices anywhere in the segment.
+static void TestStringKeysStep(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    AnimElem *a = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(a->text, "ONE");
+
+    int i0 = AnimDocAddString(&doc, "ONE");
+    int i1 = AnimDocAddString(&doc, "TWO");
+    CHECK(i0 != i1);
+    AnimTrack *tr = AnimElemAddTrack(a, AP_T_STRING);
+    AnimTrackAddKey(tr, 0.0f, (float)i0, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 4.0f, (float)i1, ANIM_EASE_LINEAR);
+
+    CHECK(TextIsEqual(AnimElemTextAt(a, &doc, 0.0f), "ONE"));
+    CHECK(TextIsEqual(AnimElemTextAt(a, &doc, 3.9f), "ONE"));   // right up to it
+    CHECK(TextIsEqual(AnimElemTextAt(a, &doc, 4.0f), "TWO"));
+    CHECK(TextIsEqual(AnimElemTextAt(a, &doc, 8.0f), "TWO"));
+
+    // Every sample across the segment is one of the two entries - never an
+    // index between them, which is what interpolation would produce.
+    for (int i = 0; i <= 40; i++)
+    {
+        float t = (float)i * 0.1f;
+        int   v = (int)(AnimElemProp(a, AP_T_STRING, t) + 0.5f);
+        CHECK(v == i0 || v == i1);
+    }
+
+    // Round-tripping through the file keeps both keys pointing where they did.
+    const char *path = "/tmp/zen_string_keys_test.cfg";
+    CHECK(AnimDocSave(&doc, path));
+    AnimDoc rd;
+    AnimDocInit(&rd);
+    CHECK(AnimDocLoad(&rd, path));
+    CHECK(rd.elemCount == 1);
+    CHECK(TextIsEqual(AnimElemTextAt(&rd.elems[0], &rd, 1.0f), "ONE"));
+    CHECK(TextIsEqual(AnimElemTextAt(&rd.elems[0], &rd, 5.0f), "TWO"));
+    remove(path);
+}
+
+
 static void TestMoveDuplicateElem(void)
 {
     AnimDoc doc;
@@ -907,6 +1298,99 @@ static void TestIOSignalGroupTargets(void)
 
 // Intro/outro trim: accessors clamp, the section round-trips through .cfg, and
 // a looping player replays [introEnd, outroStart) after its first pass.
+// Pause markers: sorted insert, the crossing query the runtime and the editor
+// share, retiming, and a .cfg round-trip.
+static void TestPauseMarkers(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration = 10.0f;
+
+    // inserted out of order, stored ascending
+    CHECK(AnimDocAddPause(&doc, 4.0f, 0.01f) != NULL);
+    CHECK(AnimDocAddPause(&doc, 1.0f, 0.01f) != NULL);
+    CHECK(AnimDocAddPause(&doc, 7.0f, 0.01f) != NULL);
+    CHECK(doc.pauseCount == 3);
+    CHECK_NEAR(doc.pauses[0].t, 1.0f);
+    CHECK_NEAR(doc.pauses[1].t, 4.0f);
+    CHECK_NEAR(doc.pauses[2].t, 7.0f);
+
+    // a marker already within eps wins: no invisible duplicates
+    CHECK(AnimDocAddPause(&doc, 4.005f, 0.01f) == NULL);
+    CHECK(doc.pauseCount == 3);
+    CHECK(AnimDocPauseAt(&doc, 4.005f, 0.01f) == 1);
+    CHECK(AnimDocPauseAt(&doc, 5.0f, 0.01f) == -1);
+
+    // crossing is half-open (from, to]: a marker exactly AT `from` was already
+    // served, so resuming from it must not re-fire it.
+    CHECK(AnimDocNextPause(&doc, 0.0f, 2.0f) == 0);
+    CHECK(AnimDocNextPause(&doc, 1.0f, 3.0f) == -1);        // at `from` -> skipped
+    CHECK(AnimDocNextPause(&doc, 1.0f, 4.0f) == 1);         // at `to`   -> caught
+    CHECK(AnimDocNextPause(&doc, 0.0f, 9.0f) == 0);         // earliest wins
+    CHECK(AnimDocNextPause(&doc, 8.0f, 9.0f) == -1);
+    CHECK(AnimDocNextPause(&doc, 5.0f, 5.0f) == -1);        // empty range
+
+    // retiming keeps the array sorted and reports the new slot
+    int ni = AnimDocSetPauseTime(&doc, 0, 6.0f);            // 1 -> 6: now middle
+    CHECK(ni == 1);
+    CHECK_NEAR(doc.pauses[0].t, 4.0f);
+    CHECK_NEAR(doc.pauses[1].t, 6.0f);
+    CHECK_NEAR(doc.pauses[2].t, 7.0f);
+    CHECK(AnimDocSetPauseTime(&doc, 99, 1.0f) == -1);       // bad index: no-op
+
+    doc.pauses[1].once = true;
+
+    // round-trip, including the optional `once` flag
+    const char *path = "anim_tests_pause_tmp.cfg";
+    CHECK(AnimDocSave(&doc, path));
+    AnimDoc in;
+    CHECK(AnimDocLoad(&in, path));
+    CHECK(in.pauseCount == 3);
+    CHECK_NEAR(in.pauses[0].t, 4.0f);
+    CHECK_NEAR(in.pauses[1].t, 6.0f);
+    CHECK_NEAR(in.pauses[2].t, 7.0f);
+    CHECK(!in.pauses[0].once && in.pauses[1].once && !in.pauses[2].once);
+    remove(path);
+
+    // capacity is a hard stop, not an overrun
+    AnimDocInit(&doc);
+    for (int i = 0; i < ANIM_PAUSES_MAX; i++)
+        CHECK(AnimDocAddPause(&doc, (float)i, 0.01f) != NULL);
+    CHECK(doc.pauseCount == ANIM_PAUSES_MAX);
+    CHECK(AnimDocAddPause(&doc, 99.0f, 0.01f) == NULL);
+    CHECK(doc.pauseCount == ANIM_PAUSES_MAX);
+
+    AnimDocRemovePause(&doc, 0);
+    CHECK(doc.pauseCount == ANIM_PAUSES_MAX - 1);
+    CHECK_NEAR(doc.pauses[0].t, 1.0f);                      // shifted down
+
+    // a doc with no markers behaves exactly as before
+    AnimDocInit(&doc);
+    CHECK(AnimDocNextPause(&doc, 0.0f, 100.0f) == -1);
+}
+
+// AnimPlayerSeek parks the clock on an exact doc time, in both directions.
+static void TestPlayerSeek(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration = 10.0f;
+    doc.outroStart = 10.0f;
+
+    AnimPlayer p = {0};
+    AnimPlayerStartAll(&p, &doc, ANIM_FWD);
+    AnimPlayerSeek(&p, 3.5f);
+    CHECK_NEAR(AnimPlayerSampleTime(&p), 3.5f);
+    AnimPlayerSeek(&p, -5.0f);                              // clamped low
+    CHECK_NEAR(AnimPlayerSampleTime(&p), 0.0f);
+    AnimPlayerSeek(&p, 99.0f);                              // clamped high
+    CHECK_NEAR(AnimPlayerSampleTime(&p), 10.0f);
+
+    AnimPlayerStartAll(&p, &doc, ANIM_REV);
+    AnimPlayerSeek(&p, 3.5f);
+    CHECK_NEAR(AnimPlayerSampleTime(&p), 3.5f);             // inverse holds
+}
+
 static void TestTrim(void)
 {
     AnimDoc doc;
@@ -1318,6 +1802,99 @@ static void WriteStageAnim(const char *name, bool terminal)
 
     if (!DirectoryExists("anims")) MakeDirectory("anims");
     AnimDocSave(&doc, TextFormat("anims/%s.cfg", name));
+}
+
+// Write a stage anim carrying a pause marker at `pauseT`.
+static void WritePauseAnim(const char *name, float pauseT, bool once, bool terminal)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    doc.duration   = 2.0f;
+    doc.introEnd   = 0.0f;
+    doc.outroStart = 2.0f;
+
+    AnimElem *e = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(e->name, "a");
+    AnimTrack *tr = AnimElemAddTrack(e, AP_T_ALPHA);
+    AnimTrackAddKey(tr, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 2.0f, 1.0f, ANIM_EASE_LINEAR);
+
+    AnimPause *p = AnimDocAddPause(&doc, pauseT, 0.01f);
+    if (p) p->once = once;
+
+    doc.signalCount = 1;
+    AnimSignal *sg = &doc.signals[0];
+    TextCopy(sg->name, "pause_sig");
+    sg->length      = 1.0f;
+    sg->terminal    = terminal;
+    sg->targetCount = 1;
+    sg->targets[0] = (AnimSigTarget){0};
+    sg->targets[0].elemIdx  = 0;
+    sg->targets[0].prop     = AP_T_ALPHA;
+    sg->targets[0].keyCount = 1;
+    sg->targets[0].keys[0]  = (AnimKey){ 1.0f, 0.0f, (Color){0,0,0,0}, ANIM_EASE_LINEAR };
+
+    if (!DirectoryExists("anims")) MakeDirectory("anims");
+    AnimDocSave(&doc, TextFormat("anims/%s.cfg", name));
+}
+
+// The runtime hold. Headless, GetKeyPressed() always returns 0, so a paused
+// instance stays paused for the whole test - which is exactly what makes the
+// isolation assertions below meaningful.
+static void TestStagePause(void)
+{
+    SignalReset();
+    AnimStageReset();
+    WritePauseAnim("_test_pause", 1.0f, false, false);
+    WriteStageAnim("_test_nopause", false);
+
+    // --- playback holds ON the marker, not past it ------------------------
+    AnimHandle h = AnimStagePlay("_test_pause", true, 0);
+    CHECK(h != ANIM_HANDLE_NONE);
+    CHECK(!AnimStagePaused(h));
+    for (int i = 0; i < 40; i++) AnimStageUpdate(0.05f);   // 2s >> the 1s marker
+    CHECK(AnimStagePaused(h));
+    CHECK(AnimStageAlive(h));                    // held, NOT finished
+
+    // it stays held for as long as no key arrives, and never runs out
+    for (int i = 0; i < 200; i++) AnimStageUpdate(0.05f);
+    CHECK(AnimStagePaused(h));
+    CHECK(AnimStageAlive(h));
+
+    // --- ISOLATION: a second instance is untouched by the first's hold ----
+    AnimHandle other = AnimStagePlay("_test_nopause", false, 0);
+    CHECK(other != ANIM_HANDLE_NONE);
+    CHECK(!AnimStagePaused(other));
+    for (int i = 0; i < 60; i++) AnimStageUpdate(0.05f);   // 3s > its 2s length
+    CHECK(!AnimStageAlive(other));               // ran to completion while h held
+    CHECK(AnimStagePaused(h));                   // and h is still holding
+
+    // --- ISOLATION: a signal keeps running on the PAUSED instance ---------
+    // A signal plays on its own clock as an override, so a doc-clock hold must
+    // not stall it. Terminal here, so completing it must still end the instance.
+    AnimStageStopAll();
+    WritePauseAnim("_test_pause_term", 1.0f, false, true);
+    AnimHandle t = AnimStagePlay("_test_pause_term", true, 0);
+    for (int i = 0; i < 40; i++) AnimStageUpdate(0.05f);
+    CHECK(AnimStagePaused(t));                   // parked on the marker
+
+    SignalEmit("pause_sig", NULL);
+    CHECK(AnimStageEndsOnCurrentSignal(t));      // the signal armed a shutdown
+    AnimStageUpdate(0.5f);                       // half the 1.0s signal
+    CHECK(AnimStageAlive(t));                    // not cut off mid-transition
+    for (int i = 0; i < 20; i++) AnimStageUpdate(0.05f);
+    CHECK(!AnimStageAlive(t));                   // signal ran to its end and ended
+                                                 // it, THROUGH the pause
+    // --- a doc with no markers never pauses -------------------------------
+    AnimStageStopAll();
+    AnimHandle n = AnimStagePlay("_test_nopause", true, 0);
+    for (int i = 0; i < 200; i++) AnimStageUpdate(0.05f);
+    CHECK(AnimStageAlive(n) && !AnimStagePaused(n));
+
+    AnimStageStopAll();
+    remove("anims/_test_pause.cfg");
+    remove("anims/_test_pause_term.cfg");
+    remove("anims/_test_nopause.cfg");
 }
 
 static void TestStage(void)
@@ -2282,6 +2859,13 @@ int main(void)
     TestDoc();
     TestRemoveTrack();
     TestMoveDuplicateElem();
+    TestCloneElemState();
+    TestClonePreservesBase();
+    TestCloneText();
+    TestStringIdxAt();
+    TestStringKeysStep();
+    TestStringPool();
+    TestStringPoolIO();
     TestIO();
     TestIOOldFormat();
     TestAuthoringFlags();
@@ -2291,6 +2875,8 @@ int main(void)
     TestSignalSeqStepIO();
     TestGroupCoverage();
     TestTrim();
+    TestPauseMarkers();
+    TestPlayerSeek();
     TestIOIdempotent();
     TestIOSignalOrphanTarget();
     TestIOSignalGroupTargets();
@@ -2299,6 +2885,7 @@ int main(void)
     TestSignalTargetRemap();
     TestSignalTerminalIO();
     TestStage();
+    TestStagePause();
     TestSignalPosParam();
     TestSignalPosCorner();
     TestSignalPosAnchor();

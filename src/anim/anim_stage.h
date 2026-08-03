@@ -36,6 +36,14 @@
 //  winds down through the authored transition instead of being cut off. Both
 //  one-shot and looping playback can run signals.
 //
+//  PAUSE MARKERS. A document can carry timed holds (AnimDoc.pauses, authored on
+//  the editor's timeline): when playback crosses one, THIS instance's doc clock
+//  freezes on it until the viewer presses a key. The hold is strictly local -
+//  every other slot keeps updating, and a signal already running on the paused
+//  instance keeps running too (it plays on its own clock as an override, so a
+//  terminal signal can still end the instance mid-hold). AnimStagePaused tells a
+//  held instance apart from a finished one.
+//
 //  Fixed capacity, no heap, singleton house style (AnimStageReset alongside
 //  SignalReset in main.c).
 // ============================================================================
@@ -95,6 +103,12 @@ void AnimStageStopAll(void);
 
 // Is this instance still playing?
 bool AnimStageAlive(AnimHandle h);
+
+// Is this instance HELD on a pause marker (AnimPause), waiting for a keypress?
+// A paused instance is still alive - this is what tells "waiting for the viewer"
+// apart from "finished". The hold is local to this instance: other animations
+// keep playing, and a signal already running on this one keeps playing too.
+bool AnimStagePaused(AnimHandle h);
 
 // Call `fn(user)` once, when this instance stops - whether it ran out, was
 // ended by a terminal signal, or was stopped explicitly. Ignored for a handle
