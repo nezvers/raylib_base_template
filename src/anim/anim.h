@@ -43,11 +43,11 @@
 //  Measured sizes at the current values (x86-64; 4-byte float/int, Color = 4B):
 //
 //      AnimKey            16 B
-//      AnimTrack         264 B   =  16 keys x 16 B  + prop/count
-//      AnimElem        3,312 B   =  12 tracks x 264 B + base props
+//      AnimTrack         384 B   =  24 keys x 16 B  + prop/count
+//      AnimElem        4,608 B   =  12 tracks x 384 B + base props
 //      AnimSigTarget     140 B   =   8 keys x 16 B  + idx/prop/count
 //      AnimSignal      4,524 B   =  32 targets x 140 B + name/length/terminal
-//      AnimDoc        57,876 B   =  12 elems x 3,312 B + 4 signals x 4,524 B
+//      AnimDoc        59,172 B   =  12 elems x 4,608 B + 4 signals x 4,524 B
 //                                =  ~57 KB
 //
 //  WHICH KNOBS COST THE MOST, per +1 of each (all else unchanged):
@@ -82,7 +82,7 @@
 #define ANIM_TEXT_LEN_MAX 512   // a TEXT element's string buffer (multi-line:
                                 // holds ~8 lines; see the x24 note above -
                                 // this one costs ~129 KB across the build)
-#define ANIM_KEYS_MAX      16   // keyframes per track (deepest nesting: this
+#define ANIM_KEYS_MAX      24   // keyframes per track (deepest nesting: this
                                 // one multiplies by tracks AND elems)
 #define ANIM_TRACKS_MAX    12   // tracks (animated properties) per element
                                 // (>= the largest per-kind property count, so
