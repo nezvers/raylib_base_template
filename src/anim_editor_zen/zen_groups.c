@@ -147,6 +147,51 @@ void ZenGroupDeleteKeyAt(AnimElem *e, int gi, float t)
     }
 }
 
+// Copy the member key at srcT onto dstT, verbatim - value, colour AND ease.
+// Unlike ZenGroupWriteKey this does NOT sample the element at the destination:
+// the point of a clone is to restate an earlier pose exactly, so an eased
+// segment running through dstT must not bleed into the copy. Members with no
+// key at srcT are left alone; a group key is the union of its members, so a
+// partial group clones partially - the same shape it had at the source.
+// Returns true when at least one member key was written.
+bool ZenGroupCloneKeyTo(AnimElem *e, int gi, float srcT, float dstT)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    if (!g || fabsf(srcT - dstT) <= ZEN_AUTOKEY_EPS) return false;
+
+    bool any = false;
+    for (int m = 0; m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        int k = tr ? KeyIndexNear(tr->keys, tr->keyCount, sizeof(AnimKey),
+                                  srcT, ZEN_AUTOKEY_EPS) : -1;
+        if (k < 0) continue;
+        AnimKey src = tr->keys[k];              // by value: the write below
+                                                // inserts and shifts the array.
+        AnimKey *dst = AnimPropIsColor(g->props[m])
+                     ? AnimTrackWriteColorKeyAt(tr, dstT, src.cval, ZEN_AUTOKEY_EPS)
+                     : AnimTrackWriteKeyAt(tr, dstT, src.value, ZEN_AUTOKEY_EPS);
+        if (!dst) continue;                     // track full
+        dst->value = src.value;                 // colour keys carry both
+        dst->cval  = src.cval;
+        dst->ease  = src.ease;
+        any = true;
+    }
+    return any;
+}
+
+// The group key at or before t, excluding one sitting on t itself. -1 when the
+// group has nothing to the left (its first key is later than t).
+float ZenGroupKeyTimeLeftOf(AnimElem *e, int gi, float t)
+{
+    float times[ZEN_GROUP_TIMES_MAX];
+    int n = ZenGroupKeyTimes(e, gi, times);
+    float best = -1.0f;
+    for (int i = 0; i < n; i++)
+        if (times[i] < t - ZEN_AUTOKEY_EPS && times[i] > best) best = times[i];
+    return best;
+}
+
 void ZenGroupMoveKeyTo(AnimElem *e, int gi, float oldT, float newT)
 {
     const AnimPropGroup *g = AnimGroupAt(e->kind, gi);

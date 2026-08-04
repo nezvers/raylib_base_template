@@ -326,6 +326,11 @@ void  ZenGroupWriteKey(AnimElem *e, int gi, float t);     // key every member
 void  ZenGroupDeleteTracks(AnimElem *e, int gi);
 void  ZenGroupDeleteKeyAt(AnimElem *e, int gi, float t);
 void  ZenGroupMoveKeyTo(AnimElem *e, int gi, float oldT, float newT);
+// Restate the group key at srcT verbatim (value, colour and ease) at dstT,
+// rather than sampling the element there the way ZenGroupWriteKey does.
+bool  ZenGroupCloneKeyTo(AnimElem *e, int gi, float srcT, float dstT);
+// Time of the nearest group key strictly before t, or -1 when there is none.
+float ZenGroupKeyTimeLeftOf(AnimElem *e, int gi, float t);
 void  ZenGroupSetEaseAt(AnimElem *e, int gi, float t, int ease);
 int   ZenGroupEase(AnimElem *e, int gi, float t);         // representative ease
 int   ZenGroupColorProp(int kind, int gi);                // colour member or -1
