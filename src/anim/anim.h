@@ -43,11 +43,11 @@
 //  Measured sizes at the current values (x86-64; 4-byte float/int, Color = 4B):
 //
 //      AnimKey            16 B
-//      AnimTrack         264 B   =  16 keys x 16 B  + prop/count
-//      AnimElem        3,312 B   =  12 tracks x 264 B + base props
+//      AnimTrack         384 B   =  24 keys x 16 B  + prop/count
+//      AnimElem        4,608 B   =  12 tracks x 384 B + base props
 //      AnimSigTarget     140 B   =   8 keys x 16 B  + idx/prop/count
 //      AnimSignal      4,524 B   =  32 targets x 140 B + name/length/terminal
-//      AnimDoc        57,876 B   =  12 elems x 3,312 B + 4 signals x 4,524 B
+//      AnimDoc        59,172 B   =  12 elems x 4,608 B + 4 signals x 4,524 B
 //                                =  ~57 KB
 //
 //  WHICH KNOBS COST THE MOST, per +1 of each (all else unchanged):
@@ -79,8 +79,10 @@
 //    printf("%zu\n", sizeof(AnimDoc));
 // ---------------------------------------------------------------------------
 #define ANIM_NAME_MAX      32   // element / signal / doc name buffer
-#define ANIM_TEXT_LEN_MAX  64   // a TEXT element's string buffer
-#define ANIM_KEYS_MAX      16   // keyframes per track (deepest nesting: this
+#define ANIM_TEXT_LEN_MAX 512   // a TEXT element's string buffer (multi-line:
+                                // holds ~8 lines; see the x24 note above -
+                                // this one costs ~129 KB across the build)
+#define ANIM_KEYS_MAX      24   // keyframes per track (deepest nesting: this
                                 // one multiplies by tracks AND elems)
 #define ANIM_TRACKS_MAX    12   // tracks (animated properties) per element
                                 // (>= the largest per-kind property count, so
@@ -88,6 +90,22 @@
 #define ANIM_ELEMS_MAX     12   // elements per document
 #define ANIM_SIGNALS_MAX    4   // signals per document (a signal is the single
                                 // largest sub-struct, ~3.4 KB each)
+#define ANIM_PAUSES_MAX    12   // pause markers per document. Cheap next to the
+                                // rest: 12 x 8 B = 96 B per doc, ~2.3 KB across
+                                // the x24 copies noted above.
+#define ANIM_STRINGS_MAX   24   // shared text strings per document (see
+                                // AnimString). 24 x 512 B = 12 KB/doc, which is
+                                // +0.28 MB across the build - the price of
+                                // ANIMATED TEXT.
+                                //
+                                // WHY A POOL AND NOT A STRING PER KEY: AnimKey
+                                // is 16 B and sits at the DEEPEST nesting
+                                // (keys x tracks x elems x ~24). Giving it a
+                                // 512 B buffer measures at 28.3 MB across the
+                                // build, because every key of every track would
+                                // carry a field only text tracks use. Storing
+                                // the string ONCE here and keying its INDEX
+                                // keeps AnimKey at 16 B.
 
 // Seconds of smooth-loop blend a document gets when nothing says otherwise -
 // new documents and .cfg files written before the field existed (see
@@ -131,6 +149,11 @@ typedef enum {
     AP_T_ROT,           // whole-text rotation, degrees
     AP_T_CRUMBLE,       // 0..1 per-glyph crumble amount (0 = intact)
     AP_T_COLOR,         // RGBA tint; keys use AnimKey.cval, not value
+    AP_T_STRING,        // WHICH STRING is shown: the key's value is an INDEX
+                        // into AnimDoc.strings (see AnimString). STEPPED, never
+                        // interpolated - there is no midpoint between two
+                        // strings, so the left key's string holds until the next
+                        // key SNAPS to the new one (AnimPropIsStepped).
 
     // SHAPE (100..) ---------------------------------------------------------
     AP_S_POS_X = 100,   // shape center X, fraction of game width
@@ -375,6 +398,36 @@ typedef struct {
     int              seqKeyCount;
 } AnimSignal;
 
+// One shared text string. TEXT elements point at these instead of each owning
+// their words, which is what lets a string CHANGE during an animation: an
+// AP_T_STRING track keys the INDEX, and the pool holds the text itself (see
+// ANIM_STRINGS_MAX for why it cannot live on the key).
+//
+// Strings are SHARED on purpose: two elements assigned the same entry both
+// follow an edit to it. The editor shows each entry's usage count so that is
+// never a surprise, and refuses to delete one still in use.
+typedef struct {
+    char text[ANIM_TEXT_LEN_MAX];
+    bool used;                  // slot occupied (a hole left by a delete is not)
+} AnimString;
+
+// A HOLD on the document clock. When playback crosses `t` the timeline stops
+// there and the pose freezes, until the viewer presses any key (see
+// AnimStageUpdate) - the way a story beat waits for the reader.
+//
+// A pause is deliberately NOT a signal: a signal is emit-driven and there are
+// only ANIM_SIGNALS_MAX of them, whereas "hold at this moment" is a property of
+// the timeline itself. It is also strictly per-instance: a paused animation
+// holds ONLY its own clock, so anything else playing beside it keeps running,
+// and a signal already in flight on the same instance keeps running too (a
+// signal plays on its own clock as an override - see AnimSignalPlayer).
+typedef struct {
+    float t;        // doc-clock seconds
+    bool  once;     // true  = holds on the FIRST pass only (later loop cycles
+                    //         run straight through)
+                    // false = holds on every cycle
+} AnimPause;
+
 // One animation document = the unit the editor edits and the .cfg stores.
 typedef struct {
     char       name[ANIM_NAME_MAX];
@@ -402,6 +455,18 @@ typedef struct {
     int        elemCount;
     AnimSignal signals[ANIM_SIGNALS_MAX];
     int        signalCount;
+
+    // Pause markers, kept ASCENDING in t (AnimDocAddPause / AnimDocSetPauseTime
+    // maintain that, and AnimDocNextPause relies on it).
+    AnimPause  pauses[ANIM_PAUSES_MAX];
+    int        pauseCount;
+
+    // Shared text strings. INDICES INTO THIS ARRAY ARE STABLE: an AP_T_STRING
+    // key stores one, so removing an entry leaves a hole (used = false) rather
+    // than shifting its neighbours out from under every track that points at
+    // them. `stringCount` is the high-water mark, not the number in use.
+    AnimString strings[ANIM_STRINGS_MAX];
+    int        stringCount;
 } AnimDoc;
 
 // ---------------------------------------------------------------------------
@@ -445,6 +510,12 @@ AnimKey *AnimTrackWriteColorKeyAt(AnimTrack *tr, float t, Color c, float eps);
 
 // True for the AP_*_COLOR properties (keys carry cval instead of value).
 bool AnimPropIsColor(int prop);
+
+// True for properties that SNAP instead of easing: the left key's value holds
+// for the whole segment and the right key takes over at its own time. Only
+// AP_T_STRING today - you cannot be half-way between two strings. Named here so
+// the rule lives in ONE place; everything that interpolates must consult it.
+bool AnimPropIsStepped(int prop);
 
 // Editor slider range for a property (e.g. fractions 0..1, rotation -360..360).
 float AnimPropMin(int prop);
@@ -491,6 +562,101 @@ Color AnimElemColor(const AnimElem *e, float t);
 // Value of property `prop` on element e at time t. If e has no track for prop,
 // returns the element's BASE value for that property (rest pose).
 float AnimElemProp(const AnimElem *e, int prop, float t);
+
+// CLONE: write keys on element `dstIdx` at time `dstT` so it LOOKS like element
+// `srcIdx` does at time `srcT`. Only properties whose values actually DIFFER get
+// a key (delta keys), so a reused element costs the minimum of the 16-key and
+// 12-track budgets - this is what lets an expired text/shape block be brought
+// back later instead of spending one of the 12 element slots on a near-copy.
+//
+// Reads are the authored ones (no signal override, no loop blend), and a track
+// is created on demand. Both elements must be the SAME KIND: the AP_* ranges are
+// disjoint per kind, so a cross-kind clone has nothing to copy and returns 0.
+// `eps` is the playhead-to-key snap - a key already within eps of dstT is
+// overwritten rather than doubled (same rule as auto-key).
+//
+// dstIdx MAY equal srcIdx: cloning from itself copies the element's own pose at
+// srcT onto dstT, which is how a look is brought back later. The two times must
+// then differ by more than eps.
+//
+// A newly created track always gets a key at 0 holding what the element showed
+// before, so the clone changes the element AT dstT rather than everywhere - a
+// lone key would otherwise override the base value across the whole timeline.
+//
+// `holdBefore` additionally writes the destination's pre-clone pose just before
+// dstT, making the change a step instead of a slide from the previous key.
+//
+// Returns the number of keys written, or -1 if a track or key capacity ran out
+// part-way through. Nothing is rolled back on -1, so push undo before calling.
+// NOTE: base-only state with no track (a shape's shapeKind) is NOT touched - the
+// caller decides whether to copy it. A text element's words ARE tracked
+// (AP_T_STRING) and travel as a key like everything else.
+int AnimDocCloneElemState(AnimDoc *doc, int dstIdx, float dstT,
+                          int srcIdx, float srcT, float eps, bool holdBefore);
+
+// ---------------------------------------------------------------------------
+//  String pool (see AnimString). Indices are STABLE - a delete leaves a hole.
+// ---------------------------------------------------------------------------
+// Add `text` to the pool and return its index. An identical string already in
+// the pool is REUSED rather than duplicated (that is what makes typing into the
+// inspector idempotent). Returns -1 when every slot is taken.
+int AnimDocAddString(AnimDoc *doc, const char *text);
+
+// Index of an exactly-matching entry, or -1.
+int AnimDocFindString(const AnimDoc *doc, const char *text);
+
+// The entry at `idx`, or NULL when the index is out of range or a hole. Callers
+// treat NULL as "fall back to the element's own text" - a stale reference must
+// degrade, never blank the element.
+const char *AnimDocStringAt(const AnimDoc *doc, int idx);
+
+// How many AP_T_STRING keys across the document point at `idx`. Drives the
+// editor's usage count and its refusal to delete an entry still in use.
+int AnimDocStringUsers(const AnimDoc *doc, int idx);
+
+// Free the entry at `idx`. Refuses (returns false) while it is still in use -
+// call AnimDocStringUsers first if you want to report why.
+bool AnimDocRemoveString(AnimDoc *doc, int idx);
+
+// Drop every EMPTY entry nothing points at. Housekeeping for the pool modal:
+// a blank string nobody uses is noise, so it does not linger in the list.
+// Returns how many were reclaimed. Never touches a non-empty or referenced one.
+int AnimDocGCStrings(AnimDoc *doc);
+
+// The text element `e` shows at time t: its AP_T_STRING track resolved through
+// the pool, else the element's own `text`. `doc` may be NULL (no pool -> the
+// element's own text), which keeps every caller that has no document handy
+// working unchanged.
+const char *AnimElemTextAt(const AnimElem *e, const AnimDoc *doc, float t);
+
+// The pool INDEX `e` shows at time t, pooling the element's own words when it
+// has no string track yet. This is what a NEW AP_T_STRING key must be seeded
+// with: the property's base value is -1 ("no pool entry"), so seeding a key the
+// way every other property does writes an index that resolves to nothing and
+// the element shows "(missing string)". Returns -1 only when the pool is full.
+int AnimDocStringIdxAt(AnimDoc *doc, AnimElem *e, float t);
+
+// ---------------------------------------------------------------------------
+//  Pause markers (see AnimPause). The array stays sorted by t.
+// ---------------------------------------------------------------------------
+// Add a marker at t. Refuses (returns NULL) when the doc is full or a marker
+// already sits within `eps` - two holds at the same instant would be one hold
+// the user cannot tell apart or delete individually.
+AnimPause *AnimDocAddPause(AnimDoc *doc, float t, float eps);
+void AnimDocRemovePause(AnimDoc *doc, int idx);
+
+// Move marker `idx` to time t, keeping the array sorted; returns its NEW index
+// (so a timeline drag can follow it across neighbours). -1 if idx is invalid.
+int AnimDocSetPauseTime(AnimDoc *doc, int idx, float t);
+
+// Index of the marker at time t (within eps), or -1. Backs both the "is there
+// already one here" menu check and the timeline's hit test.
+int AnimDocPauseAt(const AnimDoc *doc, float t, float eps);
+
+// Index of the first marker in the half-open range (from, to], or -1. This is
+// the ONE "did playback just cross a pause" query - the runtime and the editor
+// preview both use it, so the crossing rule lives in a single place.
+int AnimDocNextPause(const AnimDoc *doc, float from, float to);
 
 // Latest keyframe time across the whole document (what duration should cover).
 float AnimDocMaxKeyTime(const AnimDoc *doc);
@@ -614,6 +780,10 @@ void  AnimPlayerStart(AnimPlayer *p, const AnimDoc *doc, int dir,
                       float secStart, float secEnd);   // play a section
 void  AnimPlayerStartAll(AnimPlayer *p, const AnimDoc *doc, int dir); // whole doc
 void  AnimPlayerUpdate(AnimPlayer *p, float dt);
+// Jump the clock to doc-time `t` (clamped to the section being played). Used to
+// park playback exactly on a pause marker after a frame stepped past it, so the
+// held pose is the authored one rather than a fraction of a frame late.
+void  AnimPlayerSeek(AnimPlayer *p, float t);
 bool  AnimPlayerDone(const AnimPlayer *p);
 float AnimPlayerSampleTime(const AnimPlayer *p);   // doc-clock time to draw at
 void  AnimPlayerDraw(const AnimPlayer *p);         // AnimDocDraw at sample time

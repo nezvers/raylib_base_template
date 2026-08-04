@@ -68,8 +68,14 @@ static float PanelScroll(ZenPanelView *v, Rectangle panel,
 static float DrawElementList(float x, float y, float w)
 {
     float y0 = y, rh = 26.0f, gap = 4.0f;
-    ZenLabelTip((Rectangle){ x+4, y, w-4, 20 }, "ELEMENTS",
-                "Click selects - Ctrl+click multi-selects. All operations live in the Element menu.");
+    bool elemsFull = (zen.doc.elemCount >= ANIM_ELEMS_MAX);
+    ZenLabelTip((Rectangle){ x+4, y, w-4, 20 },
+                TextFormat("ELEMENTS  %d/%d%s", zen.doc.elemCount, ANIM_ELEMS_MAX,
+                           elemsFull? "  FULL" : ""),
+                "Click selects - Ctrl+click multi-selects. All operations live in the "
+                "Element menu.  The count is this animation's element budget - when a "
+                "block has finished its part, reuse it with Element > Clone from... "
+                "instead of spending a new slot.");
     y += 22;
 
     for (int i = 0; i < zen.doc.elemCount; i++)
@@ -142,8 +148,12 @@ void ZenFireSignal(const AnimSignal *sg)
 static float DrawSignalList(float x, float y, float w)
 {
     float y0 = y, rh = 26.0f, gap = 4.0f;
-    ZenLabelTip((Rectangle){ x+4, y, w-4, 20 }, "SIGNALS",
-                "Click opens the signal in its modal; the play glyph fires it live.");
+    bool sigsFull = (zen.doc.signalCount >= ANIM_SIGNALS_MAX);
+    ZenLabelTip((Rectangle){ x+4, y, w-4, 20 },
+                TextFormat("SIGNALS  %d/%d%s", zen.doc.signalCount, ANIM_SIGNALS_MAX,
+                           sigsFull? "  FULL" : ""),
+                "Click opens the signal in its modal; the play glyph fires it live.  "
+                "The count is this animation's signal budget.");
     y += 22;
 
     int pendingDel = -1;
@@ -344,6 +354,9 @@ static float DrawCornerRows(float x, float y, float w, float rh, float gap,
     return y;
 }
 
+// last click on the inspector's "text" label, for double-click detection
+static double s_textLblClick = 0.0;
+
 static float DrawInspector(float x, float y, float w)
 {
     float y0 = y;
@@ -365,10 +378,62 @@ static float DrawInspector(float x, float y, float w)
 
     if (e->kind == AE_TEXT)
     {
-        GuiLabel((Rectangle){ x, y, 40, rh }, "text");
-        if (GuiTextBox((Rectangle){ x+44, y, w-44, rh }, e->text, ANIM_TEXT_LEN_MAX, zen.edText))
-        { if (!zen.edText) ZenUndoPush(); zen.edText = !zen.edText; }
-        y += rh + gap;
+        // The "text" label is a BUTTON in disguise: double-clicking it opens the
+        // string pool, where this element's words can be pointed at a shared
+        // entry (the only way text can change mid-animation). Tinted on hover so
+        // it does not look like dead chrome.
+        Rectangle lblR = { x, y, 40, rh };
+        bool lblHot = !zen.guiLocked && CheckCollisionPointRec(GetMousePosition(), lblR);
+        // Resolved AT THE PLAYHEAD, not from keys[0]: once the words change
+        // over time, the first key is not what is on screen.
+        int strIdx = -1;
+        {
+            AnimTrack *st = AnimElemFindTrack(e, AP_T_STRING);
+            if (st && st->keyCount > 0)
+                strIdx = (int)(AnimTrackEval(st, zen.playhead, -1.0f) + 0.5f);
+        }
+        bool pooled = (AnimDocStringAt(&zen.doc, strIdx) != NULL);
+        DrawText("text", (int)lblR.x, (int)(lblR.y + 5), 10,
+                 lblHot ? (Color){ 150, 200, 255, 255 }
+                        : (pooled ? (Color){ 92, 158, 232, 255 }
+                                  : (Color){ 160, 166, 178, 255 }));
+        if (pooled)
+            DrawText(TextFormat("%02d", strIdx), (int)lblR.x + 26, (int)(lblR.y + 5), 10,
+                     (Color){ 92, 158, 232, 255 });
+
+        if (lblHot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        {
+            double now = GetTime();
+            if (now - s_textLblClick < 0.35) { AudioPlayButton(); ZenStringPoolShow(); }
+            s_textLblClick = now;
+        }
+
+        // grows with the content up to 8 rows, then scrolls inside itself -
+        // reading it all here is not the point, the viewport shows the text.
+        float th = ZenTextAreaHeight(e->text, 8);
+        if (th < rh) th = rh;
+        if (ZenEditTextArea((Rectangle){ x+44, y, w-44, th },
+                            e->text, ANIM_TEXT_LEN_MAX, zen.edText))
+        {
+            if (!zen.edText) ZenUndoPush();
+            else
+            {
+                // COMMIT: the words just typed join the pool (deduped), so every
+                // string in the document is reusable without extra ceremony. If
+                // this element already points at a pool entry, the edit updates
+                // THAT entry - the pool is the source of truth once assigned.
+                if (pooled) TextCopy(zen.doc.strings[strIdx].text, e->text);
+                else        AnimDocAddString(&zen.doc, e->text);
+            }
+            zen.edText = !zen.edText;
+        }
+        ZenTip(lblR, pooled
+            ? "This element shows a pooled string - editing here changes the pool "
+              "entry (and every element sharing it). Double-click 'text' to open "
+              "the string pool and reassign."
+            : "Shift+Enter adds a line, Enter commits. Double-click 'text' to open "
+              "the string pool, where a string can be shared and animated.");
+        y += th + gap;
     }
     if (e->kind == AE_SHAPE)
     {
@@ -607,7 +672,14 @@ static float DrawInspector(float x, float y, float w)
     y += 4;
     int addCount = AnimGroupCountFor(e->kind);
     if (zen.addTrackSel >= addCount) zen.addTrackSel = 0;
+    // never sit on a group that already has a track: slide to the first free
+    // one so +track always names something it can actually create.
+    if (ZenGroupHasTrack(e, zen.addTrackSel))
+        for (int i = 0; i < addCount; i++)
+            if (!ZenGroupHasTrack(e, i)) { zen.addTrackSel = i; break; }
+    bool addTaken = ZenGroupHasTrack(e, zen.addTrackSel);   // every group tracked
     Rectangle addR = { x, y, w-56, rh };
+    if (addTaken) GuiDisable();
     if (GuiButton((Rectangle){ x+w-52, y, 52, rh }, "+track"))
     {
         AudioPlayButton(); ZenUndoPush();
@@ -615,6 +687,7 @@ static float DrawInspector(float x, float y, float w)
         ZenSelKey(zen.selElem, zen.addTrackSel, zen.playhead, false);
         ZenTrackModalOpen(zen.selElem, zen.addTrackSel);
     }
+    if (addTaken) GuiEnable();
     const AnimPropGroup *addG = AnimGroupAt(e->kind, zen.addTrackSel);
     if (GuiButton(addR, TextFormat("%s  v", addG ? addG->name : "?")))
     { AudioPlayButton(); zen.addTrackOpen = !zen.addTrackOpen; }
@@ -625,7 +698,10 @@ static float DrawInspector(float x, float y, float w)
 }
 
 // The add-track group list, drawn topmost (flips above when out of room).
-static void DrawAddTrackOverlay(void)
+// Runs in the overlay pass AFTER GuiUnlock(): opening the list is what locks
+// the base layer, so drawn from inside ZenPanelsGui() its rows never register
+// a press (raygui gates presses on !guiLocked, but still draws them).
+void ZenPanelsOverlaysGui(void)
 {
     if (!zen.addTrackOpen) return;
     if (zen.selElem < 0 || zen.selElem >= zen.doc.elemCount)
@@ -647,9 +723,31 @@ static void DrawAddTrackOverlay(void)
     {
         const AnimPropGroup *g = AnimGroupAt(e->kind, i);
         Rectangle rr = { bg.x, bg.y + i*ih, bg.width, ih };
-        if (GuiButton(rr, g ? g->name : "?"))
+        bool exists = ZenGroupHasTrack(e, i);
+
+        // highlight goes under the button so it can't paint over the label.
+        if (i == zen.addTrackSel && !exists)
+            DrawRectangleRec(rr, (Color){ 90, 140, 220, 60 });
+
+        if (exists)
+        {
+            // already tracked: dimmed, and clicking jumps to its modal rather
+            // than offering to create it again. A disabled GuiButton never
+            // reports a press, so the hit test is manual.
+            GuiDisable();
+            GuiButton(rr, TextFormat("%s  (exists)", g ? g->name : "?"));
+            GuiEnable();
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+                CheckCollisionPointRec(GetMousePosition(), rr))
+            {
+                AudioPlayButton();
+                ZenSelTrack(zen.selElem, i);
+                ZenTrackModalOpen(zen.selElem, i);
+                zen.addTrackOpen = false;
+            }
+        }
+        else if (GuiButton(rr, g ? g->name : "?"))
         { AudioPlayButton(); zen.addTrackSel = i; zen.addTrackOpen = false; }
-        if (i == zen.addTrackSel) DrawRectangleRec(rr, (Color){ 90, 140, 220, 60 });
     }
 
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
@@ -680,6 +778,184 @@ static void DrawDottedV(float x, float y0, float y1, Color c)
         float seg = (yy + 4.0f < y1) ? yy + 4.0f : y1;
         DrawLine((int)x, (int)yy, (int)x, (int)seg, c);
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Timeline right-click menu: pause markers, plus key cloning / deletion.
+//
+//  The viewport already has a context menu (ZenViewContextGui) but it lists the
+//  selected ELEMENT's tracks - a different scope entirely - so the timeline gets
+//  its own. Same shape and same rules: file-static, drawn in the UNLOCKED
+//  overlay pass, click-away closes.
+//
+//  Two clone flavours, and the difference matters:
+//    * on empty bar - restate the WHOLE pose here, by cloning every track's
+//      last key to the left. This is the "hold what I have" move: it freezes
+//      the element as it was authored at the previous keys, which is not the
+//      same as sampling the element here (that would bake the mid-blend pose).
+//    * on a key - copy THAT one group key to the playhead, for repeating a
+//      single pose later without touching the other tracks.
+// ---------------------------------------------------------------------------
+static bool    s_tlCtxOpen = false;
+static Vector2 s_tlCtxPos;
+static float   s_tlCtxTime = 0.0f;  // doc time the right-click landed on
+static int     s_tlCtxPause = -1;   // marker under the cursor, -1 = empty spot
+static int     s_tlCtxKeyGroup = -1; // group of the key under the cursor, or -1
+static float   s_tlCtxKeyTime  = 0.0f;
+static int     s_tlCtxKeyElem  = -1; // element that key belonged to when opened
+
+bool ZenTimelineCtxOpen(void)  { return s_tlCtxOpen; }
+void ZenTimelineCtxClose(void) { s_tlCtxOpen = false; }
+
+// Every visible track of e gets its last key left of t restated at t. Returns
+// how many groups were cloned; 0 means there was nothing to the left anywhere.
+static int CloneAllTracksAt(AnimElem *e, float t)
+{
+    int done = 0;
+    for (int gi = 0, gn = AnimGroupCountFor(e->kind); gi < gn; gi++)
+    {
+        if (!ZenGroupHasTrack(e, gi)) continue;
+        float src = ZenGroupKeyTimeLeftOf(e, gi, t);
+        if (src < 0.0f) continue;                   // track starts after t
+        if (ZenGroupCloneKeyTo(e, gi, src, t)) done++;
+    }
+    return done;
+}
+
+void ZenTimelineCtxGui(void)
+{
+    if (!s_tlCtxOpen) return;
+
+    // the doc can change under an open menu (undo, file switch): a stale marker
+    // or element index would act on the wrong thing.
+    if (s_tlCtxPause >= zen.doc.pauseCount) { s_tlCtxOpen = false; return; }
+    if (s_tlCtxKeyElem >= zen.doc.elemCount) { s_tlCtxOpen = false; return; }
+
+    bool onMarker = (s_tlCtxPause >= 0);
+    bool onKey    = (s_tlCtxKeyGroup >= 0 && s_tlCtxKeyElem >= 0);
+    bool full     = (zen.doc.pauseCount >= ANIM_PAUSES_MAX);
+
+    AnimElem *ke = onKey ? &zen.doc.elems[s_tlCtxKeyElem] : NULL;
+    // The clone lands on the PLAYHEAD, not the click point: the playhead is the
+    // position the user parked deliberately, and it is what every other "here"
+    // in this editor means.
+    float dstT   = zen.playhead;
+    bool  keyDst = onKey && fabsf(s_tlCtxKeyTime - dstT) > ZEN_AUTOKEY_EPS;
+
+    // rows, in the order they are drawn.
+    enum { ROW_PAUSE, ROW_CLONE_ALL, ROW_KEY_CLONE, ROW_KEY_DELETE, ROW_MAX };
+    const char *labels[ROW_MAX];
+    const char *tips[ROW_MAX];
+    bool        offs[ROW_MAX];
+    int         rows[ROW_MAX], rowN = 0;
+
+    labels[ROW_PAUSE] = onMarker ? "Delete pause marker" : "Insert pause marker";
+    tips[ROW_PAUSE]   = onMarker
+        ? "Remove this hold; playback runs straight through afterwards"
+        : (full ? "This animation is at its pause-marker limit"
+                : "Hold playback here until the viewer presses a key");
+    offs[ROW_PAUSE]   = !onMarker && full;
+    rows[rowN++] = ROW_PAUSE;
+
+    bool selElem = zen.selElem >= 0 && zen.selElem < zen.doc.elemCount;
+    if (!onKey)
+    {
+        labels[ROW_CLONE_ALL] = "Clone all tracks to playhead";
+        tips[ROW_CLONE_ALL]   = selElem
+            ? "Restate every track of the selected element at the playhead, "
+              "copying each track's last key before it - the element holds the "
+              "pose it was authored into instead of drifting on through the blend"
+            : "Select an element first - this clones ITS tracks";
+        offs[ROW_CLONE_ALL]   = !selElem;
+        rows[rowN++] = ROW_CLONE_ALL;
+    }
+    else
+    {
+        labels[ROW_KEY_CLONE] = "Clone key to playhead";
+        tips[ROW_KEY_CLONE]   = keyDst
+            ? "Copy this key - values and easing - to the playhead, leaving the "
+              "original where it is"
+            : "The playhead is already on this key; move it first";
+        offs[ROW_KEY_CLONE]   = !keyDst;
+        rows[rowN++] = ROW_KEY_CLONE;
+
+        labels[ROW_KEY_DELETE] = "Delete key";
+        tips[ROW_KEY_DELETE]   = "Remove this key from every track in its group";
+        offs[ROW_KEY_DELETE]   = false;
+        rows[rowN++] = ROW_KEY_DELETE;
+    }
+
+    const float rowH = 24.0f;
+    float w = 170.0f;
+    for (int i = 0; i < rowN; i++)
+    {
+        float lw = ZenTextW(labels[rows[i]]) + 32.0f;
+        if (lw > w) w = lw;
+    }
+
+    Rectangle bg = { s_tlCtxPos.x, s_tlCtxPos.y, w, rowN*rowH + 8.0f };
+    ScreenState *ss = ScreenStateGet();
+    if (bg.x + bg.width  > ss->width)  bg.x = ss->width  - bg.width;
+    if (bg.y + bg.height > ss->height) bg.y = ss->height - bg.height;
+
+    DrawRectangleRec(bg, (Color){ 32, 34, 40, 250 });
+    DrawRectangleLinesEx(bg, 1.0f, (Color){ 70, 74, 84, 255 });
+
+    int fired = -1;
+    for (int i = 0; i < rowN; i++)
+    {
+        int id = rows[i];
+        Rectangle r = { bg.x + 4, bg.y + 4 + i*rowH, w - 8, rowH };
+        if (offs[id]) GuiDisable();
+        if (GuiButton(r, labels[id])) fired = id;
+        if (offs[id]) GuiEnable();
+        ZenTip(r, tips[id]);
+    }
+
+    if (fired >= 0)
+    {
+        AudioPlayButton();
+        ZenUndoPush();
+        switch (fired)
+        {
+        case ROW_PAUSE:
+            if (onMarker)
+            {
+                AnimDocRemovePause(&zen.doc, s_tlCtxPause);
+                if (zen.selPause == s_tlCtxPause) zen.selPause = -1;
+                else if (zen.selPause > s_tlCtxPause) zen.selPause--;
+            }
+            else if (AnimDocAddPause(&zen.doc, s_tlCtxTime, ZEN_PAUSE_EPS))
+                zen.selPause = AnimDocPauseAt(&zen.doc, s_tlCtxTime, ZEN_PAUSE_EPS);
+            break;
+
+        case ROW_CLONE_ALL:
+            CloneAllTracksAt(&zen.doc.elems[zen.selElem], dstT);
+            ZenTrackModalSync();
+            break;
+
+        case ROW_KEY_CLONE:
+            if (ZenGroupCloneKeyTo(ke, s_tlCtxKeyGroup, s_tlCtxKeyTime, dstT))
+            {
+                ZenSelKey(s_tlCtxKeyElem, s_tlCtxKeyGroup, dstT, false);
+                ZenTrackModalSync();
+            }
+            break;
+
+        case ROW_KEY_DELETE:
+            ZenGroupDeleteKeyAt(ke, s_tlCtxKeyGroup, s_tlCtxKeyTime);
+            zen.selKeyCount = 0;
+            ZenSelValidate();       // the group may have lost its last key
+            ZenTrackModalSync();
+            break;
+        }
+        zen.docDirty = true;
+        s_tlCtxOpen  = false;
+    }
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+        !CheckCollisionPointRec(GetMousePosition(), bg))
+        s_tlCtxOpen = false;                        // click-away closes
 }
 
 // While a fired signal plays, the doc timeline is frozen and this strip takes
@@ -792,6 +1068,11 @@ static void DrawTimeline(float x, float y, float w, float h)
     int   laneVis[16], laneCount = 0;
     float laneTop = y + 4, laneRowH = 0.0f;
 
+    // key under the cursor, for the right-click menu below (which needs to know
+    // whether it opened ON a key or on empty bar).
+    int   keyHotGroup = -1;
+    float keyHotTime  = 0.0f;
+
     if (!thin && zen.selElem >= 0 && zen.selElem < zen.doc.elemCount)
     {
         AnimElem *e = &zen.doc.elems[zen.selElem];
@@ -829,6 +1110,7 @@ static void DrawTimeline(float x, float y, float w, float h)
                 float kx = T2X(t);
                 Rectangle hit = { kx-10, ry-10, 20, 20 };
                 bool hot = CheckCollisionPointRec(mouse, hit);
+                if (hot && !zen.guiLocked) { keyHotGroup = gi; keyHotTime = t; }
                 bool sel = ZenKeyIsSelected(zen.selElem, gi, t);
                 float r = hot ? 9.0f : 7.0f;
                 Color ring = sel ? (Color){255,210,90,255}
@@ -866,13 +1148,15 @@ static void DrawTimeline(float x, float y, float w, float h)
                  (int)(x + w*0.5f - 90), (int)(y + h*0.5f - 5), 10,
                  (Color){ 110, 116, 128, 255 });
 
-    // playhead - muted with a pause glyph while a signal holds the doc clock.
+    // playhead - muted with a pause glyph while something holds the doc clock:
+    // either a signal playing over it, or a pause marker waiting for a key.
     bool sigLive = !AnimSignalPlayerDone(&zen.preview);
+    bool clockHeld = sigLive || zen.pausedOnMarker;
     float phx = T2X(zen.playhead);
-    Color phCol = sigLive ? (Color){ 150, 90, 90, 255 } : (Color){ 255, 90, 90, 255 };
+    Color phCol = clockHeld ? (Color){ 150, 90, 90, 255 } : (Color){ 255, 90, 90, 255 };
     DrawLine((int)phx, (int)y, (int)phx, (int)(y+h), phCol);
     DrawRectangleRec((Rectangle){ phx-6, y-2, 12, 10 }, phCol);
-    if (sigLive)
+    if (clockHeld)
     {
         DrawRectangleRec((Rectangle){ phx-3, y, 2, 6 }, (Color){ 30, 30, 34, 255 });
         DrawRectangleRec((Rectangle){ phx+1, y, 2, 6 }, (Color){ 30, 30, 34, 255 });
@@ -905,6 +1189,80 @@ static void DrawTimeline(float x, float y, float w, float h)
         if (zen.dragIntro) zen.doc.introEnd   = (nt > outStart) ? outStart : nt;
         else               zen.doc.outroStart = (nt < inEnd)    ? inEnd    : nt;
     }
+
+    // PAUSE MARKERS: a green dashed vertical, shaped like the playhead on
+    // purpose - it IS a second cursor, the one playback parks on. The grab tab
+    // at the top is the drag target, kept clear of the key diamonds' hit rects.
+    int pauseHot = -1;
+    for (int i = 0; i < zen.doc.pauseCount; i++)
+    {
+        float px = T2X(zen.doc.pauses[i].t);
+        Rectangle hit = { px-7, y, 14, 12 };
+        bool hot = !zen.guiLocked && CheckCollisionPointRec(mouse, hit);
+        if (hot) pauseHot = i;
+
+        bool held = (zen.pausedOnMarker && zen.heldPause == i);
+        bool lit  = hot || held || (zen.selPause == i);
+        Color pc = lit ? (Color){ 150, 240, 165, 255 } : (Color){ 110, 210, 130, 255 };
+
+        DrawDottedV(px, y+2, y+h-2, pc);
+        if (lit) DrawDottedV(px+1, y+2, y+h-2, pc);   // thicken, don't recolour
+        DrawRectangleRec((Rectangle){ px-6, y, 12, 8 }, pc);
+        // the pause glyph itself: two bars, same idiom as the frozen playhead
+        DrawRectangleRec((Rectangle){ px-3, y+2, 2, 4 }, (Color){ 24, 26, 30, 255 });
+        DrawRectangleRec((Rectangle){ px+1, y+2, 2, 4 }, (Color){ 24, 26, 30, 255 });
+
+        ZenTip(hit, zen.doc.pauses[i].once
+            ? "Pause marker (first pass only) - drag to retime, right-click to delete"
+            : "Pause marker - playback holds here until a key is pressed. Drag to "
+              "retime, right-click to delete.");
+    }
+
+    if (press && pauseHot >= 0)
+    {
+        ZenUndoPush();                       // once per drag, not per frame
+        zen.dragPause = pauseHot;
+        zen.selPause  = pauseHot;
+        keyHit = true;
+    }
+    if (zen.dragPause >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+    {
+        if (zen.dragPause < zen.doc.pauseCount)
+        {
+            float nt = ZenClampF(X2T(mouse.x), 0.0f, dur);
+            if (ctrl) nt = ZenClampF(roundf(nt / ZEN_TIMELINE_SNAP) * ZEN_TIMELINE_SNAP,
+                                     0.0f, dur);
+            // retiming re-sorts, so the marker's index can move under the drag
+            zen.dragPause = AnimDocSetPauseTime(&zen.doc, zen.dragPause, nt);
+            zen.selPause  = zen.dragPause;
+            zen.docDirty  = true;
+        }
+        else zen.dragPause = -1;
+    }
+
+    // Right-click anywhere on the bar opens the context menu; what it offers
+    // depends on what sits under the cursor - a pause marker, a key, or bar.
+    if (!zen.guiLocked && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) &&
+        CheckCollisionPointRec(mouse, (Rectangle){ x, y-4, w, h+4 }))
+    {
+        s_tlCtxPos   = mouse;
+        s_tlCtxTime  = ZenClampF(X2T(mouse.x), 0.0f, dur);
+        s_tlCtxPause = (pauseHot >= 0) ? pauseHot
+                                       : AnimDocPauseAt(&zen.doc, s_tlCtxTime, ZEN_PAUSE_EPS);
+        // A key's menu acts on THAT key, so it also remembers which element it
+        // belongs to: the selection can move while the menu is open.
+        s_tlCtxKeyGroup = keyHotGroup;
+        s_tlCtxKeyTime  = keyHotTime;
+        s_tlCtxKeyElem  = (keyHotGroup >= 0) ? zen.selElem : -1;
+        s_tlCtxOpen  = true;
+    }
+
+    // capacity, where the markers live (they have no panel of their own)
+    if (!thin)
+        DrawText(TextFormat("pauses %d/%d", zen.doc.pauseCount, ANIM_PAUSES_MAX),
+                 (int)(x + 4), (int)(y + h - 14), 10,
+                 zen.doc.pauseCount ? (Color){ 110, 210, 130, 255 }
+                                    : (Color){ 90, 94, 104, 255 });
 
     // bar scrub. Plain scrub re-points the track modal at whatever lane the
     // cursor is in; Shift+scrub sweeps keys into the selection as it crosses
@@ -991,7 +1349,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     }
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
     { zen.dragPlayhead = false; zen.dragKeyGroup = -1;
-      zen.dragIntro = false; zen.dragOutro = false; }
+      zen.dragIntro = false; zen.dragOutro = false; zen.dragPause = -1; }
 
     #undef T2X
     #undef X2T
@@ -1008,6 +1366,7 @@ void ZenPanelsUpdate(float dt)
     {
         // hidden widgets must not keep capturing input.
         zen.edName = zen.edText = false; zen.edSigIdx = -1;
+        ZenTextAreaClose();          // never leave it keyed to the old element
         zen.addTrackOpen = false; zen.easeDropOpen = false;
         ZenSigCloseDrops();
     }
@@ -1087,5 +1446,4 @@ void ZenPanelsGui(void)
         DrawTimeline(pad, by, W - 2*pad, tlH);
     }
 
-    DrawAddTrackOverlay();
 }

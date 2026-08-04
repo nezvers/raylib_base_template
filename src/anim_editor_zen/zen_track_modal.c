@@ -240,8 +240,13 @@ static float DrawKeyTree(Rectangle m, float y, AnimElem *e,
            : "Several keys picked: edits are staged and Apply writes only the "
              "changed fields to all of them.");
 
-    if (rootHot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    // This runs inside the floating modal, so guiLocked (the BASE layer's lock,
+    // raised whenever the cursor is over a floater) is the wrong question: ask
+    // whether this layer owns the gesture.
+    if (rootHot && ZenLayerActive(ZEN_LAYER_FLOAT_TRACK) &&
+        IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
     {
+        ZenMouseReflow();       // collapsing or rescoping moves every row below
         AudioPlayButton();
         if (single && s_scopeElem == zen.selElem && s_scopeGroup == zen.selGroup)
         {
@@ -284,7 +289,8 @@ static float DrawKeyTree(Rectangle m, float y, AnimElem *e,
                      TextFormat("key @ %.2fs", times[i]));
             GuiLabel((Rectangle){ r.x + 118, r.y, r.width - 122, TM_TREE_RH },
                      KeySummary(e, g, times[i]));
-            if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            if (hot && ZenLayerActive(ZEN_LAYER_FLOAT_TRACK) &&
+                IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
             { pick = times[i]; pickAdd = ctrl; }
         }
         ry += TM_TREE_RH;
@@ -293,6 +299,10 @@ static float DrawKeyTree(Rectangle m, float y, AnimElem *e,
 
     if (pick >= 0.0f)
     {
+        // Selecting re-lays out the modal (single-key mode inserts a time row)
+        // while the button is still down, sliding the sliders below the tree
+        // under the cursor. Poison the gesture so none of them take it.
+        ZenMouseReflow();
         AudioPlayButton();
         if (pickAdd) ZenSelKey(zen.selElem, zen.selGroup, pick, true);
         else
@@ -317,15 +327,8 @@ static Rectangle ModalChrome(ZenTrackModal *tm, float bodyH, const char *title)
     tm->rect = m;
 
     Rectangle titleR = { m.x, m.y, m.width - 24, TM_TITLE_H };
-    Vector2 mouse = GetMousePosition();
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, titleR))
-    { tm->dragging = true; tm->dragOff = (Vector2){ mouse.x - m.x, mouse.y - m.y }; }
-    if (tm->dragging)
-    {
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
-            tm->pos = (Vector2){ mouse.x - tm->dragOff.x, mouse.y - tm->dragOff.y };
-        else tm->dragging = false;
-    }
+    ZenModalDrag(titleR, &tm->pos, (Vector2){ m.x, m.y },
+                 &tm->dragging, &tm->dragOff, ZEN_LAYER_FLOAT_TRACK);
 
     DrawRectangleRec(m, (Color){ 40, 42, 48, 252 });
     DrawRectangleLinesEx(m, 1.0f, (Color){ 110, 114, 126, 255 });
@@ -438,12 +441,35 @@ static void SigModeGui(ZenTrackModal *tm)
     { AudioPlayButton(); zen.easeDropOpen = !zen.easeDropOpen; }
     y += TM_RH + TM_GAP;
 
-    if (GuiButton((Rectangle){ x, y, (m.width - 30) / 2.0f, TM_RH }, "delete key"))
+    if (ZenButton((Rectangle){ x, y, (m.width - 30) / 2.0f, TM_RH }, "delete key"))
     {
         AudioPlayButton(); ZenUndoPush();
         ZenSigGroupDeleteKeyAt(sg, zen.sigSelElem, zen.sigSelGroup, zen.sigSelU);
         ZenSigClearKeySel();
         tm->open = false;
+    }
+}
+
+// Overwrite the group's key at `dst` with the stored values of the key at
+// `src` (values, colour and ease), so +key duplicates a selected key instead
+// of resampling the curve at the playhead. Both keys must already exist.
+static void CopyKeyValues(AnimElem *e, int gi, float src, float dst)
+{
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+        int ks = -1, kd = -1;
+        for (int j = 0; j < tr->keyCount; j++)
+        {
+            if (fabsf(tr->keys[j].t - src) <= ZEN_AUTOKEY_EPS) ks = j;
+            if (fabsf(tr->keys[j].t - dst) <= ZEN_AUTOKEY_EPS) kd = j;
+        }
+        if (ks < 0 || kd < 0 || ks == kd) continue;
+        tr->keys[kd].value = tr->keys[ks].value;
+        tr->keys[kd].cval  = tr->keys[ks].cval;
+        tr->keys[kd].ease  = tr->keys[ks].ease;
     }
 }
 
@@ -476,7 +502,8 @@ void ZenTrackModalGui(void)
                 + scalarRows * (TM_RH + TM_GAP)
                 + (cp >= 0 ? TM_RH + 3*18 + TM_GAP : 0)
                 + TM_RH + TM_GAP        // ease
-                + TM_RH + 10;           // buttons
+                + TM_RH + TM_GAP        // delete / Apply row
+                + TM_RH + 10;           // +key / reset row
     Rectangle m = { tm->pos.x, tm->pos.y, TM_W, bodyH };
 
     // clamp on screen (also after window resizes).
@@ -489,15 +516,8 @@ void ZenTrackModalGui(void)
 
     // --- title bar drag ------------------------------------------------------
     Rectangle title = { m.x, m.y, m.width - 24, TM_TITLE_H };
-    Vector2 mouse = GetMousePosition();
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, title))
-    { tm->dragging = true; tm->dragOff = (Vector2){ mouse.x - m.x, mouse.y - m.y }; }
-    if (tm->dragging)
-    {
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
-            tm->pos = (Vector2){ mouse.x - tm->dragOff.x, mouse.y - tm->dragOff.y };
-        else tm->dragging = false;
-    }
+    ZenModalDrag(title, &tm->pos, (Vector2){ m.x, m.y },
+                 &tm->dragging, &tm->dragOff, ZEN_LAYER_FLOAT_TRACK);
 
     // --- chrome --------------------------------------------------------------
     DrawRectangleRec(m, (Color){ 40, 42, 48, 252 });
@@ -551,6 +571,42 @@ void ZenTrackModalGui(void)
 
         ZenLabelTip((Rectangle){ x, y, 44, TM_RH }, AnimPropName(prop),
                     ZenPropDesc(prop));
+
+        // A string key holds a POOL INDEX, not a quantity: dragging a slider
+        // through it would scrub across unrelated entries and land on holes.
+        // Show the words instead, and hand editing to the pool modal that owns
+        // them.
+        if (prop == AP_T_STRING)
+        {
+            const char *words = "(no key here)";
+            AnimTrack *tr = AnimElemFindTrack(e, prop);
+            int k = -1;
+            for (int j = 0; tr && j < tr->keyCount; j++)
+                if (fabsf(tr->keys[j].t - refT) <= ZEN_AUTOKEY_EPS) { k = j; break; }
+            if (k >= 0)
+            {
+                // +0.5f, not a bare cast: a value round-tripped through the file
+                // as 1.9999998 would otherwise truncate to the WRONG entry.
+                const char *s = AnimDocStringAt(&zen.doc,
+                                    (int)(tr->keys[k].value + 0.5f));
+                words = s ? s : "(missing string)";
+            }
+
+            Rectangle sr = { x + 44, y, w - 44, TM_RH };
+            zen.strDropRect = sr;
+            if (k < 0) GuiDisable();
+            if (GuiButton(sr, TextFormat("%s  v", ZenTextPreview(words, 24))))
+            { AudioPlayButton(); zen.strDropOpen = !zen.strDropOpen; }
+            if (k < 0) GuiEnable();
+            ZenTip(sr, k >= 0
+                ? "The words this key switches to. Click to pick another string "
+                  "from the pool - it changes THIS key only, at this time."
+                : "No key at this time, so there is nothing to assign. Use +key "
+                  "to make one here first.");
+            y += TM_RH + TM_GAP;
+            continue;
+        }
+
         if (single)
         {
             AnimTrack *tr = AnimElemFindTrack(e, prop);
@@ -609,6 +665,22 @@ void ZenTrackModalGui(void)
     }
 
     // --- ease (dropdown header; list drawn topmost by the overlay pass) -----
+    // A stepped group has nothing to ease BETWEEN: AnimTrackEval returns the
+    // left key's value outright, so an ease picked here would be stored, saved
+    // and silently ignored. Say so instead of offering a control that lies.
+    // (signal mode returned at the top of this function, so this is doc mode)
+    bool stepped = zen.selGroup >= 0 && ZenGroupIsStepped(e->kind, zen.selGroup);
+    if (stepped)
+    {
+        GuiLabel((Rectangle){ x, y, 44, TM_RH }, "ease");
+        GuiLabel((Rectangle){ x + 44, y, w - 44, TM_RH }, "steps - no easing");
+        ZenTip((Rectangle){ x, y, w, TM_RH },
+               "Text snaps at each key and holds those words until the next one. "
+               "There is no midpoint between two strings, so nothing to ease.");
+        zen.easeDropOpen = false;
+    }
+    else
+    {
     GuiLabel((Rectangle){ x, y, 44, TM_RH }, "ease");
     zen.easeDropRect = (Rectangle){ x + 44, y, w - 44, TM_RH };
     if (GuiButton(zen.easeDropRect, TextFormat("%s  v", AnimEaseName(tm->ease))))
@@ -616,35 +688,60 @@ void ZenTrackModalGui(void)
     if (!single && tm->dEase)
         DrawCircle((int)(x + w + 40), (int)(y + TM_RH/2), 3,
                    (Color){ 255, 210, 90, 255 });
+    }
     y += TM_RH + TM_GAP;
 
     // --- footer buttons ------------------------------------------------------
     float bw = (m.width - 30) / 2.0f;
     if (single)
     {
-        if (GuiButton((Rectangle){ x, y, bw, TM_RH }, "delete key"))
+        if (ZenButton((Rectangle){ x, y, bw, TM_RH }, "delete key"))
         {
             AudioPlayButton(); ZenUndoPush();
             ZenGroupDeleteKeyAt(e, zen.selGroup, zen.selKeys[0]);
             zen.selKeyCount = 0;
             ZenSelValidate();
         }
+
+        // Duplicate takes the slot Apply occupies in the other scopes: it only
+        // means anything for ONE key, and its destination is the playhead - the
+        // same target +key uses, so the two read as one idea. Blocked when a key
+        // already sits there, since that key would be silently overwritten.
+        bool dupHere = fabsf(zen.selKeys[0] - zen.playhead) <= ZEN_AUTOKEY_EPS;
+        bool dupBlocked = false;
+        for (int i = 0; i < keyTotal && !dupBlocked; i++)
+            if (fabsf(allTimes[i] - zen.playhead) <= ZEN_AUTOKEY_EPS) dupBlocked = true;
+
+        if (dupBlocked) GuiDisable();
+        if (ZenButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "duplicate key"))
+        {
+            AudioPlayButton(); ZenUndoPush();
+            ZenGroupWriteKey(e, zen.selGroup, zen.playhead);
+            CopyKeyValues(e, zen.selGroup, zen.selKeys[0], zen.playhead);
+            ZenSelKey(zen.selElem, zen.selGroup, zen.playhead, false);
+            ZenTrackModalSync();
+        }
+        if (dupBlocked) GuiEnable();
+        ZenTip((Rectangle){ x + bw + 10, y, bw, TM_RH },
+               dupHere ? "The playhead is on this key - scrub elsewhere to copy it there"
+               : dupBlocked ? "A key already exists at the playhead"
+                            : "Copy this key's values to a new key at the playhead");
     }
     else if (track)
     {
-        if (GuiButton((Rectangle){ x, y, bw, TM_RH }, "delete track"))
+        if (ZenButton((Rectangle){ x, y, bw, TM_RH }, "delete track"))
         {
             AudioPlayButton(); ZenUndoPush();
             ZenGroupDeleteTracks(e, zen.selGroup);
             ZenSelClear();
             return;
         }
-        if (GuiButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "Apply to all"))
+        if (ZenButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "Apply to all"))
         { AudioPlayButton(); BulkApply(e); }
     }
     else
     {
-        if (GuiButton((Rectangle){ x, y, bw, TM_RH }, "delete keys"))
+        if (ZenButton((Rectangle){ x, y, bw, TM_RH }, "delete keys"))
         {
             AudioPlayButton(); ZenUndoPush();
             for (int i = 0; i < zen.selKeyCount; i++)
@@ -652,9 +749,45 @@ void ZenTrackModalGui(void)
             zen.selKeyCount = 0;
             ZenSelValidate();
         }
-        if (GuiButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "Apply to selected"))
+        if (ZenButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "Apply to selected"))
         { AudioPlayButton(); BulkApply(e); }
     }
+    y += TM_RH + TM_GAP;
+
+    // --- new key at the playhead + revert staged edits ------------------------
+    // +key is offered in every mode: in bulk/track scope it is the counterpart
+    // to Apply, which only rewrites keys that already exist.
+    bool haveKey = false;
+    for (int i = 0; i < keyTotal; i++)
+        if (fabsf(allTimes[i] - zen.playhead) <= ZEN_AUTOKEY_EPS) { haveKey = true; break; }
+
+    // this row is +key alone, so it spans both slots less the reset icon.
+    float rw = 2.0f*bw + 10.0f - 34.0f;
+    if (haveKey) GuiDisable();
+    if (ZenButton((Rectangle){ x, y, rw, TM_RH },
+                  TextFormat("+key @ %.2fs", zen.playhead)))
+    {
+        AudioPlayButton(); ZenUndoPush();
+        // seed from the element's pose at the playhead, which holds the
+        // previous key's value between keys.
+        ZenGroupWriteKey(e, zen.selGroup, zen.playhead);
+        // a single selected key is the better source: copy it verbatim so
+        // +key duplicates it rather than resampling the curve.
+        if (single) CopyKeyValues(e, zen.selGroup, zen.selKeys[0], zen.playhead);
+        ZenSelKey(zen.selElem, zen.selGroup, zen.playhead, false);
+        ZenTrackModalSync();
+    }
+    if (haveKey) GuiEnable();
+    ZenTip((Rectangle){ x, y, rw, TM_RH },
+           haveKey ? "A key already exists at the playhead - scrub elsewhere to add one"
+                   : "Create a key at the playhead using the values shown above");
+
+    bool dirty = tm->dCval || tm->dEase;
+    for (int mi = 0; mi < 8 && !dirty; mi++) dirty = dirty || tm->dVals[mi];
+    if (!dirty) GuiDisable();
+    if (ZenButton((Rectangle){ x + rw + 6, y, 28, TM_RH }, "#211#"))
+    { AudioPlayButton(); ZenTrackModalSync(); }   // drops every staged edit
+    if (!dirty) GuiEnable();
 }
 
 // The ease list, drawn AFTER everything so it overlays the modal; flips above
@@ -716,4 +849,84 @@ void ZenEaseDropOverlayGui(void)
         !CheckCollisionPointRec(GetMousePosition(), bg) &&
         !CheckCollisionPointRec(GetMousePosition(), hdr))
         zen.easeDropOpen = false;
+}
+
+// ---------------------------------------------------------------------------
+//  String picker: which pool entry the SELECTED key switches to. This is the
+//  only place a string is bound to a time - the pool modal owns the words
+//  themselves, this owns which key shows which. Drawn topmost in the unlocked
+//  overlay pass, like the ease list above.
+// ---------------------------------------------------------------------------
+void ZenStringDropOverlayGui(void)
+{
+    if (!zen.strDropOpen || !zen.trackModal.open) return;
+    if (zen.trackModal.sig >= 0) { zen.strDropOpen = false; return; }
+
+    AnimElem *e = ModalElem();
+    if (!e || zen.selGroup < 0) { zen.strDropOpen = false; return; }
+
+    AnimTrack *tr = AnimElemFindTrack(e, AP_T_STRING);
+    if (!tr) { zen.strDropOpen = false; return; }
+
+    // The key being edited is the one the row resolved: at the single selected
+    // time, else the track's first - matching `refT` in ZenTrackModalGui.
+    float times[ZEN_GROUP_TIMES_MAX];
+    int   n = ZenGroupKeyTimes(e, zen.selGroup, times);
+    float refT = (zen.selKeyCount == 1) ? zen.selKeys[0] : (n ? times[0] : 0.0f);
+    int k = -1;
+    for (int j = 0; j < tr->keyCount; j++)
+        if (fabsf(tr->keys[j].t - refT) <= ZEN_AUTOKEY_EPS) { k = j; break; }
+    if (k < 0) { zen.strDropOpen = false; return; }
+
+    int cur = (int)(tr->keys[k].value + 0.5f);
+
+    // Holes left by a delete are skipped: they are not choosable strings.
+    int ids[ANIM_STRINGS_MAX], m = 0;
+    for (int i = 0; i < zen.doc.stringCount; i++)
+        if (zen.doc.strings[i].used) ids[m++] = i;
+
+    Vector2 screen = ScreenStateSize();
+    Rectangle hdr = zen.strDropRect;
+    float ih = 20.0f, listH = ih * (m + 1);      // +1 for the "new string" row
+    float ly = (hdr.y + hdr.height + listH <= screen.y - 4.0f)
+             ? hdr.y + hdr.height : hdr.y - listH;
+    if (ly < 4.0f) ly = 4.0f;
+    Rectangle bg = { hdr.x, ly, hdr.width, listH };
+    DrawRectangleRec(bg, (Color){ 32, 34, 40, 255 });
+    DrawRectangleLinesEx(bg, 1.0f, (Color){ 70, 74, 84, 255 });
+
+    for (int row = 0; row < m; row++)
+    {
+        int i = ids[row];
+        Rectangle rr = { bg.x, bg.y + row*ih, bg.width, ih };
+        if (GuiButton(rr, TextFormat("%02d  %s", i,
+                                     ZenTextPreview(zen.doc.strings[i].text, 22))))
+        {
+            AudioPlayButton();
+            zen.strDropOpen = false;
+            ZenUndoPush();
+            tr->keys[k].value = (float)i;
+            // The element's own words are the fallback when the track is gone,
+            // so mirror only the FIRST key: past that the text changes over
+            // time and there is no single "the" text to stand for it.
+            if (k == 0)
+            {
+                const char *s = AnimDocStringAt(&zen.doc, i);
+                if (s) TextCopy(e->text, s);
+            }
+            zen.docDirty = true;
+            ZenTrackModalSync();
+        }
+        if (i == cur) DrawRectangleRec(rr, (Color){ 90, 140, 220, 60 });
+    }
+
+    // The pool is where words are written; this list only chooses among them.
+    Rectangle nr = { bg.x, bg.y + m*ih, bg.width, ih };
+    if (GuiButton(nr, "+ new string..."))
+    { AudioPlayButton(); zen.strDropOpen = false; ZenStringPoolShow(); }
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+        !CheckCollisionPointRec(GetMousePosition(), bg) &&
+        !CheckCollisionPointRec(GetMousePosition(), hdr))
+        zen.strDropOpen = false;
 }

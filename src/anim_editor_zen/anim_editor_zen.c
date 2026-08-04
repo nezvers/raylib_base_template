@@ -332,7 +332,8 @@ bool ZenTyping(void)
 {
     return zen.edNameBuf || zen.edName || zen.edText || zen.edSigIdx >= 0
         || zen.trackModal.edTime || ZenSliderTyping() || ZenEasingTyping()
-        || ZenMenuTyping();
+        || ZenMenuTyping() || ZenTextAreaTyping() || ZenCloneTyping()
+        || ZenStringPoolTyping();
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +448,7 @@ static void Enter()
 
     zen.menuOpen = -1; zen.hotkeyNav = false;
     zen.helpOpen = false; zen.openListOpen = false;
+    zen.guideAnim = ANIM_HANDLE_NONE;
     zen.prompt = ZEN_PROMPT_NONE; zen.promptTargetIdx = -1;
     zen.nameBuf[0] = '\0'; zen.edNameBuf = false;
     zen.libOpen = false; zen.libScroll = 0.0f; zen.libTargetIdx = -1;
@@ -456,14 +458,20 @@ static void Enter()
     zen.elemView = zen.sigView = zen.inspView = (ZenPanelView){0};
     zen.panelAnim = 0.0f; zen.prevPlaybackUi = false;
     zen.guiLocked = false;
+    zen.mouseOwner = ZEN_LAYER_NONE; zen.mouseHeld = false;
     zen.edName = zen.edText = false; zen.edSigIdx = -1;
+    ZenTextAreaClose();          // never leave it keyed to the old element
     zen.selGroup = -1; zen.selKeyCount = 0;
     for (int i = 0; i < ANIM_ELEMS_MAX; i++) zen.trackExpand[i] = 0;
     zen.trackModal = (ZenTrackModal){0};
     zen.trackModal.sig = -1;
     zen.easeDropOpen = false; zen.addTrackOpen = false; zen.addTrackSel = 0;
+    zen.strDropOpen = false;
     zen.dragPlayhead = false; zen.dragKeyGroup = -1;
     zen.dragIntro = zen.dragOutro = false;
+    zen.dragPause = -1; zen.selPause = -1;
+    zen.pausedOnMarker = false; zen.heldPause = -1;
+    ZenTimelineCtxClose();
     zen.sigModalIdx = -1; zen.sigModalPos = (Vector2){0};
     zen.sigDragging = false; zen.sigScroll = 0.0f; zen.sigLastU = 1.0f;
     ZenSigClearKeySel(); ZenSigCloseDrops();
@@ -482,6 +490,7 @@ static void Exit()
     }
     else lastOpened[0] = '\0';
 
+    ZenGuideStop();     // never leave a tour holding a stage slot behind us
     AnimSignalUnregister(&zen.doc, &zen.preview);
 }
 
@@ -495,12 +504,27 @@ static void Update()
     if (sigLive && zen.playing && zen.stopOnSignal)
         zen.playing = false;                // stops for good; Space resumes
 
+    // A pause marker holds the preview the same way it holds a runtime instance
+    // (see AnimStageUpdate): the clock stops ON the marker until a key arrives.
+    // Space is exempt - it is the editor's stop/start and must keep working.
+    if (zen.pausedOnMarker)
+    {
+        // IsKeyPressed over the range rather than GetKeyPressed(): that call
+        // POPS the queue, and zen_menu.c's Alt-navigation reads the same queue.
+        bool released = IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
+                     || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT);
+        for (int k = KEY_SPACE; !released && k <= KEY_KB_MENU; k++)
+            if (IsKeyPressed(k)) released = true;
+        if (released || !zen.playing) zen.pausedOnMarker = false;
+    }
+
     // Timeline playback over the TRIMMED section [0..outroStart]; looping
     // restarts at introEnd (the intro is a one-shot lead-in).
-    if (zen.playing && !sigLive)
+    if (zen.playing && !sigLive && !zen.pausedOnMarker)
     {
         float inEnd = AnimDocIntroEnd(&zen.doc);
         float outStart = AnimDocOutroStart(&zen.doc);
+        float prevHead = zen.playhead;
         zen.playhead += dt;
         if (zen.playhead >= outStart)
         {
@@ -513,30 +537,64 @@ static void Update()
             }
             else zen.playhead = outStart;
         }
+
+        // Did this frame step over a marker? Park exactly on it and hold, so
+        // the editor previews what the runtime will actually do. The wrap case
+        // is two ranges, as in AnimStageUpdate.
+        int pi = (zen.playhead >= prevHead)
+               ? AnimDocNextPause(&zen.doc, prevHead, zen.playhead)
+               : AnimDocNextPause(&zen.doc, prevHead, outStart);
+        if (pi < 0 && zen.playhead < prevHead)
+            pi = AnimDocNextPause(&zen.doc, inEnd - 1e-4f, zen.playhead);
+        if (pi >= 0)
+        {
+            zen.playhead       = zen.doc.pauses[pi].t;
+            zen.pausedOnMarker = true;
+            zen.heldPause      = pi;
+        }
     }
 
     // Fired signals run on their own clock as an override (playhead untouched).
     if (!AnimSignalPlayerDone(&zen.preview)) AnimSignalPlayerUpdate(&zen.preview, dt);
+
+    // The Help guided tour, if one is running. It drives itself: its pause
+    // markers hold on any mouse press or key in KEY_SPACE..KEY_KB_MENU, which
+    // it OBSERVES rather than consumes - so the editor below stays usable and
+    // reads the same input this frame. Ahead of the ESC chain so a cancel this
+    // frame beats the tour's own advance.
+    AnimStageUpdate(dt);
 
     // ESC closes whatever is open, innermost first; leaves the editor once
     // nothing is (so it can't discard work behind a modal by accident).
     // (a slider's precise-entry textbox consumes its own ESC in the widget)
     if (IsKeyPressed(KEY_ESCAPE) && !ZenSliderTyping())
     {
-        if (zen.helpOpen)                   zen.helpOpen = false;
+        // a text area commits and closes on its own ESC, before anything else
+        // in the chain gets a chance to close a modal or leave the editor.
+        if (ZenTextAreaTyping()) { ZenTextAreaClose(); zen.edText = false; }
+        else if (zen.helpOpen)              zen.helpOpen = false;
         else if (zen.prompt != ZEN_PROMPT_NONE)
         { zen.prompt = ZEN_PROMPT_NONE; zen.edNameBuf = false; }
+        else if (ZenStringPoolEscClose()) { }
+        else if (ZenCloneEscClose()) { }
         else if (ZenEasingEscClose()) { }
         else if (zen.libOpen)               zen.libOpen = false;
         else if (zen.openListOpen)          zen.openListOpen = false;
-        else if (zen.easeDropOpen || zen.addTrackOpen || zen.sigDropMode != 0)
-        { zen.easeDropOpen = false; zen.addTrackOpen = false; ZenSigCloseDrops(); }
+        else if (zen.easeDropOpen || zen.addTrackOpen || zen.strDropOpen ||
+                 zen.sigDropMode != 0)
+        { zen.easeDropOpen = false; zen.addTrackOpen = false;
+          zen.strDropOpen = false; ZenSigCloseDrops(); }
+        else if (ZenTimelineCtxOpen())      ZenTimelineCtxClose();
         else if (ZenViewCtxOpen())          ZenViewCtxClose();
         else if (zen.trackModal.open)       zen.trackModal.open = false;
         else if (zen.sigModalIdx >= 0)
         { zen.sigModalIdx = -1; zen.edSigIdx = -1; ZenSigClearKeySel(); }
         else if (zen.menuOpen >= 0 || zen.hotkeyNav)
         { zen.menuOpen = -1; zen.hotkeyNav = false; }
+        // Last before leaving: the tour floats over the whole editor, so every
+        // modal and dropdown under it closes first - but ESC still cancels the
+        // tour rather than dropping the user out to the main menu.
+        else if (ZenGuideActive())          ZenGuideStop();
         else ZenExitEditor();
     }
 
@@ -544,7 +602,11 @@ static void Update()
     ZenMenuUpdate();
 
     bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
-    bool typing = ZenTyping();
+    // A running tour advances on ANY key, so the keyboard shortcuts that would
+    // ALSO act on that same press are held back until it ends. Mouse editing,
+    // the panels and the menu bar deliberately stay live - the tour is pointing
+    // at them, and a click advancing a beat is the intended gesture.
+    bool typing = ZenTyping() || ZenGuideActive();
     if (!typing && ctrl && IsKeyPressed(KEY_Z)) ZenUndoApply(-1);
     if (!typing && ctrl && IsKeyPressed(KEY_Y)) ZenUndoApply(+1);
     if (!typing && ctrl && IsKeyPressed(KEY_S)) ZenSaveCurrent();
@@ -576,12 +638,20 @@ static void Update()
 // ===========================================================================
 static void Draw()
 {
-    ZenViewDraw();
+    ZenViewDraw();      // ends with EndMode2D()
+
+    // The guided tour draws OUTSIDE the edit camera, so it lands at true 1:1
+    // over the whole canvas instead of being halved by ZEN_ZOOM_EDIT: its
+    // arrows and boxes were authored against the real screen and have to point
+    // at where the panels actually are. Still under raygui, which main.c draws
+    // afterwards - so the panels it describes stay visible and clickable.
+    AnimStageDraw();
 }
 
 static void Gui()
 {
     ZenWidgetsFrameEnd();
+    ZenMouseOwnerUpdate();      // latch/hold/release the gesture owner
 
     // The base layer (bar + panels) locks whenever something floats above it:
     // a menu modal, an open dropdown list, or the cursor being over one of
@@ -593,8 +663,14 @@ static void Gui()
         (zen.sigModalIdx >= 0 &&
          CheckCollisionPointRec(mouse, zen.sigModalRect));
     bool dropOpen = zen.menuOpen >= 0 || zen.easeDropOpen || zen.addTrackOpen
-                 || zen.sigDropMode != 0 || ZenViewCtxOpen();
-    zen.guiLocked = ZenMenuModalOpen() || ZenEasingModalOpen() || dropOpen || overFloat;
+                 || zen.strDropOpen
+                 || zen.sigDropMode != 0 || ZenViewCtxOpen() || ZenTimelineCtxOpen();
+    bool fullModal = ZenMenuModalOpen() || ZenEasingModalOpen() || ZenCloneOpen()
+                  || ZenStringPoolOpen();
+    // ...and for the whole of a gesture that began in another layer, so a
+    // release here can't fire a button or grab a slider the press never hit.
+    zen.guiLocked = fullModal || dropOpen || overFloat
+                 || !ZenLayerActive(ZEN_LAYER_BASE);
     if (zen.guiLocked) GuiLock();
 
     // uiHover keeps the viewport's hands off the mouse while it's on chrome;
@@ -607,19 +683,32 @@ static void Gui()
     GuiUnlock();
 
     // Floating modals: usable while the panels stay clickable outside them.
-    // Locked only under their own dropdown lists or a menu modal.
-    bool floatLock = ZenMenuModalOpen() || ZenEasingModalOpen()
-                  || zen.easeDropOpen || zen.sigDropMode != 0;
-    if (floatLock) GuiLock();
+    // Locked under their own dropdown lists or a menu modal, and separately
+    // per modal while the other one owns the gesture.
+    bool floatLock = fullModal
+                  || zen.easeDropOpen || zen.addTrackOpen || zen.strDropOpen
+                  || zen.sigDropMode != 0;
+    bool sigLock = floatLock || !ZenLayerActive(ZEN_LAYER_FLOAT_SIG);
+    bool trkLock = floatLock || !ZenLayerActive(ZEN_LAYER_FLOAT_TRACK);
+
+    if (sigLock) GuiLock();
     ZenSignalModalGui();
+    if (sigLock) GuiUnlock();
+
+    if (trkLock) GuiLock();
     ZenTrackModalGui();
-    if (floatLock) GuiUnlock();
+    if (trkLock) GuiUnlock();
 
     // Overlays topmost: dropdown lists, then the menu's modals, then the tip.
+    ZenPanelsOverlaysGui();
     ZenViewContextGui();
+    ZenTimelineCtxGui();
     ZenSignalOverlaysGui();
     ZenEaseDropOverlayGui();
+    ZenStringDropOverlayGui();
     ZenMenuOverlaysGui();
     ZenEasingGui();
+    ZenCloneGui();
+    ZenStringPoolGui();
     ZenTipDraw();
 }

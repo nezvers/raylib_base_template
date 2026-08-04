@@ -10,8 +10,14 @@
 //                                       # optional too - files written before it
 //                                       # existed load as smooth with the
 //                                       # ANIM_LOOP_BLEND_DEFAULT length.
+//    string   <idx> <escaped-single-token>  # shared text pool entry, BEFORE the
+//                                        # elements: a `string` track keys these
+//                                        # INDICES. The index is explicit
+//                                        # because a deleted entry leaves a hole
+//                                        # and the rest must not shift.
 //    elem     <kind> <name>              # kind = text|shape|global
-//      text   <quoted-single-token>      # (text elements) spaces -> '_'
+//      text   <escaped-single-token>     # (text elements) space -> '\s',
+//                                        # newline -> '\n', '\' -> '\\'
 //      color  <r> <g> <b> <a>
 //      pos    <xFrac> <yFrac>
 //      size   <xFrac> <yFrac>
@@ -23,6 +29,10 @@
 //        key  <t> <value> <ease>            # scalar tracks
 //        key  <t> <r> <g> <b> <ease>        # colour tracks (RGB; no alpha)
 //      end
+//    pause    <t> [<once>]              # doc-clock hold; playback stops here
+//                                       # until a key is pressed. `once` (0/1)
+//                                       # is OPTIONAL and defaults to 0 = holds
+//                                       # on every loop cycle.
 //    signal   <name> <length> [terminal [usesPos [posAnchor [replay]]]]
 //                                       # AFTER all elems (names resolve).
 //                                       # `terminal`, `usesPos`, `posAnchor`, `replay`
@@ -58,7 +68,7 @@ typedef struct { int prop; const char *name; } PropRow;
 static const PropRow k_textProps[] = {
     { AP_T_POS_X, "pos_x" }, { AP_T_POS_Y, "pos_y" }, { AP_T_SIZE, "size" },
     { AP_T_ALPHA, "alpha" }, { AP_T_ROT, "rot" },     { AP_T_CRUMBLE, "crumble" },
-    { AP_T_COLOR, "color" },
+    { AP_T_COLOR, "color" }, { AP_T_STRING, "string" },
 };
 static const PropRow k_shapeProps[] = {
     { AP_S_POS_X, "pos_x" }, { AP_S_POS_Y, "pos_y" }, { AP_S_W, "w" },
@@ -122,6 +132,7 @@ static const AnimPropGroup k_textGroups[] = {
     { "color",    { AP_T_COLOR, AP_T_ALPHA }, 2 },
     { "rotation", { AP_T_ROT },               1 },
     { "crumble",  { AP_T_CRUMBLE },           1 },
+    { "string",   { AP_T_STRING },            1 },
 };
 static const AnimPropGroup k_shapeGroups[] = {
     { "position", { AP_S_POS_X, AP_S_POS_Y },                       2 },
@@ -202,20 +213,56 @@ int AnimShapeKindByName(const char *name)
 }
 
 // ---------------------------------------------------------------------------
-//  Text-token helpers: the reader is whitespace-delimited, so a text element's
-//  string is stored with spaces as '_' (and '_' as itself is fine - simplest
-//  scheme that keeps the file a single fscanf token stream).
+//  Text-token helpers. The reader is whitespace-delimited, so a text element's
+//  string has to survive as one fscanf token: space -> '\s', newline -> '\n',
+//  and a literal backslash doubles. Everything else is written as itself, so
+//  '_' finally round-trips (the older scheme stored spaces AS '_' and could
+//  not tell the two apart - see the migration note in the header comment).
+//  Encoding can double the length, hence the *2 on every `enc` buffer.
 // ---------------------------------------------------------------------------
+// fscanf wants its field width as a plain literal (the preprocessor will not
+// do the arithmetic), so it is spelled out and pinned to the capacity by a
+// static assert - raise ANIM_TEXT_LEN_MAX and this fails the build until the
+// scan width follows it.
+#define ANIM_TEXT_ENC_WIDTH   "1023"
+_Static_assert(ANIM_TEXT_LEN_MAX * 2 - 1 == 1023,
+               "ANIM_TEXT_ENC_WIDTH must stay (ANIM_TEXT_LEN_MAX * 2 - 1)");
 static void EncodeText(const char *in, char *out, int cap)
 {
-    int i = 0;
-    for (; in[i] && i < cap - 1; i++) out[i] = (in[i] == ' ') ? '_' : in[i];
-    out[i] = 0;
-    if (i == 0) { out[0] = '_'; out[1] = 0; }   // never emit an empty token
+    int o = 0;
+    for (int i = 0; in[i]; i++)
+    {
+        char esc = 0;
+        switch (in[i])
+        {
+            case '\\': esc = '\\'; break;
+            case ' ':  esc = 's';  break;
+            case '\n': esc = 'n';  break;
+            case '\r': continue;                    // CRLF pastes normalise out
+        }
+        // stop on a whole pair, never half an escape.
+        if (o + (esc ? 2 : 1) > cap - 1) break;
+        if (esc) { out[o++] = '\\'; out[o++] = esc; }
+        else       out[o++] = in[i];
+    }
+    out[o] = 0;
+    if (o == 0) { TextCopy(out, "\\s"); }           // never emit an empty token
 }
 static void DecodeText(char *s)
 {
-    for (int i = 0; s[i]; i++) if (s[i] == '_') s[i] = ' ';
+    int o = 0;
+    for (int i = 0; s[i]; i++)
+    {
+        if (s[i] != '\\' || !s[i+1]) { s[o++] = s[i]; continue; }
+        switch (s[++i])
+        {
+            case 's':  s[o++] = ' ';  break;
+            case 'n':  s[o++] = '\n'; break;
+            case '\\': s[o++] = '\\'; break;
+            default:   s[o++] = '\\'; s[o++] = s[i]; break;   // unknown: as-is
+        }
+    }
+    s[o] = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,8 +277,8 @@ void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind)
 
     if (e->kind == AE_TEXT)
     {
-        char enc[ANIM_TEXT_LEN_MAX];
-        EncodeText(e->text, enc, ANIM_TEXT_LEN_MAX);
+        char enc[ANIM_TEXT_LEN_MAX * 2];
+        EncodeText(e->text, enc, sizeof(enc));
         fprintf(f, "%s  text %s\n", ind, enc);
     }
     if (e->kind == AE_SHAPE)
@@ -288,8 +335,26 @@ bool AnimDocSave(const AnimDoc *doc, const char *path)
             doc->duration, AnimDocIntroEnd(doc), AnimDocOutroStart(doc),
             doc->loopBlend, doc->loopSmooth ? 1 : 0);
 
+    // The string pool comes BEFORE the elements: an element's `string` track
+    // keys pool INDICES, so the entries must exist by the time they are read.
+    // The index is written explicitly because a deleted entry leaves a hole and
+    // the surviving indices must not shift (see AnimString).
+    for (int i = 0; i < doc->stringCount; i++)
+    {
+        if (!doc->strings[i].used) continue;
+        char enc[ANIM_TEXT_LEN_MAX * 2];
+        EncodeText(doc->strings[i].text, enc, sizeof(enc));
+        fprintf(f, "string %d %s\n", i, enc);
+    }
+
     for (int i = 0; i < doc->elemCount; i++)
         AnimElemWriteCfg(f, &doc->elems[i], "");
+
+    // Pause markers are doc-level and reference nothing, so they can sit
+    // anywhere; after the elements keeps the file reading top-down in time.
+    for (int i = 0; i < doc->pauseCount; i++)
+        fprintf(f, "pause %f %d\n", doc->pauses[i].t,
+                doc->pauses[i].once ? 1 : 0);
 
     // Signals come AFTER every element: their targets name elements, so a
     // single forward pass can resolve those names on load.
@@ -370,8 +435,9 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
 {
     if (TextIsEqual(key, "text"))
     {
-        char enc[ANIM_TEXT_LEN_MAX];
-        if (fscanf(f, "%63s", enc) == 1 && curElem)
+        // width is (sizeof enc - 1) spelled out: fscanf needs it as a literal.
+        char enc[ANIM_TEXT_LEN_MAX * 2];
+        if (fscanf(f, "%" ANIM_TEXT_ENC_WIDTH "s", enc) == 1 && curElem)
         { DecodeText(enc); TextCopy(curElem->text, enc); }
     }
     else if (TextIsEqual(key, "shape"))
@@ -552,6 +618,47 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
                 curElem  = AnimDocAddElem(doc, ElemKindByName(kindStr));
                 curTrack = NULL;
                 if (curElem) TextCopy(curElem->name, nm);
+            }
+        }
+        else if (TextIsEqual(key, "string"))
+        {
+            // Doc-level and written before the elements, so a `string` track's
+            // indices resolve on this single forward pass.
+            curElem = NULL; curTrack = NULL;
+            curSig = NULL; curTgt = NULL; curPos = NULL;
+
+            int idx = -1;
+            char enc[ANIM_TEXT_LEN_MAX * 2];
+            if (fscanf(f, "%d %" ANIM_TEXT_ENC_WIDTH "s", &idx, enc) == 2 &&
+                idx >= 0 && idx < ANIM_STRINGS_MAX)
+            {
+                DecodeText(enc);
+                // Placed AT its stored index, holes and all - the indices are
+                // what the tracks reference and must survive a round-trip.
+                TextCopy(doc->strings[idx].text, enc);
+                doc->strings[idx].used = true;
+                if (idx >= doc->stringCount) doc->stringCount = idx + 1;
+            }
+        }
+        else if (TextIsEqual(key, "pause"))
+        {
+            // Doc-level, like `doc`: close any open element/signal context so a
+            // marker written between blocks cannot be read as part of one.
+            curElem = NULL; curTrack = NULL;
+            curSig = NULL; curTgt = NULL; curPos = NULL;
+
+            // `once` is OPTIONAL (as with `doc` and `signal`): take the rest of
+            // the LINE and let the field count decide the default.
+            char rest[64];
+            float t = 0.0f; int once = 0;
+            if (fgets(rest, sizeof(rest), f))
+            {
+                int n = sscanf(rest, "%f %d", &t, &once);
+                if (n >= 1 && doc->pauseCount < ANIM_PAUSES_MAX)
+                {
+                    AnimPause *p = AnimDocAddPause(doc, t, 1e-4f);
+                    if (p) p->once = (n >= 2) && (once != 0);
+                }
             }
         }
         else if (TextIsEqual(key, "signal"))

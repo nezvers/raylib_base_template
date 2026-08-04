@@ -20,6 +20,7 @@
 #include "../anim/anim_io.h"    // property groups (ANIM_GROUP_PROPS, AnimGroupAt)
 #include "../anim/anim_ease_custom.h"   // custom easings + hide flags
 #include "../anim/anim_library.h"
+#include "../anim/anim_stage.h"  // AnimHandle - the Help guided tour plays here
 
 // Animations live as one .cfg each under ZEN_ANIM_DIR (CWD-relative, writable;
 // same directory the classic editor and AnimStage use).
@@ -28,8 +29,13 @@
 #define ZEN_ANIM_LIST_MAX 64
 // element library: '_'-prefixed so ZenRescanAnims() skips it (not an anim).
 #define ZEN_LIB_PATH      ZEN_ANIM_DIR "/_library" ZEN_ANIM_EXT
+// Help > guided tour: an ordinary authored animation, played by AnimStagePlay
+// (which appends ZEN_ANIM_DIR and the extension itself). Spaces are literal.
+#define ZEN_GUIDE_ANIM    "ZEN EDITOR - GUIDE"
 #define ZEN_UNDO_MAX      16
 #define ZEN_AUTOKEY_EPS   0.02f   // playhead-to-key snap when auto-keying (s)
+#define ZEN_PAUSE_EPS     0.02f   // marker-to-time snap: how close counts as
+                                  // "there is already a pause here" (s)
 
 // Viewport: while EDITING the doc is shown zoomed out so elements can fly in
 // from off-screen and still be seen/grabbed; the real screen is the dotted
@@ -81,6 +87,21 @@ typedef struct {
     char  timeBuf[16]; bool edTime; // key time textbox (single-key mode only)
 } ZenTrackModal;
 
+// Which layer a mouse press landed in. Latched on press and held until
+// release, so the locks below follow the OWNER of a drag rather than whatever
+// the cursor happens to be over: raygui fires GuiButton on RELEASE inside its
+// bounds without caring where the press began, and GuiSlider grabs the knob on
+// IsMouseButtonDown, so a foreign drag passing over either would trigger it.
+// Ordered back-to-front; ZEN_LAYER_NONE = the press owned nothing.
+typedef enum {
+    ZEN_LAYER_NONE = 0,
+    ZEN_LAYER_VIEWPORT,
+    ZEN_LAYER_BASE,                 // menu bar + panels
+    ZEN_LAYER_FLOAT_SIG,            // signal modal
+    ZEN_LAYER_FLOAT_TRACK,          // track modal (drawn over the signal one)
+    ZEN_LAYER_OVERLAY,              // dropdowns, context menus, full modals
+} ZenLayer;
+
 // ---------------------------------------------------------------------------
 //  The one shared context. Plain value struct: undo snapshots and doc are
 //  memcpy-able exactly like in the classic editor.
@@ -121,6 +142,8 @@ typedef struct {
     bool hotkeyNav;                 // Alt navigation mode active
     bool helpOpen;                  // Help modal
     bool openListOpen;              // File > Open anim list overlay
+    AnimHandle guideAnim;           // Help > guided tour instance on the stage
+                                    // (ANIM_HANDLE_NONE when not playing)
 
     // -- prompts (ZenPromptKind) --------------------------------------------
     int  prompt;
@@ -144,6 +167,15 @@ typedef struct {
     bool  guiLocked;                // mirrors GuiLock() for hand-drawn UI
     bool  uiHover;                  // last frame's mouse was over gui chrome,
                                     // so the viewport must not react to it
+    ZenLayer mouseOwner;            // layer that owns the held gesture
+    bool  mouseHeld;                // a press is in flight (no release yet)
+    Vector2 mousePress;             // where that press landed
+    // Set when a press reflows the UI under itself (picking a key in the track
+    // modal switches it to single-key mode, inserting a row). The press point
+    // and the cursor are the same point on the press frame, so a widget that
+    // slid under the cursor passes a "did the press land on me" test. Nothing
+    // positional can tell the two apart - the gesture has to be poisoned.
+    bool  mouseReflow;              // this gesture moved widgets; no new grabs
 
     // -- textbox edit flags -------------------------------------------------
     bool edName, edText;            // inspector name/text boxes
@@ -164,6 +196,8 @@ typedef struct {
 
     // ease dropdown of the track modal (list drawn topmost as an overlay)
     bool easeDropOpen; Rectangle easeDropRect;
+    // string-pick dropdown of the track modal (same overlay treatment)
+    bool strDropOpen; Rectangle strDropRect;
     // add-track dropdown of the inspector
     bool addTrackOpen; int addTrackSel; Rectangle addTrackRect;
 
@@ -172,6 +206,14 @@ typedef struct {
     int   dragKeyGroup;             // group being dragged (-1 = none)
     float dragKeyTime;
     bool  dragIntro, dragOutro;
+    int   dragPause;                // pause marker being dragged (-1 = none)
+
+    // -- pause markers ------------------------------------------------------
+    int   selPause;                 // marker the timeline highlights (-1 = none)
+    bool  pausedOnMarker;           // preview playback is HELD on selPause's
+                                    // marker, waiting for a key (mirrors the
+                                    // runtime hold in anim_stage.c)
+    int   heldPause;                // which marker the preview is held on
 
     // -- signal modal -------------------------------------------------------
     int   sigModalIdx;              // open signal (-1 = none); survives playback
@@ -236,7 +278,32 @@ float ZenTextW(const char *text);   // label width at the current gui font
 float ZenClampF(float v, float lo, float hi);
 bool  ZenEditSlider(Rectangle r, const char *label, float *v, float lo, float hi);
 bool  ZenSliderTyping(void);        // a slider's value textbox is open
+
+// Multi-line text field (raygui's GuiTextBox is single-line only). Same
+// contract as GuiTextBox: returns true when the caller should flip `active`.
+bool  ZenEditTextArea(Rectangle r, char *text, int cap, bool active);
+bool  ZenTextAreaTyping(void);      // a text area owns the keyboard
+void  ZenTextAreaClose(void);       // commit and release it (ESC / selection change)
+int   ZenTextAreaRows(const char *s);
+float ZenTextAreaHeight(const char *s, int maxRows);
 void  ZenWidgetsFrameEnd(void);     // close drag gestures on mouse release
+
+// Mouse gesture ownership. ZenMouseOwnerUpdate runs once at the top of Gui();
+// ZenLayerActive(l) is false while another layer owns the gesture, and the
+// caller keeps that layer GuiLock()ed for its whole duration.
+void  ZenMouseOwnerUpdate(void);
+bool  ZenLayerActive(ZenLayer l);
+// Call from any handler that changes the layout in response to a press, before
+// the moved widgets are drawn. Suppresses value grabs for the rest of the
+// gesture, so a slider that lands under the cursor stays inert until release.
+void  ZenMouseReflow(void);
+// GuiButton that also requires the press to have landed on it, for buttons
+// that can reflow under a held cursor.
+bool  ZenButton(Rectangle r, const char *text);
+// Title-bar drag shared by the floating modals. `own` is the layer the caller
+// draws in, so two overlapping title bars can't both grab one press.
+void  ZenModalDrag(Rectangle title, Vector2 *pos, Vector2 origin,
+                   bool *dragging, Vector2 *dragOff, ZenLayer own);
 void  ZenDrawSwatch(Rectangle r, Color c);
 void  ZenDrawPanelBG(Rectangle r, int mode);
 int   ZenColorPropFor(int kind);    // the kind's one colour property
@@ -265,10 +332,19 @@ void  ZenGroupWriteKey(AnimElem *e, int gi, float t);     // key every member
 void  ZenGroupDeleteTracks(AnimElem *e, int gi);
 void  ZenGroupDeleteKeyAt(AnimElem *e, int gi, float t);
 void  ZenGroupMoveKeyTo(AnimElem *e, int gi, float oldT, float newT);
+// Restate the group key at srcT verbatim (value, colour and ease) at dstT,
+// rather than sampling the element there the way ZenGroupWriteKey does.
+bool  ZenGroupCloneKeyTo(AnimElem *e, int gi, float srcT, float dstT);
+// Time of the nearest group key strictly before t, or -1 when there is none.
+float ZenGroupKeyTimeLeftOf(AnimElem *e, int gi, float t);
 void  ZenGroupSetEaseAt(AnimElem *e, int gi, float t, int ease);
 int   ZenGroupEase(AnimElem *e, int gi, float t);         // representative ease
 int   ZenGroupColorProp(int kind, int gi);                // colour member or -1
 const char *ZenGroupKeyLabel(AnimElem *e, int gi, float t);
+
+// True when every member property snaps instead of blending (the "string"
+// group). Such a group has no meaningful easing, so the UI must not offer one.
+bool ZenGroupIsStepped(int kind, int gi);
 
 // -- signal-target groups (same coordinated editing, keys in normalized u) --
 #define ZEN_SIG_U_EPS     0.001f
@@ -303,6 +379,7 @@ const char *ZenPropDesc(int prop);              // plain-language property help
 //  zen_panels.c - the four panels
 // ---------------------------------------------------------------------------
 void ZenPanelsGui(void);            // layout + ELEMENTS/SIGNALS/INSPECTOR/TIMELINE
+void ZenPanelsOverlaysGui(void);    // the add-track list, topmost (must run unlocked)
 void ZenPanelsUpdate(float dt);     // playback slide bookkeeping
 void ZenFireSignal(const AnimSignal *sg);
 
@@ -315,6 +392,7 @@ void ZenTrackModalOpenSig(int sigIdx);          // signal mode: edits the key
 void ZenTrackModalSync(void);                   // reload staged values
 void ZenTrackModalGui(void);                    // drawn above the panels
 void ZenEaseDropOverlayGui(void);               // its ease list, topmost
+void ZenStringDropOverlayGui(void);             // its string-pool list, topmost
 
 // ---------------------------------------------------------------------------
 //  zen_signal_modal.c - the draggable signal modal
@@ -334,6 +412,12 @@ void ZenMenuOverlaysGui(void);      // open dropdown + modals, drawn topmost
 bool ZenMenuModalOpen(void);        // a prompt/library/help modal is up
 bool ZenMenuTyping(void);           // File>Open search box capturing keys
 
+// Help > guided tour: the authored ZEN_GUIDE_ANIM played over the live editor
+// by anim_stage (single playback, its pause markers held by any keypress).
+void ZenGuidePlay(void);            // start, or restart if already running
+void ZenGuideStop(void);            // cancel; safe when nothing is playing
+bool ZenGuideActive(void);          // a tour instance is alive on the stage
+
 // ---------------------------------------------------------------------------
 //  zen_view.c - main viewport (zoom, dotted screen rect, later: picking)
 // ---------------------------------------------------------------------------
@@ -349,6 +433,36 @@ bool ZenEasingModalOpen(void);      // browser or graph editor showing
 bool ZenEasingEscClose(void);       // close topmost easing modal; false if none
 bool ZenEasingTyping(void);         // its name textbox captures the keyboard
 void ZenEasingGui(void);
+
+// -- zen_clone_modal.c ------------------------------------------------------
+// Element > Clone from...: write another element's look at the playhead onto
+// the SELECTED element as keys at a chosen time. Saves element slots by reusing
+// an expired block instead of adding a new one.
+void ZenCloneShow(void);            // Element > Clone from...
+bool ZenCloneOpen(void);            // the modal is showing
+bool ZenCloneEscClose(void);        // close it; false if it was not open
+bool ZenCloneTyping(void);          // its time textbox captures the keyboard
+void ZenCloneGui(void);
+
+// -- zen_string_pool.c ------------------------------------------------------
+// The document's shared text strings. Text elements point at entries here, and
+// an AP_T_STRING track keys the index, which is what lets text CHANGE mid-
+// animation (see AnimString in anim.h for why it cannot live on the key).
+// One-line preview of a possibly multi-line string, ellipsised at maxChars.
+// Returns a shared static buffer - use it before the next call.
+const char *ZenTextPreview(const char *s, int maxChars);
+
+void ZenStringPoolShow(void);
+bool ZenStringPoolOpen(void);
+bool ZenStringPoolEscClose(void);
+bool ZenStringPoolTyping(void);
+void ZenStringPoolGui(void);
+
+// timeline right-click menu (insert / delete a pause marker)
+void ZenTimelineCtxGui(void);
+bool ZenTimelineCtxOpen(void);
+void ZenTimelineCtxClose(void);
+
 Vector2 ZenScreenToDoc(Vector2 screenPos);  // raw mouse -> doc/game space
 void ZenDrawDottedRect(Rectangle r, Color c);
 void ZenDrawDottedLine(Vector2 a, Vector2 b, Color c);

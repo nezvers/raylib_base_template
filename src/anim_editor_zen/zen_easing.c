@@ -242,7 +242,10 @@ static void DrawGraphEditor(void)
 
     // --- interaction ---------------------------------------------------------
     Vector2 mouse = GetMousePosition();
-    bool inGraph = CheckCollisionPointRec(mouse, g);
+    // Not guiLocked: that is the BASE layer's lock, and it is up for as long as
+    // this modal is open. Ask whether this layer owns the gesture instead.
+    bool inGraph = ZenLayerActive(ZEN_LAYER_OVERLAY) &&
+                   CheckCollisionPointRec(mouse, g);
     bool alt  = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
     bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
 
