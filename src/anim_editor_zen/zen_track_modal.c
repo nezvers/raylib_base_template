@@ -240,7 +240,7 @@ static float DrawKeyTree(Rectangle m, float y, AnimElem *e,
            : "Several keys picked: edits are staged and Apply writes only the "
              "changed fields to all of them.");
 
-    if (rootHot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    if (rootHot && !zen.guiLocked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
     {
         AudioPlayButton();
         if (single && s_scopeElem == zen.selElem && s_scopeGroup == zen.selGroup)
@@ -284,7 +284,7 @@ static float DrawKeyTree(Rectangle m, float y, AnimElem *e,
                      TextFormat("key @ %.2fs", times[i]));
             GuiLabel((Rectangle){ r.x + 118, r.y, r.width - 122, TM_TREE_RH },
                      KeySummary(e, g, times[i]));
-            if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            if (hot && !zen.guiLocked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
             { pick = times[i]; pickAdd = ctrl; }
         }
         ry += TM_TREE_RH;
@@ -317,15 +317,8 @@ static Rectangle ModalChrome(ZenTrackModal *tm, float bodyH, const char *title)
     tm->rect = m;
 
     Rectangle titleR = { m.x, m.y, m.width - 24, TM_TITLE_H };
-    Vector2 mouse = GetMousePosition();
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, titleR))
-    { tm->dragging = true; tm->dragOff = (Vector2){ mouse.x - m.x, mouse.y - m.y }; }
-    if (tm->dragging)
-    {
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
-            tm->pos = (Vector2){ mouse.x - tm->dragOff.x, mouse.y - tm->dragOff.y };
-        else tm->dragging = false;
-    }
+    ZenModalDrag(titleR, &tm->pos, (Vector2){ m.x, m.y },
+                 &tm->dragging, &tm->dragOff, ZEN_LAYER_FLOAT_TRACK);
 
     DrawRectangleRec(m, (Color){ 40, 42, 48, 252 });
     DrawRectangleLinesEx(m, 1.0f, (Color){ 110, 114, 126, 255 });
@@ -513,15 +506,8 @@ void ZenTrackModalGui(void)
 
     // --- title bar drag ------------------------------------------------------
     Rectangle title = { m.x, m.y, m.width - 24, TM_TITLE_H };
-    Vector2 mouse = GetMousePosition();
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, title))
-    { tm->dragging = true; tm->dragOff = (Vector2){ mouse.x - m.x, mouse.y - m.y }; }
-    if (tm->dragging)
-    {
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
-            tm->pos = (Vector2){ mouse.x - tm->dragOff.x, mouse.y - tm->dragOff.y };
-        else tm->dragging = false;
-    }
+    ZenModalDrag(title, &tm->pos, (Vector2){ m.x, m.y },
+                 &tm->dragging, &tm->dragOff, ZEN_LAYER_FLOAT_TRACK);
 
     // --- chrome --------------------------------------------------------------
     DrawRectangleRec(m, (Color){ 40, 42, 48, 252 });

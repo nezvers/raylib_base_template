@@ -457,6 +457,7 @@ static void Enter()
     zen.elemView = zen.sigView = zen.inspView = (ZenPanelView){0};
     zen.panelAnim = 0.0f; zen.prevPlaybackUi = false;
     zen.guiLocked = false;
+    zen.mouseOwner = ZEN_LAYER_NONE; zen.mouseHeld = false;
     zen.edName = zen.edText = false; zen.edSigIdx = -1;
     ZenTextAreaClose();          // never leave it keyed to the old element
     zen.selGroup = -1; zen.selKeyCount = 0;
@@ -626,6 +627,7 @@ static void Draw()
 static void Gui()
 {
     ZenWidgetsFrameEnd();
+    ZenMouseOwnerUpdate();      // latch/hold/release the gesture owner
 
     // The base layer (bar + panels) locks whenever something floats above it:
     // a menu modal, an open dropdown list, or the cursor being over one of
@@ -639,8 +641,12 @@ static void Gui()
     bool dropOpen = zen.menuOpen >= 0 || zen.easeDropOpen || zen.addTrackOpen
                  || zen.strDropOpen
                  || zen.sigDropMode != 0 || ZenViewCtxOpen() || ZenTimelineCtxOpen();
-    zen.guiLocked = ZenMenuModalOpen() || ZenEasingModalOpen() || ZenCloneOpen()
-                 || ZenStringPoolOpen() || dropOpen || overFloat;
+    bool fullModal = ZenMenuModalOpen() || ZenEasingModalOpen() || ZenCloneOpen()
+                  || ZenStringPoolOpen();
+    // ...and for the whole of a gesture that began in another layer, so a
+    // release here can't fire a button or grab a slider the press never hit.
+    zen.guiLocked = fullModal || dropOpen || overFloat
+                 || !ZenLayerActive(ZEN_LAYER_BASE);
     if (zen.guiLocked) GuiLock();
 
     // uiHover keeps the viewport's hands off the mouse while it's on chrome;
@@ -653,15 +659,21 @@ static void Gui()
     GuiUnlock();
 
     // Floating modals: usable while the panels stay clickable outside them.
-    // Locked only under their own dropdown lists or a menu modal.
-    bool floatLock = ZenMenuModalOpen() || ZenEasingModalOpen() || ZenCloneOpen()
-                  || ZenStringPoolOpen()
+    // Locked under their own dropdown lists or a menu modal, and separately
+    // per modal while the other one owns the gesture.
+    bool floatLock = fullModal
                   || zen.easeDropOpen || zen.addTrackOpen || zen.strDropOpen
                   || zen.sigDropMode != 0;
-    if (floatLock) GuiLock();
+    bool sigLock = floatLock || !ZenLayerActive(ZEN_LAYER_FLOAT_SIG);
+    bool trkLock = floatLock || !ZenLayerActive(ZEN_LAYER_FLOAT_TRACK);
+
+    if (sigLock) GuiLock();
     ZenSignalModalGui();
+    if (sigLock) GuiUnlock();
+
+    if (trkLock) GuiLock();
     ZenTrackModalGui();
-    if (floatLock) GuiUnlock();
+    if (trkLock) GuiUnlock();
 
     // Overlays topmost: dropdown lists, then the menu's modals, then the tip.
     ZenPanelsOverlaysGui();

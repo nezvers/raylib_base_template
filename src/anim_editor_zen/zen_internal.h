@@ -83,6 +83,21 @@ typedef struct {
     char  timeBuf[16]; bool edTime; // key time textbox (single-key mode only)
 } ZenTrackModal;
 
+// Which layer a mouse press landed in. Latched on press and held until
+// release, so the locks below follow the OWNER of a drag rather than whatever
+// the cursor happens to be over: raygui fires GuiButton on RELEASE inside its
+// bounds without caring where the press began, and GuiSlider grabs the knob on
+// IsMouseButtonDown, so a foreign drag passing over either would trigger it.
+// Ordered back-to-front; ZEN_LAYER_NONE = the press owned nothing.
+typedef enum {
+    ZEN_LAYER_NONE = 0,
+    ZEN_LAYER_VIEWPORT,
+    ZEN_LAYER_BASE,                 // menu bar + panels
+    ZEN_LAYER_FLOAT_SIG,            // signal modal
+    ZEN_LAYER_FLOAT_TRACK,          // track modal (drawn over the signal one)
+    ZEN_LAYER_OVERLAY,              // dropdowns, context menus, full modals
+} ZenLayer;
+
 // ---------------------------------------------------------------------------
 //  The one shared context. Plain value struct: undo snapshots and doc are
 //  memcpy-able exactly like in the classic editor.
@@ -146,6 +161,8 @@ typedef struct {
     bool  guiLocked;                // mirrors GuiLock() for hand-drawn UI
     bool  uiHover;                  // last frame's mouse was over gui chrome,
                                     // so the viewport must not react to it
+    ZenLayer mouseOwner;            // layer that owns the held gesture
+    bool  mouseHeld;                // a press is in flight (no release yet)
 
     // -- textbox edit flags -------------------------------------------------
     bool edName, edText;            // inspector name/text boxes
@@ -257,6 +274,16 @@ void  ZenTextAreaClose(void);       // commit and release it (ESC / selection ch
 int   ZenTextAreaRows(const char *s);
 float ZenTextAreaHeight(const char *s, int maxRows);
 void  ZenWidgetsFrameEnd(void);     // close drag gestures on mouse release
+
+// Mouse gesture ownership. ZenMouseOwnerUpdate runs once at the top of Gui();
+// ZenLayerActive(l) is false while another layer owns the gesture, and the
+// caller keeps that layer GuiLock()ed for its whole duration.
+void  ZenMouseOwnerUpdate(void);
+bool  ZenLayerActive(ZenLayer l);
+// Title-bar drag shared by the floating modals. `own` is the layer the caller
+// draws in, so two overlapping title bars can't both grab one press.
+void  ZenModalDrag(Rectangle title, Vector2 *pos, Vector2 origin,
+                   bool *dragging, Vector2 *dragOff, ZenLayer own);
 void  ZenDrawSwatch(Rectangle r, Color c);
 void  ZenDrawPanelBG(Rectangle r, int mode);
 int   ZenColorPropFor(int kind);    // the kind's one colour property

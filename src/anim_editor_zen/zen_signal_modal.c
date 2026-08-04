@@ -478,16 +478,8 @@ void ZenSignalModalGui(void)
     // title-bar drag.
     Rectangle title = { m.x, m.y, m.width - 24, SM_TITLE_H };
     Vector2 mouse = GetMousePosition();
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, title))
-    { zen.sigDragging = true;
-      zen.sigDragOff = (Vector2){ mouse.x - m.x, mouse.y - m.y }; }
-    if (zen.sigDragging)
-    {
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
-            zen.sigModalPos = (Vector2){ mouse.x - zen.sigDragOff.x,
-                                         mouse.y - zen.sigDragOff.y };
-        else zen.sigDragging = false;
-    }
+    ZenModalDrag(title, &zen.sigModalPos, (Vector2){ m.x, m.y },
+                 &zen.sigDragging, &zen.sigDragOff, ZEN_LAYER_FLOAT_SIG);
 
     DrawRectangleRec(m, (Color){ 40, 42, 48, 250 });
     DrawRectangleLinesEx(m, 1.0f, (Color){ 110, 114, 126, 255 });

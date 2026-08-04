@@ -242,7 +242,7 @@ static void DrawGraphEditor(void)
 
     // --- interaction ---------------------------------------------------------
     Vector2 mouse = GetMousePosition();
-    bool inGraph = CheckCollisionPointRec(mouse, g);
+    bool inGraph = !zen.guiLocked && CheckCollisionPointRec(mouse, g);
     bool alt  = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
     bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
 

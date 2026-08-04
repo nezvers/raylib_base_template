@@ -127,7 +127,11 @@ static void ViewInput(void)
 {
     // The viewport listens only while EDITING with the mouse actually on it.
     if (zen.playing || zen.playPending) { dragActive = false; return; }
-    if (zen.uiHover || zen.guiLocked || ctxOpen) return;
+    // guiLocked also goes up while another layer owns a drag, so ask about the
+    // viewport's own claim instead: a drag that started here keeps running
+    // even once the cursor has wandered over the chrome.
+    if (!ZenLayerActive(ZEN_LAYER_VIEWPORT)) return;
+    if (!dragActive && (zen.uiHover || zen.guiLocked || ctxOpen)) return;
 
     Vector2 mouse = GetMousePosition();
     Vector2 dm = ZenScreenToDoc(mouse);
