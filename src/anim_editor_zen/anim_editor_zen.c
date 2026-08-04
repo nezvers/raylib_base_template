@@ -333,7 +333,7 @@ bool ZenTyping(void)
     return zen.edNameBuf || zen.edName || zen.edText || zen.edSigIdx >= 0
         || zen.trackModal.edTime || ZenSliderTyping() || ZenEasingTyping()
         || ZenMenuTyping() || ZenTextAreaTyping() || ZenCloneTyping()
-        || ZenStringPoolTyping();
+        || ZenStringPoolTyping() || ZenExportTyping();
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +577,8 @@ static void Update()
         { zen.prompt = ZEN_PROMPT_NONE; zen.edNameBuf = false; }
         else if (ZenStringPoolEscClose()) { }
         else if (ZenCloneEscClose()) { }
+        // two-stage: cancels a running export first, closes the modal next.
+        else if (ZenExportEscClose()) { }
         else if (ZenEasingEscClose()) { }
         else if (zen.libOpen)               zen.libOpen = false;
         else if (zen.openListOpen)          zen.openListOpen = false;
@@ -661,7 +663,8 @@ static void Gui()
         (zen.trackModal.open &&
          CheckCollisionPointRec(mouse, zen.trackModal.rect)) ||
         (zen.sigModalIdx >= 0 &&
-         CheckCollisionPointRec(mouse, zen.sigModalRect));
+         CheckCollisionPointRec(mouse, zen.sigModalRect)) ||
+        (ZenExportOpen() && CheckCollisionPointRec(mouse, ZenExportRect()));
     bool dropOpen = zen.menuOpen >= 0 || zen.easeDropOpen || zen.addTrackOpen
                  || zen.strDropOpen
                  || zen.sigDropMode != 0 || ZenViewCtxOpen() || ZenTimelineCtxOpen();
@@ -698,6 +701,14 @@ static void Gui()
     if (trkLock) GuiLock();
     ZenTrackModalGui();
     if (trkLock) GuiUnlock();
+
+    // Export modal floats over both of the above. It renders frames as well as
+    // drawing, so it must run in this pass: BeginTextureMode cannot nest inside
+    // the one main.c opens around Draw().
+    bool expLock = floatLock || !ZenLayerActive(ZEN_LAYER_FLOAT_EXPORT);
+    if (expLock) GuiLock();
+    ZenExportGui();
+    if (expLock) GuiUnlock();
 
     // Overlays topmost: dropdown lists, then the menu's modals, then the tip.
     ZenPanelsOverlaysGui();

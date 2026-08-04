@@ -99,6 +99,7 @@ typedef enum {
     ZEN_LAYER_BASE,                 // menu bar + panels
     ZEN_LAYER_FLOAT_SIG,            // signal modal
     ZEN_LAYER_FLOAT_TRACK,          // track modal (drawn over the signal one)
+    ZEN_LAYER_FLOAT_EXPORT,         // export modal (drawn over both of those)
     ZEN_LAYER_OVERLAY,              // dropdowns, context menus, full modals
 } ZenLayer;
 
@@ -443,6 +444,19 @@ bool ZenCloneOpen(void);            // the modal is showing
 bool ZenCloneEscClose(void);        // close it; false if it was not open
 bool ZenCloneTyping(void);          // its time textbox captures the keyboard
 void ZenCloneGui(void);
+
+// -- zen_export.c -----------------------------------------------------------
+// File > Export...: render the document to a GIF, a video (via ffmpeg) or a
+// PNG frame sequence. Draggable like the track/signal modals, and it renders in
+// chunks from the Gui() pass - BeginTextureMode cannot nest inside the one
+// main.c opens around Draw().
+void ZenExportShow(void);           // File > Export...
+bool ZenExportOpen(void);           // the modal is showing
+bool ZenExportBusy(void);           // a render is in flight
+bool ZenExportEscClose(void);       // cancel a job, else close; false if not open
+bool ZenExportTyping(void);         // its name/fps boxes capture the keyboard
+Rectangle ZenExportRect(void);      // published for hit-testing (empty if closed)
+void ZenExportGui(void);
 
 // -- zen_string_pool.c ------------------------------------------------------
 // The document's shared text strings. Text elements point at entries here, and

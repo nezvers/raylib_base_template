@@ -101,7 +101,10 @@ static void ActFileDelete(void)
     zen.promptTargetIdx = zen.animCurrent;
 }
 static void ActFileExit(void)    { ZenExitEditor(); }
+static void ActFileExport(void)  { ZenExportShow(); }
 static bool EnSavedAnim(void)    { return zen.animCurrent >= 0; }
+// nothing to render out of an empty document.
+static bool EnHasElems(void)     { return zen.doc.elemCount > 0; }
 
 // -- Editor -----------------------------------------------------------------
 static void ActEdLoop(void)      { zen.loopPlay = !zen.loopPlay; }
@@ -252,6 +255,9 @@ static void MenusInit(void)
     AddItem(m, "Save As...", 'A', ActFileSaveAs, NULL, NULL, "Save a copy under a new name and edit the copy");
     AddItem(m, "Rename...",  'R', ActFileRename, EnSavedAnim, NULL, "Rename the animation file on disk");
     AddItem(m, "Delete",     'D', ActFileDelete, EnSavedAnim, NULL, "Delete the animation file (asks first)");
+    AddItem(m, "-",          0,   NULL,          NULL, NULL, NULL);
+    AddItem(m, "Export...",  'E', ActFileExport, EnHasElems, NULL, "Render the animation to a GIF, a video, or a PNG frame sequence");
+    AddItem(m, "-",          0,   NULL,          NULL, NULL, NULL);
     AddItem(m, "Exit editor",'X', ActFileExit,   NULL, NULL, "Back to the main menu (asks when unsaved)");
 
     m = &s_menus[s_menuCount++]; *m = (ZenMenu){ "Editor", 'E' };

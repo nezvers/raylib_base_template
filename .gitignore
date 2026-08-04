@@ -87,3 +87,4 @@ android.*
 settings.cfg
 *settings.sav
 build-web/*
+anims/exports/*

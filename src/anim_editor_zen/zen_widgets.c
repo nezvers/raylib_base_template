@@ -137,6 +137,10 @@ static ZenLayer LayerAtCursor(Vector2 m)
         ZenViewCtxOpen() || ZenTimelineCtxOpen())
         return ZEN_LAYER_OVERLAY;
 
+    // Export modal is drawn after both, so it wins any overlap with them.
+    if (ZenExportOpen() && CheckCollisionPointRec(m, ZenExportRect()))
+        return ZEN_LAYER_FLOAT_EXPORT;
+
     // Track modal is drawn after the signal one, so it wins any overlap.
     if (zen.trackModal.open && CheckCollisionPointRec(m, zen.trackModal.rect))
         return ZEN_LAYER_FLOAT_TRACK;
