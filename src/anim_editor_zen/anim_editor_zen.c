@@ -448,6 +448,7 @@ static void Enter()
 
     zen.menuOpen = -1; zen.hotkeyNav = false;
     zen.helpOpen = false; zen.openListOpen = false;
+    zen.guideAnim = ANIM_HANDLE_NONE;
     zen.prompt = ZEN_PROMPT_NONE; zen.promptTargetIdx = -1;
     zen.nameBuf[0] = '\0'; zen.edNameBuf = false;
     zen.libOpen = false; zen.libScroll = 0.0f; zen.libTargetIdx = -1;
@@ -489,6 +490,7 @@ static void Exit()
     }
     else lastOpened[0] = '\0';
 
+    ZenGuideStop();     // never leave a tour holding a stage slot behind us
     AnimSignalUnregister(&zen.doc, &zen.preview);
 }
 
@@ -555,6 +557,13 @@ static void Update()
     // Fired signals run on their own clock as an override (playhead untouched).
     if (!AnimSignalPlayerDone(&zen.preview)) AnimSignalPlayerUpdate(&zen.preview, dt);
 
+    // The Help guided tour, if one is running. It drives itself: its pause
+    // markers hold on any mouse press or key in KEY_SPACE..KEY_KB_MENU, which
+    // it OBSERVES rather than consumes - so the editor below stays usable and
+    // reads the same input this frame. Ahead of the ESC chain so a cancel this
+    // frame beats the tour's own advance.
+    AnimStageUpdate(dt);
+
     // ESC closes whatever is open, innermost first; leaves the editor once
     // nothing is (so it can't discard work behind a modal by accident).
     // (a slider's precise-entry textbox consumes its own ESC in the widget)
@@ -582,6 +591,10 @@ static void Update()
         { zen.sigModalIdx = -1; zen.edSigIdx = -1; ZenSigClearKeySel(); }
         else if (zen.menuOpen >= 0 || zen.hotkeyNav)
         { zen.menuOpen = -1; zen.hotkeyNav = false; }
+        // Last before leaving: the tour floats over the whole editor, so every
+        // modal and dropdown under it closes first - but ESC still cancels the
+        // tour rather than dropping the user out to the main menu.
+        else if (ZenGuideActive())          ZenGuideStop();
         else ZenExitEditor();
     }
 
@@ -589,7 +602,11 @@ static void Update()
     ZenMenuUpdate();
 
     bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
-    bool typing = ZenTyping();
+    // A running tour advances on ANY key, so the keyboard shortcuts that would
+    // ALSO act on that same press are held back until it ends. Mouse editing,
+    // the panels and the menu bar deliberately stay live - the tour is pointing
+    // at them, and a click advancing a beat is the intended gesture.
+    bool typing = ZenTyping() || ZenGuideActive();
     if (!typing && ctrl && IsKeyPressed(KEY_Z)) ZenUndoApply(-1);
     if (!typing && ctrl && IsKeyPressed(KEY_Y)) ZenUndoApply(+1);
     if (!typing && ctrl && IsKeyPressed(KEY_S)) ZenSaveCurrent();
@@ -621,7 +638,14 @@ static void Update()
 // ===========================================================================
 static void Draw()
 {
-    ZenViewDraw();
+    ZenViewDraw();      // ends with EndMode2D()
+
+    // The guided tour draws OUTSIDE the edit camera, so it lands at true 1:1
+    // over the whole canvas instead of being halved by ZEN_ZOOM_EDIT: its
+    // arrows and boxes were authored against the real screen and have to point
+    // at where the panels actually are. Still under raygui, which main.c draws
+    // afterwards - so the panels it describes stay visible and clickable.
+    AnimStageDraw();
 }
 
 static void Gui()

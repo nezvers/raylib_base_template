@@ -200,6 +200,32 @@ static void ActEaBrowse(void)    { ZenEasingBrowserOpen(); }
 
 // -- Help -------------------------------------------------------------------
 static void ActHelp(void)        { zen.helpOpen = true; }
+static void ActGuide(void)       { ZenGuidePlay(); }
+
+// The guided tour is just an authored animation on the runtime stage, so it
+// brings its own pause-marker holds and any-key advance for free. loop=false
+// is what makes it a SINGLE playback: the .cfg's loopSmooth only shapes the
+// seam, it never decides whether the doc repeats (that is the call argument).
+void ZenGuidePlay(void)
+{
+    ZenGuideStop();                 // restart from the top, never two at once
+
+    // The editor's own preview clock is stopped for the duration: it holds on
+    // pause markers by the same any-key rule, and two clocks reading the same
+    // keypress would advance together.
+    zen.playing = false; zen.playPending = false;
+    zen.pausedOnMarker = false;
+
+    zen.guideAnim = AnimStagePlay(ZEN_GUIDE_ANIM, false, 0);
+}
+
+void ZenGuideStop(void)
+{
+    AnimStageStop(zen.guideAnim);   // a no-op on a stale or NONE handle
+    zen.guideAnim = ANIM_HANDLE_NONE;
+}
+
+bool ZenGuideActive(void) { return AnimStageAlive(zen.guideAnim); }
 
 // ---------------------------------------------------------------------------
 //  Table construction (runtime, once).
@@ -268,6 +294,7 @@ static void MenusInit(void)
     AddItem(m, "Browse easings...", 'B', ActEaBrowse, NULL, NULL, "View, hide and create easing curves");
 
     m = &s_menus[s_menuCount++]; *m = (ZenMenu){ "Help", 'H' };
+    AddItem(m, "Play the guided tour", 'G', ActGuide, NULL, NULL, "An animated tour of every panel, played over the editor - press any key to advance it");
     AddItem(m, "How the Zen editor works...", 'H', ActHelp, NULL, NULL, "All interactions explained in one page");
 }
 

@@ -20,6 +20,7 @@
 #include "../anim/anim_io.h"    // property groups (ANIM_GROUP_PROPS, AnimGroupAt)
 #include "../anim/anim_ease_custom.h"   // custom easings + hide flags
 #include "../anim/anim_library.h"
+#include "../anim/anim_stage.h"  // AnimHandle - the Help guided tour plays here
 
 // Animations live as one .cfg each under ZEN_ANIM_DIR (CWD-relative, writable;
 // same directory the classic editor and AnimStage use).
@@ -28,6 +29,9 @@
 #define ZEN_ANIM_LIST_MAX 64
 // element library: '_'-prefixed so ZenRescanAnims() skips it (not an anim).
 #define ZEN_LIB_PATH      ZEN_ANIM_DIR "/_library" ZEN_ANIM_EXT
+// Help > guided tour: an ordinary authored animation, played by AnimStagePlay
+// (which appends ZEN_ANIM_DIR and the extension itself). Spaces are literal.
+#define ZEN_GUIDE_ANIM    "ZEN EDITOR - GUIDE"
 #define ZEN_UNDO_MAX      16
 #define ZEN_AUTOKEY_EPS   0.02f   // playhead-to-key snap when auto-keying (s)
 #define ZEN_PAUSE_EPS     0.02f   // marker-to-time snap: how close counts as
@@ -138,6 +142,8 @@ typedef struct {
     bool hotkeyNav;                 // Alt navigation mode active
     bool helpOpen;                  // Help modal
     bool openListOpen;              // File > Open anim list overlay
+    AnimHandle guideAnim;           // Help > guided tour instance on the stage
+                                    // (ANIM_HANDLE_NONE when not playing)
 
     // -- prompts (ZenPromptKind) --------------------------------------------
     int  prompt;
@@ -405,6 +411,12 @@ void ZenMenuBarGui(void);           // the bar itself (widgets)
 void ZenMenuOverlaysGui(void);      // open dropdown + modals, drawn topmost
 bool ZenMenuModalOpen(void);        // a prompt/library/help modal is up
 bool ZenMenuTyping(void);           // File>Open search box capturing keys
+
+// Help > guided tour: the authored ZEN_GUIDE_ANIM played over the live editor
+// by anim_stage (single playback, its pause markers held by any keypress).
+void ZenGuidePlay(void);            // start, or restart if already running
+void ZenGuideStop(void);            // cancel; safe when nothing is playing
+bool ZenGuideActive(void);          // a tour instance is alive on the stage
 
 // ---------------------------------------------------------------------------
 //  zen_view.c - main viewport (zoom, dotted screen rect, later: picking)
