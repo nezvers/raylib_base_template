@@ -240,8 +240,13 @@ static float DrawKeyTree(Rectangle m, float y, AnimElem *e,
            : "Several keys picked: edits are staged and Apply writes only the "
              "changed fields to all of them.");
 
-    if (rootHot && !zen.guiLocked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    // This runs inside the floating modal, so guiLocked (the BASE layer's lock,
+    // raised whenever the cursor is over a floater) is the wrong question: ask
+    // whether this layer owns the gesture.
+    if (rootHot && ZenLayerActive(ZEN_LAYER_FLOAT_TRACK) &&
+        IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
     {
+        ZenMouseReflow();       // collapsing or rescoping moves every row below
         AudioPlayButton();
         if (single && s_scopeElem == zen.selElem && s_scopeGroup == zen.selGroup)
         {
@@ -284,7 +289,8 @@ static float DrawKeyTree(Rectangle m, float y, AnimElem *e,
                      TextFormat("key @ %.2fs", times[i]));
             GuiLabel((Rectangle){ r.x + 118, r.y, r.width - 122, TM_TREE_RH },
                      KeySummary(e, g, times[i]));
-            if (hot && !zen.guiLocked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            if (hot && ZenLayerActive(ZEN_LAYER_FLOAT_TRACK) &&
+                IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
             { pick = times[i]; pickAdd = ctrl; }
         }
         ry += TM_TREE_RH;
@@ -293,6 +299,10 @@ static float DrawKeyTree(Rectangle m, float y, AnimElem *e,
 
     if (pick >= 0.0f)
     {
+        // Selecting re-lays out the modal (single-key mode inserts a time row)
+        // while the button is still down, sliding the sliders below the tree
+        // under the cursor. Poison the gesture so none of them take it.
+        ZenMouseReflow();
         AudioPlayButton();
         if (pickAdd) ZenSelKey(zen.selElem, zen.selGroup, pick, true);
         else
@@ -431,7 +441,7 @@ static void SigModeGui(ZenTrackModal *tm)
     { AudioPlayButton(); zen.easeDropOpen = !zen.easeDropOpen; }
     y += TM_RH + TM_GAP;
 
-    if (GuiButton((Rectangle){ x, y, (m.width - 30) / 2.0f, TM_RH }, "delete key"))
+    if (ZenButton((Rectangle){ x, y, (m.width - 30) / 2.0f, TM_RH }, "delete key"))
     {
         AudioPlayButton(); ZenUndoPush();
         ZenSigGroupDeleteKeyAt(sg, zen.sigSelElem, zen.sigSelGroup, zen.sigSelU);
@@ -685,7 +695,7 @@ void ZenTrackModalGui(void)
     float bw = (m.width - 30) / 2.0f;
     if (single)
     {
-        if (GuiButton((Rectangle){ x, y, bw, TM_RH }, "delete key"))
+        if (ZenButton((Rectangle){ x, y, bw, TM_RH }, "delete key"))
         {
             AudioPlayButton(); ZenUndoPush();
             ZenGroupDeleteKeyAt(e, zen.selGroup, zen.selKeys[0]);
@@ -703,7 +713,7 @@ void ZenTrackModalGui(void)
             if (fabsf(allTimes[i] - zen.playhead) <= ZEN_AUTOKEY_EPS) dupBlocked = true;
 
         if (dupBlocked) GuiDisable();
-        if (GuiButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "duplicate key"))
+        if (ZenButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "duplicate key"))
         {
             AudioPlayButton(); ZenUndoPush();
             ZenGroupWriteKey(e, zen.selGroup, zen.playhead);
@@ -719,19 +729,19 @@ void ZenTrackModalGui(void)
     }
     else if (track)
     {
-        if (GuiButton((Rectangle){ x, y, bw, TM_RH }, "delete track"))
+        if (ZenButton((Rectangle){ x, y, bw, TM_RH }, "delete track"))
         {
             AudioPlayButton(); ZenUndoPush();
             ZenGroupDeleteTracks(e, zen.selGroup);
             ZenSelClear();
             return;
         }
-        if (GuiButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "Apply to all"))
+        if (ZenButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "Apply to all"))
         { AudioPlayButton(); BulkApply(e); }
     }
     else
     {
-        if (GuiButton((Rectangle){ x, y, bw, TM_RH }, "delete keys"))
+        if (ZenButton((Rectangle){ x, y, bw, TM_RH }, "delete keys"))
         {
             AudioPlayButton(); ZenUndoPush();
             for (int i = 0; i < zen.selKeyCount; i++)
@@ -739,7 +749,7 @@ void ZenTrackModalGui(void)
             zen.selKeyCount = 0;
             ZenSelValidate();
         }
-        if (GuiButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "Apply to selected"))
+        if (ZenButton((Rectangle){ x + bw + 10, y, bw, TM_RH }, "Apply to selected"))
         { AudioPlayButton(); BulkApply(e); }
     }
     y += TM_RH + TM_GAP;
@@ -754,7 +764,7 @@ void ZenTrackModalGui(void)
     // this row is +key alone, so it spans both slots less the reset icon.
     float rw = 2.0f*bw + 10.0f - 34.0f;
     if (haveKey) GuiDisable();
-    if (GuiButton((Rectangle){ x, y, rw, TM_RH },
+    if (ZenButton((Rectangle){ x, y, rw, TM_RH },
                   TextFormat("+key @ %.2fs", zen.playhead)))
     {
         AudioPlayButton(); ZenUndoPush();
@@ -775,7 +785,7 @@ void ZenTrackModalGui(void)
     bool dirty = tm->dCval || tm->dEase;
     for (int mi = 0; mi < 8 && !dirty; mi++) dirty = dirty || tm->dVals[mi];
     if (!dirty) GuiDisable();
-    if (GuiButton((Rectangle){ x + rw + 6, y, 28, TM_RH }, "#211#"))
+    if (ZenButton((Rectangle){ x + rw + 6, y, 28, TM_RH }, "#211#"))
     { AudioPlayButton(); ZenTrackModalSync(); }   // drops every staged edit
     if (!dirty) GuiEnable();
 }

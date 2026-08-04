@@ -214,7 +214,7 @@ void ZenStringPoolGui(void)
         int lw = MeasureText(tabs[i], 11);
         DrawText(tabs[i], (int)(tr.x + (tw - lw)/2), (int)(tr.y + 8), 11,
                  (s_tab == i) ? SP_TEXT : SP_DIM);
-        if (hot && !zen.guiLocked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !s_editing)
+        if (hot && ZenLayerActive(ZEN_LAYER_OVERLAY) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !s_editing)
         { AudioPlayButton(); s_tab = i; }
     }
 
@@ -351,7 +351,7 @@ void ZenStringPoolGui(void)
             DrawText("assign", (int)(ab.x + 12), (int)(ab.y + 6), 10,
                      aHot ? SP_BG : SP_TEXT);
 
-            if (hot && !zen.guiLocked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            if (hot && ZenLayerActive(ZEN_LAYER_OVERLAY) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
             {
                 AudioPlayButton();
                 if (aHot)
@@ -409,7 +409,7 @@ void ZenStringPoolGui(void)
                 DrawText("pool it", (int)(pb.x + 12), (int)(pb.y + 6), 10,
                          pHot ? SP_BG : SP_TEXT);
 
-                if (hot && !zen.guiLocked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                if (hot && ZenLayerActive(ZEN_LAYER_OVERLAY) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
                 {
                     AudioPlayButton();
                     if (pHot)
@@ -497,7 +497,7 @@ void ZenStringPoolGui(void)
             DrawText("set", (int)(sb.x + 22), (int)(sb.y + 6), 10,
                      sHot ? SP_BG : (s_armed >= 0 ? SP_TEXT : SP_DIM));
 
-            if (sHot && !zen.guiLocked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            if (sHot && ZenLayerActive(ZEN_LAYER_OVERLAY) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
             { AudioPlayButton(); AssignString(i, s_armed); }
 
             ry += SP_ROW_H + 6.0f;

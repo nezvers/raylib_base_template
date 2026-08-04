@@ -163,6 +163,13 @@ typedef struct {
                                     // so the viewport must not react to it
     ZenLayer mouseOwner;            // layer that owns the held gesture
     bool  mouseHeld;                // a press is in flight (no release yet)
+    Vector2 mousePress;             // where that press landed
+    // Set when a press reflows the UI under itself (picking a key in the track
+    // modal switches it to single-key mode, inserting a row). The press point
+    // and the cursor are the same point on the press frame, so a widget that
+    // slid under the cursor passes a "did the press land on me" test. Nothing
+    // positional can tell the two apart - the gesture has to be poisoned.
+    bool  mouseReflow;              // this gesture moved widgets; no new grabs
 
     // -- textbox edit flags -------------------------------------------------
     bool edName, edText;            // inspector name/text boxes
@@ -280,6 +287,13 @@ void  ZenWidgetsFrameEnd(void);     // close drag gestures on mouse release
 // caller keeps that layer GuiLock()ed for its whole duration.
 void  ZenMouseOwnerUpdate(void);
 bool  ZenLayerActive(ZenLayer l);
+// Call from any handler that changes the layout in response to a press, before
+// the moved widgets are drawn. Suppresses value grabs for the rest of the
+// gesture, so a slider that lands under the cursor stays inert until release.
+void  ZenMouseReflow(void);
+// GuiButton that also requires the press to have landed on it, for buttons
+// that can reflow under a held cursor.
+bool  ZenButton(Rectangle r, const char *text);
 // Title-bar drag shared by the floating modals. `own` is the layer the caller
 // draws in, so two overlapping title bars can't both grab one press.
 void  ZenModalDrag(Rectangle title, Vector2 *pos, Vector2 origin,

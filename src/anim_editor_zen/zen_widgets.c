@@ -151,13 +151,17 @@ static ZenLayer LayerAtCursor(Vector2 m)
 void ZenMouseOwnerUpdate(void)
 {
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-    { zen.mouseOwner = LayerAtCursor(GetMousePosition()); zen.mouseHeld = true; }
+    { zen.mousePress = GetMousePosition();
+      zen.mouseOwner = LayerAtCursor(zen.mousePress); zen.mouseHeld = true; }
     // The release frame is the one GuiButton acts on, so hold the owner
     // through it and only drop it once the button is properly up.
     else if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
              !IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
-    { zen.mouseOwner = ZEN_LAYER_NONE; zen.mouseHeld = false; }
+    { zen.mouseOwner = ZEN_LAYER_NONE; zen.mouseHeld = false;
+      zen.mouseReflow = false; }
 }
+
+void ZenMouseReflow(void) { if (zen.mouseHeld) zen.mouseReflow = true; }
 
 bool ZenLayerActive(ZenLayer l)
 {
@@ -165,6 +169,24 @@ bool ZenLayerActive(ZenLayer l)
     if (!zen.mouseHeld && !IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) return true;
     // A press that owned nothing leaves everything live (nothing to protect).
     return zen.mouseOwner == l || zen.mouseOwner == ZEN_LAYER_NONE;
+}
+
+// GuiButton that also demands the press landed on it. raygui fires on RELEASE
+// inside the bounds no matter where the press began, so a button that reflows
+// under a held cursor (the track modal re-lays out when a key is picked) would
+// fire on a click the user aimed somewhere else entirely.
+bool ZenButton(Rectangle r, const char *text)
+{
+    if (zen.mouseHeld &&
+        (zen.mouseReflow || !CheckCollisionPointRec(zen.mousePress, r)))
+    {
+        bool wasLocked = GuiIsLocked();
+        if (!wasLocked) GuiLock();
+        GuiButton(r, text);
+        if (!wasLocked) GuiUnlock();
+        return false;
+    }
+    return GuiButton(r, text);
 }
 
 void ZenModalDrag(Rectangle title, Vector2 *pos, Vector2 origin,
@@ -197,6 +219,32 @@ bool ZenEditSlider(Rectangle r, const char *label, float *v, float lo, float hi)
     Rectangle lbl = { r.x + r.width + pad, r.y, 44, r.height };
     Vector2 mouse = GetMousePosition();
 
+    // Does the CURRENT gesture belong to this slider? GuiSlider grabs on
+    // IsMouseButtonDown, not Pressed, so a slider that merely slides under a
+    // held cursor would latch and overwrite its value from mouse.x. That is
+    // not hypothetical: picking a key in the track modal's tree switches the
+    // modal to single-key mode, which inserts a row and shifts every slider
+    // below it down under the button that is still down from the pick.
+    // Requiring the press to have landed inside r makes the grab deliberate.
+    // A gesture that reflowed the UI owns nothing: on the press frame the press
+    // point IS the cursor, so a slider that just slid under it would pass the
+    // positional test below and grab on the still-down button.
+    bool ownPress = !zen.mouseHeld ||
+                    (!zen.mouseReflow &&
+                     (CheckCollisionPointRec(zen.mousePress, r) ||
+                      CheckCollisionPointRec(zen.mousePress, lbl)));
+    if (!ownPress)
+    {
+        // Lock rather than just discarding the value: GuiSlider's update path
+        // also sets guiControlExclusiveMode, which would go on suppressing
+        // every GuiButton until release.
+        bool wasLocked = GuiIsLocked();
+        if (!wasLocked) GuiLock();
+        GuiSlider(r, label, TextFormat("%.2f", *v), &(float){ *v }, lo, hi);
+        if (!wasLocked) GuiUnlock();
+        return false;
+    }
+
     // --- textbox mode: this slider owns the open value editor ---------------
     if (edSliderActive && SameRect(edSliderRect, r))
     {
@@ -222,7 +270,9 @@ bool ZenEditSlider(Rectangle r, const char *label, float *v, float lo, float hi)
     }
 
     // --- open the textbox on a double-click of the value label --------------
-    if (!zen.guiLocked &&
+    // GuiIsLocked, not zen.guiLocked: sliders are drawn in every layer, and
+    // this reports the lock of whichever one is drawing us right now.
+    if (!GuiIsLocked() &&
         IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, lbl))
     {
         if (GetTime() - lastSliderClick < 0.3 && SameRect(lastSliderClickRect, r))
@@ -251,7 +301,7 @@ bool ZenEditSlider(Rectangle r, const char *label, float *v, float lo, float hi)
     // --- Shift = fine relative drag -----------------------------------------
     // Follows the LIVE Shift key, so a drag can move in and out of fine mode.
     // fineSticky only latches "undo already pushed for this gesture".
-    if (!zen.guiLocked &&
+    if (!GuiIsLocked() &&
         IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, r))
     {
         finePressRect = r; finePressActive = true; fineSticky = false;
