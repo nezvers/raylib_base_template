@@ -268,6 +268,25 @@ typedef struct {
                                        // all edges app-wide, or pixel-snap the
                                        // crisp draw to match the baked look.
 
+    // AE_TEXT: the SHAPE of the crumble scatter. The AP_T_CRUMBLE track says
+    // how far ALONG the effect is (0 intact, 1 gone); these say what it looks
+    // like while it gets there, and are authored once per element rather than
+    // keyed. Angles are screen-space degrees: 0 = right, turning CLOCKWISE
+    // (screen y is down), so 90 = straight down. The defaults reproduce the
+    // look the effect had when it was hardcoded - see AnimElemInit.
+    float   crumbleRot;                // per-glyph tumble at crumble=1, in
+                                       // degrees; each glyph gets its own
+                                       // amount between -this and +this, so 0
+                                       // keeps every letter upright.
+    float   crumbleDir;                // travel direction, degrees (90 = down)
+    float   crumbleSpread;             // cone width around crumbleDir, degrees;
+                                       // 0 = every glyph travels the same way,
+                                       // 360 = scattered in all directions
+    float   crumbleDist;               // travel distance at crumble=1, as a
+                                       // fraction of game HEIGHT (both axes, so
+                                       // the scatter keeps its shape whatever
+                                       // the aspect ratio)
+
     AnimTrack tracks[ANIM_TRACKS_MAX];
     int       trackCount;
 } AnimElem;

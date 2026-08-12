@@ -537,6 +537,8 @@ static float DrawInspector(float x, float y, float w)
                 "the 'alpha' track is what animates opacity over time");
     y += 22;
 
+    y = ZenCrumbleRows(x, y, w, rh, gap, e);
+
     if (e->kind == AE_GLOBAL)
     {
         GuiLine((Rectangle){ x, y, w, 8 }, "background"); y += 12;

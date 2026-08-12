@@ -25,6 +25,13 @@
 //      outline <r> <g> <b> <a> <thickFrac>                 # (shape elements)
 //      outline_style crisp                 # OPTIONAL (circle): smooth DrawRing
 //                                          # outline; absent -> faceted polygon
+//      crumble_fx <spin> <dir> <spread> <dist>   # OPTIONAL (text): shape of the
+//                                          # crumble scatter, in degrees except
+//                                          # dist (fraction of height). Written
+//                                          # only when it differs from the
+//                                          # defaults; absent -> 90 90 12 0.5,
+//                                          # the values the effect was
+//                                          # hardcoded to before it took params
 //      track  <prop> <keyCount>         # then keyCount x `key` lines
 //        key  <t> <value> <ease>            # scalar tracks
 //        key  <t> <r> <g> <b> <ease>        # colour tracks (RGB; no alpha)
@@ -308,6 +315,16 @@ void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind)
     if (e->outlineCrisp)     fprintf(f, "%s  outline_style crisp\n", ind);
     if (e->rotBase != 0.0f)  fprintf(f, "%s  rot %f\n", ind, e->rotBase);
 
+    // Crumble scatter shape, written as one token only when it differs from the
+    // defaults. Four fields that almost always hold their default would be four
+    // lines of noise on every text element, and skipping them keeps documents
+    // authored before the effect was parameterized byte-identical on a re-save.
+    if (e->kind == AE_TEXT &&
+        (e->crumbleRot    != 90.0f || e->crumbleDir  != 90.0f ||
+         e->crumbleSpread != 12.0f || e->crumbleDist != 0.5f))
+        fprintf(f, "%s  crumble_fx %f %f %f %f\n", ind, e->crumbleRot,
+                e->crumbleDir, e->crumbleSpread, e->crumbleDist);
+
     for (int j = 0; j < e->trackCount; j++)
     {
         const AnimTrack *tr = &e->tracks[j];
@@ -482,6 +499,20 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
         char s[16];
         if (fscanf(f, "%15s", s) == 1 && curElem)
             curElem->outlineCrisp = TextIsEqual(s, "crisp");
+    }
+    else if (TextIsEqual(key, "crumble_fx"))
+    {
+        // absent in older files - AnimElemInit's defaults stand, and those are
+        // exactly the constants the crumble effect used before it took
+        // parameters, so an old document crumbles the way it was authored to.
+        float r, d, sp, ds;
+        if (fscanf(f, "%f %f %f %f", &r, &d, &sp, &ds) == 4 && curElem)
+        {
+            curElem->crumbleRot    = r;
+            curElem->crumbleDir    = d;
+            curElem->crumbleSpread = sp;
+            curElem->crumbleDist   = ds;
+        }
     }
     else if (TextIsEqual(key, "rot"))
     {

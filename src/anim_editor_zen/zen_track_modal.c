@@ -342,6 +342,16 @@ static Rectangle ModalChrome(ZenTrackModal *tm, float bodyH, const char *title)
 
 // Signal mode: live editor for the group key (zen.sigSelElem, zen.sigSelGroup,
 // zen.sigSelU) of signal tm->sig.
+// True when the group on screen contains the crumble track. The crumble SHAPE
+// fields hang off the element, not the key, so they are shown only here - beside
+// the track they shape - rather than on every group either modal can open.
+static bool GroupHasCrumble(const AnimPropGroup *g)
+{
+    for (int m = 0; g && m < g->propCount; m++)
+        if (g->props[m] == AP_T_CRUMBLE) return true;
+    return false;
+}
+
 static void SigModeGui(ZenTrackModal *tm)
 {
     if (tm->sig >= zen.doc.signalCount ||
@@ -361,10 +371,12 @@ static void SigModeGui(ZenTrackModal *tm)
         if (AnimPropIsColor(g->props[m])) hasColor = true;
         else scalarRows++;
     }
+    bool crumble = GroupHasCrumble(g);
     float bodyH = TM_TITLE_H + 22
                 + TM_RH + TM_GAP                    // u
                 + scalarRows * (TM_RH + TM_GAP)
                 + (hasColor ? TM_RH + 3*18 + TM_GAP : 0)
+                + (crumble ? 12 + 4*(TM_RH + TM_GAP) : 0)   // crumble shape
                 + TM_RH + TM_GAP                    // ease
                 + TM_RH + 10;                       // delete
     Rectangle m = ModalChrome(tm, bodyH,
@@ -433,6 +445,13 @@ static void SigModeGui(ZenTrackModal *tm)
         }
     }
 
+    // Crumble shape, same fields the inspector and doc-mode modal edit. They
+    // live on the ELEMENT, so a signal that crumbles a text element shares them
+    // with every other user of that element - editing here is not scoped to this
+    // signal, and the tooltip on each row says what it does rather than implying
+    // otherwise.
+    if (crumble) y = ZenCrumbleRows(x, y, w, TM_RH, TM_GAP, el);
+
     // ease (header; the shared overlay applies it in signal mode).
     GuiLabel((Rectangle){ x, y, 44, TM_RH }, "ease");
     zen.easeDropRect = (Rectangle){ x + 44, y, w - 44, TM_RH };
@@ -498,9 +517,11 @@ void ZenTrackModalGui(void)
     int scalarRows = 0;
     for (int m = 0; g && m < g->propCount; m++)
         if (!AnimPropIsColor(g->props[m])) scalarRows++;
+    bool crumble = GroupHasCrumble(g);
     float bodyH = TM_TITLE_H + treeH + (single ? TM_RH + TM_GAP : 0)
                 + scalarRows * (TM_RH + TM_GAP)
                 + (cp >= 0 ? TM_RH + 3*18 + TM_GAP : 0)
+                + (crumble ? 12 + 4*(TM_RH + TM_GAP) : 0)   // crumble shape
                 + TM_RH + TM_GAP        // ease
                 + TM_RH + TM_GAP        // delete / Apply row
                 + TM_RH + 10;           // +key / reset row
@@ -663,6 +684,13 @@ void ZenTrackModalGui(void)
         }
         y += TM_GAP;
     }
+
+    // --- crumble shape -------------------------------------------------------
+    // Per-ELEMENT, not per-key: these are the same fields the inspector edits,
+    // so they apply to every key of this track at once and ignore the modal's
+    // single/bulk selection entirely. No dirty markers and no Apply - they are
+    // live like the single-key rows, and each drag is its own undo step.
+    if (crumble) y = ZenCrumbleRows(x, y, w, TM_RH, TM_GAP, e);
 
     // --- ease (dropdown header; list drawn topmost by the overlay pass) -----
     // A stepped group has nothing to ease BETWEEN: AnimTrackEval returns the

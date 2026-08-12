@@ -315,6 +315,13 @@ void  ZenEnsureZeroColorKey(AnimElem *e, AnimTrack *tr);
 void  ZenPropSlider(Rectangle r, AnimElem *e, int prop, float *baseField);
 float ZenColorRGBRows(float x, float y, float w, AnimElem *e, int prop,
                       Color *base, const char *label);
+// The four AE_TEXT crumble-shape rows (dir/spread/dist/spin), drawn from x..x+w
+// starting at y and returning the y below them. Shared by the inspector and both
+// modals: the fields live on the ELEMENT, so all three edit the same values and
+// must offer the same controls - a crumble track you can key from the track or
+// signal modal but only shape from the inspector is a discoverability trap.
+// Draws nothing and returns y unchanged for non-text elements.
+float ZenCrumbleRows(float x, float y, float w, float rh, float gap, AnimElem *e);
 // hover tooltip: widgets call ZenTip after drawing; ZenTipDraw paints the one
 // recorded tip topmost at the end of Gui (labels aren't focusable in raygui,
 // so this is hand-rolled rather than GuiSetTooltip).

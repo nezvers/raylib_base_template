@@ -116,6 +116,14 @@ void AnimElemInit(AnimElem *e, AnimElemKind kind)
     e->sizeAbsolute = false;             // sizes are canvas fractions by default
     e->cornerMode   = false;             // center+size authoring by default
     e->outlineCrisp = false;             // faceted polygon outline by default
+    // Crumble scatter shape. These four are the values the effect was hardcoded
+    // to before it was parameterized, so a doc that never touches them - and
+    // every file written before they existed, since a missing token leaves
+    // these standing - crumbles exactly the way it always did.
+    e->crumbleRot    = 90.0f;            // +/- 90 deg of tumble per glyph
+    e->crumbleDir    = 90.0f;            // straight down
+    e->crumbleSpread = 12.0f;            // the old sideways drift, as a cone
+    e->crumbleDist   = 0.5f;             // half the canvas height
     e->trackCount   = 0;
 
     switch (kind)
@@ -1121,14 +1129,19 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game, const char *s
 
     if (crumble > 0.0f)
     {
-        // Simple crumble preview: scatter glyphs downward by `crumble`. This is
-        // an editor-friendly approximation (deterministic, no physics state) -
-        // enough to see the effect on the timeline; runtime players can add the
-        // full particle sim later if wanted.
+        // Crumble: throw each glyph along its own angle inside a cone. Shaped
+        // by the element's four crumble fields (see anim.h) rather than
+        // hardcoded, so the same track can be a collapse, an explosion or a
+        // gust sideways. Still an approximation with NO physics state - every
+        // glyph's angle and spin hash its INDEX, never the clock, which is what
+        // keeps a frame a pure function of (doc, t) for the exporter.
         float scale = sizePx / (float)font.baseSize;
         float penX  = left;
         float penY  = top;
         int   idx   = 0;
+        // Quadratic in crumble: the letters accelerate away, so most of the
+        // travel happens late and the text stays readable as it starts to go.
+        float reach = crumble * crumble * game.y * e->crumbleDist;
         for (const char *c = str; *c; c++)
         {
             int cp = (unsigned char)*c;
@@ -1141,12 +1154,17 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game, const char *s
             if (cp != ' ')
             {
                 char buf[2]  = { (char)cp, 0 };
-                float fall   = crumble * crumble * game.y * 0.5f;
-                float drift  = sinf((float)idx * 12.9898f) * crumble * game.x * 0.05f;
+                // The angle hash is OFFSET from the spin hash so the two stay
+                // independent: without it a glyph's tumble would predict which
+                // way it flies, and the cone would visibly pair up at narrow
+                // spreads.
+                float   ang  = (e->crumbleDir + Rand11i(idx + 977)
+                                              * e->crumbleSpread * 0.5f) * DEG2RAD;
                 Vector2 gsz  = MeasureTextEx(font, buf, sizePx, spacing);
                 Vector2 org  = { gsz.x * 0.5f, gsz.y * 0.5f };
-                Vector2 ctr  = { penX + org.x + drift, penY + org.y + fall };
-                float   grot = rot + crumble * (Rand11i(idx) * 90.0f);
+                Vector2 ctr  = { penX + org.x + cosf(ang) * reach,
+                                 penY + org.y + sinf(ang) * reach };
+                float   grot = rot + crumble * (Rand11i(idx) * e->crumbleRot);
                 DrawTextPro(font, buf, ctr, org, grot, sizePx, spacing, col);
                 idx++;
             }
