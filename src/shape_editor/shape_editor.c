@@ -50,6 +50,9 @@ AppState app_state_shape_editor = { Enter, Exit, Update, Draw, Gui, "ShapeEditor
 static int   s_slot = ANIM_SHAPE_MISSING;   // shape being edited
 static char  s_wanted[ANIM_SHAPE_NAME_MAX]; // what ShapeEditorOpen asked for
 static int   s_ink = ANIM_PX_FILL;          // active brush value
+// Brush DIAMETER in cells, 1..32. A round brush, so the stamp is a disc of this
+// width; 1 is the single-cell pencil the editor started with.
+static int   s_brush = 1;
 
 static float s_zoom = 12.0f;                // screen pixels per cell
 static Vector2 s_pan = { 0 };               // canvas top-left, screen space
@@ -130,6 +133,41 @@ static void UndoPop(void)
 }
 
 static void UndoClear(void) { s_undoHead = 0; s_undoCount = 0; s_strokeOpen = false; }
+
+// ---------------------------------------------------------------------------
+//  Brush
+// ---------------------------------------------------------------------------
+// Stamp the brush disc centred on (cx, cy). Returns true if any cell actually
+// changed - the caller only invalidates the texture cache when it did.
+//
+// The undo push happens HERE rather than in the caller because it must fire on
+// the first cell that really changes: pushing on mouse-press alone would record
+// a step for a click that painted nothing (a stamp entirely off-grid, or over
+// cells already holding this ink), and those empty steps eat the 32-deep ring.
+static bool StampAt(AnimShapeDef *s, int cx, int cy, unsigned char v)
+{
+    // Even diameters have no centre cell, so the disc is offset by half a cell
+    // and the radius is measured from cell centres. Odd diameters land square
+    // on (cx, cy), which is what makes brush 1 an exact single-cell pencil.
+    int   r    = s_brush / 2;
+    float half = (s_brush % 2 == 0) ? 0.5f : 0.0f;
+    float rr   = (s_brush * 0.5f) * (s_brush * 0.5f);
+    bool  any  = false;
+
+    for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++)
+        {
+            float fx = (float)dx - half, fy = (float)dy - half;
+            if (s_brush > 2 && fx*fx + fy*fy > rr) continue;   // round it off
+            int px = cx + dx, py = cy + dy;
+            if (px < 0 || py < 0 || px >= s->w || py >= s->h) continue;
+            if (AnimShapePx(s, px, py) == v) continue;
+            if (!s_strokeOpen) { UndoPush(); s_strokeOpen = true; }
+            AnimShapeSetPx(s, px, py, v);
+            any = true;
+        }
+    return any;
+}
 
 // ---------------------------------------------------------------------------
 //  Canvas geometry (screen space)
@@ -485,11 +523,18 @@ static void Update()
     }
     if (s_browseOpen || Typing()) return;       // modal / typing: no shortcuts
 
-    if ((IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) &&
-        IsKeyPressed(KEY_Z)) UndoPop();
+    bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    if (ctrl && IsKeyPressed(KEY_Z)) UndoPop();
+    if (ctrl && IsKeyPressed(KEY_S) && AnimShapePoolGet(s_slot))
+        Status(AnimShapePoolSaveOne(s_slot, ANIM_SHAPE_USER_DIR)
+               ? "saved to shapes/" : "could not write shapes/");
     if (IsKeyPressed(KEY_ONE))   s_ink = ANIM_PX_EMPTY;
     if (IsKeyPressed(KEY_TWO))   s_ink = ANIM_PX_FILL;
     if (IsKeyPressed(KEY_THREE)) s_ink = ANIM_PX_OUTLINE;
+
+    // Photoshop's brush-size keys, because the hand is already on the canvas.
+    if (IsKeyPressed(KEY_LEFT_BRACKET)  && s_brush >  1) s_brush--;
+    if (IsKeyPressed(KEY_RIGHT_BRACKET) && s_brush < 32) s_brush++;
     if (IsKeyPressed(KEY_F))     CanvasFit();
 
     Rectangle wa = WorkArea();
@@ -535,10 +580,8 @@ static void Update()
         if (CellAtCursor(&cx, &cy))
         {
             unsigned char v = right ? ANIM_PX_EMPTY : (unsigned char)s_ink;
-            if (AnimShapePx(s, cx, cy) != v)
+            if (StampAt(s, cx, cy, v))
             {
-                if (!s_strokeOpen) { UndoPush(); s_strokeOpen = true; }
-                AnimShapeSetPx(s, cx, cy, v);
                 AnimShapePoolInvalidate(s_slot);
             }
         }
@@ -622,6 +665,21 @@ static void DrawCanvas(void)
     int hx, hy;
     if (!s_browseOpen && CellAtCursor(&hx, &hy))
     {
+        // Outline every cell the brush would touch, so the disc is visible
+        // before it is committed - a 32-wide brush is otherwise a guess.
+        int   r    = s_brush / 2;
+        float half = (s_brush % 2 == 0) ? 0.5f : 0.0f;
+        float rr   = (s_brush * 0.5f) * (s_brush * 0.5f);
+        for (int dy = -r; dy <= r; dy++)
+            for (int dx = -r; dx <= r; dx++)
+            {
+                float fx = (float)dx - half, fy = (float)dy - half;
+                if (s_brush > 2 && fx*fx + fy*fy > rr) continue;
+                int px = hx + dx, py = hy + dy;
+                if (px < 0 || py < 0 || px >= s->w || py >= s->h) continue;
+                DrawRectangle((int)(c.x + px*s_zoom), (int)(c.y + py*s_zoom),
+                              (int)s_zoom + 1, (int)s_zoom + 1, Fade(SKYBLUE, 0.25f));
+            }
         DrawRectangleLinesEx((Rectangle){ c.x + hx*s_zoom, c.y + hy*s_zoom,
                                           s_zoom, s_zoom }, 2.0f, SKYBLUE);
         GuiLabel((Rectangle){ wa.x + 12.0f, wa.y + 8.0f, 200.0f, 20.0f },
@@ -735,7 +793,17 @@ static void Gui()
             if (on) s_ink = i;
         }
         y += SE_RH + 2.0f;
-        GuiLabel((Rectangle){ x, y, w, 18.0f }, "right-drag erases");
+
+        // Brush size. GuiSlider is float-only, so round to a whole cell count -
+        // a 2.5-cell brush has no meaning on a pixel grid.
+        float bsz = (float)s_brush;
+        GuiSlider((Rectangle){ x + 46.0f, y, w - 46.0f - 30.0f, SE_RH },
+                  "size", TextFormat("%d", s_brush), &bsz, 1.0f, 32.0f);
+        s_brush = (int)(bsz + 0.5f);
+        if (s_brush < 1)  s_brush = 1;
+        if (s_brush > 32) s_brush = 32;
+        y += SE_RH + 2.0f;
+        GuiLabel((Rectangle){ x, y, w, 18.0f }, "right-drag erases   [ ] size");
         y += 20.0f;
 
         // -- size of the CURRENT shape ---------------------------------------
@@ -767,13 +835,7 @@ static void Gui()
         }
         y += SE_RH + SE_GAP;
 
-        if (GuiButton((Rectangle){ x, y, hw, SE_RH }, "undo (^Z)")) UndoPop();
-        if (GuiButton((Rectangle){ x + hw + SE_GAP, y, hw, SE_RH }, "SAVE"))
-        {
-            AudioPlayButton();
-            Status(AnimShapePoolSaveOne(s_slot, ANIM_SHAPE_USER_DIR)
-                   ? "saved to shapes/" : "could not write shapes/");
-        }
+        if (GuiButton((Rectangle){ x, y, w, SE_RH }, "undo (^Z)")) UndoPop();
         y += SE_RH + SE_GAP + 4.0f;
 
         // -- reference image -------------------------------------------------
@@ -812,6 +874,23 @@ static void Gui()
                 Status("reference unloaded");
             }
             y += SE_RH + SE_GAP;
+        }
+    }
+
+    // -- save bar, PINNED to the bottom of the panel -------------------------
+    // Deliberately not part of the flowing column above: that column has no
+    // scrollbar, so on a short window the controls at its tail simply are not
+    // on screen - which is exactly how the save button went missing. Anchoring
+    // to sc.y means SAVE is reachable at any window height.
+    if (s)
+    {
+        float sy = sc.y - 26.0f - SE_RH - SE_GAP;
+        if (GuiButton((Rectangle){ x, sy, w, SE_RH },
+                      TextFormat("#2# SAVE  %s  (^S)", s->name)))
+        {
+            AudioPlayButton();
+            Status(AnimShapePoolSaveOne(s_slot, ANIM_SHAPE_USER_DIR)
+                   ? "saved to shapes/" : "could not write shapes/");
         }
     }
 
