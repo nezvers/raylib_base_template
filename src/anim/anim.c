@@ -9,6 +9,7 @@
 
 #include "anim.h"
 #include "anim_ease_custom.h"
+#include "anim_shape_pool.h"    // SHAPE_CUSTOM pixel shapes + their texture cache
 #include "../include/easing.h"
 #include "../screen_state/screen_state.h"
 #include <string.h>
@@ -358,7 +359,13 @@ AnimKey *AnimTrackWriteColorKeyAt(AnimTrack *tr, float t, Color c, float eps)
 
 bool AnimPropIsStepped(int prop)
 {
-    return prop == AP_T_STRING;
+    // Both of these key a POOL INDEX, not a quantity. This one predicate is
+    // what makes AnimTrackEval snap instead of interpolate, what makes
+    // AnimElemProp skip signal override / loop blend / sequence offset / pos
+    // anchor (all of which are additive floats that would land BETWEEN two pool
+    // entries and resolve to the wrong one), and what makes the zen editor drop
+    // the easing controls for the group.
+    return prop == AP_T_STRING || prop == AP_S_SHAPE;
 }
 
 bool AnimPropIsColor(int prop)
@@ -581,6 +588,9 @@ static float ElemBaseProp(const AnimElem *e, int prop)
         // No string track -> the element shows its own text, which
         // AnimElemTextAt expresses as the fallback. -1 = "no pool entry".
         case AP_T_STRING:                 return -1.0f;
+        // No shape track -> the element shows e->shapeName, which DrawShapeElem
+        // resolves as the fallback. -1 = "no pool slot".
+        case AP_S_SHAPE:                  return -1.0f;
         case AP_G_FADE:                   return 0.0f;
         case AP_G_BG_ALPHA:               return (float)e->bgColor.a / 255.0f;
         default:                          return 0.0f;
@@ -678,6 +688,7 @@ float AnimPropMax(int prop)
         case AP_S_SCALE:                  return 10.0f;   // multiplier, 1 = rest
         // a pool INDEX, not a quantity: the whole pool must be reachable
         case AP_T_STRING:                 return (float)(ANIM_STRINGS_MAX - 1);
+        case AP_S_SHAPE:                  return (float)(ANIM_SHAPE_POOL_MAX - 1);
         default:                          return 1.0f;
     }
 }
@@ -695,6 +706,7 @@ static const int k_textProps[] = {
 static const int k_shapeProps[] = {
     AP_S_POS_X, AP_S_POS_Y, AP_S_W, AP_S_H, AP_S_ALPHA, AP_S_ROT, AP_S_COLOR,
     AP_S_OUTLINE_COLOR, AP_S_OUTLINE, AP_S_OUTLINE_ALPHA, AP_S_SCALE,
+    AP_S_SHAPE,
 };
 static const int k_globalProps[] = {
     AP_G_FADE, AP_G_COLOR, AP_G_BG_ALPHA, AP_G_BG_COLOR,
@@ -1272,7 +1284,10 @@ static void DrawShapeElem(const AnimElem *e, float t, Vector2 game)
     float uW = e->sizeAbsolute ? 1.0f : game.x;   // width-axis reference
     float uH = e->sizeAbsolute ? 1.0f : game.y;   // height-axis reference
     float thickPx = uH * AnimElemProp(e, AP_S_OUTLINE, t) * sc;
-    if (fillA <= 0.0f && (outA <= 0.0f || thickPx < 0.5f)) return;
+    // A custom shape's outline is PIXEL DATA, not a stroke, so it has no
+    // thickness to fall below half a pixel - it is visible whenever its alpha is.
+    if (e->shapeKind == SHAPE_CUSTOM) { if (fillA <= 0.0f && outA <= 0.0f) return; }
+    else if (fillA <= 0.0f && (outA <= 0.0f || thickPx < 0.5f)) return;
 
     float cxF = AnimElemProp(e, AP_S_POS_X, t);
     float cyF = AnimElemProp(e, AP_S_POS_Y, t);
@@ -1306,6 +1321,41 @@ static void DrawShapeElem(const AnimElem *e, float t, Vector2 game)
         DrawLineEx(a, b, th, fill);
         DrawCircleV(a, th * 0.5f, fill);        // round caps
         DrawCircleV(b, th * 0.5f, fill);
+        return;
+    }
+
+    if (e->shapeKind == SHAPE_CUSTOM)
+    {
+        // WHICH shape: the stepped AP_S_SHAPE track if it has keys, else the
+        // element's rest-pose name. The track stores a pool slot as a float, so
+        // round rather than truncate - a value that round-tripped through the
+        // .cfg as 1.9999998 would otherwise land on slot 1.
+        float sIdx = AnimElemProp(e, AP_S_SHAPE, t);
+        int slot = sIdx < 0.0f ? AnimShapePoolFindByName(e->shapeName)
+                               : (int)(sIdx + 0.5f);
+
+        Texture2D fillTex, lineTex;
+        if (!AnimShapePoolTextures(slot, &fillTex, &lineTex))
+        {
+            // Missing shape: a hatched box, drawn HERE rather than in the editor
+            // so exports and the game show the problem too instead of a hole.
+            Color warn = Fade(MAGENTA, fillA > 0.0f ? fillA : 1.0f);
+            Vector2 box[SHAPE_RIM_MAX];
+            int bn = RimRect(c, hw, hh, cr, sr, box);
+            DrawPolyShape(c, box, bn, BLANK, warn, 2.0f);
+            DrawLineEx(box[0], box[2], 2.0f, warn);     // one diagonal is enough
+            return;
+        }
+
+        // Both stencils cover the same box, so one dest/origin serves both.
+        // DrawTexturePro rotates about `origin`, which is the box centre - the
+        // same center-anchored rotation every other shape uses, and pixel-exact
+        // because POINT filtering keeps the texels square.
+        Rectangle src  = { 0.0f, 0.0f, (float)fillTex.width, (float)fillTex.height };
+        Rectangle dst  = { c.x, c.y, hw * 2.0f, hh * 2.0f };
+        Vector2   orig = { hw, hh };
+        if (fillA > 0.0f && fillTex.id) DrawTexturePro(fillTex, src, dst, orig, rot, fill);
+        if (outA  > 0.0f && lineTex.id) DrawTexturePro(lineTex, src, dst, orig, rot, line);
         return;
     }
 

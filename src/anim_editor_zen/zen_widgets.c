@@ -133,7 +133,8 @@ static ZenLayer LayerAtCursor(Vector2 m)
     // click, so they own the cursor wherever it is.
     if (ZenMenuModalOpen() || ZenEasingModalOpen() || ZenCloneOpen() ||
         ZenStringPoolOpen() || zen.menuOpen >= 0 || zen.easeDropOpen ||
-        zen.addTrackOpen || zen.strDropOpen || zen.sigDropMode != 0 ||
+        zen.addTrackOpen || zen.strDropOpen || zen.shapeDropOpen ||
+        zen.sigDropMode != 0 ||
         ZenViewCtxOpen() || ZenTimelineCtxOpen())
         return ZEN_LAYER_OVERLAY;
 

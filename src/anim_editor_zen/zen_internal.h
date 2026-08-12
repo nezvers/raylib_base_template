@@ -199,6 +199,10 @@ typedef struct {
     bool easeDropOpen; Rectangle easeDropRect;
     // string-pick dropdown of the track modal (same overlay treatment)
     bool strDropOpen; Rectangle strDropRect;
+    // shape-pick dropdown; unlike the others this one is opened from TWO places
+    // (the track modal's shape row and the inspector's rest-pose row), so the
+    // overlay works out which by looking at what is open.
+    bool shapeDropOpen; Rectangle shapeDropRect;
     // add-track dropdown of the inspector
     bool addTrackOpen; int addTrackSel; Rectangle addTrackRect;
 
@@ -401,6 +405,7 @@ void ZenTrackModalSync(void);                   // reload staged values
 void ZenTrackModalGui(void);                    // drawn above the panels
 void ZenEaseDropOverlayGui(void);               // its ease list, topmost
 void ZenStringDropOverlayGui(void);             // its string-pool list, topmost
+void ZenShapeDropOverlayGui(void);              // its shape-pool list, topmost
 
 // ---------------------------------------------------------------------------
 //  zen_signal_modal.c - the draggable signal modal

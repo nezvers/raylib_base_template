@@ -82,6 +82,16 @@ bool ZenGroupHasTrack(AnimElem *e, int gi)
     return false;
 }
 
+// Which pool slot a SHAPE_CUSTOM element shows at t: the track's stepped value
+// if it has one, else the element's rest-pose name. ANIM_SHAPE_MISSING (-1) when
+// neither resolves - the caller treats that as "nothing to key".
+static int ShapeIdxAt(const AnimElem *e, float t)
+{
+    float v = AnimElemProp(e, AP_S_SHAPE, t);
+    if (v >= 0.0f) return (int)(v + 0.5f);
+    return AnimShapePoolFindByName(e->shapeName);
+}
+
 // Write a group key at t: every member gets one, seeded from the element's
 // current value there (creating member tracks + a zero key as needed).
 void ZenGroupWriteKey(AnimElem *e, int gi, float t)
@@ -102,15 +112,28 @@ void ZenGroupWriteKey(AnimElem *e, int gi, float t)
         }
         else if (AnimPropIsStepped(prop))
         {
-            // A string key holds a POOL INDEX, not a quantity. Seeding it the
+            // A stepped key holds a POOL INDEX, not a quantity. Seeding it the
             // way the branch below does would write the -1 "no pool entry" base
-            // value and the key would resolve to nothing; carry the words the
-            // element actually shows instead. Both indices are read BEFORE any
-            // key is added, since adding one changes what is sampled.
-            int idx = AnimDocStringIdxAt(&zen.doc, e, t);
-            int zero = (t > ZEN_AUTOKEY_EPS && tr->keyCount == 0)
+            // value and the key would resolve to nothing; carry what the element
+            // actually shows instead. Both indices are read BEFORE any key is
+            // added, since adding one changes what is sampled.
+            int idx, zero;
+            if (prop == AP_S_SHAPE)
+            {
+                // The shape pool is global, so unlike the string pool there is
+                // nothing to intern - the element's name either resolves or the
+                // element has no shape to key yet.
+                idx  = ShapeIdxAt(e, t);
+                zero = (t > ZEN_AUTOKEY_EPS && tr->keyCount == 0)
+                     ? ShapeIdxAt(e, 0.0f) : -1;
+            }
+            else
+            {
+                idx  = AnimDocStringIdxAt(&zen.doc, e, t);
+                zero = (t > ZEN_AUTOKEY_EPS && tr->keyCount == 0)
                      ? AnimDocStringIdxAt(&zen.doc, e, 0.0f) : -1;
-            if (idx < 0) continue;              // pool full - leave the track be
+            }
+            if (idx < 0) continue;              // nothing to key - leave the track be
             // ZenEnsureZeroKey cannot serve here: it seeds through AnimElemProp,
             // which is exactly the sentinel this branch exists to avoid.
             if (zero >= 0) AnimTrackAddKey(tr, 0.0f, (float)zero, ANIM_EASE_LINEAR);
@@ -265,6 +288,11 @@ const char *ZenGroupKeyLabel(AnimElem *e, int gi, float t)
         {
             Color c = AnimElemColorProp(e, prop, t);
             one = TextFormat("#%02X%02X%02X", c.r, c.g, c.b);
+        }
+        else if (prop == AP_S_SHAPE)
+        {
+            const AnimShapeDef *sd = AnimShapePoolGet(ShapeIdxAt(e, t));
+            one = ZenTextPreview(sd ? sd->name : "(none)", 16);
         }
         else if (AnimPropIsStepped(prop))
         {

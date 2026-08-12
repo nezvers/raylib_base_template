@@ -20,6 +20,7 @@
 #include "zen_internal.h"
 #include "../screen_state/screen_state.h"
 #include "../audio_state/audio_state.h"
+#include "../shape_editor/shape_editor.h"
 #include <math.h>
 #include <stdlib.h>
 
@@ -628,6 +629,37 @@ void ZenTrackModalGui(void)
             continue;
         }
 
+        // Same story one pool over: a shape key holds a pool SLOT, so it gets a
+        // picker rather than a slider.
+        if (prop == AP_S_SHAPE)
+        {
+            const char *nm = "(no key here)";
+            AnimTrack *tr = AnimElemFindTrack(e, prop);
+            int k = -1;
+            for (int j = 0; tr && j < tr->keyCount; j++)
+                if (fabsf(tr->keys[j].t - refT) <= ZEN_AUTOKEY_EPS) { k = j; break; }
+            if (k >= 0)
+            {
+                const AnimShapeDef *sd =
+                    AnimShapePoolGet((int)(tr->keys[k].value + 0.5f));
+                nm = sd ? sd->name : "(missing shape)";
+            }
+
+            Rectangle sr = { x + 44, y, w - 44, TM_RH };
+            zen.shapeDropRect = sr;
+            if (k < 0) GuiDisable();
+            if (GuiButton(sr, TextFormat("%s  v", ZenTextPreview(nm, 24))))
+            { AudioPlayButton(); zen.shapeDropOpen = !zen.shapeDropOpen; }
+            if (k < 0) GuiEnable();
+            ZenTip(sr, k >= 0
+                ? "The pixel shape this key switches to. Click to pick another "
+                  "from the pool - it changes THIS key only, at this time."
+                : "No key at this time, so there is nothing to assign. Use +key "
+                  "to make one here first.");
+            y += TM_RH + TM_GAP;
+            continue;
+        }
+
         if (single)
         {
             AnimTrack *tr = AnimElemFindTrack(e, prop);
@@ -702,9 +734,11 @@ void ZenTrackModalGui(void)
     {
         GuiLabel((Rectangle){ x, y, 44, TM_RH }, "ease");
         GuiLabel((Rectangle){ x + 44, y, w - 44, TM_RH }, "steps - no easing");
-        ZenTip((Rectangle){ x, y, w, TM_RH },
-               "Text snaps at each key and holds those words until the next one. "
-               "There is no midpoint between two strings, so nothing to ease.");
+        ZenTip((Rectangle){ x, y, w, TM_RH }, e->kind == AE_SHAPE
+               ? "The shape snaps at each key and holds until the next one. There "
+                 "is no midpoint between two shapes, so nothing to ease."
+               : "Text snaps at each key and holds those words until the next one. "
+                 "There is no midpoint between two strings, so nothing to ease.");
         zen.easeDropOpen = false;
     }
     else
@@ -957,4 +991,99 @@ void ZenStringDropOverlayGui(void)
         !CheckCollisionPointRec(GetMousePosition(), bg) &&
         !CheckCollisionPointRec(GetMousePosition(), hdr))
         zen.strDropOpen = false;
+}
+
+// ---------------------------------------------------------------------------
+//  Shape-pool list for the AP_S_SHAPE row. The pool is GLOBAL, not part of the
+//  document, so unlike the string list this one is not bounded by the doc - but
+//  it is just as sparse (a deleted shape leaves its slot free) and is walked the
+//  same way. The row it edits is opened from the inspector too, so this serves
+//  BOTH: the inspector sets the element's rest-pose shapeName, the track modal
+//  sets one key.
+// ---------------------------------------------------------------------------
+void ZenShapeDropOverlayGui(void)
+{
+    if (!zen.shapeDropOpen) return;
+
+    // Which of the two callers opened it: a track key (modal open on a shape
+    // group) or the inspector's rest-pose row.
+    AnimTrack *tr = NULL;
+    int k = -1;
+    AnimElem *e = NULL;
+
+    if (zen.trackModal.open && zen.trackModal.sig < 0 && zen.selGroup >= 0)
+    {
+        e = ModalElem();
+        if (e) tr = AnimElemFindTrack(e, AP_S_SHAPE);
+        if (tr)
+        {
+            float times[ZEN_GROUP_TIMES_MAX];
+            int   n = ZenGroupKeyTimes(e, zen.selGroup, times);
+            float refT = (zen.selKeyCount == 1) ? zen.selKeys[0]
+                                                : (n ? times[0] : 0.0f);
+            for (int j = 0; j < tr->keyCount; j++)
+                if (fabsf(tr->keys[j].t - refT) <= ZEN_AUTOKEY_EPS) { k = j; break; }
+            if (k < 0) tr = NULL;               // no key here: fall back to base
+        }
+    }
+    if (!e) e = (zen.selElem >= 0 && zen.selElem < zen.doc.elemCount)
+              ? &zen.doc.elems[zen.selElem] : NULL;
+    if (!e || e->kind != AE_SHAPE) { zen.shapeDropOpen = false; return; }
+
+    int cur = tr ? (int)(tr->keys[k].value + 0.5f)
+                 : AnimShapePoolFindByName(e->shapeName);
+
+    int ids[ANIM_SHAPE_POOL_MAX], m = 0;
+    for (int i = 0; i < ANIM_SHAPE_POOL_MAX; i++)
+        if (AnimShapeIdValid(i)) ids[m++] = i;
+
+    Vector2 screen = ScreenStateSize();
+    Rectangle hdr = zen.shapeDropRect;
+    float ih = 20.0f, listH = ih * (m + 1);      // +1 for the "new shape" row
+    float ly = (hdr.y + hdr.height + listH <= screen.y - 4.0f)
+             ? hdr.y + hdr.height : hdr.y - listH;
+    if (ly < 4.0f) ly = 4.0f;
+    Rectangle bg = { hdr.x, ly, hdr.width, listH };
+    DrawRectangleRec(bg, (Color){ 32, 34, 40, 255 });
+    DrawRectangleLinesEx(bg, 1.0f, (Color){ 70, 74, 84, 255 });
+
+    for (int row = 0; row < m; row++)
+    {
+        int i = ids[row];
+        const AnimShapeDef *sd = AnimShapePoolGet(i);
+        Rectangle rr = { bg.x, bg.y + row*ih, bg.width, ih };
+        if (GuiButton(rr, TextFormat("%s  %dx%d", sd->name, sd->w, sd->h)))
+        {
+            AudioPlayButton();
+            zen.shapeDropOpen = false;
+            ZenUndoPush();
+            if (tr)
+            {
+                tr->keys[k].value = (float)i;
+                // The element's own shapeName is the fallback when the track is
+                // gone, so mirror only the FIRST key - past that the shape
+                // changes over time and no single one stands for it.
+                if (k == 0) TextCopy(e->shapeName, sd->name);
+            }
+            else TextCopy(e->shapeName, sd->name);
+            zen.docDirty = true;
+            ZenTrackModalSync();
+        }
+        if (i == cur) DrawRectangleRec(rr, (Color){ 90, 140, 220, 60 });
+    }
+
+    // Shapes are drawn in their own editor; this list only chooses among them.
+    Rectangle nr = { bg.x, bg.y + m*ih, bg.width, ih };
+    if (GuiButton(nr, "+ new shape..."))
+    {
+        AudioPlayButton();
+        zen.shapeDropOpen = false;
+        ShapeEditorOpen("");
+        AppStateTransition(&app_state_shape_editor);
+    }
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+        !CheckCollisionPointRec(GetMousePosition(), bg) &&
+        !CheckCollisionPointRec(GetMousePosition(), hdr))
+        zen.shapeDropOpen = false;
 }

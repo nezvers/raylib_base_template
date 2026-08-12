@@ -419,6 +419,9 @@ static void Enter()
     ZenRescanAnims();
     AnimLibraryLoad(&zen.library, ZEN_LIB_PATH);
     AnimCustomEasesLoad(ZenAnimPath("_easings"));   // before any doc load
+    // Also before any doc load, and for the same reason: a document's shape
+    // references resolve by NAME against the live pool as it is read.
+    AnimShapePoolLoadAll(ANIM_SHAPE_RES_DIR, ANIM_SHAPE_USER_DIR);
 
     // Reopen the animation last left (this run only), else the first saved
     // one, else start on a demo. A remembered anim deleted since just misses.
@@ -466,7 +469,7 @@ static void Enter()
     zen.trackModal = (ZenTrackModal){0};
     zen.trackModal.sig = -1;
     zen.easeDropOpen = false; zen.addTrackOpen = false; zen.addTrackSel = 0;
-    zen.strDropOpen = false;
+    zen.strDropOpen = false; zen.shapeDropOpen = false;
     zen.dragPlayhead = false; zen.dragKeyGroup = -1;
     zen.dragIntro = zen.dragOutro = false;
     zen.dragPause = -1; zen.selPause = -1;
@@ -492,6 +495,9 @@ static void Exit()
 
     ZenGuideStop();     // never leave a tour holding a stage slot behind us
     AnimSignalUnregister(&zen.doc, &zen.preview);
+    // Drop the baked shape stencils. They rebake lazily on the next draw, so
+    // this costs nothing but keeps the GPU handles owned by whoever is running.
+    AnimShapePoolUnloadTextures();
 }
 
 static void Update()
@@ -583,9 +589,9 @@ static void Update()
         else if (zen.libOpen)               zen.libOpen = false;
         else if (zen.openListOpen)          zen.openListOpen = false;
         else if (zen.easeDropOpen || zen.addTrackOpen || zen.strDropOpen ||
-                 zen.sigDropMode != 0)
+                 zen.shapeDropOpen || zen.sigDropMode != 0)
         { zen.easeDropOpen = false; zen.addTrackOpen = false;
-          zen.strDropOpen = false; ZenSigCloseDrops(); }
+          zen.strDropOpen = false; zen.shapeDropOpen = false; ZenSigCloseDrops(); }
         else if (ZenTimelineCtxOpen())      ZenTimelineCtxClose();
         else if (ZenViewCtxOpen())          ZenViewCtxClose();
         else if (zen.trackModal.open)       zen.trackModal.open = false;
@@ -666,7 +672,7 @@ static void Gui()
          CheckCollisionPointRec(mouse, zen.sigModalRect)) ||
         (ZenExportOpen() && CheckCollisionPointRec(mouse, ZenExportRect()));
     bool dropOpen = zen.menuOpen >= 0 || zen.easeDropOpen || zen.addTrackOpen
-                 || zen.strDropOpen
+                 || zen.strDropOpen || zen.shapeDropOpen
                  || zen.sigDropMode != 0 || ZenViewCtxOpen() || ZenTimelineCtxOpen();
     bool fullModal = ZenMenuModalOpen() || ZenEasingModalOpen() || ZenCloneOpen()
                   || ZenStringPoolOpen();
@@ -690,7 +696,7 @@ static void Gui()
     // per modal while the other one owns the gesture.
     bool floatLock = fullModal
                   || zen.easeDropOpen || zen.addTrackOpen || zen.strDropOpen
-                  || zen.sigDropMode != 0;
+                  || zen.shapeDropOpen || zen.sigDropMode != 0;
     bool sigLock = floatLock || !ZenLayerActive(ZEN_LAYER_FLOAT_SIG);
     bool trkLock = floatLock || !ZenLayerActive(ZEN_LAYER_FLOAT_TRACK);
 
@@ -717,6 +723,7 @@ static void Gui()
     ZenSignalOverlaysGui();
     ZenEaseDropOverlayGui();
     ZenStringDropOverlayGui();
+    ZenShapeDropOverlayGui();
     ZenMenuOverlaysGui();
     ZenEasingGui();
     ZenCloneGui();

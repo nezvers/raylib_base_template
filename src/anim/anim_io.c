@@ -63,6 +63,7 @@
 // ============================================================================
 
 #include "anim_io.h"
+#include "anim_shape_pool.h"    // shape_ref name <-> live slot resolution
 #include "raylib.h"     // TextIsEqual, TextCopy
 #include <stdio.h>
 #include <stddef.h>
@@ -85,6 +86,9 @@ static const PropRow k_shapeProps[] = {
     { AP_S_OUTLINE, "outline" },
     { AP_S_OUTLINE_ALPHA, "outline_alpha" },
     { AP_S_SCALE, "scale" },
+    // NOT "shape": that token is already the element's base shapeKind field
+    // (see AnimElemWriteCfg), and a collision would make the reader ambiguous.
+    { AP_S_SHAPE, "shape_id" },
 };
 static const PropRow k_globalProps[] = {
     { AP_G_FADE, "fade" }, { AP_G_COLOR, "color" },
@@ -148,6 +152,9 @@ static const AnimPropGroup k_shapeGroups[] = {
     { "color",    { AP_S_COLOR, AP_S_ALPHA },                       2 },
     { "outline",  { AP_S_OUTLINE, AP_S_OUTLINE_COLOR, AP_S_OUTLINE_ALPHA }, 3 },
     { "rotation", { AP_S_ROT },                                     1 },
+    // Single-member, so ZenGroupIsStepped reports true and the editor drops the
+    // easing controls automatically (same as text's "string" group).
+    { "shape",    { AP_S_SHAPE },                                   1 },
 };
 static const AnimPropGroup k_globalGroups[] = {
     { "fade",       { AP_G_FADE, AP_G_COLOR },        2 },
@@ -203,8 +210,12 @@ static int ElemKindByName(const char *name)
 
 // Shape kind <-> stable .cfg name (order matches AnimShapeKind).
 static const char *k_shapeKindNames[SHAPE_KIND_COUNT] = {
-    "rect", "circle", "square", "rhombus", "triangle", "line",
+    "rect", "circle", "square", "rhombus", "triangle", "line", "custom",
 };
+// Appending to AnimShapeKind without a name here would be an out-of-bounds READ,
+// not a compile error - the sized array makes it one.
+_Static_assert(sizeof(k_shapeKindNames)/sizeof(k_shapeKindNames[0]) == SHAPE_KIND_COUNT,
+               "k_shapeKindNames must have one entry per AnimShapeKind");
 
 const char *AnimShapeKindName(int kind)
 {
@@ -291,6 +302,8 @@ void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind)
     if (e->kind == AE_SHAPE)
     {
         fprintf(f, "%s  shape %s\n", ind, AnimShapeKindName(e->shapeKind));
+        if (e->shapeName[0])
+            fprintf(f, "%s  shape_name %s\n", ind, e->shapeName);
         fprintf(f, "%s  outline %d %d %d %d %f\n", ind,
                 e->outlineColor.r, e->outlineColor.g,
                 e->outlineColor.b, e->outlineColor.a, e->outlineFrac);
@@ -324,6 +337,29 @@ void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind)
          e->crumbleSpread != 12.0f || e->crumbleDist != 0.5f))
         fprintf(f, "%s  crumble_fx %f %f %f %f\n", ind, e->crumbleRot,
                 e->crumbleDir, e->crumbleSpread, e->crumbleDist);
+
+    // An AP_S_SHAPE key holds a pool SLOT INDEX, which is a runtime-only handle:
+    // the pool is global, it is not part of this document, and its slots are
+    // assigned in whatever order the shapes/ directory happened to enumerate.
+    // So every index the track uses is written out with the NAME it stood for,
+    // and the reader maps saved index -> name -> whatever slot that name has NOW
+    // (see the fixup at the element's `end`). Names are the durable reference;
+    // indices survive only as long as one run.
+    for (int j = 0; j < e->trackCount; j++)
+    {
+        const AnimTrack *tr = &e->tracks[j];
+        if (tr->prop != AP_S_SHAPE) continue;
+        for (int k = 0; k < tr->keyCount; k++)
+        {
+            int slot = (int)(tr->keys[k].value + 0.5f);
+            const AnimShapeDef *sd = AnimShapePoolGet(slot);
+            if (!sd) continue;                          // unresolvable: nothing to name
+            bool dupe = false;                          // one line per distinct slot
+            for (int p = 0; p < k && !dupe; p++)
+                dupe = ((int)(tr->keys[p].value + 0.5f) == slot);
+            if (!dupe) fprintf(f, "%s  shape_ref %d %s\n", ind, slot, sd->name);
+        }
+    }
 
     for (int j = 0; j < e->trackCount; j++)
     {
@@ -447,6 +483,47 @@ bool AnimDocSave(const AnimDoc *doc, const char *path)
 //  exactly one reader. `curElem` may be NULL (tokens are then skipped, not
 //  misapplied); `*curTrack` is the open track, updated in place.
 // ---------------------------------------------------------------------------
+// Saved-index -> name map for the element currently being read, filled by its
+// `shape_ref` lines and consumed by the fixup at its `end`. File-static because
+// both callers (AnimDocLoad and the element library) open the `elem` block
+// themselves and only ever have ONE element in flight; the `end` handler clears
+// it, so a document whose elements have no shape_ref lines never sees a stale
+// entry. Not thread-safe, in keeping with the rest of this reader.
+static char s_shapeRefs[ANIM_SHAPE_POOL_MAX][ANIM_SHAPE_NAME_MAX];
+static bool s_shapeRefUsed[ANIM_SHAPE_POOL_MAX];
+// fscanf wants its field width as a literal, so the "%23s" reads below are
+// pinned to the buffer here - raise the name cap and this fails the build until
+// those widths follow it.
+_Static_assert(ANIM_SHAPE_NAME_MAX == 24,
+               "the %23s shape-name scan widths must stay ANIM_SHAPE_NAME_MAX-1");
+
+// Rewrites every AP_S_SHAPE key from the index it had WHEN SAVED to the slot the
+// same-named shape occupies NOW. A name the live pool does not have (the shape
+// was deleted or renamed) becomes ANIM_SHAPE_MISSING, which draws the
+// placeholder - deliberately, rather than silently resolving to whatever shape
+// inherited that slot number.
+static void FixupShapeRefs(AnimElem *e)
+{
+    if (e)
+        for (int j = 0; j < e->trackCount; j++)
+        {
+            AnimTrack *tr = &e->tracks[j];
+            if (tr->prop != AP_S_SHAPE) continue;
+            for (int k = 0; k < tr->keyCount; k++)
+            {
+                int saved = (int)(tr->keys[k].value + 0.5f);
+                if (saved < 0 || saved >= ANIM_SHAPE_POOL_MAX || !s_shapeRefUsed[saved])
+                {
+                    tr->keys[k].value = (float)ANIM_SHAPE_MISSING;
+                    continue;
+                }
+                tr->keys[k].value = (float)AnimShapePoolFindByName(s_shapeRefs[saved]);
+            }
+        }
+
+    for (int i = 0; i < ANIM_SHAPE_POOL_MAX; i++) s_shapeRefUsed[i] = false;
+}
+
 bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
                           AnimTrack **curTrack)
 {
@@ -462,6 +539,25 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
         char s[16];
         if (fscanf(f, "%15s", s) == 1 && curElem)
             curElem->shapeKind = AnimShapeKindByName(s);
+    }
+    else if (TextIsEqual(key, "shape_name"))
+    {
+        // SHAPE_CUSTOM rest pose, by name. Absent in older files and in shapes
+        // that are not custom - AnimElemInit's empty string stands there.
+        char s[ANIM_SHAPE_NAME_MAX];
+        if (fscanf(f, "%23s", s) == 1 && curElem) TextCopy(curElem->shapeName, s);
+    }
+    else if (TextIsEqual(key, "shape_ref"))
+    {
+        // Pool index -> name, as of the save. Recorded now, applied at `end`
+        // once every track of this element has been read.
+        int idx = -1; char s[ANIM_SHAPE_NAME_MAX];
+        if (fscanf(f, "%d %23s", &idx, s) == 2 &&
+            idx >= 0 && idx < ANIM_SHAPE_POOL_MAX)
+        {
+            TextCopy(s_shapeRefs[idx], s);
+            s_shapeRefUsed[idx] = true;
+        }
     }
     else if (TextIsEqual(key, "outline"))
     {
@@ -585,7 +681,12 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
         }
     }
     else if (TextIsEqual(key, "end"))
+    {
+        // Every track is in by now, so the saved shape indices can be remapped
+        // onto the live pool.
+        FixupShapeRefs(curElem);
         *curTrack = NULL;          // element stays current until the next `elem`
+    }
     else
         return false;              // not ours
 

@@ -16,6 +16,7 @@
 #include "../src/anim/anim_signal.h"
 #include "../src/anim/anim_stage.h"
 #include "../src/anim/anim_scene.h"
+#include "../src/anim/anim_shape_pool.h"
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -2846,6 +2847,166 @@ static void TestTextEscapeIO(void)
     remove(p);
 }
 
+// ---------------------------------------------------------------------------
+//  Pixel shape pool  (anim_shape_pool.c)
+//
+//  Textures are never touched here: baking is lazy and lives on the draw path,
+//  so this runs without a GL context like the rest of the suite.
+// ---------------------------------------------------------------------------
+static void TestShapePool(void)
+{
+    const char *root = "anim_tests_shapes/";
+
+    // -- slots ---------------------------------------------------------------
+    AnimShapePoolLoadAll(NULL, NULL);                   // wipe
+    CHECK(AnimShapePoolCount() == 0);
+
+    int a = AnimShapePoolAdd("fangs_upper", 6, 4);
+    CHECK(a >= 0);
+    CHECK(AnimShapeIdValid(a));
+    CHECK(AnimShapePoolFindByName("fangs_upper") == a);
+    CHECK(AnimShapePoolFindByName("nope") == ANIM_SHAPE_MISSING);
+    CHECK(AnimShapePoolAdd("fangs_upper", 4, 4) == ANIM_SHAPE_MISSING);  // dupe
+    CHECK(AnimShapePoolAdd("has space", 4, 4) == ANIM_SHAPE_MISSING);
+    CHECK(AnimShapePoolAdd("", 4, 4) == ANIM_SHAPE_MISSING);
+
+    // Oversize dims clamp rather than overrun the fixed grid.
+    int big = AnimShapePoolAdd("big", 9999, -3);
+    CHECK(AnimShapePoolGet(big)->w == ANIM_SHAPE_GRID_MAX);
+    CHECK(AnimShapePoolGet(big)->h == 1);
+    AnimShapePoolDelete(big, NULL);
+    CHECK(!AnimShapeIdValid(big));
+
+    // -- pixels --------------------------------------------------------------
+    AnimShapeDef *s = AnimShapePoolGet(a);
+    AnimShapeSetPx(s, 0, 0, ANIM_PX_FILL);
+    AnimShapeSetPx(s, 5, 3, ANIM_PX_OUTLINE);
+    AnimShapeSetPx(s, 99, 99, ANIM_PX_FILL);            // out of bounds: ignored
+    CHECK(AnimShapePx(s, 0, 0) == ANIM_PX_FILL);
+    CHECK(AnimShapePx(s, 5, 3) == ANIM_PX_OUTLINE);
+    CHECK(AnimShapePx(s, 1, 1) == ANIM_PX_EMPTY);
+    CHECK(AnimShapePx(s, 99, 99) == ANIM_PX_EMPTY);     // reads clamp too
+
+    // -- round trip ----------------------------------------------------------
+    CHECK(AnimShapePoolSaveOne(a, root));
+    AnimShapePoolLoadAll(NULL, root);
+    int b = AnimShapePoolFindByName("fangs_upper");
+    CHECK(b >= 0);
+    AnimShapeDef *r = AnimShapePoolGet(b);
+    CHECK(r->w == 6 && r->h == 4);
+    CHECK(AnimShapePx(r, 0, 0) == ANIM_PX_FILL);
+    CHECK(AnimShapePx(r, 5, 3) == ANIM_PX_OUTLINE);
+    CHECK(AnimShapePx(r, 2, 2) == ANIM_PX_EMPTY);
+    CHECK(!r->builtin);                                 // came from the user root
+
+    // -- resize preserves the overlap ---------------------------------------
+    AnimShapeResize(r, 3, 2);
+    CHECK(r->w == 3 && r->h == 2);
+    CHECK(AnimShapePx(r, 0, 0) == ANIM_PX_FILL);        // still inside
+    AnimShapeResize(r, 6, 4);
+    CHECK(AnimShapePx(r, 5, 3) == ANIM_PX_EMPTY);       // shrink really dropped it
+
+    // -- unknown keys skip, per the forward-compat contract ------------------
+    const char *odd = "anim_tests_shapes/odd.shp";
+    FILE *f = fopen(odd, "w");
+    CHECK(f != NULL);
+    fprintf(f, "# a comment line\n");
+    fprintf(f, "future_field 42\n");                    // unknown: skipped
+    fprintf(f, "shape odd\nsize 3 2\nrows\n#.#\n.O.\nend\n");
+    fclose(f);
+
+    AnimShapePoolLoadAll(NULL, root);
+    int o = AnimShapePoolFindByName("odd");
+    CHECK(o >= 0);
+    CHECK(AnimShapePoolGet(o)->w == 3 && AnimShapePoolGet(o)->h == 2);
+    CHECK(AnimShapePx(AnimShapePoolGet(o), 0, 0) == ANIM_PX_FILL);
+    CHECK(AnimShapePx(AnimShapePoolGet(o), 1, 1) == ANIM_PX_OUTLINE);
+    CHECK(AnimShapePoolCount() == 2);
+
+    // -- delete removes the file too ----------------------------------------
+    CHECK(AnimShapePoolDelete(o, root));
+    CHECK(!FileExists(odd));
+    AnimShapePoolLoadAll(NULL, root);
+    CHECK(AnimShapePoolCount() == 1);
+
+    remove("anim_tests_shapes/fangs_upper.shp");
+    AnimShapePoolLoadAll(NULL, NULL);
+}
+
+// ---------------------------------------------------------------------------
+//  Shape references survive pool renumbering
+//
+//  A saved AP_S_SHAPE key holds a runtime slot index, which means nothing on the
+//  next run. The .cfg carries `shape_ref <idx> <name>` so the reader can put the
+//  key back on the right SHAPE rather than the right NUMBER.
+// ---------------------------------------------------------------------------
+static void TestShapeRefIO(void)
+{
+    const char *path = "anim_tests_shaperef.cfg";
+
+    AnimShapePoolLoadAll(NULL, NULL);
+    int alpha = AnimShapePoolAdd("alpha", 2, 2);
+    int beta  = AnimShapePoolAdd("beta",  2, 2);
+    CHECK(alpha == 0 && beta == 1);                 // first two free slots
+
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    e->shapeKind = SHAPE_CUSTOM;
+    TextCopy(e->shapeName, "beta");
+    AnimTrack *tr = AnimElemAddTrack(e, AP_S_SHAPE);
+    AnimTrackAddKey(tr, 0.0f, (float)alpha, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 1.0f, (float)beta,  ANIM_EASE_LINEAR);
+    CHECK(AnimDocSave(&doc, path));
+
+    // Rebuild the pool with the names in the OTHER order, as a differently
+    // sorted shapes/ directory would.
+    AnimShapePoolLoadAll(NULL, NULL);
+    int beta2  = AnimShapePoolAdd("beta",  2, 2);
+    int alpha2 = AnimShapePoolAdd("alpha", 2, 2);
+    CHECK(beta2 == 0 && alpha2 == 1);               // indices genuinely swapped
+
+    AnimDoc back;
+    CHECK(AnimDocLoad(&back, path));
+    CHECK(back.elems[0].shapeKind == SHAPE_CUSTOM);
+    CHECK(TextIsEqual(back.elems[0].shapeName, "beta"));
+    AnimTrack *bt = NULL;
+    for (int i = 0; i < back.elems[0].trackCount; i++)
+        if (back.elems[0].tracks[i].prop == AP_S_SHAPE) bt = &back.elems[0].tracks[i];
+    CHECK(bt != NULL);
+    // The keys follow the NAMES, not the numbers they were saved as.
+    CHECK((int)bt->keys[0].value == alpha2);
+    CHECK((int)bt->keys[1].value == beta2);
+
+    // A name the pool no longer has resolves to MISSING (placeholder), never to
+    // whatever shape inherited that slot number.
+    AnimShapePoolLoadAll(NULL, NULL);
+    AnimShapePoolAdd("beta", 2, 2);                 // "alpha" is gone
+    CHECK(AnimDocLoad(&back, path));
+    bt = NULL;
+    for (int i = 0; i < back.elems[0].trackCount; i++)
+        if (back.elems[0].tracks[i].prop == AP_S_SHAPE) bt = &back.elems[0].tracks[i];
+    CHECK(bt != NULL);
+    CHECK((int)bt->keys[0].value == ANIM_SHAPE_MISSING);
+    CHECK((int)bt->keys[1].value == AnimShapePoolFindByName("beta"));
+
+    // AP_S_SHAPE is stepped: it snaps at each key rather than interpolating
+    // between two pool indices, which would land on an unrelated third shape.
+    CHECK(AnimPropIsStepped(AP_S_SHAPE));
+    AnimTrack st = { AP_S_SHAPE, {{0}}, 0 };
+    AnimTrackAddKey(&st, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(&st, 1.0f, 2.0f, ANIM_EASE_LINEAR);
+    CHECK_NEAR(AnimTrackEval(&st, 0.5f, 0), 0.0f);  // holds, no midpoint
+    CHECK_NEAR(AnimTrackEval(&st, 1.0f, 0), 2.0f);  // snaps
+
+    // "custom" round-trips as a shape kind name.
+    CHECK(TextIsEqual(AnimShapeKindName(SHAPE_CUSTOM), "custom"));
+    CHECK(AnimShapeKindByName("custom") == SHAPE_CUSTOM);
+
+    remove(path);
+    AnimShapePoolLoadAll(NULL, NULL);
+}
+
 int main(void)
 {
     TestEval();
@@ -2900,6 +3061,8 @@ int main(void)
     TestMultiSegmentEases();
     TestAutoKeyStartsTrack();
     TestTextEscapeIO();
+    TestShapePool();
+    TestShapeRefIO();
 
     printf("anim_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails ? 1 : 0;

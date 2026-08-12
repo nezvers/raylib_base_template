@@ -23,6 +23,7 @@
 #include "zen_internal.h"
 #include "../screen_state/screen_state.h"
 #include "../audio_state/audio_state.h"
+#include "../shape_editor/shape_editor.h"
 #include "../anim/signal.h"
 #include <math.h>
 
@@ -448,7 +449,41 @@ static float DrawInspector(float x, float y, float w)
             GuiToggle(rr, AnimShapeKindName(si), &on);
             if (on && e->shapeKind != si) { ZenUndoPush(); e->shapeKind = si; }
         }
-        y += 2*(rh + 4) + gap - 4;
+        // Derived from the count, not hardcoded: the grid is 3 wide, so every
+        // kind appended to AnimShapeKind must push the following rows down.
+        y += ((SHAPE_KIND_COUNT + 2) / 3) * (rh + 4) + gap - 4;
+
+        if (e->shapeKind == SHAPE_CUSTOM)
+        {
+            ZenLabelTip((Rectangle){ x, y, 40, rh }, "pixels",
+                        "Which pixel shape from the shared pool. The shape stores "
+                        "no colour: its fill takes this element's colour and its "
+                        "outline takes the outline colour, so both stay animatable.");
+            int slot = AnimShapePoolFindByName(e->shapeName);
+            bool missing = (slot == ANIM_SHAPE_MISSING);
+            float bw = (w - 44 - 4) * 0.62f;
+
+            int prev = GuiGetStyle(BUTTON, TEXT_COLOR_NORMAL);
+            if (missing) GuiSetStyle(BUTTON, TEXT_COLOR_NORMAL, ColorToInt(ORANGE));
+            const char *lbl = e->shapeName[0]
+                            ? (missing ? TextFormat("missing: %s", e->shapeName)
+                                       : e->shapeName)
+                            : "(none)";
+            if (GuiButton((Rectangle){ x+44, y, bw, rh }, lbl))
+            {
+                zen.shapeDropOpen = !zen.shapeDropOpen;
+                zen.shapeDropRect = (Rectangle){ x+44, y, bw, rh };
+            }
+            GuiSetStyle(BUTTON, TEXT_COLOR_NORMAL, prev);
+
+            float ew = w - 44 - bw - 8;
+            if (GuiButton((Rectangle){ x+44+bw+4, y, ew, rh }, "edit..."))
+            {
+                ShapeEditorOpen(e->shapeName);      // empty name = new shape
+                AppStateTransition(&app_state_shape_editor);
+            }
+            y += rh + gap;
+        }
     }
 
     if (e->kind != AE_GLOBAL)
