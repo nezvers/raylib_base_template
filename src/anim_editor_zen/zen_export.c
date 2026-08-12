@@ -73,6 +73,30 @@
 #define EXP_GAP         6.0f
 #define EXP_DIR         ZEN_ANIM_DIR "/exports"
 
+#if !defined(PLATFORM_WEB)
+// Opens the exports folder in the OS file manager. The three platforms share no
+// common command, and the path handed over must be absolute - EXP_DIR is relative
+// to the game's working directory, which the file manager knows nothing about.
+//
+// The folder is a compile-time constant, so no user text ever reaches this command
+// line - unlike the output name, which SanitizeName() has to guard because it is
+// passed to ffmpeg. The quotes here are for paths containing spaces, nothing more.
+static void OpenExportDir(void)
+{
+    const char *abs = TextFormat("%s/%s", GetWorkingDirectory(), EXP_DIR);
+    #if defined(_WIN32)
+        system(TextFormat("explorer \"%s\"", abs));
+    #elif defined(__APPLE__)
+        system(TextFormat("open \"%s\"", abs));
+    #else
+        // & so a file manager that does not detach cannot freeze the editor:
+        // system() blocks until the child exits, and a GUI app exits when the
+        // user closes its window.
+        system(TextFormat("xdg-open \"%s\" &", abs));
+    #endif
+}
+#endif
+
 // ---------------------------------------------------------------------------
 //  Formats
 // ---------------------------------------------------------------------------
@@ -128,6 +152,11 @@ static int   s_videoQuality = 70;       // 0..100, mapped to CRF
 static char  s_nameBuf[96] = "";
 static bool  s_edName = false;
 static bool  s_edFps = false;
+// Seconds to freeze on each pause marker. A marker is a hold that waits for a
+// KEYPRESS, and an exported file has nobody to press one, so the hold has to
+// become a duration here or it vanishes from the output. 0 = the old behaviour,
+// where the export runs straight through every marker.
+static float s_pauseHold = 0.0f;
 
 // format dropdown
 static bool      s_fmtDrop = false;
@@ -136,7 +165,6 @@ static Rectangle s_fmtDropRect = { 0 };
 // job
 static ExpState        s_state = EXP_IDLE;
 static int             s_frame = 0, s_total = 0;
-static float           s_tStart = 0.0f;
 static double          s_jobStart = 0.0;
 static char            s_status[192] = "";
 static char            s_outPath[512] = "";
@@ -147,6 +175,13 @@ static bool            s_gifOpen = false;
 static FILE           *s_gifFile = NULL;
 static FILE           *s_pipe = NULL;
 static long long       s_bytes = 0;     // actual size after a PNG-sequence run
+
+// Pause markers this job holds on, snapshotted at JobStart. The document stays
+// editable while a job runs, and a marker added or dragged mid-export would
+// desync the frame->time mapping from the s_total already committed to.
+static float s_holdAt[ANIM_PAUSES_MAX];
+static int   s_holdCount = 0;
+static int   s_holdFrames = 0;          // frames each marker is worth
 
 // ffmpeg presence: -1 unknown, 0 missing, 1 present. Probed once - spawning a
 // process every frame to ask the same question would be absurd.
@@ -211,12 +246,75 @@ static bool HasIntro(void)
     return AnimDocIntroEnd(&zen.doc) > 0.0001f;
 }
 
+// The pause markers inside the export range, ascending (doc.pauses already is).
+//
+// Containment is [a, b), NOT the (from, to] that AnimDocNextPause uses. That
+// exclusive start is a RESUME rule - it stops the runtime re-firing the marker
+// it just released - and a single forward export pass has no such history. Used
+// here it would silently drop a marker sitting exactly at the range start,
+// which is precisely where an intro-trimmed loop tends to put one.
+//
+// `once` is ignored for the same reason: an export is one pass, so every marker
+// is on its first pass and `once` can never suppress anything.
+static int HoldMarkers(float *out)
+{
+    float a, b;
+    ExportRange(&a, &b);
+    int n = 0;
+    for (int i = 0; i < zen.doc.pauseCount; i++)
+    {
+        float t = zen.doc.pauses[i].t;
+        if (t >= a && t < b) out[n++] = t;
+    }
+    return n;
+}
+
+static int HoldFrameCount(void)
+{
+    int f = (int)(s_pauseHold * (float)s_fps + 0.5f);
+    return f < 0 ? 0 : f;
+}
+
 static int ExportFrameCount(void)
 {
     float a, b;
     ExportRange(&a, &b);
     int n = (int)((b - a) * (float)s_fps + 0.5f);
+    float marks[ANIM_PAUSES_MAX];
+    n += HoldMarkers(marks) * HoldFrameCount();
     return n < 1 ? 1 : n;
+}
+
+// Frame index -> doc time, the one place the export's clock is defined.
+//
+// Without holds this is the plain linear map. With them, each marker absorbs
+// s_holdFrames frames at a FIXED time - the same pose written repeatedly, which
+// is what a hold looks like once there is no keypress to wait for - and the
+// clock resumes after. Reads the JobStart snapshot, so it stays stable for the
+// whole job even if the document is edited underneath it.
+static float FrameTime(int frame)
+{
+    float a, b;
+    ExportRange(&a, &b);
+    if (s_holdFrames <= 0 || s_holdCount <= 0)
+        return a + (float)frame / (float)s_fps;
+
+    // Walk the markers in order, tracking where each one lands once the earlier
+    // holds have pushed it later. At most ANIM_PAUSES_MAX of them.
+    //
+    // The marker's OWN frame is the last free-running one, and the hold adds
+    // s_holdFrames after it - hence `at + 1`. Counting the marker's frame as
+    // the first held frame instead would show that pose s_holdFrames + 1 times
+    // and make a "2 second" hold two seconds plus a frame.
+    int consumed = 0;
+    for (int i = 0; i < s_holdCount; i++)
+    {
+        int at = (int)((s_holdAt[i] - a) * (float)s_fps + 0.5f) + consumed;
+        if (frame <= at) break;                                 // running freely
+        if (frame <= at + s_holdFrames) return s_holdAt[i];     // parked on it
+        consumed += s_holdFrames;
+    }
+    return a + (float)(frame - consumed) / (float)s_fps;
 }
 
 // Highest fps worth offering for the current format.
@@ -264,12 +362,32 @@ static const char *HumanSize(double bytes)
 //
 // Accuracy on the fitting set: gif within 1.45x, png similar, video within
 // ~2.1x, uncompressed AVI exact.
+//
+// Frames held on a pause marker are charged at a DISCOUNT for the formats that
+// difference between frames: a held frame is pixel-identical to the one before
+// it, so gif's frame differencing and H.264's P-frames encode it for almost
+// nothing. Charging it in full would let a 12-second hold triple a size that
+// barely moves. PNG (a whole file per frame) and raw AVI get no discount -
+// there the duplicate genuinely costs full price.
+static double EstimateFrames(void)
+{
+    float marks[ANIM_PAUSES_MAX];
+    int frames = ExportFrameCount();
+    int held   = HoldMarkers(marks) * HoldFrameCount();
+    if (held <= 0 || held > frames) return (double)frames;
+
+    bool differenced = (s_format == EXP_FMT_GIF || s_format == EXP_FMT_MP4 ||
+                        s_format == EXP_FMT_WEBM);
+    if (!differenced) return (double)frames;
+    return (double)(frames - held) + 0.1 * (double)held;
+}
+
 static double EstimateBytes(void)
 {
     int w, h; ExportSize(&w, &h);
-    int frames = ExportFrameCount();
+    double frames = EstimateFrames();
     Vector2 game = ScreenStateTargetSize();
-    double basePx = (double)game.x * (double)game.y * (double)frames;
+    double basePx = (double)game.x * (double)game.y * frames;
     double sc = (double)s_scale;
 
     switch (s_format)
@@ -284,7 +402,7 @@ static double EstimateBytes(void)
         case EXP_FMT_AVI:
             // rawvideo bgr24 is 3 bytes per pixel with no compression at all:
             // this one is exact arithmetic, not a guess.
-            return (double)w * (double)h * (double)frames * 3.0;
+            return (double)w * (double)h * frames * 3.0;
         case EXP_FMT_MP4:
         case EXP_FMT_WEBM:
         {
@@ -293,7 +411,7 @@ static double EstimateBytes(void)
             double crf = (double)VideoCRF();
             double q = pow(0.89, crf - 23.0);
             double bytes = 0.01146 * (double)game.x * (double)game.y *
-                           pow((double)frames, 0.55) * pow(sc, 0.6) * q;
+                           pow(frames, 0.55) * pow(sc, 0.6) * q;
             if (s_format == EXP_FMT_WEBM) bytes *= 0.85;
             return bytes;
         }
@@ -361,11 +479,13 @@ static void JobStart(void)
     if (!DirectoryExists(EXP_DIR)) MakeDirectory(EXP_DIR);
 
     int w, h; ExportSize(&w, &h);
+    // Freeze the markers BEFORE the count is taken, so s_total and FrameTime()
+    // are derived from the same snapshot.
+    s_holdCount  = HoldMarkers(s_holdAt);
+    s_holdFrames = HoldFrameCount();
     s_total = ExportFrameCount();
     s_frame = 0;
     s_bytes = 0;
-    float end;
-    ExportRange(&s_tStart, &end);
 
     if (s_format == EXP_FMT_PNG)
     {
@@ -456,7 +576,7 @@ static void JobStart(void)
 static bool JobStep(void)
 {
     int w, h; ExportSize(&w, &h);
-    float t = s_tStart + (float)s_frame / (float)s_fps;
+    float t = FrameTime(s_frame);
 
     // Only GIF and PNG can carry alpha; the video encoders would bake a
     // transparent clear into black, so they always get the real background.
@@ -584,6 +704,7 @@ void ZenExportGui(void)
                 + EXP_ROW_H + EXP_GAP        // scale
                 + EXP_ROW_H + EXP_GAP        // fps
                 + EXP_ROW_H + EXP_GAP        // loop range
+                + EXP_ROW_H + EXP_GAP        // pause hold
                 + 18 + EXP_GAP;              // frames/duration line
     if (s_format == EXP_FMT_GIF)  bodyH += 2*(EXP_ROW_H + EXP_GAP);  // quality + alpha
     if (s_format == EXP_FMT_PNG)  bodyH += EXP_ROW_H + EXP_GAP;      // alpha
@@ -750,10 +871,43 @@ void ZenExportGui(void)
                       "exported; the outro is always trimmed.");
     cy += EXP_ROW_H + EXP_GAP;
 
-    float a, b; ExportRange(&a, &b);
+    // -- pause hold -----------------------------------------------------------
+    // Same ownDisable dance as the row above: the panel is already inside the
+    // running-job GuiDisable, so this row may only re-enable when IT is the one
+    // that disabled.
+    float marks[ANIM_PAUSES_MAX];
+    int   nMarks = HoldMarkers(marks);
+    bool  ownDisableHold = (nMarks == 0) && !running;
+    if (nMarks == 0)
+        // Nothing to hold on, so the value must not keep inflating the frame
+        // count - same reasoning as the intro checkbox above.
+        s_pauseHold = 0.0f;
+    if (ownDisableHold) GuiDisable();
+    GuiLabel((Rectangle){ x, cy, lw, EXP_ROW_H }, "Pause hold");
+    Rectangle phR = { x + lw, cy, wIn - lw - 46, EXP_ROW_H };
+    GuiSlider(phR, NULL, TextFormat("%.1fs", s_pauseHold), &s_pauseHold,
+              0.0f, 12.0f);
+    // 12s across ~280px is ~40ms a pixel, so the raw value lands on unreachable
+    // numbers like 3.4297; snapped to a tenth it reads as something chosen.
+    s_pauseHold = roundf(s_pauseHold * 10.0f) / 10.0f;
+    if (ownDisableHold) GuiEnable();
+    ZenTip(phR, nMarks
+        ? TextFormat("A pause marker waits for a keypress, and a file has "
+                     "nobody to press one - so each of this range's %d marker%s "
+                     "freezes for this long instead. 0 runs straight through "
+                     "them.", nMarks, nMarks == 1 ? "" : "s")
+        : "This animation has no pause markers in the exported range");
+    cy += EXP_ROW_H + EXP_GAP;
+
     int frames = ExportFrameCount();
+    int heldFrames = nMarks * HoldFrameCount();
+    // Duration comes from the FRAME COUNT, not the range, so the held frames
+    // are counted - they are real seconds of output.
     GuiLabel((Rectangle){ x, cy, wIn, 18 },
-             TextFormat("%d frames  -  %.2fs", frames, b - a));
+             TextFormat("%d frames  -  %.2fs%s", frames,
+                        (float)frames / (float)s_fps,
+                        heldFrames ? TextFormat("   (%d held)", heldFrames)
+                                   : ""));
     cy += 18 + EXP_GAP;
 
     // -- per-format controls --------------------------------------------------
@@ -861,6 +1015,22 @@ void ZenExportGui(void)
     // -- footer ---------------------------------------------------------------
     float bh = 28, by = m.y + bodyH - bh - 12;
     bool canExport = avail && frames > 0 && zen.doc.elemCount > 0;
+
+#if !defined(PLATFORM_WEB)
+    // The folder only exists once something has been exported. Greyed rather than
+    // created on click - a button that says "open" should not also make things.
+    // The tip sits outside the disable pair: while the button is dead, that
+    // tooltip is the only thing saying why.
+    bool haveDir = DirectoryExists(EXP_DIR);
+    if (!haveDir) GuiDisable();
+    if (GuiButton((Rectangle){ m.x + 12, by, 86, bh }, "Folder"))
+    { AudioPlayButton(); OpenExportDir(); }
+    if (!haveDir) GuiEnable();
+    ZenTip((Rectangle){ m.x + 12, by, 86, bh },
+           haveDir ? "Open the exports folder in the file manager"
+                   : "Nothing has been exported yet - the folder is created on "
+                     "the first export");
+#endif
 
     if (running)
     {
