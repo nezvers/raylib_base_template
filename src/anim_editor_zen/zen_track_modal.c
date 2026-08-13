@@ -24,7 +24,12 @@
 #include <math.h>
 #include <stdlib.h>
 
-#define TM_W        300.0f
+// Width is set by the WIDEST thing the modal has to say: a crumble member row
+// is "crumble_spread" + a usable slider + the value readout, and at 300px the
+// name column clipped to "crumbl..." while the slider had no room to aim with.
+#define TM_W        420.0f
+#define TM_LBL      104.0f      // property-name column, left of every slider
+#define TM_VALW      50.0f      // ZenEditSlider's readout, right of every slider
 #define TM_TITLE_H   24.0f
 #define TM_RH        24.0f
 #define TM_GAP        6.0f
@@ -188,12 +193,12 @@ static void DrawBadge(Rectangle r, const char *text, Color c)
              (int)(r.y + (r.height - fs)*0.5f), fs, (Color){ 20, 21, 25, 255 });
 }
 
-// One-line summary of a key: the first two scalar members at that time.
+// One-line summary of a key: the first three scalar members at that time.
 static const char *KeySummary(AnimElem *e, const AnimPropGroup *g, float t)
 {
     const char *out = "";
     int shown = 0;
-    for (int m = 0; g && m < g->propCount && shown < 2; m++)
+    for (int m = 0; g && m < g->propCount && shown < 3; m++)
     {
         if (AnimPropIsColor(g->props[m])) continue;
         out = TextFormat("%s%s%s %.0f", out, shown ? "  " : "",
@@ -343,16 +348,6 @@ static Rectangle ModalChrome(ZenTrackModal *tm, float bodyH, const char *title)
 
 // Signal mode: live editor for the group key (zen.sigSelElem, zen.sigSelGroup,
 // zen.sigSelU) of signal tm->sig.
-// True when the group on screen contains the crumble track. The crumble SHAPE
-// fields hang off the element, not the key, so they are shown only here - beside
-// the track they shape - rather than on every group either modal can open.
-static bool GroupHasCrumble(const AnimPropGroup *g)
-{
-    for (int m = 0; g && m < g->propCount; m++)
-        if (g->props[m] == AP_T_CRUMBLE) return true;
-    return false;
-}
-
 static void SigModeGui(ZenTrackModal *tm)
 {
     if (tm->sig >= zen.doc.signalCount ||
@@ -372,19 +367,17 @@ static void SigModeGui(ZenTrackModal *tm)
         if (AnimPropIsColor(g->props[m])) hasColor = true;
         else scalarRows++;
     }
-    bool crumble = GroupHasCrumble(g);
     float bodyH = TM_TITLE_H + 22
                 + TM_RH + TM_GAP                    // u
                 + scalarRows * (TM_RH + TM_GAP)
                 + (hasColor ? TM_RH + 3*18 + TM_GAP : 0)
-                + (crumble ? 12 + 4*(TM_RH + TM_GAP) : 0)   // crumble shape
                 + TM_RH + TM_GAP                    // ease
                 + TM_RH + 10;                       // delete
     Rectangle m = ModalChrome(tm, bodyH,
         TextFormat("SIGNAL KEY  %s . %s . %s", sg->name, el->name, g->name));
     if (!tm->open) return;
 
-    float x = m.x + 10, w = m.width - 20 - 50;
+    float x = m.x + 10, w = m.width - 20 - TM_VALW;
     float y = m.y + TM_TITLE_H + 2;
     Rectangle banner = { x, y, m.width - 20, 18 };
     DrawRectangleRec(banner, (Color){ 58, 62, 74, 255 });
@@ -397,9 +390,9 @@ static void SigModeGui(ZenTrackModal *tm)
     y += 22;
 
     // u: moves the whole group key.
-    GuiLabel((Rectangle){ x, y, 44, TM_RH }, "u");
+    GuiLabel((Rectangle){ x, y, TM_LBL, TM_RH }, "u");
     float u = zen.sigSelU;
-    if (ZenEditSlider((Rectangle){ x + 44, y, w - 44, TM_RH }, "", &u, 0.0f, 1.0f))
+    if (ZenEditSlider((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "", &u, 0.0f, 1.0f))
     {
         ZenSigGroupMoveKeyTo(sg, zen.sigSelElem, zen.sigSelGroup, zen.sigSelU, u);
         zen.sigSelU = u; zen.sigLastU = u;
@@ -432,30 +425,23 @@ static void SigModeGui(ZenTrackModal *tm)
         }
         else
         {
-            ZenLabelTip((Rectangle){ x, y, 44, TM_RH }, AnimPropName(prop),
-                        AnimPropName(prop));
+            ZenLabelTip((Rectangle){ x, y, TM_LBL, TM_RH }, AnimPropName(prop),
+                        ZenPropDesc(prop));
             if (k >= 0)
             {
                 float v = tg->keys[k].value, lo, hi;
                 ZenPropRange(el, prop, &lo, &hi);
-                if (ZenEditSlider((Rectangle){ x + 44, y, w - 44, TM_RH }, "", &v, lo, hi))
+                if (ZenEditSlider((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "", &v, lo, hi))
                     tg->keys[k].value = v;
             }
-            else GuiLabel((Rectangle){ x + 44, y, w - 44, TM_RH }, "(no key)");
+            else GuiLabel((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "(no key)");
             y += TM_RH + TM_GAP;
         }
     }
 
-    // Crumble shape, same fields the inspector and doc-mode modal edit. They
-    // live on the ELEMENT, so a signal that crumbles a text element shares them
-    // with every other user of that element - editing here is not scoped to this
-    // signal, and the tooltip on each row says what it does rather than implying
-    // otherwise.
-    if (crumble) y = ZenCrumbleRows(x, y, w, TM_RH, TM_GAP, el);
-
     // ease (header; the shared overlay applies it in signal mode).
-    GuiLabel((Rectangle){ x, y, 44, TM_RH }, "ease");
-    zen.easeDropRect = (Rectangle){ x + 44, y, w - 44, TM_RH };
+    GuiLabel((Rectangle){ x, y, TM_LBL, TM_RH }, "ease");
+    zen.easeDropRect = (Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH };
     int ease = ZenSigGroupEase(sg, zen.sigSelElem, zen.sigSelGroup, zen.sigSelU);
     if (GuiButton(zen.easeDropRect, TextFormat("%s  v", AnimEaseName(ease))))
     { AudioPlayButton(); zen.easeDropOpen = !zen.easeDropOpen; }
@@ -518,11 +504,9 @@ void ZenTrackModalGui(void)
     int scalarRows = 0;
     for (int m = 0; g && m < g->propCount; m++)
         if (!AnimPropIsColor(g->props[m])) scalarRows++;
-    bool crumble = GroupHasCrumble(g);
     float bodyH = TM_TITLE_H + treeH + (single ? TM_RH + TM_GAP : 0)
                 + scalarRows * (TM_RH + TM_GAP)
                 + (cp >= 0 ? TM_RH + 3*18 + TM_GAP : 0)
-                + (crumble ? 12 + 4*(TM_RH + TM_GAP) : 0)   // crumble shape
                 + TM_RH + TM_GAP        // ease
                 + TM_RH + TM_GAP        // delete / Apply row
                 + TM_RH + 10;           // +key / reset row
@@ -551,7 +535,7 @@ void ZenTrackModalGui(void)
     if (GuiButton((Rectangle){ m.x + m.width - 22, m.y + 2, 20, 20 }, "x"))
     { AudioPlayButton(); tm->open = false; return; }
 
-    float x = m.x + 10, w = m.width - 20 - 50;
+    float x = m.x + 10, w = m.width - 20 - TM_VALW;
     float y = m.y + TM_TITLE_H + 2;
 
     // tree: the scope banner plus a row per key the edits will hit.
@@ -562,8 +546,8 @@ void ZenTrackModalGui(void)
     // --- single-key: time row -----------------------------------------------
     if (single)
     {
-        GuiLabel((Rectangle){ x, y, 40, TM_RH }, "time");
-        if (GuiTextBox((Rectangle){ x + 44, y, w - 44, TM_RH }, tm->timeBuf,
+        GuiLabel((Rectangle){ x, y, TM_LBL, TM_RH }, "time");
+        if (GuiTextBox((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, tm->timeBuf,
                        sizeof(tm->timeBuf), tm->edTime))
         {
             if (!tm->edTime) tm->edTime = true;
@@ -591,7 +575,7 @@ void ZenTrackModalGui(void)
         if (AnimPropIsColor(prop)) continue;        // colour block below
         float lo, hi; ZenPropRange(e, prop, &lo, &hi);
 
-        ZenLabelTip((Rectangle){ x, y, 44, TM_RH }, AnimPropName(prop),
+        ZenLabelTip((Rectangle){ x, y, TM_LBL, TM_RH }, AnimPropName(prop),
                     ZenPropDesc(prop));
 
         // A string key holds a POOL INDEX, not a quantity: dragging a slider
@@ -614,7 +598,7 @@ void ZenTrackModalGui(void)
                 words = s ? s : "(missing string)";
             }
 
-            Rectangle sr = { x + 44, y, w - 44, TM_RH };
+            Rectangle sr = { x + TM_LBL, y, w - TM_LBL, TM_RH };
             zen.strDropRect = sr;
             if (k < 0) GuiDisable();
             if (GuiButton(sr, TextFormat("%s  v", ZenTextPreview(words, 24))))
@@ -645,7 +629,7 @@ void ZenTrackModalGui(void)
                 nm = sd ? sd->name : "(missing shape)";
             }
 
-            Rectangle sr = { x + 44, y, w - 44, TM_RH };
+            Rectangle sr = { x + TM_LBL, y, w - TM_LBL, TM_RH };
             zen.shapeDropRect = sr;
             if (k < 0) GuiDisable();
             if (GuiButton(sr, TextFormat("%s  v", ZenTextPreview(nm, 24))))
@@ -669,18 +653,18 @@ void ZenTrackModalGui(void)
             if (k >= 0)
             {
                 float v = tr->keys[k].value;
-                if (ZenEditSlider((Rectangle){ x + 44, y, w - 44, TM_RH }, "", &v, lo, hi))
+                if (ZenEditSlider((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "", &v, lo, hi))
                     tr->keys[k].value = v;
             }
-            else GuiLabel((Rectangle){ x + 44, y, w - 44, TM_RH }, "(no key)");
+            else GuiLabel((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "(no key)");
         }
         else
         {
             float v = tm->vals[mi];
-            if (ZenEditSlider((Rectangle){ x + 44, y, w - 44, TM_RH }, "", &v, lo, hi))
+            if (ZenEditSlider((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "", &v, lo, hi))
             { tm->vals[mi] = v; tm->dVals[mi] = true; }
             if (tm->dVals[mi])                      // dirty marker
-                DrawCircle((int)(x + w + 40), (int)(y + TM_RH/2), 3,
+                DrawCircle((int)(x + w + TM_VALW - 10), (int)(y + TM_RH/2), 3,
                            (Color){ 255, 210, 90, 255 });
         }
         y += TM_RH + TM_GAP;
@@ -700,7 +684,7 @@ void ZenTrackModalGui(void)
         ZenDrawSwatch((Rectangle){ m.x + m.width - 30, y + 3, 18, 18 },
                       (Color){ cc.r, cc.g, cc.b, 255 });
         if (!single && tm->dCval)
-            DrawCircle((int)(x + w + 40), (int)(y + TM_RH/2), 3,
+            DrawCircle((int)(x + w + TM_VALW - 10), (int)(y + TM_RH/2), 3,
                        (Color){ 255, 210, 90, 255 });
         y += TM_RH;
         float cr = cc.r, cg = cc.g, cb = cc.b;
@@ -717,13 +701,6 @@ void ZenTrackModalGui(void)
         y += TM_GAP;
     }
 
-    // --- crumble shape -------------------------------------------------------
-    // Per-ELEMENT, not per-key: these are the same fields the inspector edits,
-    // so they apply to every key of this track at once and ignore the modal's
-    // single/bulk selection entirely. No dirty markers and no Apply - they are
-    // live like the single-key rows, and each drag is its own undo step.
-    if (crumble) y = ZenCrumbleRows(x, y, w, TM_RH, TM_GAP, e);
-
     // --- ease (dropdown header; list drawn topmost by the overlay pass) -----
     // A stepped group has nothing to ease BETWEEN: AnimTrackEval returns the
     // left key's value outright, so an ease picked here would be stored, saved
@@ -732,8 +709,8 @@ void ZenTrackModalGui(void)
     bool stepped = zen.selGroup >= 0 && ZenGroupIsStepped(e->kind, zen.selGroup);
     if (stepped)
     {
-        GuiLabel((Rectangle){ x, y, 44, TM_RH }, "ease");
-        GuiLabel((Rectangle){ x + 44, y, w - 44, TM_RH }, "steps - no easing");
+        GuiLabel((Rectangle){ x, y, TM_LBL, TM_RH }, "ease");
+        GuiLabel((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "steps - no easing");
         ZenTip((Rectangle){ x, y, w, TM_RH }, e->kind == AE_SHAPE
                ? "The shape snaps at each key and holds until the next one. There "
                  "is no midpoint between two shapes, so nothing to ease."
@@ -743,12 +720,12 @@ void ZenTrackModalGui(void)
     }
     else
     {
-    GuiLabel((Rectangle){ x, y, 44, TM_RH }, "ease");
-    zen.easeDropRect = (Rectangle){ x + 44, y, w - 44, TM_RH };
+    GuiLabel((Rectangle){ x, y, TM_LBL, TM_RH }, "ease");
+    zen.easeDropRect = (Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH };
     if (GuiButton(zen.easeDropRect, TextFormat("%s  v", AnimEaseName(tm->ease))))
     { AudioPlayButton(); zen.easeDropOpen = !zen.easeDropOpen; }
     if (!single && tm->dEase)
-        DrawCircle((int)(x + w + 40), (int)(y + TM_RH/2), 3,
+        DrawCircle((int)(x + w + TM_VALW - 10), (int)(y + TM_RH/2), 3,
                    (Color){ 255, 210, 90, 255 });
     }
     y += TM_RH + TM_GAP;

@@ -585,6 +585,13 @@ static float ElemBaseProp(const AnimElem *e, int prop)
                                                ? e->scaleFrac : 1.0f;
         case AP_T_ROT:   case AP_S_ROT:   return e->rotBase;
         case AP_T_CRUMBLE:                return 0.0f;
+        // The crumble SHAPE fields are the rest pose of their tracks, exactly
+        // as rotBase is for AP_T_ROT: an element that keys none of them still
+        // crumbles the way its inspector sliders (and `crumble_fx`) say.
+        case AP_T_CRUMBLE_DIR:            return e->crumbleDir;
+        case AP_T_CRUMBLE_SPREAD:         return e->crumbleSpread;
+        case AP_T_CRUMBLE_DIST:           return e->crumbleDist;
+        case AP_T_CRUMBLE_SPIN:           return e->crumbleRot;
         // No string track -> the element shows its own text, which
         // AnimElemTextAt expresses as the fallback. -1 = "no pool entry".
         case AP_T_STRING:                 return -1.0f;
@@ -670,6 +677,8 @@ float AnimPropMin(int prop)
         // so elements can be keyed off screen and slide in/out.
         case AP_T_POS_X: case AP_S_POS_X:
         case AP_T_POS_Y: case AP_S_POS_Y: return -1.0f;
+        // a full turn either way, so the tumble can be keyed clockwise or not
+        case AP_T_CRUMBLE_SPIN:           return -720.0f;
         default:                          return 0.0f;
     }
 }
@@ -686,6 +695,11 @@ float AnimPropMax(int prop)
         case AP_T_SIZE:  case AP_S_W:
         case AP_S_H:                      return 3.0f;    // allow off-screen sizes
         case AP_S_SCALE:                  return 10.0f;   // multiplier, 1 = rest
+        // same ranges the inspector's crumble sliders have always used
+        case AP_T_CRUMBLE_DIR:
+        case AP_T_CRUMBLE_SPREAD:         return 360.0f;
+        case AP_T_CRUMBLE_DIST:           return 2.0f;    // 2 screen heights
+        case AP_T_CRUMBLE_SPIN:           return 720.0f;
         // a pool INDEX, not a quantity: the whole pool must be reachable
         case AP_T_STRING:                 return (float)(ANIM_STRINGS_MAX - 1);
         case AP_S_SHAPE:                  return (float)(ANIM_SHAPE_POOL_MAX - 1);
@@ -701,6 +715,7 @@ float AnimPropMax(int prop)
 // anim_io includes anim.h, not the other way round.
 static const int k_textProps[] = {
     AP_T_POS_X, AP_T_POS_Y, AP_T_SIZE, AP_T_ALPHA, AP_T_ROT, AP_T_CRUMBLE,
+    AP_T_CRUMBLE_DIR, AP_T_CRUMBLE_SPREAD, AP_T_CRUMBLE_DIST, AP_T_CRUMBLE_SPIN,
     AP_T_COLOR, AP_T_STRING,
 };
 static const int k_shapeProps[] = {
@@ -1142,18 +1157,24 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game, const char *s
     if (crumble > 0.0f)
     {
         // Crumble: throw each glyph along its own angle inside a cone. Shaped
-        // by the element's four crumble fields (see anim.h) rather than
-        // hardcoded, so the same track can be a collapse, an explosion or a
-        // gust sideways. Still an approximation with NO physics state - every
-        // glyph's angle and spin hash its INDEX, never the clock, which is what
-        // keeps a frame a pure function of (doc, t) for the exporter.
+        // by four TRACKS (see anim.h) rather than hardcoded, so the same
+        // crumble can be a collapse, an explosion or a gust sideways - and can
+        // change from one into another mid-effect, since these are sampled at t
+        // like everything else. An element that keys none of them falls back to
+        // its crumble* fields. Still an approximation with NO physics state -
+        // every glyph's angle and spin hash its INDEX, never the clock, which is
+        // what keeps a frame a pure function of (doc, t) for the exporter.
+        float cDir    = AnimElemProp(e, AP_T_CRUMBLE_DIR,    t);
+        float cSpread = AnimElemProp(e, AP_T_CRUMBLE_SPREAD, t);
+        float cDist   = AnimElemProp(e, AP_T_CRUMBLE_DIST,   t);
+        float cSpin   = AnimElemProp(e, AP_T_CRUMBLE_SPIN,   t);
         float scale = sizePx / (float)font.baseSize;
         float penX  = left;
         float penY  = top;
         int   idx   = 0;
         // Quadratic in crumble: the letters accelerate away, so most of the
         // travel happens late and the text stays readable as it starts to go.
-        float reach = crumble * crumble * game.y * e->crumbleDist;
+        float reach = crumble * crumble * game.y * cDist;
         for (const char *c = str; *c; c++)
         {
             int cp = (unsigned char)*c;
@@ -1170,13 +1191,13 @@ static void DrawTextElem(const AnimElem *e, float t, Vector2 game, const char *s
                 // independent: without it a glyph's tumble would predict which
                 // way it flies, and the cone would visibly pair up at narrow
                 // spreads.
-                float   ang  = (e->crumbleDir + Rand11i(idx + 977)
-                                              * e->crumbleSpread * 0.5f) * DEG2RAD;
+                float   ang  = (cDir + Rand11i(idx + 977)
+                                     * cSpread * 0.5f) * DEG2RAD;
                 Vector2 gsz  = MeasureTextEx(font, buf, sizePx, spacing);
                 Vector2 org  = { gsz.x * 0.5f, gsz.y * 0.5f };
                 Vector2 ctr  = { penX + org.x + cosf(ang) * reach,
                                  penY + org.y + sinf(ang) * reach };
-                float   grot = rot + crumble * (Rand11i(idx) * e->crumbleRot);
+                float   grot = rot + crumble * (Rand11i(idx) * cSpin);
                 DrawTextPro(font, buf, ctr, org, grot, sizePx, spacing, col);
                 idx++;
             }

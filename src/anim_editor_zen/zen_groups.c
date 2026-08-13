@@ -548,6 +548,57 @@ void ZenSelClear(void)
     zen.trackModal.open = false;
 }
 
+// Switch the selected element WITHOUT throwing away what is being edited.
+// Closing the track modal on every element click made comparing two similar
+// elements a reopen-and-re-find chore, so when the modal is open on a doc
+// track we carry the group over BY NAME (group indices differ across kinds)
+// and land on the new element's key nearest the one in hand - the playhead
+// when the scope was a whole track or several keys. No matching track over
+// there means there is nothing to carry: fall back to the old clear.
+void ZenSelSwitchElem(int elem)
+{
+    if (elem < 0 || elem >= zen.doc.elemCount || elem == zen.selElem) return;
+
+    AnimElem *old = (zen.selElem >= 0 && zen.selElem < zen.doc.elemCount)
+                  ? &zen.doc.elems[zen.selElem] : NULL;
+    const AnimPropGroup *og = (old && zen.selGroup >= 0)
+                            ? AnimGroupAt(old->kind, zen.selGroup) : NULL;
+    bool carry = zen.trackModal.open && zen.trackModal.sig < 0 && og != NULL;
+    float refT = (carry && zen.selKeyCount == 1) ? zen.selKeys[0] : zen.playhead;
+
+    zen.selElem = elem;
+    if (!carry) { ZenSelClear(); return; }
+
+    AnimElem *e = &zen.doc.elems[elem];
+    int gi = -1;
+    for (int i = 0, n = AnimGroupCountFor(e->kind); i < n && gi < 0; i++)
+    {
+        const AnimPropGroup *g = AnimGroupAt(e->kind, i);
+        if (g && TextIsEqual(g->name, og->name)) gi = i;
+    }
+    if (gi < 0 || !ZenGroupHasTrack(e, gi)) { ZenSelClear(); return; }
+
+    zen.selGroup = gi;
+    zen.selKeyCount = 0;
+
+    // Nearest key rather than the first: scrubbing to a moment and flipping
+    // through elements should keep showing THAT moment on each of them.
+    float times[ZEN_GROUP_TIMES_MAX];
+    int nt = ZenGroupKeyTimes(e, gi, times);
+    if (nt > 0)
+    {
+        int best = 0;
+        for (int i = 1; i < nt; i++)
+            if (fabsf(times[i] - refT) < fabsf(times[best] - refT)) best = i;
+        zen.selKeys[0] = times[best];
+        zen.selKeyCount = 1;
+    }
+    // The modal relays out around the new key (row counts differ per group),
+    // sliding its sliders under the still-down button that picked the element.
+    ZenMouseReflow();
+    ZenTrackModalSync();        // keeps the modal open, re-baselines its fields
+}
+
 // Select a whole track (no individual keys): the modal bulk-edits every key.
 void ZenSelTrack(int elem, int gi)
 {

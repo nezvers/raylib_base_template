@@ -105,8 +105,7 @@ static float DrawElementList(float x, float y, float w)
             if (ctrl && i != zen.selElem) zen.multiSel[i] = !zen.multiSel[i];
             else
             {
-                if (zen.selElem != i) ZenSelClear();
-                zen.selElem = i;
+                ZenSelSwitchElem(i);
                 for (int k = 0; k < ANIM_ELEMS_MAX; k++) zen.multiSel[k] = false;
             }
         }

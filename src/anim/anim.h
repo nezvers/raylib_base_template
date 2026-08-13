@@ -88,11 +88,12 @@
 #define ANIM_TRACKS_MAX    12   // tracks (animated properties) per element
                                 // (>= the largest per-kind property count, so
                                 //  every property of an element is trackable)
-                                // EXACTLY FULL: SHAPE has 12 properties, so a
-                                // 13th shape prop must raise this too, or that
-                                // prop silently becomes untrackable once the
-                                // other 12 have tracks. tests/anim_tests.c
-                                // TestGroupCoverage asserts the fit.
+                                // EXACTLY FULL FOR BOTH: SHAPE and TEXT each
+                                // have 12 properties, so a 13th prop on either
+                                // must raise this too, or that prop silently
+                                // becomes untrackable once the other 12 have
+                                // tracks. tests/anim_tests.c TestGroupCoverage
+                                // asserts the fit.
 #define ANIM_ELEMS_MAX     12   // elements per document
 #define ANIM_SIGNALS_MAX    4   // signals per document (a signal is the single
                                 // largest sub-struct, ~3.4 KB each)
@@ -154,6 +155,13 @@ typedef enum {
     AP_T_ALPHA,         // 0..1 opacity
     AP_T_ROT,           // whole-text rotation, degrees
     AP_T_CRUMBLE,       // 0..1 per-glyph crumble amount (0 = intact)
+    // The SHAPE of that crumble, animatable alongside the amount above. Each
+    // one's rest pose (no track) is the element's matching crumble* field, so a
+    // document that never keys them behaves exactly as before they existed.
+    AP_T_CRUMBLE_DIR,   // travel direction, degrees (90 = down)
+    AP_T_CRUMBLE_SPREAD,// cone width around the direction, degrees
+    AP_T_CRUMBLE_DIST,  // travel distance at crumble=1, fraction of game HEIGHT
+    AP_T_CRUMBLE_SPIN,  // per-glyph tumble at crumble=1, degrees (+/- per glyph)
     AP_T_COLOR,         // RGBA tint; keys use AnimKey.cval, not value
     AP_T_STRING,        // WHICH STRING is shown: the key's value is an INDEX
                         // into AnimDoc.strings (see AnimString). STEPPED, never
@@ -295,12 +303,14 @@ typedef struct {
                                        // all edges app-wide, or pixel-snap the
                                        // crisp draw to match the baked look.
 
-    // AE_TEXT: the SHAPE of the crumble scatter. The AP_T_CRUMBLE track says
-    // how far ALONG the effect is (0 intact, 1 gone); these say what it looks
-    // like while it gets there, and are authored once per element rather than
-    // keyed. Angles are screen-space degrees: 0 = right, turning CLOCKWISE
-    // (screen y is down), so 90 = straight down. The defaults reproduce the
-    // look the effect had when it was hardcoded - see AnimElemInit.
+    // AE_TEXT: the REST POSE of the crumble scatter's shape. The AP_T_CRUMBLE
+    // track says how far ALONG the effect is (0 intact, 1 gone); these say what
+    // it looks like while it gets there. Each has a matching AP_T_CRUMBLE_*
+    // track and behaves like rotBase does for AP_T_ROT: the field is what the
+    // element uses until a track drives that param. Angles are screen-space
+    // degrees: 0 = right, turning CLOCKWISE (screen y is down), so 90 = straight
+    // down. The defaults reproduce the look the effect had when it was
+    // hardcoded - see AnimElemInit.
     float   crumbleRot;                // per-glyph tumble at crumble=1, in
                                        // degrees; each glyph gets its own
                                        // amount between -this and +this, so 0

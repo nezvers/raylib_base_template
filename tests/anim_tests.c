@@ -1504,6 +1504,125 @@ static void TestIOIdempotent(void)
     remove(p1); remove(p2);
 }
 
+// A crumble key carries the whole state of the effect - the amount AND the four
+// params that shape the scatter - on one line. Round-trips through save/load,
+// and a re-save is byte-identical (the wide form has to be stable too).
+static void TestIOCrumbleKeys(void)
+{
+    const char *p1 = "anim_tests_crumble1.cfg", *p2 = "anim_tests_crumble2.cfg";
+
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    TextCopy(doc.name, "crumble");
+    doc.duration = 2.0f;
+
+    AnimElem *t = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(t->name, "title");
+    TextCopy(t->text, "GONE");
+
+    // the five members keyed as a group would key them: same two times.
+    const int props[5] = { AP_T_CRUMBLE, AP_T_CRUMBLE_DIR, AP_T_CRUMBLE_SPREAD,
+                           AP_T_CRUMBLE_DIST, AP_T_CRUMBLE_SPIN };
+    const float v0[5] = { 0.0f,  90.0f,  12.0f, 0.5f,  90.0f };
+    const float v1[5] = { 1.0f, 270.0f, 180.0f, 1.5f, 360.0f };
+    for (int i = 0; i < 5; i++)
+    {
+        AnimTrack *tr = AnimElemAddTrack(t, props[i]);
+        CHECK(tr != NULL);
+        AnimTrackAddKey(tr, 0.0f, v0[i], ANIM_EASE_LINEAR);
+        AnimTrackAddKey(tr, 1.0f, v1[i], ANIM_EASE_SINE_OUT);
+    }
+
+    CHECK(AnimDocSave(&doc, p1));
+
+    AnimDoc back;
+    CHECK(AnimDocLoad(&back, p1));
+    CHECK(back.elemCount == 1);
+    CHECK(back.elems[0].trackCount == 5);
+    for (int i = 0; i < 5; i++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(&back.elems[0], props[i]);
+        CHECK(tr != NULL);
+        if (!tr) continue;
+        CHECK(tr->keyCount == 2);
+        CHECK_NEAR(tr->keys[0].value, v0[i]);
+        CHECK_NEAR(tr->keys[1].value, v1[i]);
+        CHECK(tr->keys[0].ease == ANIM_EASE_LINEAR);
+        CHECK(tr->keys[1].ease == ANIM_EASE_SINE_OUT);
+    }
+    // and the shape is genuinely animated, not stuck on the element's rest pose
+    // (mid-segment, so eased - the bound is what matters, not the exact value)
+    float midDir = AnimElemProp(&back.elems[0], AP_T_CRUMBLE_DIR, 0.5f);
+    CHECK(midDir > 90.0f && midDir < 270.0f);
+    CHECK_NEAR(AnimElemProp(&back.elems[0], AP_T_CRUMBLE_DIR, 1.0f), 270.0f);
+
+    CHECK(AnimDocSave(&back, p2));
+    FILE *f1 = fopen(p1, "rb"), *f2 = fopen(p2, "rb");
+    CHECK(f1 && f2);
+    if (f1 && f2)
+    {
+        int c1, c2, same = 1;
+        do { c1 = fgetc(f1); c2 = fgetc(f2); if (c1 != c2) { same = 0; break; } }
+        while (c1 != EOF);
+        CHECK(same);
+    }
+    if (f1) fclose(f1);
+    if (f2) fclose(f2);
+    remove(p1); remove(p2);
+}
+
+// A crumble track with only the AMOUNT keyed still writes the wide line: the
+// four shape members come from the element's rest pose. This is what migrated
+// every pre-existing document, so a param nobody keyed keeps its authored look.
+static void TestIOCrumbleRestPoseFill(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    TextCopy(doc.name, "crumblefill");
+    doc.duration = 2.0f;
+
+    AnimElem *e = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(e->name, "title");
+    TextCopy(e->text, "GONE");
+    e->crumbleDir = 270.0f; e->crumbleSpread = 30.0f;
+    e->crumbleDist = 1.25f; e->crumbleRot    = 45.0f;
+    AnimTrack *tr = AnimElemAddTrack(e, AP_T_CRUMBLE);
+    AnimTrackAddKey(tr, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 1.0f, 1.0f, ANIM_EASE_LINEAR);
+
+    const char *path = "anim_tests_crumble_fill.cfg";
+    CHECK(AnimDocSave(&doc, path));
+
+    AnimDoc back;
+    CHECK(AnimDocLoad(&back, path));
+    CHECK(back.elemCount == 1);
+    AnimElem *b = &back.elems[0];
+    CHECK(b->trackCount == 5);                      // all five members now exist
+    CHECK_NEAR(AnimElemProp(b, AP_T_CRUMBLE, 1.0f), 1.0f);
+    // the rest pose was baked into every key, so it reads back unchanged
+    CHECK_NEAR(AnimElemProp(b, AP_T_CRUMBLE_DIR,    0.5f), 270.0f);
+    CHECK_NEAR(AnimElemProp(b, AP_T_CRUMBLE_SPREAD, 0.5f),  30.0f);
+    CHECK_NEAR(AnimElemProp(b, AP_T_CRUMBLE_DIST,   0.5f),   1.25f);
+    CHECK_NEAR(AnimElemProp(b, AP_T_CRUMBLE_SPIN,   0.5f),  45.0f);
+
+    // and the fill is stable: a second save is byte-identical to the first
+    const char *out = "anim_tests_crumble_fill2.cfg";
+    CHECK(AnimDocSave(&back, out));
+    FILE *f1 = fopen(path, "rb"), *f2 = fopen(out, "rb");
+    CHECK(f1 && f2);
+    if (f1 && f2)
+    {
+        int c1, c2, same = 1;
+        do { c1 = fgetc(f1); c2 = fgetc(f2); if (c1 != c2) { same = 0; break; } }
+        while (c1 != EOF);
+        CHECK(same);
+    }
+    if (f1) fclose(f1);
+    if (f2) fclose(f2);
+    remove(out);
+    remove(path);
+}
+
 // ---------------------------------------------------------------------------
 //  Element library: CRUD + round-trip through the shared elem grammar
 // ---------------------------------------------------------------------------
@@ -3039,6 +3158,8 @@ int main(void)
     TestPauseMarkers();
     TestPlayerSeek();
     TestIOIdempotent();
+    TestIOCrumbleKeys();
+    TestIOCrumbleRestPoseFill();
     TestIOSignalOrphanTarget();
     TestIOSignalGroupTargets();
     TestLibrary();

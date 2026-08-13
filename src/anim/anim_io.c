@@ -25,16 +25,31 @@
 //      outline <r> <g> <b> <a> <thickFrac>                 # (shape elements)
 //      outline_style crisp                 # OPTIONAL (circle): smooth DrawRing
 //                                          # outline; absent -> faceted polygon
-//      crumble_fx <spin> <dir> <spread> <dist>   # OPTIONAL (text): shape of the
-//                                          # crumble scatter, in degrees except
-//                                          # dist (fraction of height). Written
-//                                          # only when it differs from the
-//                                          # defaults; absent -> 90 90 12 0.5,
-//                                          # the values the effect was
+//      crumble_fx <spin> <dir> <spread> <dist>   # OPTIONAL (text): REST POSE of
+//                                          # the crumble scatter's shape, in
+//                                          # degrees except dist (fraction of
+//                                          # height) - what the element uses
+//                                          # where no crumble key drives it.
+//                                          # Written only when it differs from
+//                                          # the defaults; absent -> 90 90 12
+//                                          # 0.5, the values the effect was
 //                                          # hardcoded to before it took params
 //      track  <prop> <keyCount>         # then keyCount x `key` lines
 //        key  <t> <value> <ease>            # scalar tracks
 //        key  <t> <r> <g> <b> <ease>        # colour tracks (RGB; no alpha)
+//        key  <t> <amount> <dir> <spread> <dist> <spin> <ease>
+//                                           # the `crumble` track, ALWAYS: one
+//                                           # crumble key is the whole state of
+//                                           # the effect at that instant, so its
+//                                           # five properties share a line
+//                                           # instead of splitting into five
+//                                           # blocks to keep time-aligned. Params
+//                                           # left unkeyed are written from the
+//                                           # rest pose, so the line is complete.
+//                                           # Documents written before the
+//                                           # scatter was keyable used the plain
+//                                           # scalar form; they were migrated
+//                                           # in place and are no longer read.
 //      end
 //    pause    <t> [<once>]              # doc-clock hold; playback stops here
 //                                       # until a key is pressed. `once` (0/1)
@@ -76,6 +91,12 @@ typedef struct { int prop; const char *name; } PropRow;
 static const PropRow k_textProps[] = {
     { AP_T_POS_X, "pos_x" }, { AP_T_POS_Y, "pos_y" }, { AP_T_SIZE, "size" },
     { AP_T_ALPHA, "alpha" }, { AP_T_ROT, "rot" },     { AP_T_CRUMBLE, "crumble" },
+    // Serialized inside the `crumble` track's own key lines (see the grammar at
+    // the top of this file), never as `track crumble_dir` blocks of their own.
+    // The names still matter: signal `target` lines are per-property, and the
+    // editor labels its member rows with them.
+    { AP_T_CRUMBLE_DIR, "crumble_dir" }, { AP_T_CRUMBLE_SPREAD, "crumble_spread" },
+    { AP_T_CRUMBLE_DIST, "crumble_dist" }, { AP_T_CRUMBLE_SPIN, "crumble_spin" },
     { AP_T_COLOR, "color" }, { AP_T_STRING, "string" },
 };
 static const PropRow k_shapeProps[] = {
@@ -142,7 +163,10 @@ static const AnimPropGroup k_textGroups[] = {
     { "size",     { AP_T_SIZE },              1 },
     { "color",    { AP_T_COLOR, AP_T_ALPHA }, 2 },
     { "rotation", { AP_T_ROT },               1 },
-    { "crumble",  { AP_T_CRUMBLE },           1 },
+    // The one group whose members share a .cfg line: a crumble key carries the
+    // amount AND the shape of the scatter at that instant.
+    { "crumble",  { AP_T_CRUMBLE, AP_T_CRUMBLE_DIR, AP_T_CRUMBLE_SPREAD,
+                    AP_T_CRUMBLE_DIST, AP_T_CRUMBLE_SPIN },              5 },
     { "string",   { AP_T_STRING },            1 },
 };
 static const AnimPropGroup k_shapeGroups[] = {
@@ -284,6 +308,86 @@ static void DecodeText(char *s)
 }
 
 // ---------------------------------------------------------------------------
+//  The crumble group: the one group whose members share a key line
+//
+//  A crumble key is the whole state of the effect at that instant - how far
+//  along it is AND what the scatter looks like - so the five member tracks
+//  serialize as one `track crumble` block with wide key lines instead of five
+//  blocks a reader would have to keep time-aligned by hand. Order below IS the
+//  field order on the line.
+// ---------------------------------------------------------------------------
+#define CRUMBLE_PROPS 5
+static const int k_crumbleProps[CRUMBLE_PROPS] = {
+    AP_T_CRUMBLE, AP_T_CRUMBLE_DIR, AP_T_CRUMBLE_SPREAD,
+    AP_T_CRUMBLE_DIST, AP_T_CRUMBLE_SPIN,
+};
+
+// The four SHAPE members (everything but the amount, which owns the block).
+static bool CrumbleShapeProp(int prop)
+{
+    for (int i = 1; i < CRUMBLE_PROPS; i++)
+        if (k_crumbleProps[i] == prop) return true;
+    return false;
+}
+
+// The key index in `tr` at time t, or -1. Exact float compare is right here:
+// the times being matched were written by the same group edit, not typed.
+static int CrumbleKeyAt(const AnimElem *e, int prop, float t)
+{
+    AnimTrack *tr = AnimElemFindTrack((AnimElem *)e, prop);
+    if (!tr) return -1;
+    for (int k = 0; k < tr->keyCount; k++)
+        if (tr->keys[k].t == t) return k;
+    return -1;
+}
+
+// One `track crumble <n>` block, wide form. `n` is the UNION of the members'
+// key times: group editing keys them as a unit, but a union costs little and
+// means a ragged member can never silently drop a key on save.
+static void WriteCrumbleTrack(FILE *f, const char *ind, const AnimElem *e,
+                              const AnimTrack *amount)
+{
+    float times[ANIM_KEYS_MAX];
+    int   n = 0;
+    for (int i = 0; i < CRUMBLE_PROPS; i++)
+    {
+        AnimTrack *tr = (i == 0) ? (AnimTrack *)amount
+                                 : AnimElemFindTrack((AnimElem *)e, k_crumbleProps[i]);
+        for (int k = 0; tr && k < tr->keyCount && n < ANIM_KEYS_MAX; k++)
+        {
+            bool dup = false;
+            for (int q = 0; q < n && !dup; q++) dup = (times[q] == tr->keys[k].t);
+            if (!dup) times[n++] = tr->keys[k].t;
+        }
+    }
+    for (int i = 1; i < n; i++)         // insertion sort: n <= ANIM_KEYS_MAX
+    {
+        float v = times[i]; int j = i - 1;
+        while (j >= 0 && times[j] > v) { times[j+1] = times[j]; j--; }
+        times[j+1] = v;
+    }
+
+    fprintf(f, "%s  track %s %d\n", ind, AnimPropName(AP_T_CRUMBLE), n);
+    for (int i = 0; i < n; i++)
+    {
+        float t = times[i];
+        fprintf(f, "%s    key %f", ind, t);
+        for (int p = 0; p < CRUMBLE_PROPS; p++)
+        {
+            int prop = k_crumbleProps[p];
+            int k    = CrumbleKeyAt(e, prop, t);
+            // No key on this member here (ragged): write what the element
+            // actually shows at t, so the reload renders identically.
+            AnimTrack *tr = AnimElemFindTrack((AnimElem *)e, prop);
+            fprintf(f, " %f", k >= 0 ? tr->keys[k].value : AnimElemProp(e, prop, t));
+        }
+        int ka = CrumbleKeyAt(e, AP_T_CRUMBLE, t);
+        fprintf(f, " %s\n", AnimEaseName(ka >= 0 ? amount->keys[ka].ease
+                                                 : ANIM_EASE_LINEAR));
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  Save
 // ---------------------------------------------------------------------------
 // One element as `elem ... end`, indented by `ind`. Shared by AnimDocSave and
@@ -364,6 +468,10 @@ void AnimElemWriteCfg(FILE *f, const AnimElem *e, const char *ind)
     for (int j = 0; j < e->trackCount; j++)
     {
         const AnimTrack *tr = &e->tracks[j];
+        // The crumble group serializes as ONE block whose key lines carry all
+        // five member values; the four shape members have no block of their own.
+        if (CrumbleShapeProp(tr->prop)) continue;
+        if (tr->prop == AP_T_CRUMBLE) { WriteCrumbleTrack(f, ind, e, tr); continue; }
         fprintf(f, "%s  track %s %d\n", ind, AnimPropName(tr->prop), tr->keyCount);
         for (int k = 0; k < tr->keyCount; k++)
         {
@@ -664,6 +772,32 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
             // the whole stream.
             int c;
             while ((c = fgetc(f)) != EOF && c != '\n') { }
+        }
+        else if (tr->prop == AP_T_CRUMBLE)
+        {
+            // A crumble key is wide: one line carries all five members, in
+            // k_crumbleProps order, and they fan out into the member tracks
+            // here. Reading the line whole (rather than fscanf-ing tokens)
+            // keeps a malformed key from desyncing the rest of the stream.
+            char line[256];
+            if (!fgets(line, sizeof line, f)) return true;
+            float t, v[CRUMBLE_PROPS]; char easeName[32];
+            int n = sscanf(line, "%f %f %f %f %f %f %31s", &t, &v[0], &v[1],
+                           &v[2], &v[3], &v[4], easeName);
+            if (n == 1 + CRUMBLE_PROPS + 1)     // t + members + ease
+            {
+                int ease = AnimEaseByName(easeName);
+                for (int i = 0; i < CRUMBLE_PROPS; i++)
+                {
+                    AnimTrack *mt = (i == 0) ? tr : NULL;
+                    if (!mt && curElem)
+                    {
+                        mt = AnimElemFindTrack(curElem, k_crumbleProps[i]);
+                        if (!mt) mt = AnimElemAddTrack(curElem, k_crumbleProps[i]);
+                    }
+                    if (mt) AnimTrackAddKey(mt, t, v[i], ease);
+                }
+            }
         }
         else if (AnimPropIsColor(tr->prop))
         {

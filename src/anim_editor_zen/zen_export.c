@@ -35,6 +35,7 @@
 // ============================================================================
 
 #include "raylib.h"
+#include "rlgl.h"
 #include "raygui.h"
 #include "zen_internal.h"
 #include "../screen_state/screen_state.h"
@@ -148,6 +149,10 @@ static int   s_fps = 30;
 static bool  s_showIntro = false;
 static bool  s_transparent = false;
 static int   s_gifQuality = 16;         // msf_gif 1..16
+// How opaque a pixel must be to survive a transparent gif. The format has no
+// partial alpha, so a fade has to snap somewhere and where it snaps is a
+// per-animation judgement call - hence a control rather than a constant.
+static int   s_gifCutout = 128;         // 1..255
 static int   s_videoQuality = 70;       // 0..100, mapped to CRF
 static char  s_nameBuf[96] = "";
 static bool  s_edName = false;
@@ -512,7 +517,7 @@ static void JobStart(void)
         s_gifFile = fopen(s_outPath, "wb");
         if (!s_gifFile) { JobFail("could not open the output file for writing"); return; }
         // 1-bit alpha: 0 disables it entirely, which is what an opaque gif wants.
-        msf_gif_alpha_threshold = s_transparent ? 128 : 0;
+        msf_gif_alpha_threshold = s_transparent ? s_gifCutout : 0;
         if (!msf_gif_begin_to_file(&s_gif, w, h, (MsfGifFileWriteFunc)fwrite,
                                    (void *)s_gifFile))
         { JobFail("gif encoder failed to start (out of memory?)"); return; }
@@ -570,6 +575,25 @@ static void JobStart(void)
     s_status[0] = '\0';
 }
 
+// Undo the premultiply the separate-blend export path leaves behind, so the
+// encoders get straight alpha. Nothing to do at either end of the range: a == 0
+// has no colour to recover, a == 255 was never scaled.
+static void UnpremultiplyRGBA(Image *img)
+{
+    unsigned char *p = (unsigned char *)img->data;
+    int n = img->width * img->height;
+    for (int i = 0; i < n; i++, p += 4)
+    {
+        int a = p[3];
+        if (a == 0 || a == 255) continue;
+        for (int c = 0; c < 3; c++)
+        {
+            int v = (p[c] * 255 + a / 2) / a;
+            p[c] = (unsigned char)(v > 255 ? 255 : v);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  Render one frame and hand it to the active encoder.
 // ---------------------------------------------------------------------------
@@ -584,7 +608,22 @@ static bool JobStep(void)
                                    s_format == EXP_FMT_PNG);
     BeginTextureMode(s_rt);
         ClearBackground(alpha ? BLANK : ScreenStateGet()->clear_color);
+        if (alpha)
+        {
+            // The default BLEND_ALPHA multiplies the ALPHA channel by src.a as
+            // well, so drawing onto a BLANK target SQUARES it - a 50% element
+            // lands at 25% and the cutout below then erases it entirely. That
+            // is what used to swallow anything mid-fade (a crumbling text is
+            // partly transparent for its whole run, so it vanished outright).
+            // Alpha wants a straight "over"; rgb comes out premultiplied and is
+            // undone on readback.
+            rlSetBlendFactorsSeparate(RL_SRC_ALPHA, RL_ONE_MINUS_SRC_ALPHA,
+                                      RL_ONE,       RL_ONE_MINUS_SRC_ALPHA,
+                                      RL_FUNC_ADD,  RL_FUNC_ADD);
+            BeginBlendMode(BLEND_CUSTOM_SEPARATE);
+        }
         AnimDocDrawLoop(&zen.doc, t, NULL, !s_showIntro);
+        if (alpha) EndBlendMode();
     EndTextureMode();
 
     Image img = LoadImageFromTexture(s_rt.texture);
@@ -594,6 +633,8 @@ static bool JobStep(void)
     ImageFlipVertical(&img);
     if (s_scale > 1) ImageResizeNN(&img, w, h);
     ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    // after the format conversion: the helper indexes raw RGBA8 bytes.
+    if (alpha) UnpremultiplyRGBA(&img);
 
     bool ok = true;
     if (s_format == EXP_FMT_GIF)
@@ -706,7 +747,9 @@ void ZenExportGui(void)
                 + EXP_ROW_H + EXP_GAP        // loop range
                 + EXP_ROW_H + EXP_GAP        // pause hold
                 + 18 + EXP_GAP;              // frames/duration line
-    if (s_format == EXP_FMT_GIF)  bodyH += 2*(EXP_ROW_H + EXP_GAP);  // quality + alpha
+    // quality + alpha, plus the cutout row that only shows when alpha is on
+    if (s_format == EXP_FMT_GIF)
+        bodyH += (2 + (s_transparent ? 1 : 0)) * (EXP_ROW_H + EXP_GAP);
     if (s_format == EXP_FMT_PNG)  bodyH += EXP_ROW_H + EXP_GAP;      // alpha
     if (video && s_format != EXP_FMT_AVI) bodyH += EXP_ROW_H + EXP_GAP;  // quality
     bodyH += 18 + EXP_GAP;                   // estimate
@@ -929,6 +972,21 @@ void ZenExportGui(void)
                "GIF transparency is 1-bit: a pixel is either fully see-through "
                "or fully opaque, with no soft edges.");
         cy += EXP_ROW_H + EXP_GAP;
+
+        if (s_transparent)
+        {
+            GuiLabel((Rectangle){ x, cy, lw, EXP_ROW_H }, "Cutout");
+            float c = (float)s_gifCutout;
+            GuiSlider((Rectangle){ x + lw, cy, wIn - lw - 46, EXP_ROW_H }, NULL,
+                      TextFormat("%d", s_gifCutout), &c, 1, 255);
+            s_gifCutout = (int)(c + 0.5f);
+            ZenTip((Rectangle){ x + lw, cy, wIn - lw - 46, EXP_ROW_H },
+                   "How opaque a pixel must be to be kept, since GIF alpha is "
+                   "on/off. Lower keeps faint pixels such as fading or "
+                   "crumbling text; too low and a semi-transparent full-screen "
+                   "fade becomes a solid wall.");
+            cy += EXP_ROW_H + EXP_GAP;
+        }
     }
     else if (video && s_format != EXP_FMT_AVI)
     {

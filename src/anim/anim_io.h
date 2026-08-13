@@ -54,7 +54,8 @@ int         AnimPropAt(int elemKind, int index);        // the index-th AP_* pro
 // (Position = pos_x+pos_y, Color = color+alpha, ...). Purely a presentation +
 // coordinated-editing layer: the underlying per-prop tracks and the .cfg format
 // are unchanged. `props` lists the member AP_* values (up to ANIM_GROUP_PROPS).
-#define ANIM_GROUP_PROPS 3
+// 5 = the "crumble" group: amount + the four params that shape the scatter.
+#define ANIM_GROUP_PROPS 5
 typedef struct { const char *name; int props[ANIM_GROUP_PROPS]; int propCount; } AnimPropGroup;
 
 int                  AnimGroupCountFor(int elemKind);        // # groups for a kind

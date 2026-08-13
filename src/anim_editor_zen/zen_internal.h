@@ -380,6 +380,8 @@ const char *ZenSigGroupKeyLabel(AnimSignal *sg, int elemIdx, int gi, float u);
 
 // -- track/key selection helpers (ctx-level, shared by panels + modals) -----
 void  ZenSelClear(void);                        // drop track + key selection
+void  ZenSelSwitchElem(int elem);               // pick an element, carrying the
+                                                // open modal's group + key over
 void  ZenSelTrack(int elem, int gi);            // select a whole track
 void  ZenSelKey(int elem, int gi, float t, bool additive);  // click / shift-click
 bool  ZenKeyIsSelected(int elem, int gi, float t);

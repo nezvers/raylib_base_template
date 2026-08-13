@@ -201,8 +201,7 @@ static void ViewInput(void)
             pickCycle++;
             if (pick != zen.selElem)
             {
-                ZenSelClear();
-                zen.selElem = pick;
+                ZenSelSwitchElem(pick);
                 for (int k = 0; k < ANIM_ELEMS_MAX; k++) zen.multiSel[k] = false;
             }
         }
@@ -218,8 +217,7 @@ static void ViewInput(void)
             {
                 if (i != zen.selElem)
                 {
-                    ZenSelClear();
-                    zen.selElem = i;
+                    ZenSelSwitchElem(i);
                     for (int k = 0; k < ANIM_ELEMS_MAX; k++) zen.multiSel[k] = false;
                 }
                 break;
