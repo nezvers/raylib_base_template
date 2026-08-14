@@ -206,6 +206,13 @@ typedef struct {
     // add-track dropdown of the inspector
     bool addTrackOpen; int addTrackSel; Rectangle addTrackRect;
 
+    // -- timeline view (zoom / pan) -----------------------------------------
+    // The visible slice of doc time, in seconds. Span (not a zoom factor) is
+    // what the time<->pixel macros want directly, and it clamps trivially.
+    // span <= 0 means "uninitialised" - ZenTimelineClampView snaps it to full.
+    float tlViewT0, tlViewSpan;
+    bool  tlFollow;                 // keep the playhead in frame (View menu)
+
     // -- timeline drag state ------------------------------------------------
     bool  dragPlayhead;
     int   dragKeyGroup;             // group being dragged (-1 = none)
@@ -395,6 +402,7 @@ const char *ZenPropDesc(int prop);              // plain-language property help
 void ZenPanelsGui(void);            // layout + ELEMENTS/SIGNALS/INSPECTOR/TIMELINE
 void ZenPanelsOverlaysGui(void);    // the add-track list, topmost (must run unlocked)
 void ZenPanelsUpdate(float dt);     // playback slide bookkeeping
+void ZenTimelineClampView(float dur);   // hold the zoom window inside 0..dur
 void ZenFireSignal(const AnimSignal *sg);
 
 // ---------------------------------------------------------------------------

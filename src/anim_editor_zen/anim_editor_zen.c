@@ -470,6 +470,9 @@ static void Enter()
     zen.trackModal.sig = -1;
     zen.easeDropOpen = false; zen.addTrackOpen = false; zen.addTrackSel = 0;
     zen.strDropOpen = false; zen.shapeDropOpen = false;
+    // Timeline zoom is per-visit: it survives playback and element switches,
+    // but leaving the editor drops it. span 0 => the clamp helper snaps to full.
+    zen.tlViewT0 = 0.0f; zen.tlViewSpan = 0.0f; zen.tlFollow = true;
     zen.dragPlayhead = false; zen.dragKeyGroup = -1;
     zen.dragIntro = zen.dragOutro = false;
     zen.dragPause = -1; zen.selPause = -1;

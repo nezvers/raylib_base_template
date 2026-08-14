@@ -28,6 +28,12 @@
 #include <math.h>
 
 #define ZEN_TIMELINE_SNAP 0.1f     // Ctrl-drag key snap grid (seconds)
+// Tightest zoom: two ticks of the finest (0.1s) gridline. Zooming past this
+// buys no precision - the Ctrl-drag snap grid is 0.1s anyway.
+#define ZEN_TL_MIN_SPAN   0.2f
+#define ZEN_TL_ZOOM_STEP  0.85f    // span multiplier per wheel notch / arrow press
+#define ZEN_TL_PAN_STEP   0.15f    // pan per wheel notch, as a fraction of span
+#define ZEN_TL_EDGE_PAD   24.0f    // drag this close to an edge and the view pans
 // How close the scrubbing playhead counts as "on" a key. Wider than
 // ZEN_AUTOKEY_EPS so a sweep reliably catches keys at normal mouse speed, and
 // wide enough that near-coincident keys are picked up together.
@@ -1060,6 +1066,32 @@ static void DrawSignalOverlay(float x, float y, float w, float h,
     DrawRectangleRec((Rectangle){ sx-6, y+14, 12, 8 }, (Color){ 150, 240, 165, 255 });
 }
 
+// Hold the zoom window inside 0..dur. Called every frame from DrawTimeline, so
+// a duration that changes under a zoomed view (doc reload, duration textbox)
+// re-clamps for free. span <= 0 is the "reset me" sentinel Enter() writes.
+void ZenTimelineClampView(float dur)
+{
+    if (zen.tlViewSpan <= 0.0f || zen.tlViewSpan > dur) zen.tlViewSpan = dur;
+    if (zen.tlViewSpan < ZEN_TL_MIN_SPAN)
+        zen.tlViewSpan = (dur < ZEN_TL_MIN_SPAN) ? dur : ZEN_TL_MIN_SPAN;
+    zen.tlViewT0 = ZenClampF(zen.tlViewT0, 0.0f, dur - zen.tlViewSpan);
+}
+
+// Dragging something to the edge of a zoomed window pans the view after it, so
+// a key can be carried past what is currently on screen. Returns nothing: the
+// next frame's X2T reads the shifted window and the drag continues into it.
+static void TimelineEdgePan(float mx, float trackLeft, float trackW, float dur)
+{
+    if (zen.tlViewSpan >= dur) return;              // nothing to pan
+    float dt = GetFrameTime();
+    if (mx < trackLeft + ZEN_TL_EDGE_PAD)
+        zen.tlViewT0 -= zen.tlViewSpan * dt;
+    else if (mx > trackLeft + trackW - ZEN_TL_EDGE_PAD)
+        zen.tlViewT0 += zen.tlViewSpan * dt;
+    else return;
+    ZenTimelineClampView(dur);
+}
+
 static void DrawTimeline(float x, float y, float w, float h)
 {
     bool thin = h < 60.0f;
@@ -1072,32 +1104,118 @@ static void DrawTimeline(float x, float y, float w, float h)
     float gutter = 56.0f, padR = 8.0f;
     float trackLeft = x + gutter, trackW = w - gutter - padR;
 
-    #define T2X(t) (trackLeft + (trackW) * ((t)/dur))
-    #define X2T(px) (((px) - trackLeft)/trackW * dur)
-
-    for (float s = 0; s <= dur + 0.001f; s += 0.5f)
-    {
-        float tx = T2X(s);
-        DrawLine((int)tx, (int)y+2, (int)tx, (int)(y+h-16), (Color){ 50,54,62,255 });
-        if (fmodf(s,1.0f) < 0.01f)
-            DrawText(TextFormat("%.0f", s), (int)tx+2, (int)(y+h-14), 10, (Color){110,116,128,255});
-    }
-
     Vector2 mouse = GetMousePosition();
     bool ctrl  = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
     bool shift = IsKeyDown(KEY_LEFT_SHIFT)   || IsKeyDown(KEY_RIGHT_SHIFT);
     bool press = !zen.guiLocked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     bool keyHit = false;
 
+    // ZOOM / PAN. The window is resolved BEFORE the macros are defined, so
+    // everything below - gridlines, keys, playhead, hit-tests - sees one
+    // consistent view for the whole frame.
+    ZenTimelineClampView(dur);
+    {
+        bool overTl = !zen.guiLocked &&
+                      CheckCollisionPointRec(mouse, (Rectangle){ x, y-4, w, h+8 });
+        float wheel = overTl ? GetMouseWheelMove() : 0.0f;
+
+        // Ctrl+wheel zooms about the cursor; Ctrl+arrows zoom about the
+        // playhead. Both keep their anchor time pinned to its pixel.
+        float zoomN = 0.0f, anchorT = zen.playhead, anchorX = -1.0f;
+        if (ctrl && wheel != 0.0f)
+        {
+            zoomN   = wheel;
+            anchorX = mouse.x;
+            anchorT = zen.tlViewT0 + (mouse.x - trackLeft)/trackW * zen.tlViewSpan;
+        }
+        else if (overTl && ctrl)
+        {
+            if (IsKeyPressed(KEY_UP)   || IsKeyPressedRepeat(KEY_UP))   zoomN =  1.0f;
+            if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) zoomN = -1.0f;
+            // playhead anchor: hold it where it currently sits on screen, so
+            // the bar grows around it instead of jumping.
+            if (zoomN != 0.0f)
+                anchorX = trackLeft +
+                          trackW * ((zen.playhead - zen.tlViewT0)/zen.tlViewSpan);
+        }
+
+        if (zoomN != 0.0f)
+        {
+            zen.tlViewSpan *= powf(ZEN_TL_ZOOM_STEP, zoomN);
+            ZenTimelineClampView(dur);      // clamp span before solving for T0
+            float f = ZenClampF((anchorX - trackLeft)/trackW, 0.0f, 1.0f);
+            zen.tlViewT0 = anchorT - f * zen.tlViewSpan;
+            ZenTimelineClampView(dur);
+        }
+        else if (wheel != 0.0f && !ctrl)    // plain wheel pans
+        {
+            zen.tlViewT0 -= wheel * zen.tlViewSpan * ZEN_TL_PAN_STEP;
+            ZenTimelineClampView(dur);
+        }
+
+        // Follow the playhead once it nears the edge of the window. Runs for
+        // playback and scrubbing alike; a no-op when fully zoomed out.
+        if (zen.tlFollow && zen.tlViewSpan < dur)
+        {
+            float lo = zen.tlViewT0 + zen.tlViewSpan*0.10f;
+            float hi = zen.tlViewT0 + zen.tlViewSpan*0.90f;
+            if (zen.playhead < lo || zen.playhead > hi)
+            {
+                zen.tlViewT0 = zen.playhead - zen.tlViewSpan*0.5f;
+                ZenTimelineClampView(dur);
+            }
+        }
+    }
+    float v0 = zen.tlViewT0, vs = zen.tlViewSpan;
+
+    #define T2X(t) (trackLeft + (trackW) * (((t) - v0)/vs))
+    #define X2T(px) (v0 + ((px) - trackLeft)/trackW * vs)
+
+    // Adaptive gridlines: the finest step whose on-screen spacing still reads.
+    Rectangle tlClip = { trackLeft, y-4, trackW, h+8 };
+    {
+        static const float steps[] = { 0.1f, 0.25f, 0.5f, 1.0f, 2.0f, 5.0f, 10.0f };
+        int si = (int)(sizeof(steps)/sizeof(steps[0])) - 1;
+        for (int i = 0; i < (int)(sizeof(steps)/sizeof(steps[0])); i++)
+            if (trackW * (steps[i]/vs) >= 28.0f) { si = i; break; }
+        float step = steps[si];
+        // 0.25 lands on .25/.75 so it needs two decimals; 0.1 and 0.5 need one.
+        const char *fmt = (step < 1.0f) ? ((step == 0.25f) ? "%.2f" : "%.1f")
+                                        : "%.0f";
+
+        BeginScissorMode((int)tlClip.x, (int)tlClip.y, (int)tlClip.width, (int)tlClip.height);
+        float first = floorf(v0/step) * step;
+        for (float s = first; s <= v0 + vs + step*0.001f; s += step)
+        {
+            if (s < -0.001f || s > dur + 0.001f) continue;
+            float tx = T2X(s);
+            // second boundaries stay brighter, so the ruler reads at a glance
+            bool onSec = fabsf(s - roundf(s)) < step*0.01f;
+            DrawLine((int)tx, (int)y+2, (int)tx, (int)(y+h-16),
+                     onSec ? (Color){ 50,54,62,255 } : (Color){ 38,41,48,255 });
+            if (onSec || step < 1.0f)
+                DrawText(TextFormat(fmt, s), (int)tx+2, (int)(y+h-14), 10,
+                         onSec ? (Color){110,116,128,255} : (Color){82,88,98,255});
+        }
+        EndScissorMode();
+    }
+
     // intro / outro trim dead zones.
     float inEnd = AnimDocIntroEnd(&zen.doc), outStart = AnimDocOutroStart(&zen.doc);
     float inX = T2X(inEnd), outX = T2X(outStart);
-    if (inEnd > 0.0f)
-        DrawRectangleRec((Rectangle){ trackLeft, y+1, inX-trackLeft, h-2 },
-                         (Color){ 90, 140, 200, 26 });
-    if (outStart < dur)
-        DrawRectangleRec((Rectangle){ outX, y+1, x+w-padR-outX, h-2 },
-                         (Color){ 0, 0, 0, 120 });
+    // The dead zones are time-mapped, so zoom can push their edges off the
+    // track; clamp the painted span rather than bleeding over the gutter.
+    {
+        float trackR = trackLeft + trackW;
+        float inClip  = ZenClampF(inX,  trackLeft, trackR);
+        float outClip = ZenClampF(outX, trackLeft, trackR);
+        if (inEnd > 0.0f && inClip > trackLeft)
+            DrawRectangleRec((Rectangle){ trackLeft, y+1, inClip-trackLeft, h-2 },
+                             (Color){ 90, 140, 200, 26 });
+        if (outStart < dur && outClip < trackR)
+            DrawRectangleRec((Rectangle){ outClip, y+1, trackR-outClip, h-2 },
+                             (Color){ 0, 0, 0, 120 });
+    }
 
     // lane layout, kept for the scrub handler below (which lane is the cursor
     // in, so scrubbing can follow the swimlane it passes over).
@@ -1144,6 +1262,10 @@ static void DrawTimeline(float x, float y, float w, float h)
             {
                 float t = times[i];
                 float kx = T2X(t);
+                // Scrolled out of the window: don't draw it over the gutter,
+                // and above all don't let its hit rect claim clicks.
+                if (kx < trackLeft - 12.0f || kx > trackLeft + trackW + 12.0f)
+                    continue;
                 Rectangle hit = { kx-10, ry-10, 20, 20 };
                 bool hot = CheckCollisionPointRec(mouse, hit);
                 if (hot && !zen.guiLocked) { keyHotGroup = gi; keyHotTime = t; }
@@ -1155,8 +1277,11 @@ static void DrawTimeline(float x, float y, float w, float h)
                 if (colorProp >= 0)
                 { Color c = AnimElemColorProp(e, colorProp, t); fill = (Color){c.r,c.g,c.b,255}; }
                 else fill = sel ? (Color){255,255,255,255} : (Color){120,180,240,255};
+                BeginScissorMode((int)tlClip.x, (int)tlClip.y,
+                                 (int)tlClip.width, (int)tlClip.height);
                 DrawDiamond(kx, ry, r + 2.0f, ring);
                 DrawDiamond(kx, ry, r, fill);
+                EndScissorMode();
 
                 if (hot && press)
                 {
@@ -1190,6 +1315,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     bool clockHeld = sigLive || zen.pausedOnMarker;
     float phx = T2X(zen.playhead);
     Color phCol = clockHeld ? (Color){ 150, 90, 90, 255 } : (Color){ 255, 90, 90, 255 };
+    BeginScissorMode((int)tlClip.x, (int)tlClip.y, (int)tlClip.width, (int)tlClip.height);
     DrawLine((int)phx, (int)y, (int)phx, (int)(y+h), phCol);
     DrawRectangleRec((Rectangle){ phx-6, y-2, 12, 10 }, phCol);
     if (clockHeld)
@@ -1197,21 +1323,27 @@ static void DrawTimeline(float x, float y, float w, float h)
         DrawRectangleRec((Rectangle){ phx-3, y, 2, 6 }, (Color){ 30, 30, 34, 255 });
         DrawRectangleRec((Rectangle){ phx+1, y, 2, 6 }, (Color){ 30, 30, 34, 255 });
     }
+    EndScissorMode();
 
     if (sigLive) DrawSignalOverlay(x, y, w, h, trackLeft, trackW);
 
     // trim markers (hit-tested BEFORE the bar scrub).
     Color introCol = (Color){ 120, 190, 255, 255 };
     Color outroCol = (Color){ 255, 160, 90, 255 };
-    if (inEnd > 0.0f)    DrawDottedV(inX,  y+2, y+h-2, introCol);
-    if (outStart < dur)  DrawDottedV(outX, y+2, y+h-2, outroCol);
+    bool introVis = (inX  >= trackLeft - 12.0f && inX  <= trackLeft + trackW + 12.0f);
+    bool outroVis = (outX >= trackLeft - 12.0f && outX <= trackLeft + trackW + 12.0f);
 
     Rectangle introHit = { inX-9,  y,      18, 14 };
     Rectangle outroHit = { outX-9, y+h-14, 18, 14 };
-    bool introHot = CheckCollisionPointRec(mouse, introHit);
-    bool outroHot = CheckCollisionPointRec(mouse, outroHit);
-    DrawMarkerTriangle(inX,  y+1.0f,   introHot ? 9.0f : 7.0f, true,  introCol);
-    DrawMarkerTriangle(outX, y+h-1.0f, outroHot ? 9.0f : 7.0f, false, outroCol);
+    bool introHot = introVis && CheckCollisionPointRec(mouse, introHit);
+    bool outroHot = outroVis && CheckCollisionPointRec(mouse, outroHit);
+
+    BeginScissorMode((int)tlClip.x, (int)tlClip.y, (int)tlClip.width, (int)tlClip.height);
+    if (inEnd > 0.0f)    DrawDottedV(inX,  y+2, y+h-2, introCol);
+    if (outStart < dur)  DrawDottedV(outX, y+2, y+h-2, outroCol);
+    if (introVis) DrawMarkerTriangle(inX,  y+1.0f,   introHot ? 9.0f : 7.0f, true,  introCol);
+    if (outroVis) DrawMarkerTriangle(outX, y+h-1.0f, outroHot ? 9.0f : 7.0f, false, outroCol);
+    EndScissorMode();
 
     if (press && (introHot || outroHot))
     {
@@ -1221,6 +1353,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     }
     if ((zen.dragIntro || zen.dragOutro) && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
     {
+        TimelineEdgePan(mouse.x, trackLeft, trackW, dur);
         float nt = ZenClampF(X2T(mouse.x), 0.0f, dur);
         if (zen.dragIntro) zen.doc.introEnd   = (nt > outStart) ? outStart : nt;
         else               zen.doc.outroStart = (nt < inEnd)    ? inEnd    : nt;
@@ -1233,6 +1366,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     for (int i = 0; i < zen.doc.pauseCount; i++)
     {
         float px = T2X(zen.doc.pauses[i].t);
+        if (px < trackLeft - 12.0f || px > trackLeft + trackW + 12.0f) continue;
         Rectangle hit = { px-7, y, 14, 12 };
         bool hot = !zen.guiLocked && CheckCollisionPointRec(mouse, hit);
         if (hot) pauseHot = i;
@@ -1241,12 +1375,14 @@ static void DrawTimeline(float x, float y, float w, float h)
         bool lit  = hot || held || (zen.selPause == i);
         Color pc = lit ? (Color){ 150, 240, 165, 255 } : (Color){ 110, 210, 130, 255 };
 
+        BeginScissorMode((int)tlClip.x, (int)tlClip.y, (int)tlClip.width, (int)tlClip.height);
         DrawDottedV(px, y+2, y+h-2, pc);
         if (lit) DrawDottedV(px+1, y+2, y+h-2, pc);   // thicken, don't recolour
         DrawRectangleRec((Rectangle){ px-6, y, 12, 8 }, pc);
         // the pause glyph itself: two bars, same idiom as the frozen playhead
         DrawRectangleRec((Rectangle){ px-3, y+2, 2, 4 }, (Color){ 24, 26, 30, 255 });
         DrawRectangleRec((Rectangle){ px+1, y+2, 2, 4 }, (Color){ 24, 26, 30, 255 });
+        EndScissorMode();
 
         ZenTip(hit, zen.doc.pauses[i].once
             ? "Pause marker (first pass only) - drag to retime, right-click to delete"
@@ -1265,6 +1401,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     {
         if (zen.dragPause < zen.doc.pauseCount)
         {
+            TimelineEdgePan(mouse.x, trackLeft, trackW, dur);
             float nt = ZenClampF(X2T(mouse.x), 0.0f, dur);
             if (ctrl) nt = ZenClampF(roundf(nt / ZEN_TIMELINE_SNAP) * ZEN_TIMELINE_SNAP,
                                      0.0f, dur);
@@ -1300,6 +1437,16 @@ static void DrawTimeline(float x, float y, float w, float h)
                  zen.doc.pauseCount ? (Color){ 110, 210, 130, 255 }
                                     : (Color){ 90, 94, 104, 255 });
 
+    // Zoom readout, so the state is discoverable. Hidden at 1x, where the
+    // window IS the doc and there is nothing to report.
+    if (!thin && vs < dur)
+    {
+        const char *zt = TextFormat("%.1fx  %s", dur/vs,
+                                    zen.tlFollow ? "follow" : "free");
+        DrawText(zt, (int)(x + w - padR - MeasureText(zt, 10) - 2),
+                 (int)(y + h - 14), 10, (Color){ 140, 170, 210, 255 });
+    }
+
     // bar scrub. Plain scrub re-points the track modal at whatever lane the
     // cursor is in; Shift+scrub sweeps keys into the selection as it crosses
     // them (the quick way to grab a run of keys without clicking each).
@@ -1313,6 +1460,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     if (zen.dragKeyGroup >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
     {
         AnimElem *de = &zen.doc.elems[zen.selElem];
+        TimelineEdgePan(mouse.x, trackLeft, trackW, dur);
         float nt = ZenClampF(X2T(mouse.x), 0.0f, dur);
         // Ctrl snaps the key to the tick grid while dragging.
         if (ctrl) nt = ZenClampF(roundf(nt / ZEN_TIMELINE_SNAP) * ZEN_TIMELINE_SNAP, 0.0f, dur);
@@ -1324,6 +1472,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     else if (zen.dragPlayhead && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
     {
         float prevHead = zen.playhead;
+        TimelineEdgePan(mouse.x, trackLeft, trackW, dur);
         zen.playhead = ZenClampF(X2T(mouse.x), 0.0f, dur);
         zen.playing = false; zen.playPending = false;
         zen.preview.playing = false;

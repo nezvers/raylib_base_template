@@ -197,6 +197,8 @@ static void ActVwTimeline(void)  { zen.showTimeline = !zen.showTimeline; }
 static bool ChkVwTimeline(void)  { return zen.showTimeline; }
 static void ActVwZoom(void)      { zen.zoomFull = !zen.zoomFull; }
 static bool ChkVwZoom(void)      { return zen.zoomFull; }
+static void ActVwFollow(void)    { zen.tlFollow = !zen.tlFollow; }
+static bool ChkVwFollow(void)    { return zen.tlFollow; }
 
 // -- Easing -----------------------------------------------------------------
 static void ActEaBrowse(void)    { ZenEasingBrowserOpen(); }
@@ -295,6 +297,7 @@ static void MenusInit(void)
     AddItem(m, "Timeline panel",  'T', ActVwTimeline,  NULL, ChkVwTimeline,  "Show / hide the TIMELINE panel");
     AddItem(m, "-",               0,   NULL,           NULL, NULL,           NULL);
     AddItem(m, "Edit at 1:1 zoom",'Z', ActVwZoom,      NULL, ChkVwZoom,      "Edit at actual screen size instead of zoomed out");
+    AddItem(m, "Follow playhead", 'F', ActVwFollow,    NULL, ChkVwFollow,    "Keep the playhead in frame while the timeline is zoomed in");
 
     m = &s_menus[s_menuCount++]; *m = (ZenMenu){ "Easing", 'G' };
     AddItem(m, "Browse easings...", 'B', ActEaBrowse, NULL, NULL, "View, hide and create easing curves");
@@ -940,6 +943,15 @@ static const char *k_helpLines[] = {
     "  outro sections.",
     "  Right-click anywhere on the bar to add or remove a pause marker, and",
     "  see the marker count in the bottom-left (see PAUSE MARKERS).",
+    "  ZOOM: on a long animation a second is only a few pixels wide, so keys",
+    "  are hard to place. Ctrl+Wheel over the bar zooms about the cursor, and",
+    "  Ctrl+Up / Ctrl+Down zoom about the playhead. Gridlines subdivide as you",
+    "  go in, down to 0.1s. Plain wheel over the bar pans, and dragging a key",
+    "  or marker to either edge pans the view after it. The zoom factor shows",
+    "  in the bottom-right whenever you are zoomed in.",
+    "  Zoom survives playback and switching elements; leaving the editor",
+    "  resets it. View > Follow playhead decides whether the window chases the",
+    "  playhead when it runs off the edge.",
     "",
     "TRACK MODAL",
     "  Drag its title bar to move it; the editor stays usable underneath.",
