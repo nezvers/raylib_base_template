@@ -88,7 +88,10 @@ void ZenTrackModalSync(void)
     ZenTrackModal *tm = &zen.trackModal;
     if (tm->sig >= 0) return;               // signal mode edits live, no staging
     AnimElem *e = ModalElem();
-    if (!e || zen.selGroup < 0) { tm->open = false; return; }
+    if (!e) { tm->open = false; return; }
+    // No group is the empty state, not a reason to close: there is simply
+    // nothing to stage. Still rescope, or the tree keeps the old element's rows.
+    if (zen.selGroup < 0) { ScopeCapture(); return; }
 
     float times[ZEN_GROUP_TIMES_MAX];
     int nt = BulkTimes(e, times);
@@ -479,14 +482,74 @@ static void CopyKeyValues(AnimElem *e, int gi, float src, float dst)
     }
 }
 
+// The element has nothing to edit. Rather than closing - which is what made the
+// modal feel like it kept vanishing while clicking through elements - it stays
+// put and offers the one thing that fixes the situation. Adding a SPECIFIC
+// group stays the inspector's job: its +track dropdown is single-instance
+// (zen.addTrackOpen / addTrackRect, drawn in the panels overlay pass), so a
+// second copy driven from here would fight it. Group 0 covers the common case.
+static void EmptyGui(ZenTrackModal *tm, AnimElem *e)
+{
+    float bodyH = TM_TITLE_H + TM_RH*2 + TM_GAP + 10;
+    Rectangle m = { tm->pos.x, tm->pos.y, TM_W, bodyH };
+
+    Vector2 screen = ScreenStateSize();
+    if (m.x < 0) m.x = 0; if (m.y < 0) m.y = 0;
+    if (m.x + m.width  > screen.x) m.x = screen.x - m.width;
+    if (m.y + m.height > screen.y) m.y = screen.y - m.height;
+    tm->pos = (Vector2){ m.x, m.y };
+    tm->rect = m;
+
+    Rectangle title = { m.x, m.y, m.width - 24, TM_TITLE_H };
+    ZenModalDrag(title, &tm->pos, (Vector2){ m.x, m.y },
+                 &tm->dragging, &tm->dragOff, ZEN_LAYER_FLOAT_TRACK);
+
+    DrawRectangleRec(m, (Color){ 40, 42, 48, 252 });
+    DrawRectangleLinesEx(m, 1.0f, (Color){ 110, 114, 126, 255 });
+    DrawRectangleRec(title, (Color){ 52, 56, 66, 255 });
+    ZenLabelTip((Rectangle){ m.x + 8, m.y + 3, title.width - 8, 18 },
+                TextFormat("TRACK  %s . (none)", e->name),
+                "Drag this bar to move the modal");
+    if (GuiButton((Rectangle){ m.x + m.width - 22, m.y + 2, 20, 20 }, "x"))
+    { AudioPlayButton(); tm->open = false; return; }
+
+    float x = m.x + 10, w = m.width - 20;
+    float y = m.y + TM_TITLE_H + 2;
+    GuiLabel((Rectangle){ x, y, w, TM_RH }, "no tracks on this element");
+    y += TM_RH + TM_GAP;
+
+    const AnimPropGroup *g0 = AnimGroupAt(e->kind, 0);
+    if (GuiButton((Rectangle){ x, y, w, TM_RH },
+                  TextFormat("+ track  %s  @ %.2fs", g0 ? g0->name : "?", zen.playhead)))
+    {
+        AudioPlayButton(); ZenUndoPush();
+        ZenGroupWriteKey(e, 0, zen.playhead);
+        ZenSelKey(zen.selElem, 0, zen.playhead, false);
+        ZenTrackModalOpen(zen.selElem, 0);
+    }
+}
+
+// Open is not the same as on screen: playback is for watching, so the modal
+// HIDES rather than closes and is back - same element, same key - the moment
+// the clock stops. The ESC chain asks too, so a hidden modal does not eat the
+// press. Matches the `playbackUi` predicate the panels slide on.
+bool ZenTrackModalVisible(void)
+{
+    return zen.trackModal.open && !zen.playing && !zen.playPending
+        && AnimSignalPlayerDone(&zen.preview);
+}
+
 void ZenTrackModalGui(void)
 {
     ZenTrackModal *tm = &zen.trackModal;
-    if (!tm->open) { tm->rect = (Rectangle){0}; return; }
+    // Clearing the rect matters as much as skipping the draw: ZenLayerAt() hit
+    // tests it, and a stale one would keep claiming clicks over the viewport.
+    if (!ZenTrackModalVisible()) { tm->rect = (Rectangle){0}; return; }
     if (tm->sig >= 0) { SigModeGui(tm); return; }
     AnimElem *e = ModalElem();
-    if (!e || zen.selGroup < 0 || !ZenGroupHasTrack(e, zen.selGroup))
-    { tm->open = false; tm->rect = (Rectangle){0}; return; }
+    if (!e) { tm->open = false; tm->rect = (Rectangle){0}; return; }
+    if (zen.selGroup < 0 || !ZenGroupHasTrack(e, zen.selGroup))
+    { EmptyGui(tm, e); return; }
 
     const AnimPropGroup *g = AnimGroupAt(e->kind, zen.selGroup);
     int cp = ZenGroupColorProp(e->kind, zen.selGroup);

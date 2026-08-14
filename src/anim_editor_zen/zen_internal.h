@@ -404,6 +404,7 @@ void ZenTrackModalOpen(int elem, int gi);       // doc-track mode
 void ZenTrackModalOpenSig(int sigIdx);          // signal mode: edits the key
                                                 // selected in zen.sigSel*
 void ZenTrackModalSync(void);                   // reload staged values
+bool ZenTrackModalVisible(void);                // open AND not hidden by playback
 void ZenTrackModalGui(void);                    // drawn above the panels
 void ZenEaseDropOverlayGui(void);               // its ease list, topmost
 void ZenStringDropOverlayGui(void);             // its string-pool list, topmost

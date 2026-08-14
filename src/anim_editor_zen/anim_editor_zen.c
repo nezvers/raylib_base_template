@@ -594,7 +594,10 @@ static void Update()
           zen.strDropOpen = false; zen.shapeDropOpen = false; ZenSigCloseDrops(); }
         else if (ZenTimelineCtxOpen())      ZenTimelineCtxClose();
         else if (ZenViewCtxOpen())          ZenViewCtxClose();
-        else if (zen.trackModal.open)       zen.trackModal.open = false;
+        // ...but only while it is actually on screen: hidden by playback it must
+        // not silently eat the press that the user meant for the editor.
+        else if (zen.trackModal.open && ZenTrackModalVisible())
+                                            zen.trackModal.open = false;
         else if (zen.sigModalIdx >= 0)
         { zen.sigModalIdx = -1; zen.edSigIdx = -1; ZenSigClearKeySel(); }
         else if (zen.menuOpen >= 0 || zen.hotkeyNav)

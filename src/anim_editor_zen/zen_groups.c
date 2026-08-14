@@ -82,6 +82,20 @@ bool ZenGroupHasTrack(AnimElem *e, int gi)
     return false;
 }
 
+// The group key time AT `t`, or -1 when the group has none there. Deliberately
+// NOT the nearest-key rule the same-name carry uses: landing on an unrelated
+// track because the old one had no counterpart should not fake a key selection
+// out of whatever happens to be closest.
+static bool GroupKeyTimeAt(AnimElem *e, int gi, float t, float *out)
+{
+    float times[ZEN_GROUP_TIMES_MAX];
+    int nt = ZenGroupKeyTimes(e, gi, times);
+    int k = KeyIndexNear(times, nt, sizeof(float), t, ZEN_AUTOKEY_EPS);
+    if (k < 0) return false;
+    *out = times[k];
+    return true;
+}
+
 // Which pool slot a SHAPE_CUSTOM element shows at t: the track's stepped value
 // if it has one, else the element's rest-pose name. ANIM_SHAPE_MISSING (-1) when
 // neither resolves - the caller treats that as "nothing to key".
@@ -550,11 +564,19 @@ void ZenSelClear(void)
 
 // Switch the selected element WITHOUT throwing away what is being edited.
 // Closing the track modal on every element click made comparing two similar
-// elements a reopen-and-re-find chore, so when the modal is open on a doc
-// track we carry the group over BY NAME (group indices differ across kinds)
-// and land on the new element's key nearest the one in hand - the playhead
-// when the scope was a whole track or several keys. No matching track over
-// there means there is nothing to carry: fall back to the old clear.
+// elements a reopen-and-re-find chore, so an open doc-track modal FOLLOWS the
+// selection. Three landings, in order of how much of the edit survives:
+//
+//   1. the same group BY NAME (indices differ across kinds), if the new element
+//      actually tracks it - keeps the closest thing to what was in hand, so it
+//      lands on the key nearest the one being edited;
+//   2. otherwise the element's first tracked group, since carrying a `crumble`
+//      to a shape (or any track the target simply hasn't been given yet) used
+//      to close the modal outright. Nothing carried over means nothing to be
+//      near, so a key is only selected when one sits ON the playhead - the
+//      whole track otherwise, which is the honest scope;
+//   3. no tracks at all - selGroup goes to -1 and the modal draws its empty
+//      state. Deliberately NOT ZenSelClear(), which would close it.
 void ZenSelSwitchElem(int elem)
 {
     if (elem < 0 || elem >= zen.doc.elemCount || elem == zen.selElem) return;
@@ -563,7 +585,9 @@ void ZenSelSwitchElem(int elem)
                   ? &zen.doc.elems[zen.selElem] : NULL;
     const AnimPropGroup *og = (old && zen.selGroup >= 0)
                             ? AnimGroupAt(old->kind, zen.selGroup) : NULL;
-    bool carry = zen.trackModal.open && zen.trackModal.sig < 0 && og != NULL;
+    // An open modal follows even from the empty state (og == NULL): the element
+    // it was parked on having no tracks is no reason to drop the next one.
+    bool carry = zen.trackModal.open && zen.trackModal.sig < 0;
     float refT = (carry && zen.selKeyCount == 1) ? zen.selKeys[0] : zen.playhead;
 
     zen.selElem = elem;
@@ -574,25 +598,33 @@ void ZenSelSwitchElem(int elem)
     for (int i = 0, n = AnimGroupCountFor(e->kind); i < n && gi < 0; i++)
     {
         const AnimPropGroup *g = AnimGroupAt(e->kind, i);
-        if (g && TextIsEqual(g->name, og->name)) gi = i;
+        if (og && g && TextIsEqual(g->name, og->name) && ZenGroupHasTrack(e, i)) gi = i;
     }
-    if (gi < 0 || !ZenGroupHasTrack(e, gi)) { ZenSelClear(); return; }
+    bool sameName = gi >= 0;
+    for (int i = 0, n = AnimGroupCountFor(e->kind); i < n && gi < 0; i++)
+        if (ZenGroupHasTrack(e, i)) gi = i;
 
     zen.selGroup = gi;
     zen.selKeyCount = 0;
+    if (gi < 0) { ZenMouseReflow(); ZenTrackModalSync(); return; }   // empty state
 
-    // Nearest key rather than the first: scrubbing to a moment and flipping
-    // through elements should keep showing THAT moment on each of them.
-    float times[ZEN_GROUP_TIMES_MAX];
-    int nt = ZenGroupKeyTimes(e, gi, times);
-    if (nt > 0)
+    if (sameName)
     {
-        int best = 0;
-        for (int i = 1; i < nt; i++)
-            if (fabsf(times[i] - refT) < fabsf(times[best] - refT)) best = i;
-        zen.selKeys[0] = times[best];
-        zen.selKeyCount = 1;
+        // Nearest key rather than the first: scrubbing to a moment and flipping
+        // through elements should keep showing THAT moment on each of them.
+        float times[ZEN_GROUP_TIMES_MAX];
+        int nt = ZenGroupKeyTimes(e, gi, times);
+        if (nt > 0)
+        {
+            int best = 0;
+            for (int i = 1; i < nt; i++)
+                if (fabsf(times[i] - refT) < fabsf(times[best] - refT)) best = i;
+            zen.selKeys[0] = times[best];
+            zen.selKeyCount = 1;
+        }
     }
+    else if (GroupKeyTimeAt(e, gi, zen.playhead, &zen.selKeys[0])) zen.selKeyCount = 1;
+
     // The modal relays out around the new key (row counts differ per group),
     // sliding its sliders under the still-down button that picked the element.
     ZenMouseReflow();
