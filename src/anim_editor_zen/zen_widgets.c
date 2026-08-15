@@ -48,6 +48,23 @@ float ZenTextW(const char *text)
            sp * (float)TextLength(text);
 }
 
+// Case-insensitive substring test, for the search boxes that filter a list of
+// animation names (File > Open, the export chain's picker). ASCII only: the
+// names come from filenames this editor itself writes, so `| 32` is the whole
+// of the case folding needed.
+bool ZenStrContainsCI(const char *hay, const char *needle)
+{
+    if (!needle[0]) return true;
+    for (; *hay; hay++)
+    {
+        const char *h = hay, *n = needle;
+        while (*h && *n &&
+               (*h | 32) == (*n | 32)) { h++; n++; }   // ascii lowercase both
+        if (!*n) return true;
+    }
+    return false;
+}
+
 // Plain-language description of an animatable property. The short .cfg names
 // (AnimPropName: "rot", "w", "fade") are the file format and stay as they are;
 // this is what the UI explains on hover.

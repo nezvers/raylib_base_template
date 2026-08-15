@@ -51,6 +51,7 @@ typedef enum {
     ZEN_PROMPT_NEW_NAME,            // File > New: name the fresh animation
     ZEN_PROMPT_SAVE_THEN_SWITCH,    // dirty doc guarded before an Open
     ZEN_PROMPT_SAVE_THEN_EXIT,      // dirty doc guarded before leaving
+    ZEN_PROMPT_SAVE_THEN_EXPORT,    // dirty doc guarded before an export reads it
     ZEN_PROMPT_CONFIRM_DELETE,      // File > Delete of the current animation
     ZEN_PROMPT_RENAME_ANIM,         // File > Rename (moves the .cfg)
     ZEN_PROMPT_COPY_ANIM,           // File > Save As (copy under a new name)
@@ -288,6 +289,7 @@ void ZenLibraryInsert(int entry);   // library entry -> new doc element
 // ---------------------------------------------------------------------------
 float ZenTextW(const char *text);   // label width at the current gui font
 float ZenClampF(float v, float lo, float hi);
+bool  ZenStrContainsCI(const char *hay, const char *needle);  // list search filter
 bool  ZenEditSlider(Rectangle r, const char *label, float *v, float lo, float hi);
 bool  ZenSliderTyping(void);        // a slider's value textbox is open
 
@@ -469,11 +471,14 @@ bool ZenCloneTyping(void);          // its time textbox captures the keyboard
 void ZenCloneGui(void);
 
 // -- zen_export.c -----------------------------------------------------------
-// File > Export...: render the document to a GIF, a video (via ffmpeg) or a
-// PNG frame sequence. Draggable like the track/signal modals, and it renders in
-// chunks from the Gui() pass - BeginTextureMode cannot nest inside the one
-// main.c opens around Draw().
+// File > Export...: render a CHAIN of animations - one or more, played back to
+// back - to a GIF, a video (via ffmpeg) or a PNG frame sequence. Draggable like
+// the track/signal modals, and it renders in chunks from the Gui() pass -
+// BeginTextureMode cannot nest inside the one main.c opens around Draw().
 void ZenExportShow(void);           // File > Export...
+// Every link is read from its .cfg, so a dirty document raises
+// ZEN_PROMPT_SAVE_THEN_EXPORT first and the prompt lands here to start the job.
+void ZenExportStartAfterSave(void);
 bool ZenExportOpen(void);           // the modal is showing
 bool ZenExportBusy(void);           // a render is in flight
 bool ZenExportEscClose(void);       // cancel a job, else close; false if not open
