@@ -44,6 +44,7 @@
 #define ZEN_ZOOM_TIME     0.2f    // zoom in/out duration in seconds
 
 #define ZEN_MENU_BAR_H    26.0f   // top menu bar height (panels sit below it)
+#define ZEN_SHAPE_DROP_ROWS 12    // visible rows of the shape dropdown; it scrolls
 
 // Modal prompts (small centered boxes, drawn topmost, block other input).
 typedef enum {
@@ -203,7 +204,9 @@ typedef struct {
     // shape-pick dropdown; unlike the others this one is opened from TWO places
     // (the track modal's shape row and the inspector's rest-pose row), so the
     // overlay works out which by looking at what is open.
-    bool shapeDropOpen; Rectangle shapeDropRect;
+    // The pool can hold hundreds of shapes, so this list is capped at
+    // ZEN_SHAPE_DROP_ROWS and scrolls; the scroll is <= 0, in pixels.
+    bool shapeDropOpen; Rectangle shapeDropRect; float shapeDropScroll;
     // add-track dropdown of the inspector
     bool addTrackOpen; int addTrackSel; Rectangle addTrackRect;
 

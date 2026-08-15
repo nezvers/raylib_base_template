@@ -597,13 +597,23 @@ bool AnimDocSave(const AnimDoc *doc, const char *path)
 // themselves and only ever have ONE element in flight; the `end` handler clears
 // it, so a document whose elements have no shape_ref lines never sees a stale
 // entry. Not thread-safe, in keeping with the rest of this reader.
-static char s_shapeRefs[ANIM_SHAPE_POOL_MAX][ANIM_SHAPE_NAME_MAX];
-static bool s_shapeRefUsed[ANIM_SHAPE_POOL_MAX];
+// Sized by ANIM_SHAPE_REF_MAX, NOT by this build's pool size: the indices in a
+// file are the SAVING build's slot numbers, and a 512-slot desktop build writes
+// indices an 8-slot web build could never allocate. Rejecting those on the index
+// would drop the line before its NAME - the thing that actually resolves - was
+// ever read, losing shapes the web build does have.
+static char s_shapeRefs[ANIM_SHAPE_REF_MAX][ANIM_SHAPE_NAME_MAX];
+static bool s_shapeRefUsed[ANIM_SHAPE_REF_MAX];
 // fscanf wants its field width as a literal, so the "%23s" reads below are
 // pinned to the buffer here - raise the name cap and this fails the build until
 // those widths follow it.
 _Static_assert(ANIM_SHAPE_NAME_MAX == 24,
                "the %23s shape-name scan widths must stay ANIM_SHAPE_NAME_MAX-1");
+// A build that can ALLOCATE a slot this reader cannot ACCEPT would write files
+// it could not read back. Raise ANIM_SHAPE_REF_MAX with the pool if that day
+// comes - it costs 24 bytes per index and nothing else.
+_Static_assert(ANIM_SHAPE_POOL_MAX <= ANIM_SHAPE_REF_MAX,
+               "ANIM_SHAPE_REF_MAX must cover every slot index this build can write");
 
 // Rewrites every AP_S_SHAPE key from the index it had WHEN SAVED to the slot the
 // same-named shape occupies NOW. A name the live pool does not have (the shape
@@ -620,7 +630,7 @@ static void FixupShapeRefs(AnimElem *e)
             for (int k = 0; k < tr->keyCount; k++)
             {
                 int saved = (int)(tr->keys[k].value + 0.5f);
-                if (saved < 0 || saved >= ANIM_SHAPE_POOL_MAX || !s_shapeRefUsed[saved])
+                if (saved < 0 || saved >= ANIM_SHAPE_REF_MAX || !s_shapeRefUsed[saved])
                 {
                     tr->keys[k].value = (float)ANIM_SHAPE_MISSING;
                     continue;
@@ -629,7 +639,7 @@ static void FixupShapeRefs(AnimElem *e)
             }
         }
 
-    for (int i = 0; i < ANIM_SHAPE_POOL_MAX; i++) s_shapeRefUsed[i] = false;
+    for (int i = 0; i < ANIM_SHAPE_REF_MAX; i++) s_shapeRefUsed[i] = false;
 }
 
 bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
@@ -661,7 +671,7 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
         // once every track of this element has been read.
         int idx = -1; char s[ANIM_SHAPE_NAME_MAX];
         if (fscanf(f, "%d %23s", &idx, s) == 2 &&
-            idx >= 0 && idx < ANIM_SHAPE_POOL_MAX)
+            idx >= 0 && idx < ANIM_SHAPE_REF_MAX)
         {
             TextCopy(s_shapeRefs[idx], s);
             s_shapeRefUsed[idx] = true;

@@ -124,6 +124,28 @@ if (APPLE)
     target_link_libraries(${PROJECT_NAME} "-framework OpenGL")
 endif()
 
+# Custom pixel-shape slots. Each slot is a fixed 16 KB grid of static memory
+# (see src/anim/anim_shape_pool.h), so this is a memory budget, not a GL limit.
+# Web links a FIXED 128 MB emscripten heap with no ALLOW_MEMORY_GROWTH, and the
+# pool is spent before main() runs - hence the low ceiling there. Override on the
+# command line with -DANIM_SHAPE_POOL_MAX=<n>.
+# A plain variable, NOT a cache entry: the platform default must be recomputed
+# every configure, or reconfiguring one build dir from desktop to Web would keep
+# the cached 512 and blow the emscripten heap. An explicit -D still wins, since
+# that defines the variable before this runs.
+if (NOT DEFINED ANIM_SHAPE_POOL_MAX)
+    if ("${PLATFORM}" STREQUAL "Web")
+        set(ANIM_SHAPE_POOL_MAX 8)
+    else()
+        set(ANIM_SHAPE_POOL_MAX 512)
+    endif()
+endif()
+message(STATUS " - - - ANIM_SHAPE_POOL_MAX = ${ANIM_SHAPE_POOL_MAX}")
+target_compile_definitions(${PROJECT_NAME} PUBLIC ANIM_SHAPE_POOL_MAX=${ANIM_SHAPE_POOL_MAX})
+if (TARGET anim_tests)
+    target_compile_definitions(anim_tests PUBLIC ANIM_SHAPE_POOL_MAX=${ANIM_SHAPE_POOL_MAX})
+endif()
+
 # Setting RESOURCES_PATH
 if (${PLATFORM} STREQUAL "Web")
   # Wasm builds have resources directory copied next to it

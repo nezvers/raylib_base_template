@@ -3049,6 +3049,32 @@ static void TestShapePool(void)
     CHECK(AnimShapePoolCount() == 1);
 
     remove("anim_tests_shapes/fangs_upper.shp");
+
+    // -- the pool fills at ANIM_SHAPE_POOL_MAX, wherever that is set ----------
+    // The count is a BUILD-TIME knob (8 on web, 512 on desktop - see
+    // anim_shape_pool.h), so this asserts the boundary rather than a number:
+    // every slot up to the limit must be claimable and addressable, and the one
+    // past it must fail. Guards the old hardcoded 8 from creeping back in as an
+    // array bound somewhere.
+    AnimShapePoolLoadAll(NULL, NULL);
+    bool allAdded = true, allAddressable = true;
+    for (int i = 0; i < ANIM_SHAPE_POOL_MAX; i++)
+    {
+        int slot = AnimShapePoolAdd(TextFormat("bulk_%d", i), 2, 2);
+        if (slot == ANIM_SHAPE_MISSING) { allAdded = false; break; }
+        AnimShapeSetPx(AnimShapePoolGet(slot), 1, 1, ANIM_PX_FILL);
+    }
+    CHECK(allAdded);
+    CHECK(AnimShapePoolCount() == ANIM_SHAPE_POOL_MAX);
+    for (int i = 0; i < ANIM_SHAPE_POOL_MAX; i++)
+    {
+        int slot = AnimShapePoolFindByName(TextFormat("bulk_%d", i));
+        if (slot < 0 || AnimShapePx(AnimShapePoolGet(slot), 1, 1) != ANIM_PX_FILL)
+        { allAddressable = false; break; }
+    }
+    CHECK(allAddressable);
+    CHECK(AnimShapePoolAdd("one_too_many", 2, 2) == ANIM_SHAPE_MISSING);
+
     AnimShapePoolLoadAll(NULL, NULL);
 }
 
@@ -3123,6 +3149,62 @@ static void TestShapeRefIO(void)
     CHECK(AnimShapeKindByName("custom") == SHAPE_CUSTOM);
 
     remove(path);
+
+    // -- a saved index this build could never allocate ------------------------
+    // The pool size differs per platform (8 on web, 512 on desktop), so a .cfg
+    // written by a desktop build carries slot numbers a web build has no slot
+    // for. Those lines must still resolve BY NAME: the index is only a handle
+    // into the file's own shape_ref table, never a bound on this pool. Written
+    // by hand, since no build can save an index beyond its own pool.
+    const char *far = "anim_tests_shaperef_far.cfg";
+    AnimShapePoolLoadAll(NULL, NULL);
+    int gamma = AnimShapePoolAdd("gamma", 2, 2);
+    CHECK(gamma == 0);
+
+    FILE *cf = fopen(far, "w");
+    CHECK(cf != NULL);
+    fprintf(cf, "doc far 1.000000 0.000000 1.000000 0.300000 0\n");
+    fprintf(cf, "elem shape blob\n");
+    fprintf(cf, "  shape custom\n");
+    fprintf(cf, "  shape_name gamma\n");
+    fprintf(cf, "  shape_ref %d gamma\n", ANIM_SHAPE_REF_MAX - 1);
+    fprintf(cf, "  track shape_id 1\n");
+    fprintf(cf, "    key 0.000000 %d linear\n", ANIM_SHAPE_REF_MAX - 1);
+    fprintf(cf, "  end\n");
+    fclose(cf);
+
+    AnimDoc farDoc;
+    CHECK(AnimDocLoad(&farDoc, far));
+    CHECK(farDoc.elemCount == 1);
+    AnimTrack *ft = NULL;
+    for (int i = 0; i < farDoc.elems[0].trackCount; i++)
+        if (farDoc.elems[0].tracks[i].prop == AP_S_SHAPE) ft = &farDoc.elems[0].tracks[i];
+    CHECK(ft != NULL);
+    CHECK((int)ft->keys[0].value == gamma);         // resolved by NAME, not index
+    remove(far);
+
+    // Past ANIM_SHAPE_REF_MAX there is no table entry to hold the name, so the
+    // key resolves to MISSING (the placeholder) instead of reading off the end.
+    cf = fopen(far, "w");
+    CHECK(cf != NULL);
+    fprintf(cf, "doc far 1.000000 0.000000 1.000000 0.300000 0\n");
+    fprintf(cf, "elem shape blob\n");
+    fprintf(cf, "  shape custom\n");
+    fprintf(cf, "  shape_name gamma\n");
+    fprintf(cf, "  shape_ref %d gamma\n", ANIM_SHAPE_REF_MAX);
+    fprintf(cf, "  track shape_id 1\n");
+    fprintf(cf, "    key 0.000000 %d linear\n", ANIM_SHAPE_REF_MAX);
+    fprintf(cf, "  end\n");
+    fclose(cf);
+
+    CHECK(AnimDocLoad(&farDoc, far));
+    ft = NULL;
+    for (int i = 0; i < farDoc.elems[0].trackCount; i++)
+        if (farDoc.elems[0].tracks[i].prop == AP_S_SHAPE) ft = &farDoc.elems[0].tracks[i];
+    CHECK(ft != NULL);
+    CHECK((int)ft->keys[0].value == ANIM_SHAPE_MISSING);
+
+    remove(far);
     AnimShapePoolLoadAll(NULL, NULL);
 }
 

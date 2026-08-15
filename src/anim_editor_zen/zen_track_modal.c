@@ -696,7 +696,8 @@ void ZenTrackModalGui(void)
             zen.shapeDropRect = sr;
             if (k < 0) GuiDisable();
             if (GuiButton(sr, TextFormat("%s  v", ZenTextPreview(nm, 24))))
-            { AudioPlayButton(); zen.shapeDropOpen = !zen.shapeDropOpen; }
+            { AudioPlayButton(); zen.shapeDropOpen = !zen.shapeDropOpen;
+              zen.shapeDropScroll = 0.0f; }       // reopen at the top of the list
             if (k < 0) GuiEnable();
             ZenTip(sr, k >= 0
                 ? "The pixel shape this key switches to. Click to pick another "
@@ -1079,7 +1080,13 @@ void ZenShapeDropOverlayGui(void)
 
     Vector2 screen = ScreenStateSize();
     Rectangle hdr = zen.shapeDropRect;
-    float ih = 20.0f, listH = ih * (m + 1);      // +1 for the "new shape" row
+    // The pool holds up to ANIM_SHAPE_POOL_MAX shapes (512 on desktop), so the
+    // list is CAPPED and scrolls. An uncapped one would be taller than the
+    // window and put its own rows off screen.
+    float ih = 20.0f;
+    int   vis = (m < ZEN_SHAPE_DROP_ROWS) ? m : ZEN_SHAPE_DROP_ROWS;
+    float rowsH = ih * vis;
+    float listH = rowsH + ih;                    // +1 row for "new shape"
     float ly = (hdr.y + hdr.height + listH <= screen.y - 4.0f)
              ? hdr.y + hdr.height : hdr.y - listH;
     if (ly < 4.0f) ly = 4.0f;
@@ -1087,11 +1094,24 @@ void ZenShapeDropOverlayGui(void)
     DrawRectangleRec(bg, (Color){ 32, 34, 40, 255 });
     DrawRectangleLinesEx(bg, 1.0f, (Color){ 70, 74, 84, 255 });
 
+    Rectangle rowsBox = { bg.x, bg.y, bg.width, rowsH };
+    if (CheckCollisionPointRec(GetMousePosition(), rowsBox))
+        zen.shapeDropScroll += GetMouseWheelMove() * ih;
+    float maxScroll = m * ih - rowsH;
+    if (maxScroll < 0.0f) maxScroll = 0.0f;
+    if (zen.shapeDropScroll < -maxScroll) zen.shapeDropScroll = -maxScroll;
+    if (zen.shapeDropScroll > 0.0f) zen.shapeDropScroll = 0.0f;
+
+    BeginScissorMode((int)rowsBox.x, (int)rowsBox.y,
+                     (int)rowsBox.width, (int)rowsBox.height);
     for (int row = 0; row < m; row++)
     {
         int i = ids[row];
         const AnimShapeDef *sd = AnimShapePoolGet(i);
-        Rectangle rr = { bg.x, bg.y + row*ih, bg.width, ih };
+        Rectangle rr = { bg.x, bg.y + row*ih + zen.shapeDropScroll, bg.width, ih };
+        // Skipped rather than merely clipped: an offscreen GuiButton still
+        // reads the mouse and would fire from behind the timeline.
+        if (rr.y + ih < rowsBox.y || rr.y > rowsBox.y + rowsBox.height) continue;
         if (GuiButton(rr, TextFormat("%s  %dx%d", sd->name, sd->w, sd->h)))
         {
             AudioPlayButton();
@@ -1111,9 +1131,11 @@ void ZenShapeDropOverlayGui(void)
         }
         if (i == cur) DrawRectangleRec(rr, (Color){ 90, 140, 220, 60 });
     }
+    EndScissorMode();
 
     // Shapes are drawn in their own editor; this list only chooses among them.
-    Rectangle nr = { bg.x, bg.y + m*ih, bg.width, ih };
+    // Pinned below the scrolling rows, so it is always reachable.
+    Rectangle nr = { bg.x, bg.y + rowsH, bg.width, ih };
     if (GuiButton(nr, "+ new shape..."))
     {
         AudioPlayButton();

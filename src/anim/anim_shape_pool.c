@@ -15,6 +15,7 @@
 #include <string.h>
 
 static AnimShapeDef s_pool[ANIM_SHAPE_POOL_MAX];
+static int s_skipped = 0;       // .shp files the last load could not fit
 
 // ---------------------------------------------------------------------------
 //  Slots
@@ -251,7 +252,14 @@ static int LoadRoot(const char *root, bool builtin)
             // Claim a slot. Add() rejects names that are too long or malformed,
             // which is exactly the filter we want on filenames too.
             slot = AnimShapePoolAdd(base, 1, 1);
-            if (slot == ANIM_SHAPE_MISSING) continue;   // pool full / bad name
+            if (slot == ANIM_SHAPE_MISSING)
+            {
+                // Pool full, or a filename Add rejects (too long / malformed).
+                // Either way this file is on disk and not in the pool, which is
+                // the one failure a person needs told about.
+                s_skipped++;
+                continue;
+            }
         }
         else
         {
@@ -281,11 +289,14 @@ int AnimShapePoolLoadAll(const char *resRoot, const char *userRoot)
 {
     AnimShapePoolUnloadTextures();
     memset(s_pool, 0, sizeof(s_pool));
+    s_skipped = 0;
 
     int n = LoadRoot(resRoot, true);
     n += LoadRoot(userRoot, false);
     return n;
 }
+
+int AnimShapePoolSkipped(void) { return s_skipped; }
 
 // ---------------------------------------------------------------------------
 //  Render cache

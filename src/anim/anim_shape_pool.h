@@ -16,8 +16,18 @@
 //  editor keeps a 16-deep ring of whole-document undo snapshots, so 256 KB of
 //  pixels inside the doc would cost 4 MB of undo.
 //
-//  MEMORY: ANIM_SHAPE_GRID_MAX^2 bytes per slot (16 KB) x ANIM_SHAPE_POOL_MAX
-//  slots = 128 KB static, plus two cached textures per slot once drawn.
+//  MEMORY: ANIM_SHAPE_GRID_MAX^2 bytes per slot (16 KB, spent whether the shape
+//  is 128x128 or 4x4) x ANIM_SHAPE_POOL_MAX slots, plus two cached textures per
+//  slot once drawn. The slot count is a BUILD-TIME knob set by CMake:
+//
+//      Web      8 slots =  128 KB    desktop   512 slots = 8.4 MB
+//
+//  Web is pinned low because Emscripten links a FIXED 128 MB heap with no
+//  ALLOW_MEMORY_GROWTH (CMakeLists.txt), and this array is static - it is spent
+//  before main() runs, so overshooting is an abort at load, not a slow game. On
+//  desktop the same 8.4 MB is zero-filled BSS and costs nothing worth counting.
+//  Nothing about the number is a GL or shader limit: shapes are CPU-baked into
+//  two ALPHA stencils and drawn with two DrawTexturePro calls.
 //
 //  DOCUMENTS REFERENCE SHAPES BY NAME, never by slot index (see anim_io.c's
 //  shape_ref lines). Slot indices are a runtime convenience only - they are how
@@ -45,7 +55,17 @@
 #include "raylib.h"     // Texture2D
 
 #define ANIM_SHAPE_GRID_MAX  128    // max cells per side
-#define ANIM_SHAPE_POOL_MAX    8    // pool slots (16 KB of pixels each)
+#ifndef ANIM_SHAPE_POOL_MAX
+    // CMake supplies this: 8 on Web, 512 elsewhere. The fallback matches Web,
+    // so a build that forgets the define is small rather than 8 MB by accident.
+    #define ANIM_SHAPE_POOL_MAX 8   // pool slots (16 KB of pixels each)
+#endif
+// How far a SAVED shape_ref index may reach, independent of this build's pool
+// size. A .cfg written by a 512-slot desktop build carries indices a 8-slot web
+// build could never allocate, but its shape_ref lines still name shapes that web
+// build may well have - so parsing must not reject the index before the NAME is
+// consulted. Fixed, so the same file parses identically on every platform.
+#define ANIM_SHAPE_REF_MAX   512
 #define ANIM_SHAPE_NAME_MAX   24    // matches ANIM_CUSTOM_NAME_MAX
 #define ANIM_SHAPE_MISSING   (-1)   // "no shape" / "name did not resolve"
 
@@ -69,11 +89,19 @@ typedef struct
     bool texValid;
 } AnimShapeDef;
 
-// The two roots, in load order. The resources root ships with the build (and is
-// preloaded read-only on web); the user root is CWD-relative and writable,
-// created on demand, exactly like ZEN_ANIM_DIR. A user shape overrides a shipped
-// one of the same name. On web the user root is MEMFS: authoring works for the
-// session and does not survive a reload - the same known limitation as anims/.
+// The two roots, in load order, and the whole of the web/desktop split.
+//
+//   resources/shapes/  ships with the build and is PRELOADED into the web VFS,
+//                      so it is the only place a web build can see shapes from.
+//                      Keep it under the web slot count (8) - anything past that
+//                      is skipped at load (see AnimShapePoolSkipped).
+//   shapes/            CWD-relative and writable, created on demand, exactly
+//                      like ZEN_ANIM_DIR. This is where the editor saves, and
+//                      where the desktop build's hundreds of shapes live.
+//
+// A user shape overrides a shipped one of the same name, keeping its slot. On
+// web the user root is MEMFS: authoring works for the session and does not
+// survive a reload - the same known limitation as anims/.
 #ifdef RESOURCES_PATH
     #define ANIM_SHAPE_RES_DIR   RESOURCES_PATH "shapes/"
 #else
@@ -87,6 +115,10 @@ typedef struct
 // overrides a builtin of the same name. Returns the number of shapes loaded.
 // Either root may be NULL or missing.
 int  AnimShapePoolLoadAll(const char *resRoot, const char *userRoot);
+// How many .shp files the LAST AnimShapePoolLoadAll could not fit, because the
+// pool filled up. Silence here is how a web build loses shapes without saying
+// so, which is exactly what the editor surfaces.
+int  AnimShapePoolSkipped(void);
 // Writes one slot to "<userRoot>/<name>.shp". Marks the slot non-builtin,
 // since it now has a user copy that shadows any shipped one.
 bool AnimShapePoolSaveOne(int slot, const char *userRoot);

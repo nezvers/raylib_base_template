@@ -43,6 +43,11 @@ AppState app_state_shape_editor = { Enter, Exit, Update, Draw, Gui, "ShapeEditor
 #define SE_UNDO_MAX    32
 #define SE_STATUS_SECS  3.0f
 #define SE_BROWSE_MAX  128      // image files listed by the picker
+// Visible rows of the shape list, which scrolls. Kept SHORT on purpose: the
+// tool column below it flows without a scrollbar (see the SAVE bar's comment),
+// and the reference section's placement controls now sit at its tail, so every
+// row spent here is a row that can push them off a short window.
+#define SE_LIST_ROWS     6
 
 // ---------------------------------------------------------------------------
 //  State
@@ -56,6 +61,14 @@ static int   s_brush = 1;
 
 static float s_zoom = 12.0f;                // screen pixels per cell
 static Vector2 s_pan = { 0 };               // canvas top-left, screen space
+static float s_listScroll = 0.0f;           // shape list, <= 0, in screen pixels
+
+// The tool column scrolls as a whole: it holds more rows than a short window
+// has height, and the rows that fell off the bottom were simply unreachable.
+// Content height is measured by the flow itself, one frame behind - which is
+// invisible, and far simpler than predicting the height of a variable panel.
+static float s_panelScroll = 0.0f;          // <= 0, in screen pixels
+static float s_panelContentH = 0.0f;        // measured at the end of last frame's flow
 
 static char  s_status[96];
 static float s_statusT = 0.0f;
@@ -66,6 +79,10 @@ static bool  s_edName = false;
 static int   s_newW = 24, s_newH = 16;
 static bool  s_edNewW = false, s_edNewH = false;
 static bool  s_edCurW = false, s_edCurH = false;
+// Creating a shape is a modal question - name AND size, both needed before the
+// slot exists. Inline in the column it read as three unrelated controls sitting
+// next to the shape list, and the name box shared a lane with the list rows.
+static bool  s_newOpen = false;
 
 // Reference image, shown faintly under the grid to trace over.
 static Texture2D s_refTex;
@@ -75,6 +92,16 @@ static float     s_refAlpha = 0.35f;
 static float     s_threshold = 0.5f;
 static bool      s_previewOn = false;       // live threshold preview vs the pixels
 static bool      s_refInvert = false;       // bright ink on dark, or the reverse
+
+// Where the reference sits, in GRID CELLS - not screen pixels. Cell space is
+// what makes the reference stay glued to the grid through canvas zoom and pan:
+// convert once at draw time and the placement survives every view change. It is
+// also the space the sampler works in, so what you see traced is exactly what
+// Convert reads.
+//   scale 1.0 = the image fitted inside the grid with its ASPECT PRESERVED
+//   offset    = cells away from that centred fit
+static float     s_refScale = 1.0f;
+static Vector2   s_refOff = { 0 };
 
 // File picker. raylib has no native dialog and this repo pulls in no dialog
 // library, so this is zen's File>Open list pointed at image files instead.
@@ -204,6 +231,32 @@ static void CanvasFit(void)
     s_pan.y = wa.y + 48.0f + (availH - s->h * s_zoom) * 0.5f;
 }
 
+// ---------------------------------------------------------------------------
+//  Reference placement
+// ---------------------------------------------------------------------------
+// The reference's box in CELL space. Base is an aspect-preserving "contain" fit
+// inside the grid - NOT the old stretch-to-grid, which distorted every image
+// whose proportions were not the grid's and left nothing to centre. Scale grows
+// the box about its own centre, then the offset slides it.
+static Rectangle RefCellRect(void)
+{
+    AnimShapeDef *s = AnimShapePoolGet(s_slot);
+    if (!s || !s_refLoaded) return (Rectangle){ 0, 0, 1, 1 };
+
+    float gw = (float)s->w, gh = (float)s->h;
+    float iw = (float)s_refImg.width, ih = (float)s_refImg.height;
+    if (iw <= 0.0f || ih <= 0.0f) return (Rectangle){ 0, 0, gw, gh };
+
+    float k = (gw / iw < gh / ih) ? gw / iw : gh / ih;   // contain
+    float w = iw * k * s_refScale;
+    float h = ih * k * s_refScale;
+    return (Rectangle){ (gw - w)*0.5f + s_refOff.x,
+                        (gh - h)*0.5f + s_refOff.y, w, h };
+}
+
+static void RefFit(void)    { s_refScale = 1.0f; s_refOff = (Vector2){ 0 }; }
+static void RefCenter(void) { s_refOff = (Vector2){ 0 }; }
+
 // Cell under the cursor, or false when the cursor is off the grid. Raw mouse:
 // see the screen-space note in the file header.
 static bool CellAtCursor(int *cx, int *cy)
@@ -227,6 +280,21 @@ static void SelectSlot(int slot)
     UndoClear();
     AnimShapeDef *s = AnimShapePoolGet(slot);
     if (s) { TextCopy(s_nameBuf, s->name); CanvasFit(); }
+
+    // Scroll the list so the selection is visible. With hundreds of slots the
+    // shape opened from zen is usually nowhere near the top, and a selection
+    // you cannot see reads as no selection at all. Rows are packed (unused slots
+    // draw nothing), so the visual row is the count of used slots before this one.
+    if (s)
+    {
+        int row = 0;
+        for (int i = 0; i < slot; i++) if (AnimShapeIdValid(i)) row++;
+        float rowH = SE_RH + 2.0f;
+        float top = -s_listScroll;                      // first visible pixel
+        float bot = top + rowH * SE_LIST_ROWS;
+        if (row * rowH < top)             s_listScroll = -(row * rowH);
+        else if ((row + 1) * rowH > bot)  s_listScroll = -((row + 1) * rowH - rowH * SE_LIST_ROWS);
+    }
 }
 
 static void SelectFirst(void)
@@ -250,17 +318,30 @@ void ShapeEditorOpen(const char *name)
 //  derived afterwards rather than sampled: any fill cell touching an empty
 //  4-neighbour is the boundary, which is the cheapest rule that produces a
 //  usable two-tone shape to hand-fix.
+//
+//  The cell -> image mapping goes through RefCellRect, the SAME box the draw
+//  path uses, so moving or scaling the reference moves what Convert reads by
+//  exactly as much. A cell outside the box has no source at all and is never
+//  ink - that is what stops a shrunken reference from painting its margins.
 // ---------------------------------------------------------------------------
-static float CellCoverage(const Image *img, int cx, int cy, int gw, int gh)
+static float CellCoverage(const Image *img, int cx, int cy, Rectangle r)
 {
-    int x0 = (int)((float)cx      / gw * img->width);
-    int x1 = (int)((float)(cx+1)  / gw * img->width);
-    int y0 = (int)((float)cy      / gh * img->height);
-    int y1 = (int)((float)(cy+1)  / gh * img->height);
+    if (r.width <= 0.0f || r.height <= 0.0f) return 0.0f;
+
+    // Cell extents -> normalised position within the reference box -> pixels.
+    int x0 = (int)(((float)cx     - r.x) / r.width  * img->width);
+    int x1 = (int)(((float)(cx+1) - r.x) / r.width  * img->width);
+    int y0 = (int)(((float)cy     - r.y) / r.height * img->height);
+    int y1 = (int)(((float)(cy+1) - r.y) / r.height * img->height);
+    // Wholly outside the reference: no source, so no ink.
+    if (x1 <= 0 || y1 <= 0 || x0 >= img->width || y0 >= img->height) return 0.0f;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
     if (x1 <= x0) x1 = x0 + 1;
     if (y1 <= y0) y1 = y0 + 1;
     if (x1 > img->width)  x1 = img->width;
     if (y1 > img->height) y1 = img->height;
+    if (x0 >= x1 || y0 >= y1) return 0.0f;
 
     float sum = 0.0f;
     int n = 0;
@@ -283,11 +364,12 @@ static float CellCoverage(const Image *img, int cx, int cy, int gw, int gh)
 // Fills `out` (gw*gh at the ANIM_SHAPE_GRID_MAX stride) from the reference.
 static void Downsample(unsigned char *out, int gw, int gh, float thresh)
 {
+    Rectangle r = RefCellRect();
     for (int y = 0; y < gh; y++)
         for (int x = 0; x < gw; x++)
             out[y*ANIM_SHAPE_GRID_MAX + x] =
-                (CellCoverage(&s_refImg, x, y, gw, gh) >= thresh) ? ANIM_PX_FILL
-                                                                  : ANIM_PX_EMPTY;
+                (CellCoverage(&s_refImg, x, y, r) >= thresh) ? ANIM_PX_FILL
+                                                             : ANIM_PX_EMPTY;
 
     // Boundary pass: a fill cell with an empty (or off-grid) 4-neighbour is rim.
     // Read from a copy so a cell promoted to outline does not make its neighbour
@@ -317,6 +399,54 @@ static void ApplyDownsample(void)
     Status("converted from reference");
 }
 
+// ---------------------------------------------------------------------------
+//  Bulk ink
+// ---------------------------------------------------------------------------
+// Rewrites every INKED cell to `v`, leaving empty cells empty - so it changes
+// which ink a shape uses without changing the shape. One undo step for the lot,
+// like clear and convert. The common case is a shape traced or converted as
+// fill-plus-derived-rim that only ever needed one of the two.
+static void ConvertAllInk(unsigned char v)
+{
+    AnimShapeDef *s = AnimShapePoolGet(s_slot);
+    if (!s) return;
+
+    bool any = false;
+    for (int y = 0; y < s->h && !any; y++)
+        for (int x = 0; x < s->w && !any; x++)
+        {
+            unsigned char c = AnimShapePx(s, x, y);
+            if (c != ANIM_PX_EMPTY && c != v) any = true;
+        }
+    if (!any) { Status("nothing to convert"); return; }
+
+    UndoPush();
+    for (int y = 0; y < s->h; y++)
+        for (int x = 0; x < s->w; x++)
+            if (AnimShapePx(s, x, y) != ANIM_PX_EMPTY) AnimShapeSetPx(s, x, y, v);
+    AnimShapePoolInvalidate(s_slot);
+    Status(v == ANIM_PX_FILL ? "all ink -> fill" : "all ink -> rim");
+}
+
+// Step the current shape's grid by one cell. The value boxes above these can do
+// the same job, but only by committing a whole typed number - which is the wrong
+// gesture for "one column narrower" and cannot be repeated by eye.
+static void ResizeCur(int dw, int dh)
+{
+    AnimShapeDef *s = AnimShapePoolGet(s_slot);
+    if (!s) return;
+    int nw = s->w + dw, nh = s->h + dh;
+    if (nw < 1) nw = 1;
+    if (nh < 1) nh = 1;
+    if (nw > ANIM_SHAPE_GRID_MAX) nw = ANIM_SHAPE_GRID_MAX;
+    if (nh > ANIM_SHAPE_GRID_MAX) nh = ANIM_SHAPE_GRID_MAX;
+    if (nw == s->w && nh == s->h) return;
+    UndoPush();
+    AnimShapeResize(s, nw, nh);     // clears its own texture cache
+    CanvasFit();
+    Status(TextFormat("%dx%d", nw, nh));
+}
+
 static void LoadReference(const char *path)
 {
     if (!path || !path[0]) return;
@@ -336,6 +466,7 @@ static void LoadReference(const char *path)
     s_refImg = img;
     s_refTex = LoadTextureFromImage(s_refImg);
     s_refLoaded = true;
+    RefFit();               // a new image starts fitted and centred, not where the last one was
     TextCopy(s_pathBuf, path);
     Status(TextFormat("reference %dx%d", s_refImg.width, s_refImg.height));
 }
@@ -468,11 +599,104 @@ static void BrowseGui(void)
 }
 
 // ---------------------------------------------------------------------------
+//  New-shape modal
+// ---------------------------------------------------------------------------
+static void NewShapeOpen(void)
+{
+    s_newOpen = true;
+    s_edName = s_edNewW = s_edNewH = false;
+
+    // Propose a name nothing in the pool holds. The buffer arrives carrying the
+    // SELECTED shape's name (SelectSlot puts it there), so offering it unchanged
+    // would open the dialog pre-loaded with the one name guaranteed to be taken.
+    for (int i = 1; i < ANIM_SHAPE_POOL_MAX + 2; i++)
+    {
+        const char *cand = TextFormat("shape_%d", i);
+        if (AnimShapePoolFindByName(cand) == ANIM_SHAPE_MISSING)
+        { TextCopy(s_nameBuf, cand); break; }
+    }
+}
+
+static void NewShapeCreate(void)
+{
+    int slot = AnimShapePoolAdd(s_nameBuf, s_newW, s_newH);
+    if (slot == ANIM_SHAPE_MISSING)
+    {
+        // Two very different problems used to wear one message: a full pool is a
+        // build limit to work around, a bad name is a typo to fix. The modal
+        // stays open either way - both are fixed right here.
+        Status(AnimShapeNameOk(s_nameBuf)
+               ? TextFormat("pool full (%d/%d slots)",
+                            AnimShapePoolCount(), ANIM_SHAPE_POOL_MAX)
+               : "name taken, empty, or has spaces / # / slashes");
+        return;
+    }
+    s_newOpen = false;
+    s_edName = s_edNewW = s_edNewH = false;
+    SelectSlot(slot);
+    Status("created - save to keep it");
+}
+
+static void NewShapeGui(void)
+{
+    if (!s_newOpen) return;
+
+    Vector2 sc = ScreenStateSize();
+    float mw = 320.0f, mh = 210.0f;
+    if (mw > sc.x - 40.0f) mw = sc.x - 40.0f;
+    if (mh > sc.y - 40.0f) mh = sc.y - 40.0f;
+    Rectangle m = { (sc.x - mw)*0.5f, (sc.y - mh)*0.5f, mw, mh };
+
+    DrawRectangle(0, 0, (int)sc.x, (int)sc.y, (Color){ 0, 0, 0, 140 });
+    DrawRectangleRec(m, (Color){ 40, 42, 48, 255 });
+    DrawRectangleLinesEx(m, 1.0f, (Color){ 90, 94, 104, 255 });
+    GuiLabel((Rectangle){ m.x+14, m.y+8, mw-28, 20 }, "NEW SHAPE");
+
+    float x = m.x + 14.0f, w = mw - 28.0f;
+    float y = m.y + 34.0f;
+    float hw = (w - SE_GAP) * 0.5f;
+
+    GuiLabel((Rectangle){ x, y, w, 18.0f }, "name  (no spaces, # or slashes)");
+    y += 20.0f;
+    if (GuiTextBox((Rectangle){ x, y, w, SE_RH }, s_nameBuf, ANIM_SHAPE_NAME_MAX, s_edName))
+        s_edName = !s_edName;
+    y += SE_RH + SE_GAP + 4.0f;
+
+    GuiLabel((Rectangle){ x, y, w, 18.0f }, "size in cells");
+    y += 20.0f;
+    GuiLabel((Rectangle){ x, y, 16.0f, SE_RH }, "w");
+    if (GuiValueBox((Rectangle){ x + 18.0f, y, hw - 18.0f, SE_RH }, NULL,
+                    &s_newW, 1, ANIM_SHAPE_GRID_MAX, s_edNewW))
+        s_edNewW = !s_edNewW;
+    GuiLabel((Rectangle){ x + hw + SE_GAP, y, 16.0f, SE_RH }, "h");
+    if (GuiValueBox((Rectangle){ x + hw + SE_GAP + 18.0f, y, hw - 18.0f, SE_RH }, NULL,
+                    &s_newH, 1, ANIM_SHAPE_GRID_MAX, s_edNewH))
+        s_edNewH = !s_edNewH;
+    y += SE_RH + SE_GAP + 6.0f;
+
+    // ENTER creates, so the whole dialog can be driven from the name box. Only
+    // while a field owns the keyboard would ENTER otherwise do nothing at all.
+    bool enter = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER);
+    if (GuiButton((Rectangle){ x, y, hw, SE_RH }, "create") || enter)
+    { AudioPlayButton(); s_edName = s_edNewW = s_edNewH = false; NewShapeCreate(); }
+    if (GuiButton((Rectangle){ x + hw + SE_GAP, y, hw, SE_RH }, "cancel"))
+    {
+        AudioPlayButton();
+        s_newOpen = false;
+        s_edName = s_edNewW = s_edNewH = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  State lifecycle
 // ---------------------------------------------------------------------------
 static void Enter()
 {
     AnimShapePoolLoadAll(ANIM_SHAPE_RES_DIR, ANIM_SHAPE_USER_DIR);
+
+    // Before the selection, not after: SelectSlot scrolls the list to reveal
+    // what it picked, and clearing afterwards would undo that.
+    s_listScroll = 0.0f;
 
     int want = s_wanted[0] ? AnimShapePoolFindByName(s_wanted) : ANIM_SHAPE_MISSING;
     if (want >= 0) SelectSlot(want); else SelectFirst();
@@ -484,6 +708,8 @@ static void Enter()
     s_edName = s_edNewW = s_edNewH = s_edCurW = s_edCurH = s_edPath = false;
     s_previewOn = false;
     s_browseOpen = false;
+    s_newOpen = false;
+    s_panelScroll = 0.0f;
     CanvasFit();
 }
 
@@ -516,12 +742,13 @@ static void Update()
 
     if (IsKeyPressed(KEY_ESCAPE))
     {
-        // ESC unwinds one layer at a time: picker, then the state.
+        // ESC unwinds one layer at a time: modals, then the state.
         if (s_browseOpen) { s_browseOpen = false; return; }
+        if (s_newOpen)    { s_newOpen = false; s_edName = s_edNewW = s_edNewH = false; return; }
         AppStateTransition(&app_state_main_menu);
         return;
     }
-    if (s_browseOpen || Typing()) return;       // modal / typing: no shortcuts
+    if (s_browseOpen || s_newOpen || Typing()) return;  // modal / typing: no shortcuts
 
     bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
     if (ctrl && IsKeyPressed(KEY_Z)) UndoPop();
@@ -540,9 +767,53 @@ static void Update()
     Rectangle wa = WorkArea();
     bool overCanvas = CheckCollisionPointRec(GetMousePosition(), wa);
 
+    // ALT is the reference-image modifier, for the whole gesture set: while it
+    // is held the canvas does not zoom, the brush does not paint, and the same
+    // wheel-and-drag the hand already knows moves the REFERENCE instead. A
+    // modifier rather than a mode, because aligning a reference is a handful of
+    // nudges between strokes - a mode you must leave again would be worse.
+    // With no reference loaded ALT means nothing, and swallowing the wheel then
+    // would just look broken.
+    bool alt = (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))
+             && s_refLoaded && AnimShapePoolGet(s_slot) != NULL;
+    if (alt)
+    {
+        float rw = GetMouseWheelMove();
+        if (rw != 0.0f && overCanvas)
+        {
+            // Scale about the cursor, so the detail being aligned stays under
+            // the pointer. Cell space throughout: find the cursor's cell, scale,
+            // then push the offset by however far that cell's image point moved.
+            Rectangle c = CanvasRect();
+            Vector2 m = GetMousePosition();
+            Vector2 cell = { (m.x - c.x) / s_zoom, (m.y - c.y) / s_zoom };
+            Rectangle before = RefCellRect();
+            float k = 1.0f + rw * 0.08f;
+            s_refScale *= k;
+            if (s_refScale < 0.05f) s_refScale = 0.05f;
+            if (s_refScale > 8.0f)  s_refScale = 8.0f;
+            Rectangle after = RefCellRect();
+            // Where the cursor sat inside the box before, it must sit after.
+            if (before.width > 0.0f && before.height > 0.0f)
+            {
+                float u = (cell.x - before.x) / before.width;
+                float v = (cell.y - before.y) / before.height;
+                s_refOff.x += cell.x - (after.x + u * after.width);
+                s_refOff.y += cell.y - (after.y + v * after.height);
+            }
+        }
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && overCanvas)
+        {
+            Vector2 d = GetMouseDelta();
+            s_refOff.x += d.x / s_zoom;     // screen pixels -> cells
+            s_refOff.y += d.y / s_zoom;
+        }
+        s_strokeOpen = false;               // an alt-drag is never a paint stroke
+    }
+
     // Zoom about the cursor, so the cell under it stays put - panning by hand
     // after every zoom step is the thing that makes a pixel editor tiring.
-    float wheel = GetMouseWheelMove();
+    float wheel = alt ? 0.0f : GetMouseWheelMove();
     if (wheel != 0.0f && overCanvas)
     {
         Vector2 m = GetMousePosition();
@@ -571,8 +842,8 @@ static void Update()
 
     // Painting. Left paints the active ink, right erases - and the undo push
     // happens ONCE on press, so the whole drag is a single step.
-    bool left  = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
-    bool right = IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
+    bool left  = !alt && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+    bool right = !alt && IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
     if (!left && !right) s_strokeOpen = false;
     else if (overCanvas)
     {
@@ -616,12 +887,16 @@ static void DrawCanvas(void)
     // Clip to the work area so a zoomed-in canvas cannot spill under the panel.
     BeginScissorMode((int)wa.x, (int)wa.y, (int)wa.width, (int)wa.height);
 
-    // Reference image first, faint, stretched over the same box the grid covers
-    // so a traced pixel lands where the reference shows it.
+    // Reference image first, faint, in its own placed box - converted from cell
+    // space here and nowhere else, so a traced pixel lands where the reference
+    // shows it at any zoom, pan or reference offset.
+    Rectangle refCells = RefCellRect();
+    Rectangle refScreen = { c.x + refCells.x * s_zoom, c.y + refCells.y * s_zoom,
+                            refCells.width * s_zoom,  refCells.height * s_zoom };
     if (s_refLoaded && s_refAlpha > 0.0f)
     {
         Rectangle src = { 0, 0, (float)s_refTex.width, (float)s_refTex.height };
-        DrawTexturePro(s_refTex, src, c, (Vector2){ 0, 0 }, 0.0f,
+        DrawTexturePro(s_refTex, src, refScreen, (Vector2){ 0, 0 }, 0.0f,
                        Fade(WHITE, s_refAlpha));
     }
 
@@ -661,6 +936,13 @@ static void DrawCanvas(void)
     }
     DrawRectangleLinesEx(c, 1.0f, (Color){ 90, 95, 110, 255 });
 
+    // While ALT is held the reference is what the mouse acts on, so show its
+    // box - otherwise a drag that moves something invisible past the grid edge
+    // is impossible to aim.
+    if (s_refLoaded &&
+        (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)))
+        DrawRectangleLinesEx(refScreen, 2.0f, Fade(ORANGE, 0.8f));
+
     // Cursor cell, so the brush lands where the eye expects.
     int hx, hy;
     if (!s_browseOpen && CellAtCursor(&hx, &hy))
@@ -688,9 +970,12 @@ static void DrawCanvas(void)
 
     EndScissorMode();
 
-    GuiLabel((Rectangle){ wa.x + wa.width - 260.0f, wa.y + 8.0f, 250.0f, 20.0f },
-             TextFormat("%dx%d   zoom %.0fx   wheel zoom / MMB pan / F fit",
-                        s->w, s->h, s_zoom));
+    GuiLabel((Rectangle){ wa.x + wa.width - 380.0f, wa.y + 8.0f, 370.0f, 20.0f },
+             s_refLoaded
+             ? TextFormat("%dx%d   zoom %.0fx   wheel zoom / MMB pan / F fit / ALT ref",
+                          s->w, s->h, s_zoom)
+             : TextFormat("%dx%d   zoom %.0fx   wheel zoom / MMB pan / F fit",
+                          s->w, s->h, s_zoom));
 }
 
 // ---------------------------------------------------------------------------
@@ -707,12 +992,38 @@ static void Gui()
 
     GuiPanel((Rectangle){ 0, 0, SE_PANEL_W, sc.y }, NULL);
 
-    // The picker eats input for everything under it.
-    if (s_browseOpen) GuiLock();
+    // A modal eats input for everything under it.
+    bool modal = s_browseOpen || s_newOpen;
+    if (modal) GuiLock();
 
     if (GuiButton((Rectangle){ x, y, w, SE_RH }, "< BACK TO MENU"))
     { AudioPlayButton(); GuiUnlock(); AppStateTransition(&app_state_main_menu); return; }
     y += SE_RH + SE_GAP;
+
+    // -- the scrolling body --------------------------------------------------
+    // Everything between BACK and SAVE lives in a scissored, wheel-scrolled box.
+    // BACK and SAVE stay pinned outside it: they are the two controls that must
+    // never be scrolled out of reach.
+    //
+    // Scissoring alone is not enough. raygui reads the mouse from the rectangle
+    // it is passed, and a scissor only clips the DRAWING - so a control scrolled
+    // out of the box still answers clicks aimed at whatever is visible in its
+    // place. Hence the lock whenever the cursor is outside the box.
+    Vector2 mouse = GetMousePosition();
+    float wheel = modal ? 0.0f : GetMouseWheelMove();
+    Rectangle body = { 0, y, SE_PANEL_W, sc.y - 26.0f - SE_RH - SE_GAP*2 - y };
+    if (body.height < SE_RH) body.height = SE_RH;
+    bool overBody = CheckCollisionPointRec(mouse, body);
+
+    // Exempted while a field owns the keyboard: a locked raygui control ignores
+    // keys as well as clicks, so locking here would stop a value box accepting
+    // digits the moment the cursor drifted onto the canvas.
+    bool bodyLock = !modal && !overBody && !Typing();
+    if (bodyLock) GuiLock();
+    BeginScissorMode((int)body.x, (int)body.y, (int)body.width, (int)body.height);
+
+    float flowTop = y + s_panelScroll;
+    y = flowTop;
 
     // -- the colour-modularity banner ---------------------------------------
     // Not advice to follow, a fact about the format: there is nowhere in a .shp
@@ -726,56 +1037,75 @@ static void Gui()
     y += 22.0f;
 
     // -- shape list ----------------------------------------------------------
+    // The pool holds up to ANIM_SHAPE_POOL_MAX shapes (8 on web, 512 on desktop),
+    // so this cannot be a flowing column - it is a fixed box that scrolls, the
+    // same construction as the file picker's list below.
     GuiLine((Rectangle){ x, y, w, 10.0f }, "shapes");
     y += 14.0f;
+    GuiLabel((Rectangle){ x, y, w, 16.0f },
+             TextFormat("%d / %d slots used", AnimShapePoolCount(), ANIM_SHAPE_POOL_MAX));
+    y += 17.0f;
+    if (AnimShapePoolSkipped() > 0)
+    {
+        // The pool filled before every .shp on disk got in. Silence here is how
+        // a web build loses shapes it looks like it should have.
+        GuiLabel((Rectangle){ x, y, w, 16.0f },
+                 TextFormat("! %d file(s) did not fit", AnimShapePoolSkipped()));
+        y += 17.0f;
+    }
+
+    float rowH = SE_RH + 2.0f;
+    Rectangle list = { x, y, w, rowH * SE_LIST_ROWS };
+    DrawRectangleRec(list, (Color){ 28, 29, 34, 255 });
+    DrawRectangleLinesEx(list, 1.0f, (Color){ 70, 74, 84, 255 });
+    bool overList = CheckCollisionPointRec(mouse, list) && overBody;
+    if (overList) { s_listScroll += wheel * rowH; wheel = 0.0f; }   // the list eats it
+    float listMax = AnimShapePoolCount() * rowH - list.height;
+    if (listMax < 0.0f) listMax = 0.0f;
+    if (s_listScroll < -listMax) s_listScroll = -listMax;
+    if (s_listScroll > 0.0f) s_listScroll = 0.0f;
+
+    // Same reason as the body's lock, one level in: a row straddling the box
+    // edge is drawn clipped but still reads the mouse over its FULL height, so
+    // its bottom half used to swallow clicks meant for whatever sat below the
+    // list - which is how clicking the name field selected a shape instead.
+    bool listLock = !GuiIsLocked() && !overList;
+    if (listLock) GuiLock();
+    // Intersected with the body, and the body's scissor restored after: raylib's
+    // EndScissorMode turns the test off rather than popping back to the outer
+    // rectangle, so scissors do not nest on their own.
+    Rectangle lclip = GetCollisionRec(list, body);
+    BeginScissorMode((int)lclip.x, (int)lclip.y, (int)lclip.width, (int)lclip.height);
+    float ry = list.y + s_listScroll;
     for (int i = 0; i < ANIM_SHAPE_POOL_MAX; i++)
     {
         AnimShapeDef *sd = AnimShapePoolGet(i);
         if (!sd) continue;
-        bool on = (i == s_slot);
-        GuiToggle((Rectangle){ x, y, w - 26.0f, SE_RH },
-                  TextFormat("%s  %dx%d", sd->name, sd->w, sd->h), &on);
-        if (on && i != s_slot) { AudioPlayButton(); SelectSlot(i); }
-        if (i == s_slot &&
-            GuiButton((Rectangle){ x + w - 22.0f, y, 22.0f, SE_RH }, "#143#"))
+        if (ry + SE_RH >= list.y && ry <= list.y + list.height)
         {
-            AudioPlayButton();
-            AnimShapePoolDelete(i, ANIM_SHAPE_USER_DIR);
-            SelectFirst();
-            Status("shape deleted");
+            bool on = (i == s_slot);
+            GuiToggle((Rectangle){ list.x + 2.0f, ry, w - 28.0f, SE_RH },
+                      TextFormat("%s  %dx%d", sd->name, sd->w, sd->h), &on);
+            if (on && i != s_slot) { AudioPlayButton(); SelectSlot(i); }
+            if (i == s_slot &&
+                GuiButton((Rectangle){ list.x + w - 24.0f, ry, 22.0f, SE_RH }, "#143#"))
+            {
+                AudioPlayButton();
+                AnimShapePoolDelete(i, ANIM_SHAPE_USER_DIR);
+                SelectFirst();
+                Status("shape deleted");
+            }
         }
-        y += SE_RH + 2.0f;
+        ry += rowH;
     }
-    y += SE_GAP;
+    EndScissorMode();
+    if (listLock) GuiUnlock();
+    BeginScissorMode((int)body.x, (int)body.y, (int)body.width, (int)body.height);
+    if (bodyLock) GuiLock();       // GuiUnlock is global; put the body's lock back
+    y += list.height + SE_GAP;
 
-    // -- new shape -----------------------------------------------------------
-    GuiLine((Rectangle){ x, y, w, 10.0f }, "new shape");
-    y += 14.0f;
-    if (GuiTextBox((Rectangle){ x, y, w, SE_RH }, s_nameBuf, ANIM_SHAPE_NAME_MAX, s_edName))
-        s_edName = !s_edName;
-    y += SE_RH + SE_GAP;
-
-    // Value boxes, not spinners: a spinner with a label eats most of its own
-    // width at this size and leaves no room to SHOW the number, which is the
-    // one thing these controls exist to do. Click to type, arrows to step.
-    GuiLabel((Rectangle){ x, y, 16.0f, SE_RH }, "w");
-    if (GuiValueBox((Rectangle){ x + 18.0f, y, hw - 18.0f, SE_RH }, NULL,
-                    &s_newW, 1, ANIM_SHAPE_GRID_MAX, s_edNewW))
-        s_edNewW = !s_edNewW;
-    GuiLabel((Rectangle){ x + hw + SE_GAP, y, 16.0f, SE_RH }, "h");
-    if (GuiValueBox((Rectangle){ x + hw + SE_GAP + 18.0f, y, hw - 18.0f, SE_RH }, NULL,
-                    &s_newH, 1, ANIM_SHAPE_GRID_MAX, s_edNewH))
-        s_edNewH = !s_edNewH;
-    y += SE_RH + SE_GAP;
-
-    if (GuiButton((Rectangle){ x, y, w, SE_RH }, "+ create shape"))
-    {
-        AudioPlayButton();
-        int slot = AnimShapePoolAdd(s_nameBuf, s_newW, s_newH);
-        if (slot == ANIM_SHAPE_MISSING)
-            Status("pool full, or name taken/invalid");
-        else { SelectSlot(slot); Status("created - save to keep it"); }
-    }
+    if (GuiButton((Rectangle){ x, y, w, SE_RH }, "+ new shape..."))
+    { AudioPlayButton(); NewShapeOpen(); }
     y += SE_RH + SE_GAP + 4.0f;
 
     AnimShapeDef *s = AnimShapePoolGet(s_slot);
@@ -822,6 +1152,17 @@ static void Gui()
         // would crop the shape to a single column on the way through.
         if ((cw != s->w || ch != s->h) && !s_edCurW && !s_edCurH)
         { UndoPush(); AnimShapeResize(s, cw, ch); CanvasFit(); }
+        y += SE_RH + 2.0f;
+
+        // One cell at a time, each pair sitting under the field it steps. Sized
+        // from the FIELD width, not the column width, so the two halves keep
+        // their gap instead of colliding in the middle.
+        float qw = (hw - 18.0f - SE_GAP) * 0.5f;
+        if (GuiButton((Rectangle){ x + 18.0f, y, qw, SE_RH }, "-")) ResizeCur(-1, 0);
+        if (GuiButton((Rectangle){ x + 18.0f + qw + SE_GAP, y, qw, SE_RH }, "+")) ResizeCur(1, 0);
+        if (GuiButton((Rectangle){ x + hw + SE_GAP + 18.0f, y, qw, SE_RH }, "-")) ResizeCur(0, -1);
+        if (GuiButton((Rectangle){ x + hw + SE_GAP + 18.0f + qw + SE_GAP, y, qw, SE_RH }, "+"))
+            ResizeCur(0, 1);
         y += SE_RH + SE_GAP;
 
         if (GuiButton((Rectangle){ x, y, hw, SE_RH }, "fit (F)")) CanvasFit();
@@ -833,6 +1174,14 @@ static void Gui()
             AnimShapePoolInvalidate(s_slot);
             Status("cleared");
         }
+        y += SE_RH + SE_GAP;
+
+        // Ink of the WHOLE shape at once - see ConvertAllInk. Sits with clear
+        // rather than with the brush: these act on the shape, not on the stroke.
+        if (GuiButton((Rectangle){ x, y, hw, SE_RH }, "all -> fill"))
+        { AudioPlayButton(); ConvertAllInk(ANIM_PX_FILL); }
+        if (GuiButton((Rectangle){ x + hw + SE_GAP, y, hw, SE_RH }, "all -> rim"))
+        { AudioPlayButton(); ConvertAllInk(ANIM_PX_OUTLINE); }
         y += SE_RH + SE_GAP;
 
         if (GuiButton((Rectangle){ x, y, w, SE_RH }, "undo (^Z)")) UndoPop();
@@ -856,6 +1205,32 @@ static void Gui()
             GuiSlider((Rectangle){ x + 34.0f, y, w - 34.0f, SE_RH }, "thr", NULL,
                       &s_threshold, 0.0f, 1.0f);
             y += SE_RH + 2.0f;
+
+            // Placement. The sliders and the ALT gestures write the same two
+            // values, so either route can finish what the other started.
+            GuiSlider((Rectangle){ x + 34.0f, y, w - 34.0f - 34.0f, SE_RH }, "scale",
+                      TextFormat("%.2f", s_refScale), &s_refScale, 0.05f, 8.0f);
+            y += SE_RH + 2.0f;
+            // Offsets range over the grid either way, which is enough to push
+            // any part of the image onto any part of the grid.
+            float ext = (float)(s->w > s->h ? s->w : s->h);
+            GuiSlider((Rectangle){ x + 34.0f, y, w - 34.0f - 34.0f, SE_RH }, "off x",
+                      TextFormat("%.1f", s_refOff.x), &s_refOff.x, -ext, ext);
+            y += SE_RH + 2.0f;
+            GuiSlider((Rectangle){ x + 34.0f, y, w - 34.0f - 34.0f, SE_RH }, "off y",
+                      TextFormat("%.1f", s_refOff.y), &s_refOff.y, -ext, ext);
+            y += SE_RH + 2.0f;
+
+            float tw = (w - SE_GAP*2) / 3.0f;
+            if (GuiButton((Rectangle){ x, y, tw, SE_RH }, "fit"))
+            { AudioPlayButton(); RefFit(); }
+            if (GuiButton((Rectangle){ x + tw + SE_GAP, y, tw, SE_RH }, "center"))
+            { AudioPlayButton(); RefCenter(); }
+            if (GuiButton((Rectangle){ x + (tw + SE_GAP)*2, y, tw, SE_RH }, "reset"))
+            { AudioPlayButton(); RefFit(); s_refAlpha = 0.35f; s_threshold = 0.5f; }
+            y += SE_RH + 2.0f;
+            GuiLabel((Rectangle){ x, y, w, 18.0f }, "ALT+drag move   ALT+wheel scale");
+            y += 20.0f;
             GuiCheckBox((Rectangle){ x, y, 16.0f, 16.0f }, " preview", &s_previewOn);
             GuiCheckBox((Rectangle){ x + hw + SE_GAP, y, 16.0f, 16.0f },
                         " dark ink", &s_refInvert);
@@ -877,11 +1252,36 @@ static void Gui()
         }
     }
 
+    // -- end of the scrolling body -------------------------------------------
+    s_panelContentH = y - flowTop;
+    EndScissorMode();
+    if (bodyLock) GuiUnlock();
+
+    // Scrolled here rather than before the flow because the content height is
+    // only known once the flow has run - which is also why a wheel notch lands
+    // on the next frame. Clamping against last frame's height is close enough:
+    // the column only changes height when a section appears or disappears.
+    float panelMax = s_panelContentH - body.height;
+    if (panelMax < 0.0f) panelMax = 0.0f;
+    if (wheel != 0.0f && overBody) s_panelScroll += wheel * 40.0f;
+    if (s_panelScroll < -panelMax) s_panelScroll = -panelMax;
+    if (s_panelScroll > 0.0f) s_panelScroll = 0.0f;
+
+    if (panelMax > 0.0f)
+    {
+        // A plain indicator, not a grabbable bar: the wheel is the only way to
+        // scroll this column and drawing a handle would promise otherwise.
+        float frac = body.height / s_panelContentH;
+        float bh = body.height * frac;
+        float bt = body.y + (-s_panelScroll / s_panelContentH) * body.height;
+        DrawRectangle((int)(SE_PANEL_W - 5.0f), (int)bt, 3, (int)bh,
+                      (Color){ 110, 116, 130, 200 });
+    }
+
     // -- save bar, PINNED to the bottom of the panel -------------------------
-    // Deliberately not part of the flowing column above: that column has no
-    // scrollbar, so on a short window the controls at its tail simply are not
-    // on screen - which is exactly how the save button went missing. Anchoring
-    // to sc.y means SAVE is reachable at any window height.
+    // Outside the scrolling body on purpose. The body scrolls now, so nothing is
+    // unreachable there, but SAVE should never need a scroll to find - anchoring
+    // to sc.y keeps it in the same place at any window height.
     if (s)
     {
         float sy = sc.y - 26.0f - SE_RH - SE_GAP;
@@ -897,5 +1297,7 @@ static void Gui()
     if (s_statusT > 0.0f && s_status[0])
         GuiLabel((Rectangle){ x, sc.y - 26.0f, SE_PANEL_W - 24.0f, SE_RH }, s_status);
 
-    if (s_browseOpen) { GuiUnlock(); BrowseGui(); }
+    if (modal) GuiUnlock();
+    if (s_browseOpen) BrowseGui();
+    if (s_newOpen)    NewShapeGui();
 }

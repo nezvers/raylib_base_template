@@ -478,6 +478,7 @@ static float DrawInspector(float x, float y, float w)
             {
                 zen.shapeDropOpen = !zen.shapeDropOpen;
                 zen.shapeDropRect = (Rectangle){ x+44, y, bw, rh };
+                zen.shapeDropScroll = 0.0f;     // reopen at the top of the list
             }
             GuiSetStyle(BUTTON, TEXT_COLOR_NORMAL, prev);
 
