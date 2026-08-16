@@ -883,7 +883,20 @@ void ZenTimelineCtxGui(void)
     // position the user parked deliberately, and it is what every other "here"
     // in this editor means.
     float dstT   = zen.playhead;
-    bool  keyDst = onKey && fabsf(s_tlCtxKeyTime - dstT) > ZEN_AUTOKEY_EPS;
+
+    // Right-clicking a key that is part of a multi-key selection acts on the
+    // WHOLE set: the selection is what the user built, and having the menu
+    // silently drop it to the one key under the cursor would undo that work.
+    // Right-clicking a key OUTSIDE the set stays single - it was never in it.
+    bool setScope = onKey && zen.selKeyCount > 1 &&
+                    ZenKeyIsSelected(s_tlCtxKeyElem, s_tlCtxKeyGroup, s_tlCtxKeyTime);
+    int   setN    = setScope ? zen.selKeyCount : 0;
+    // The set moves rigidly, anchored on its earliest key, so the whole thing
+    // is blocked only when that anchor already sits on the playhead.
+    float anchorT = s_tlCtxKeyTime;
+    for (int i = 0; i < setN; i++)
+        if (zen.selKeys[i] < anchorT) anchorT = zen.selKeys[i];
+    bool  keyDst = onKey && fabsf(anchorT - dstT) > ZEN_AUTOKEY_EPS;
 
     // rows, in the order they are drawn.
     enum { ROW_PAUSE, ROW_CLONE_ALL, ROW_KEY_CLONE, ROW_KEY_DELETE, ROW_MAX };
@@ -914,16 +927,24 @@ void ZenTimelineCtxGui(void)
     }
     else
     {
-        labels[ROW_KEY_CLONE] = "Clone key to playhead";
-        tips[ROW_KEY_CLONE]   = keyDst
-            ? "Copy this key - values and easing - to the playhead, leaving the "
-              "original where it is"
-            : "The playhead is already on this key; move it first";
+        labels[ROW_KEY_CLONE] = setScope ? "Clone keys at playhead"
+                                         : "Clone key to playhead";
+        tips[ROW_KEY_CLONE]   = !keyDst
+            ? (setScope ? "The playhead is already on the first selected key; move it first"
+                        : "The playhead is already on this key; move it first")
+            : (setScope
+               ? "Copy all selected keys - values and easing - to the playhead, "
+                 "keeping their spacing: the earliest lands on the playhead and "
+                 "the rest follow at the same intervals"
+               : "Copy this key - values and easing - to the playhead, leaving the "
+                 "original where it is");
         offs[ROW_KEY_CLONE]   = !keyDst;
         rows[rowN++] = ROW_KEY_CLONE;
 
-        labels[ROW_KEY_DELETE] = "Delete key";
-        tips[ROW_KEY_DELETE]   = "Remove this key from every track in its group";
+        labels[ROW_KEY_DELETE] = setScope ? "Delete keys" : "Delete key";
+        tips[ROW_KEY_DELETE]   = setScope
+            ? "Remove every selected key from all tracks in its group"
+            : "Remove this key from every track in its group";
         offs[ROW_KEY_DELETE]   = false;
         rows[rowN++] = ROW_KEY_DELETE;
     }
@@ -978,7 +999,24 @@ void ZenTimelineCtxGui(void)
             break;
 
         case ROW_KEY_CLONE:
-            if (ZenGroupCloneKeyTo(ke, s_tlCtxKeyGroup, s_tlCtxKeyTime, dstT))
+            if (setScope)
+            {
+                // Copy the times out first: the selection is rebuilt below to
+                // point at the clones, which would otherwise be read as sources.
+                float src[ZEN_GROUP_TIMES_MAX];
+                for (int i = 0; i < setN; i++) src[i] = zen.selKeys[i];
+                if (ZenGroupCloneKeySet(ke, s_tlCtxKeyGroup, src, setN, dstT) > 0)
+                {
+                    // Land the selection on the copies, matching the single-key
+                    // case: what was just made is what stays in hand.
+                    for (int i = 0; i < setN; i++)
+                        ZenSelKey(s_tlCtxKeyElem, s_tlCtxKeyGroup,
+                                  dstT + (src[i] - anchorT), i > 0);
+                    ZenSelValidate();   // clones off the end of a full track
+                    ZenTrackModalSync();
+                }
+            }
+            else if (ZenGroupCloneKeyTo(ke, s_tlCtxKeyGroup, s_tlCtxKeyTime, dstT))
             {
                 ZenSelKey(s_tlCtxKeyElem, s_tlCtxKeyGroup, dstT, false);
                 ZenTrackModalSync();
@@ -986,7 +1024,13 @@ void ZenTimelineCtxGui(void)
             break;
 
         case ROW_KEY_DELETE:
-            ZenGroupDeleteKeyAt(ke, s_tlCtxKeyGroup, s_tlCtxKeyTime);
+            if (setScope)
+            {
+                float del[ZEN_GROUP_TIMES_MAX];
+                for (int i = 0; i < setN; i++) del[i] = zen.selKeys[i];
+                ZenGroupDeleteKeySet(ke, s_tlCtxKeyGroup, del, setN);
+            }
+            else ZenGroupDeleteKeyAt(ke, s_tlCtxKeyGroup, s_tlCtxKeyTime);
             zen.selKeyCount = 0;
             ZenSelValidate();       // the group may have lost its last key
             ZenTrackModalSync();
@@ -1292,10 +1336,27 @@ static void DrawTimeline(float x, float y, float w, float h)
                         ZenSelKey(zen.selElem, gi, t, true);
                         ZenTrackModalOpen(zen.selElem, gi);
                     }
+                    else if (zen.selKeyCount > 1 && ZenKeyIsSelected(zen.selElem, gi, t))
+                    {
+                        // Grabbing a key that is already part of a multi-key
+                        // selection drags the WHOLE set. ZenSelKey is
+                        // deliberately NOT called: it would collapse the set to
+                        // this one key. The times are snapshotted here and the
+                        // per-frame move is a rigid shift off that snapshot.
+                        ZenUndoPush();                 // once per drag gesture
+                        zen.dragKeyGroup = gi; zen.dragKeyTime = t;
+                        zen.dragKeySet = true; zen.dragKeyAnchor = t;
+                        zen.dragKeyOrigCount = zen.selKeyCount;
+                        for (int s = 0; s < zen.selKeyCount; s++)
+                            zen.dragKeyOrig[s] = zen.selKeys[s];
+                        ZenTrackModalOpen(zen.selElem, gi);
+                        zen.scrollToSelKey = true;
+                    }
                     else
                     {
                         ZenUndoPush();                 // once per drag gesture
                         zen.dragKeyGroup = gi; zen.dragKeyTime = t;
+                        zen.dragKeySet = false;
                         ZenSelKey(zen.selElem, gi, t, false);
                         ZenTrackModalOpen(zen.selElem, gi);
                         zen.scrollToSelKey = true;
@@ -1465,9 +1526,41 @@ static void DrawTimeline(float x, float y, float w, float h)
         float nt = ZenClampF(X2T(mouse.x), 0.0f, dur);
         // Ctrl snaps the key to the tick grid while dragging.
         if (ctrl) nt = ZenClampF(roundf(nt / ZEN_TIMELINE_SNAP) * ZEN_TIMELINE_SNAP, 0.0f, dur);
-        ZenGroupMoveKeyTo(de, zen.dragKeyGroup, zen.dragKeyTime, nt);
-        zen.dragKeyTime = nt;
-        if (zen.selKeyCount == 1) zen.selKeys[0] = nt;
+
+        if (zen.dragKeySet)
+        {
+            // Rigid shift of the whole selection. The grabbed key chases the
+            // cursor (and the Ctrl grid); everyone else keeps their offset to
+            // it, so the set never squashes - it just blocks at 0 / dur.
+            int   sn = zen.dragKeyOrigCount;
+            float delta = nt - zen.dragKeyAnchor;
+            float lo = zen.dragKeyOrig[0], hi = zen.dragKeyOrig[0];
+            for (int s = 1; s < sn; s++)
+            {
+                if (zen.dragKeyOrig[s] < lo) lo = zen.dragKeyOrig[s];
+                if (zen.dragKeyOrig[s] > hi) hi = zen.dragKeyOrig[s];
+            }
+            delta = ZenClampF(delta, -lo, dur - hi);
+
+            // The keys sit where LAST frame put them, so that is what the
+            // lookup must match; the target stays anchored to the press-time
+            // snapshot so rounding cannot accumulate over a long drag.
+            // One atomic pass, because a per-key loop would let a member
+            // sliding past another key be re-grabbed by time.
+            float cur[ZEN_GROUP_TIMES_MAX];
+            for (int s = 0; s < sn; s++) cur[s] = zen.selKeys[s];
+            ZenGroupMoveKeySetTo(de, zen.dragKeyGroup, cur, zen.dragKeyOrig, sn, delta);
+
+            for (int s = 0; s < sn; s++) zen.selKeys[s] = zen.dragKeyOrig[s] + delta;
+            zen.selKeyCount = sn;
+            zen.dragKeyTime = zen.dragKeyAnchor + delta;
+        }
+        else
+        {
+            ZenGroupMoveKeyTo(de, zen.dragKeyGroup, zen.dragKeyTime, nt);
+            zen.dragKeyTime = nt;
+            if (zen.selKeyCount == 1) zen.selKeys[0] = nt;
+        }
         ZenTrackModalSync();
     }
     else if (zen.dragPlayhead && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
@@ -1535,6 +1628,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     }
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
     { zen.dragPlayhead = false; zen.dragKeyGroup = -1;
+      zen.dragKeySet = false; zen.dragKeyOrigCount = 0;
       zen.dragIntro = false; zen.dragOutro = false; zen.dragPause = -1; }
 
     #undef T2X

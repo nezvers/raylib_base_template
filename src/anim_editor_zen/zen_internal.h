@@ -221,6 +221,14 @@ typedef struct {
     bool  dragPlayhead;
     int   dragKeyGroup;             // group being dragged (-1 = none)
     float dragKeyTime;
+    // Dragging a key that is part of a multi-key selection moves the WHOLE set
+    // rigidly. The members' times are snapshotted at press and never refreshed:
+    // ZenGroupMoveKeyTo matches keys BY TIME, so a delta recomputed from live
+    // times could re-grab a key this same drag already moved.
+    bool  dragKeySet;               // the drag moves the whole selKeys[] set
+    float dragKeyAnchor;            // grabbed key's time at press (delta origin)
+    float dragKeyOrig[ANIM_KEYS_MAX * ANIM_GROUP_PROPS];  // == ZEN_GROUP_TIMES_MAX
+    int   dragKeyOrigCount;
     bool  dragIntro, dragOutro;
     int   dragPause;                // pause marker being dragged (-1 = none)
 
@@ -355,10 +363,22 @@ bool  ZenGroupHasTrack(AnimElem *e, int gi);
 void  ZenGroupWriteKey(AnimElem *e, int gi, float t);     // key every member
 void  ZenGroupDeleteTracks(AnimElem *e, int gi);
 void  ZenGroupDeleteKeyAt(AnimElem *e, int gi, float t);
+// Delete a whole key set in one index-resolved pass, so removals cannot shift
+// the array out from under the times still to be matched.
+void  ZenGroupDeleteKeySet(AnimElem *e, int gi, const float *times, int n);
 void  ZenGroupMoveKeyTo(AnimElem *e, int gi, float oldT, float newT);
+// Rigid shift of a whole key set: found at curT[s], landed at baseT[s] + delta.
+// Index-resolved, so members can slide past other keys without being re-grabbed
+// by time. See the note on the impl for why the two arrays are separate.
+void  ZenGroupMoveKeySetTo(AnimElem *e, int gi, const float *curT,
+                           const float *baseT, int n, float delta);
 // Restate the group key at srcT verbatim (value, colour and ease) at dstT,
 // rather than sampling the element there the way ZenGroupWriteKey does.
 bool  ZenGroupCloneKeyTo(AnimElem *e, int gi, float srcT, float dstT);
+// Same, for a whole set: the EARLIEST key lands on dstT and the rest keep their
+// offsets from it, so the selection's spacing survives the copy. Returns how
+// many group keys wrote.
+int   ZenGroupCloneKeySet(AnimElem *e, int gi, const float *srcT, int n, float dstT);
 // Time of the nearest group key strictly before t, or -1 when there is none.
 float ZenGroupKeyTimeLeftOf(AnimElem *e, int gi, float t);
 void  ZenGroupSetEaseAt(AnimElem *e, int gi, float t, int ease);

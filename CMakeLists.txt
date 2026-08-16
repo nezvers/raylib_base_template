@@ -99,22 +99,38 @@ if(WIN32)
     endif()
 endif()
 
-# Headless unit tests for the anim / signal modules (desktop only; the test
-# stubs ScreenStateTargetSize so no window/screen_state is needed).
+# Headless unit tests (desktop only; the tests stub ScreenStateTargetSize so no
+# window/screen_state is needed).
+#
+# Two suites:
+#   anim_tests - the ARCHIVED legacy suite. Frozen: build it and run it, but do
+#                not edit or even open tests/archive/ - it is ~3k lines.
+#   zen_tests  - where NEW checks go. Kept small on purpose.
+set(ANIM_TEST_SRC
+    src/anim/anim.c
+    src/anim/anim_ease_custom.c
+    src/anim/anim_io.c
+    src/anim/anim_library.c
+    src/anim/anim_stage.c
+    src/anim/anim_scene.c
+    src/anim/anim_shape_pool.c
+    src/anim/signal.c
+    src/anim/anim_signal.c
+    src/easing/easing.c)
+
 if (NOT "${PLATFORM}" STREQUAL "Web")
     add_executable(anim_tests
-        tests/anim_tests.c
-        src/anim/anim.c
-        src/anim/anim_ease_custom.c
-        src/anim/anim_io.c
-        src/anim/anim_library.c
-        src/anim/anim_stage.c
-        src/anim/anim_scene.c
-        src/anim/anim_shape_pool.c
-        src/anim/signal.c
-        src/anim/anim_signal.c
-        src/easing/easing.c)
+        tests/archive/anim_tests_archived.c
+        ${ANIM_TEST_SRC})
     target_link_libraries(anim_tests raylib)
+
+    # zen_groups.c pulls in the editor's group/selection helpers; the few UI
+    # symbols it references are provided by the test file itself.
+    add_executable(zen_tests
+        tests/zen_tests.c
+        src/anim_editor_zen/zen_groups.c
+        ${ANIM_TEST_SRC})
+    target_link_libraries(zen_tests raylib)
 endif()
 
 # Checks if OSX and links appropriate frameworks (Only required on MacOS)
@@ -144,6 +160,9 @@ message(STATUS " - - - ANIM_SHAPE_POOL_MAX = ${ANIM_SHAPE_POOL_MAX}")
 target_compile_definitions(${PROJECT_NAME} PUBLIC ANIM_SHAPE_POOL_MAX=${ANIM_SHAPE_POOL_MAX})
 if (TARGET anim_tests)
     target_compile_definitions(anim_tests PUBLIC ANIM_SHAPE_POOL_MAX=${ANIM_SHAPE_POOL_MAX})
+endif()
+if (TARGET zen_tests)
+    target_compile_definitions(zen_tests PUBLIC ANIM_SHAPE_POOL_MAX=${ANIM_SHAPE_POOL_MAX})
 endif()
 
 # Setting RESOURCES_PATH

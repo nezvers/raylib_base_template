@@ -184,6 +184,32 @@ void ZenGroupDeleteKeyAt(AnimElem *e, int gi, float t)
     }
 }
 
+// Delete a SET of group keys in one pass. Same reasoning as
+// ZenGroupMoveKeySetTo: resolve every source index before removing anything,
+// since each removal shifts the array under the times still to be matched.
+void ZenGroupDeleteKeySet(AnimElem *e, int gi, const float *times, int n)
+{
+    if (n > ZEN_GROUP_TIMES_MAX) n = ZEN_GROUP_TIMES_MAX;
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+
+        int idx[ZEN_GROUP_TIMES_MAX];
+        for (int s = 0; s < n; s++)
+            idx[s] = KeyIndexNear(tr->keys, tr->keyCount, sizeof(AnimKey),
+                                  times[s], ZEN_AUTOKEY_EPS);
+        // descending, so a removal never renumbers an index still pending.
+        for (int a = 0; a < n; a++)
+            for (int b = a + 1; b < n; b++)
+                if (idx[b] > idx[a]) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+        for (int s = 0; s < n; s++)
+            if (idx[s] >= 0)
+                KeyRemoveAt(tr->keys, &tr->keyCount, sizeof(AnimKey), idx[s]);
+    }
+}
+
 // Copy the member key at srcT onto dstT, verbatim - value, colour AND ease.
 // Unlike ZenGroupWriteKey this does NOT sample the element at the destination:
 // the point of a clone is to restate an earlier pose exactly, so an eased
@@ -217,6 +243,64 @@ bool ZenGroupCloneKeyTo(AnimElem *e, int gi, float srcT, float dstT)
     return any;
 }
 
+// Clone a SET of group keys, keeping their spacing: the EARLIEST key in the
+// set lands on dstT and every other keeps its offset from it. That is what
+// "clone the selection to the playhead" has to mean - a set is a rhythm, not a
+// bag of times, and re-anchoring it anywhere else would rewrite that rhythm.
+//
+// Every member key is snapshotted BEFORE the first write, because a write
+// inserts into the same array the remaining sources are read from. Sources are
+// read by index (resolved up front) for the reason ZenGroupMoveKeySetTo spells
+// out: a freshly written clone landing within ZEN_AUTOKEY_EPS of a pending
+// source would otherwise be picked up as that source.
+//
+// Returns how many group keys wrote at least one member.
+int ZenGroupCloneKeySet(AnimElem *e, int gi, const float *srcT, int n, float dstT)
+{
+    if (n <= 0) return 0;
+    if (n > ZEN_GROUP_TIMES_MAX) n = ZEN_GROUP_TIMES_MAX;
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    if (!g) return 0;
+
+    float first = srcT[0];
+    for (int s = 1; s < n; s++) if (srcT[s] < first) first = srcT[s];
+    if (fabsf(first - dstT) <= ZEN_AUTOKEY_EPS) return 0;   // already there
+
+    bool wrote[ZEN_GROUP_TIMES_MAX] = { 0 };
+    for (int m = 0; m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+
+        AnimKey snap[ZEN_GROUP_TIMES_MAX];
+        bool    have[ZEN_GROUP_TIMES_MAX];
+        for (int s = 0; s < n; s++)
+        {
+            int k = KeyIndexNear(tr->keys, tr->keyCount, sizeof(AnimKey),
+                                 srcT[s], ZEN_AUTOKEY_EPS);
+            have[s] = (k >= 0);
+            if (have[s]) snap[s] = tr->keys[k];
+        }
+        for (int s = 0; s < n; s++)
+        {
+            if (!have[s]) continue;
+            float t = dstT + (srcT[s] - first);
+            AnimKey *dst = AnimPropIsColor(g->props[m])
+                         ? AnimTrackWriteColorKeyAt(tr, t, snap[s].cval, ZEN_AUTOKEY_EPS)
+                         : AnimTrackWriteKeyAt(tr, t, snap[s].value, ZEN_AUTOKEY_EPS);
+            if (!dst) continue;                 // track full
+            dst->value = snap[s].value;
+            dst->cval  = snap[s].cval;
+            dst->ease  = snap[s].ease;
+            wrote[s] = true;
+        }
+    }
+
+    int done = 0;
+    for (int s = 0; s < n; s++) if (wrote[s]) done++;
+    return done;
+}
+
 // The group key at or before t, excluding one sitting on t itself. -1 when the
 // group has nothing to the left (its first key is later than t).
 float ZenGroupKeyTimeLeftOf(AnimElem *e, int gi, float t)
@@ -239,6 +323,44 @@ void ZenGroupMoveKeyTo(AnimElem *e, int gi, float oldT, float newT)
                                   oldT, ZEN_AUTOKEY_EPS) : -1;
         if (k < 0) continue;
         tr->keys[k].t = newT;
+        KeySortByT(tr->keys, tr->keyCount, sizeof(AnimKey));
+    }
+}
+
+// Shift a SET of group keys, as a single atomic pass. Keys are FOUND at
+// curT[s] and LANDED at baseT[s] + delta.
+//
+// The two arrays are separate on purpose. A drag re-applies the shift every
+// frame: the keys sit where the last frame left them (curT), while the target
+// stays measured from the press-time snapshot (baseT) so a long drag cannot
+// accumulate rounding. Passing the snapshot as the lookup instead - the obvious
+// one-array version - matches nothing after the first frame, and the set stops
+// following the cursor.
+//
+// Not a loop over ZenGroupMoveKeyTo either: that resolves one key at a time, so
+// a member sliding within ZEN_AUTOKEY_EPS of a key it is passing (one outside
+// the set, or one this same pass already moved) gets re-grabbed by the next
+// lookup. Resolving EVERY source index up front, before a single write, removes
+// the ambiguity - indices cannot collide the way times can.
+void ZenGroupMoveKeySetTo(AnimElem *e, int gi, const float *curT,
+                          const float *baseT, int n, float delta)
+{
+    if (n > ZEN_GROUP_TIMES_MAX) n = ZEN_GROUP_TIMES_MAX;
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+
+        // resolve first ...
+        int idx[ZEN_GROUP_TIMES_MAX];
+        for (int s = 0; s < n; s++)
+            idx[s] = KeyIndexNear(tr->keys, tr->keyCount, sizeof(AnimKey),
+                                  curT[s], ZEN_AUTOKEY_EPS);
+        // ... then write, so no lookup ever sees a half-shifted track.
+        for (int s = 0; s < n; s++)
+            if (idx[s] >= 0) tr->keys[idx[s]].t = baseT[s] + delta;
+
         KeySortByT(tr->keys, tr->keyCount, sizeof(AnimKey));
     }
 }

@@ -474,6 +474,7 @@ static void Enter()
     // but leaving the editor drops it. span 0 => the clamp helper snaps to full.
     zen.tlViewT0 = 0.0f; zen.tlViewSpan = 0.0f; zen.tlFollow = true;
     zen.dragPlayhead = false; zen.dragKeyGroup = -1;
+    zen.dragKeySet = false; zen.dragKeyOrigCount = 0;
     zen.dragIntro = zen.dragOutro = false;
     zen.dragPause = -1; zen.selPause = -1;
     zen.pausedOnMarker = false; zen.heldPause = -1;

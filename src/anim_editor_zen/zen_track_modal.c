@@ -847,8 +847,7 @@ void ZenTrackModalGui(void)
         if (ZenButton((Rectangle){ x, y, bw, TM_RH }, "delete keys"))
         {
             AudioPlayButton(); ZenUndoPush();
-            for (int i = 0; i < zen.selKeyCount; i++)
-                ZenGroupDeleteKeyAt(e, zen.selGroup, zen.selKeys[i]);
+            ZenGroupDeleteKeySet(e, zen.selGroup, zen.selKeys, zen.selKeyCount);
             zen.selKeyCount = 0;
             ZenSelValidate();
         }
