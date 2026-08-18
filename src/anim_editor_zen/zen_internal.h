@@ -44,6 +44,7 @@
 #define ZEN_ZOOM_TIME     0.2f    // zoom in/out duration in seconds
 
 #define ZEN_MENU_BAR_H    26.0f   // top menu bar height (panels sit below it)
+#define ZEN_SHAPE_DROP_ROWS 12    // visible rows of the shape dropdown; it scrolls
 
 // Modal prompts (small centered boxes, drawn topmost, block other input).
 typedef enum {
@@ -51,6 +52,7 @@ typedef enum {
     ZEN_PROMPT_NEW_NAME,            // File > New: name the fresh animation
     ZEN_PROMPT_SAVE_THEN_SWITCH,    // dirty doc guarded before an Open
     ZEN_PROMPT_SAVE_THEN_EXIT,      // dirty doc guarded before leaving
+    ZEN_PROMPT_SAVE_THEN_EXPORT,    // dirty doc guarded before an export reads it
     ZEN_PROMPT_CONFIRM_DELETE,      // File > Delete of the current animation
     ZEN_PROMPT_RENAME_ANIM,         // File > Rename (moves the .cfg)
     ZEN_PROMPT_COPY_ANIM,           // File > Save As (copy under a new name)
@@ -199,13 +201,40 @@ typedef struct {
     bool easeDropOpen; Rectangle easeDropRect;
     // string-pick dropdown of the track modal (same overlay treatment)
     bool strDropOpen; Rectangle strDropRect;
+    // shape-pick dropdown; unlike the others this one is opened from TWO places
+    // (the track modal's shape row and the inspector's rest-pose row), so the
+    // overlay works out which by looking at what is open.
+    // The pool can hold hundreds of shapes, so this list is capped at
+    // ZEN_SHAPE_DROP_ROWS and scrolls; the scroll is <= 0, in pixels.
+    bool shapeDropOpen; Rectangle shapeDropRect; float shapeDropScroll;
     // add-track dropdown of the inspector
     bool addTrackOpen; int addTrackSel; Rectangle addTrackRect;
+
+    // -- timeline view (zoom / pan) -----------------------------------------
+    // The visible slice of doc time, in seconds. Span (not a zoom factor) is
+    // what the time<->pixel macros want directly, and it clamps trivially.
+    // span <= 0 means "uninitialised" - ZenTimelineClampView snaps it to full.
+    float tlViewT0, tlViewSpan;
+    bool  tlFollow;                 // keep the playhead in frame (View menu)
+    // Pan is velocity-driven, not a per-notch jump: the wheel kicks tlPanVel
+    // and it decays, the edge gutters hold it. One integrator, so the two
+    // sources can never fight each other mid-frame.
+    float tlPanVel;                 // pan velocity, seconds of doc time / sec
+    int   tlEdgeHot;                // pan gutter under the cursor: -1/0=L/1=R
+    float tlEdgeRamp;               // 0..1 ease-in, so entering never lurches
 
     // -- timeline drag state ------------------------------------------------
     bool  dragPlayhead;
     int   dragKeyGroup;             // group being dragged (-1 = none)
     float dragKeyTime;
+    // Dragging a key that is part of a multi-key selection moves the WHOLE set
+    // rigidly. The members' times are snapshotted at press and never refreshed:
+    // ZenGroupMoveKeyTo matches keys BY TIME, so a delta recomputed from live
+    // times could re-grab a key this same drag already moved.
+    bool  dragKeySet;               // the drag moves the whole selKeys[] set
+    float dragKeyAnchor;            // grabbed key's time at press (delta origin)
+    float dragKeyOrig[ANIM_KEYS_MAX * ANIM_GROUP_PROPS];  // == ZEN_GROUP_TIMES_MAX
+    int   dragKeyOrigCount;
     bool  dragIntro, dragOutro;
     int   dragPause;                // pause marker being dragged (-1 = none)
 
@@ -277,6 +306,7 @@ void ZenLibraryInsert(int entry);   // library entry -> new doc element
 // ---------------------------------------------------------------------------
 float ZenTextW(const char *text);   // label width at the current gui font
 float ZenClampF(float v, float lo, float hi);
+bool  ZenStrContainsCI(const char *hay, const char *needle);  // list search filter
 bool  ZenEditSlider(Rectangle r, const char *label, float *v, float lo, float hi);
 bool  ZenSliderTyping(void);        // a slider's value textbox is open
 
@@ -315,6 +345,13 @@ void  ZenEnsureZeroColorKey(AnimElem *e, AnimTrack *tr);
 void  ZenPropSlider(Rectangle r, AnimElem *e, int prop, float *baseField);
 float ZenColorRGBRows(float x, float y, float w, AnimElem *e, int prop,
                       Color *base, const char *label);
+// The four AE_TEXT crumble-shape rows (dir/spread/dist/spin), drawn from x..x+w
+// starting at y and returning the y below them. Shared by the inspector and both
+// modals: the fields live on the ELEMENT, so all three edit the same values and
+// must offer the same controls - a crumble track you can key from the track or
+// signal modal but only shape from the inspector is a discoverability trap.
+// Draws nothing and returns y unchanged for non-text elements.
+float ZenCrumbleRows(float x, float y, float w, float rh, float gap, AnimElem *e);
 // hover tooltip: widgets call ZenTip after drawing; ZenTipDraw paints the one
 // recorded tip topmost at the end of Gui (labels aren't focusable in raygui,
 // so this is hand-rolled rather than GuiSetTooltip).
@@ -332,10 +369,22 @@ bool  ZenGroupHasTrack(AnimElem *e, int gi);
 void  ZenGroupWriteKey(AnimElem *e, int gi, float t);     // key every member
 void  ZenGroupDeleteTracks(AnimElem *e, int gi);
 void  ZenGroupDeleteKeyAt(AnimElem *e, int gi, float t);
+// Delete a whole key set in one index-resolved pass, so removals cannot shift
+// the array out from under the times still to be matched.
+void  ZenGroupDeleteKeySet(AnimElem *e, int gi, const float *times, int n);
 void  ZenGroupMoveKeyTo(AnimElem *e, int gi, float oldT, float newT);
+// Rigid shift of a whole key set: found at curT[s], landed at baseT[s] + delta.
+// Index-resolved, so members can slide past other keys without being re-grabbed
+// by time. See the note on the impl for why the two arrays are separate.
+void  ZenGroupMoveKeySetTo(AnimElem *e, int gi, const float *curT,
+                           const float *baseT, int n, float delta);
 // Restate the group key at srcT verbatim (value, colour and ease) at dstT,
 // rather than sampling the element there the way ZenGroupWriteKey does.
 bool  ZenGroupCloneKeyTo(AnimElem *e, int gi, float srcT, float dstT);
+// Same, for a whole set: the EARLIEST key lands on dstT and the rest keep their
+// offsets from it, so the selection's spacing survives the copy. Returns how
+// many group keys wrote.
+int   ZenGroupCloneKeySet(AnimElem *e, int gi, const float *srcT, int n, float dstT);
 // Time of the nearest group key strictly before t, or -1 when there is none.
 float ZenGroupKeyTimeLeftOf(AnimElem *e, int gi, float t);
 void  ZenGroupSetEaseAt(AnimElem *e, int gi, float t, int ease);
@@ -369,6 +418,8 @@ const char *ZenSigGroupKeyLabel(AnimSignal *sg, int elemIdx, int gi, float u);
 
 // -- track/key selection helpers (ctx-level, shared by panels + modals) -----
 void  ZenSelClear(void);                        // drop track + key selection
+void  ZenSelSwitchElem(int elem);               // pick an element, carrying the
+                                                // open modal's group + key over
 void  ZenSelTrack(int elem, int gi);            // select a whole track
 void  ZenSelKey(int elem, int gi, float t, bool additive);  // click / shift-click
 bool  ZenKeyIsSelected(int elem, int gi, float t);
@@ -382,6 +433,7 @@ const char *ZenPropDesc(int prop);              // plain-language property help
 void ZenPanelsGui(void);            // layout + ELEMENTS/SIGNALS/INSPECTOR/TIMELINE
 void ZenPanelsOverlaysGui(void);    // the add-track list, topmost (must run unlocked)
 void ZenPanelsUpdate(float dt);     // playback slide bookkeeping
+void ZenTimelineClampView(float dur);   // hold the zoom window inside 0..dur
 void ZenFireSignal(const AnimSignal *sg);
 
 // ---------------------------------------------------------------------------
@@ -391,9 +443,11 @@ void ZenTrackModalOpen(int elem, int gi);       // doc-track mode
 void ZenTrackModalOpenSig(int sigIdx);          // signal mode: edits the key
                                                 // selected in zen.sigSel*
 void ZenTrackModalSync(void);                   // reload staged values
+bool ZenTrackModalVisible(void);                // open AND not hidden by playback
 void ZenTrackModalGui(void);                    // drawn above the panels
 void ZenEaseDropOverlayGui(void);               // its ease list, topmost
 void ZenStringDropOverlayGui(void);             // its string-pool list, topmost
+void ZenShapeDropOverlayGui(void);              // its shape-pool list, topmost
 
 // ---------------------------------------------------------------------------
 //  zen_signal_modal.c - the draggable signal modal
@@ -446,11 +500,14 @@ bool ZenCloneTyping(void);          // its time textbox captures the keyboard
 void ZenCloneGui(void);
 
 // -- zen_export.c -----------------------------------------------------------
-// File > Export...: render the document to a GIF, a video (via ffmpeg) or a
-// PNG frame sequence. Draggable like the track/signal modals, and it renders in
-// chunks from the Gui() pass - BeginTextureMode cannot nest inside the one
-// main.c opens around Draw().
+// File > Export...: render a CHAIN of animations - one or more, played back to
+// back - to a GIF, a video (via ffmpeg) or a PNG frame sequence. Draggable like
+// the track/signal modals, and it renders in chunks from the Gui() pass -
+// BeginTextureMode cannot nest inside the one main.c opens around Draw().
 void ZenExportShow(void);           // File > Export...
+// Every link is read from its .cfg, so a dirty document raises
+// ZEN_PROMPT_SAVE_THEN_EXPORT first and the prompt lands here to start the job.
+void ZenExportStartAfterSave(void);
 bool ZenExportOpen(void);           // the modal is showing
 bool ZenExportBusy(void);           // a render is in flight
 bool ZenExportEscClose(void);       // cancel a job, else close; false if not open

@@ -23,10 +23,24 @@
 #include "zen_internal.h"
 #include "../screen_state/screen_state.h"
 #include "../audio_state/audio_state.h"
+#include "../shape_editor/shape_editor.h"
 #include "../anim/signal.h"
 #include <math.h>
 
 #define ZEN_TIMELINE_SNAP 0.1f     // Ctrl-drag key snap grid (seconds)
+// Tightest zoom: two ticks of the finest (0.1s) gridline. Zooming past this
+// buys no precision - the Ctrl-drag snap grid is 0.1s anyway.
+#define ZEN_TL_MIN_SPAN   0.2f
+#define ZEN_TL_ZOOM_STEP  0.85f    // span multiplier per wheel notch / arrow press
+#define ZEN_TL_PAN_STEP   0.15f    // pan per wheel notch, as a fraction of span
+// Pan gutters: hover strips at the two ends of the track area. Speed ramps with
+// how deep the cursor sits in the strip, so touching the inner lip crawls and
+// pinning the outer edge runs flat out - no binary "you are near the edge" lurch.
+#define ZEN_TL_EDGE_W     28.0f    // width of a pan gutter, pixels
+#define ZEN_TL_EDGE_SPEED 0.90f    // full-tilt edge pan, as a fraction of span/sec
+#define ZEN_TL_EDGE_RAMP  6.0f     // ease-in/out rate of that speed, 1/sec
+#define ZEN_TL_PAN_DAMP   12.0f    // pan velocity decay, 1/sec (wheel glide)
+#define ZEN_TL_FOLLOW_EASE 10.0f   // playhead-follow recentre rate, 1/sec
 // How close the scrubbing playhead counts as "on" a key. Wider than
 // ZEN_AUTOKEY_EPS so a sweep reliably catches keys at normal mouse speed, and
 // wide enough that near-coincident keys are picked up together.
@@ -104,8 +118,7 @@ static float DrawElementList(float x, float y, float w)
             if (ctrl && i != zen.selElem) zen.multiSel[i] = !zen.multiSel[i];
             else
             {
-                if (zen.selElem != i) ZenSelClear();
-                zen.selElem = i;
+                ZenSelSwitchElem(i);
                 for (int k = 0; k < ANIM_ELEMS_MAX; k++) zen.multiSel[k] = false;
             }
         }
@@ -448,7 +461,42 @@ static float DrawInspector(float x, float y, float w)
             GuiToggle(rr, AnimShapeKindName(si), &on);
             if (on && e->shapeKind != si) { ZenUndoPush(); e->shapeKind = si; }
         }
-        y += 2*(rh + 4) + gap - 4;
+        // Derived from the count, not hardcoded: the grid is 3 wide, so every
+        // kind appended to AnimShapeKind must push the following rows down.
+        y += ((SHAPE_KIND_COUNT + 2) / 3) * (rh + 4) + gap - 4;
+
+        if (e->shapeKind == SHAPE_CUSTOM)
+        {
+            ZenLabelTip((Rectangle){ x, y, 40, rh }, "pixels",
+                        "Which pixel shape from the shared pool. The shape stores "
+                        "no colour: its fill takes this element's colour and its "
+                        "outline takes the outline colour, so both stay animatable.");
+            int slot = AnimShapePoolFindByName(e->shapeName);
+            bool missing = (slot == ANIM_SHAPE_MISSING);
+            float bw = (w - 44 - 4) * 0.62f;
+
+            int prev = GuiGetStyle(BUTTON, TEXT_COLOR_NORMAL);
+            if (missing) GuiSetStyle(BUTTON, TEXT_COLOR_NORMAL, ColorToInt(ORANGE));
+            const char *lbl = e->shapeName[0]
+                            ? (missing ? TextFormat("missing: %s", e->shapeName)
+                                       : e->shapeName)
+                            : "(none)";
+            if (GuiButton((Rectangle){ x+44, y, bw, rh }, lbl))
+            {
+                zen.shapeDropOpen = !zen.shapeDropOpen;
+                zen.shapeDropRect = (Rectangle){ x+44, y, bw, rh };
+                zen.shapeDropScroll = 0.0f;     // reopen at the top of the list
+            }
+            GuiSetStyle(BUTTON, TEXT_COLOR_NORMAL, prev);
+
+            float ew = w - 44 - bw - 8;
+            if (GuiButton((Rectangle){ x+44+bw+4, y, ew, rh }, "edit..."))
+            {
+                ShapeEditorOpen(e->shapeName);      // empty name = new shape
+                AppStateTransition(&app_state_shape_editor);
+            }
+            y += rh + gap;
+        }
     }
 
     if (e->kind != AE_GLOBAL)
@@ -536,6 +584,8 @@ static float DrawInspector(float x, float y, float w)
     ZenTip(caR, "Base opacity of this colour (0-255). This is the rest pose - "
                 "the 'alpha' track is what animates opacity over time");
     y += 22;
+
+    y = ZenCrumbleRows(x, y, w, rh, gap, e);
 
     if (e->kind == AE_GLOBAL)
     {
@@ -771,6 +821,34 @@ static void DrawMarkerTriangle(float cx, float cy, float r, bool down, Color c)
     else      DrawTriangle((Vector2){cx,cy},(Vector2){cx-r,cy+r},(Vector2){cx+r,cy+r}, c);
 }
 
+// A pan gutter: invisible until hovered, then a soft glow bleeding in from the
+// end of the track with a chevron pointing the way the view will travel.
+// Brightens as the ramp builds, so the speed you are getting is visible.
+static void DrawTimelinePanGutter(Rectangle g, bool left, bool held, float ramp)
+{
+    Color accent = held ? (Color){ 150, 240, 165, 255 }
+                        : (Color){ 150, 220, 160, 255 };
+    // strongest at the outer edge, fading to nothing inward
+    Color hot = Fade(accent, 0.22f + 0.38f * (held ? ramp : 0.0f));
+    Color cold = Fade(accent, 0.0f);
+    Color oL = left ? hot : cold, oR = left ? cold : hot;
+    // corners run top-left, bottom-left, bottom-right, top-right
+    DrawRectangleGradientEx(g, oL, oL, oR, oR);
+
+    // Sideways triangle, wound counter-clockwise so raylib does not cull it.
+    float cy = g.y + g.height*0.5f;
+    float cx = left ? g.x + 9.0f : g.x + g.width - 9.0f;
+    float r  = held ? 9.0f : 7.0f;
+    float tip  = left ? cx - r*0.6f : cx + r*0.6f;
+    float back = left ? cx + r*0.4f : cx - r*0.4f;
+    if (left) DrawTriangle((Vector2){ tip,  cy      },
+                           (Vector2){ back, cy + r  },
+                           (Vector2){ back, cy - r  }, accent);
+    else      DrawTriangle((Vector2){ tip,  cy      },
+                           (Vector2){ back, cy - r  },
+                           (Vector2){ back, cy + r  }, accent);
+}
+
 static void DrawDottedV(float x, float y0, float y1, Color c)
 {
     for (float yy = y0; yy < y1; yy += 8.0f)
@@ -840,7 +918,20 @@ void ZenTimelineCtxGui(void)
     // position the user parked deliberately, and it is what every other "here"
     // in this editor means.
     float dstT   = zen.playhead;
-    bool  keyDst = onKey && fabsf(s_tlCtxKeyTime - dstT) > ZEN_AUTOKEY_EPS;
+
+    // Right-clicking a key that is part of a multi-key selection acts on the
+    // WHOLE set: the selection is what the user built, and having the menu
+    // silently drop it to the one key under the cursor would undo that work.
+    // Right-clicking a key OUTSIDE the set stays single - it was never in it.
+    bool setScope = onKey && zen.selKeyCount > 1 &&
+                    ZenKeyIsSelected(s_tlCtxKeyElem, s_tlCtxKeyGroup, s_tlCtxKeyTime);
+    int   setN    = setScope ? zen.selKeyCount : 0;
+    // The set moves rigidly, anchored on its earliest key, so the whole thing
+    // is blocked only when that anchor already sits on the playhead.
+    float anchorT = s_tlCtxKeyTime;
+    for (int i = 0; i < setN; i++)
+        if (zen.selKeys[i] < anchorT) anchorT = zen.selKeys[i];
+    bool  keyDst = onKey && fabsf(anchorT - dstT) > ZEN_AUTOKEY_EPS;
 
     // rows, in the order they are drawn.
     enum { ROW_PAUSE, ROW_CLONE_ALL, ROW_KEY_CLONE, ROW_KEY_DELETE, ROW_MAX };
@@ -871,16 +962,24 @@ void ZenTimelineCtxGui(void)
     }
     else
     {
-        labels[ROW_KEY_CLONE] = "Clone key to playhead";
-        tips[ROW_KEY_CLONE]   = keyDst
-            ? "Copy this key - values and easing - to the playhead, leaving the "
-              "original where it is"
-            : "The playhead is already on this key; move it first";
+        labels[ROW_KEY_CLONE] = setScope ? "Clone keys at playhead"
+                                         : "Clone key to playhead";
+        tips[ROW_KEY_CLONE]   = !keyDst
+            ? (setScope ? "The playhead is already on the first selected key; move it first"
+                        : "The playhead is already on this key; move it first")
+            : (setScope
+               ? "Copy all selected keys - values and easing - to the playhead, "
+                 "keeping their spacing: the earliest lands on the playhead and "
+                 "the rest follow at the same intervals"
+               : "Copy this key - values and easing - to the playhead, leaving the "
+                 "original where it is");
         offs[ROW_KEY_CLONE]   = !keyDst;
         rows[rowN++] = ROW_KEY_CLONE;
 
-        labels[ROW_KEY_DELETE] = "Delete key";
-        tips[ROW_KEY_DELETE]   = "Remove this key from every track in its group";
+        labels[ROW_KEY_DELETE] = setScope ? "Delete keys" : "Delete key";
+        tips[ROW_KEY_DELETE]   = setScope
+            ? "Remove every selected key from all tracks in its group"
+            : "Remove this key from every track in its group";
         offs[ROW_KEY_DELETE]   = false;
         rows[rowN++] = ROW_KEY_DELETE;
     }
@@ -935,7 +1034,24 @@ void ZenTimelineCtxGui(void)
             break;
 
         case ROW_KEY_CLONE:
-            if (ZenGroupCloneKeyTo(ke, s_tlCtxKeyGroup, s_tlCtxKeyTime, dstT))
+            if (setScope)
+            {
+                // Copy the times out first: the selection is rebuilt below to
+                // point at the clones, which would otherwise be read as sources.
+                float src[ZEN_GROUP_TIMES_MAX];
+                for (int i = 0; i < setN; i++) src[i] = zen.selKeys[i];
+                if (ZenGroupCloneKeySet(ke, s_tlCtxKeyGroup, src, setN, dstT) > 0)
+                {
+                    // Land the selection on the copies, matching the single-key
+                    // case: what was just made is what stays in hand.
+                    for (int i = 0; i < setN; i++)
+                        ZenSelKey(s_tlCtxKeyElem, s_tlCtxKeyGroup,
+                                  dstT + (src[i] - anchorT), i > 0);
+                    ZenSelValidate();   // clones off the end of a full track
+                    ZenTrackModalSync();
+                }
+            }
+            else if (ZenGroupCloneKeyTo(ke, s_tlCtxKeyGroup, s_tlCtxKeyTime, dstT))
             {
                 ZenSelKey(s_tlCtxKeyElem, s_tlCtxKeyGroup, dstT, false);
                 ZenTrackModalSync();
@@ -943,7 +1059,13 @@ void ZenTimelineCtxGui(void)
             break;
 
         case ROW_KEY_DELETE:
-            ZenGroupDeleteKeyAt(ke, s_tlCtxKeyGroup, s_tlCtxKeyTime);
+            if (setScope)
+            {
+                float del[ZEN_GROUP_TIMES_MAX];
+                for (int i = 0; i < setN; i++) del[i] = zen.selKeys[i];
+                ZenGroupDeleteKeySet(ke, s_tlCtxKeyGroup, del, setN);
+            }
+            else ZenGroupDeleteKeyAt(ke, s_tlCtxKeyGroup, s_tlCtxKeyTime);
             zen.selKeyCount = 0;
             ZenSelValidate();       // the group may have lost its last key
             ZenTrackModalSync();
@@ -1024,6 +1146,17 @@ static void DrawSignalOverlay(float x, float y, float w, float h,
     DrawRectangleRec((Rectangle){ sx-6, y+14, 12, 8 }, (Color){ 150, 240, 165, 255 });
 }
 
+// Hold the zoom window inside 0..dur. Called every frame from DrawTimeline, so
+// a duration that changes under a zoomed view (doc reload, duration textbox)
+// re-clamps for free. span <= 0 is the "reset me" sentinel Enter() writes.
+void ZenTimelineClampView(float dur)
+{
+    if (zen.tlViewSpan <= 0.0f || zen.tlViewSpan > dur) zen.tlViewSpan = dur;
+    if (zen.tlViewSpan < ZEN_TL_MIN_SPAN)
+        zen.tlViewSpan = (dur < ZEN_TL_MIN_SPAN) ? dur : ZEN_TL_MIN_SPAN;
+    zen.tlViewT0 = ZenClampF(zen.tlViewT0, 0.0f, dur - zen.tlViewSpan);
+}
+
 static void DrawTimeline(float x, float y, float w, float h)
 {
     bool thin = h < 60.0f;
@@ -1036,32 +1169,184 @@ static void DrawTimeline(float x, float y, float w, float h)
     float gutter = 56.0f, padR = 8.0f;
     float trackLeft = x + gutter, trackW = w - gutter - padR;
 
-    #define T2X(t) (trackLeft + (trackW) * ((t)/dur))
-    #define X2T(px) (((px) - trackLeft)/trackW * dur)
-
-    for (float s = 0; s <= dur + 0.001f; s += 0.5f)
-    {
-        float tx = T2X(s);
-        DrawLine((int)tx, (int)y+2, (int)tx, (int)(y+h-16), (Color){ 50,54,62,255 });
-        if (fmodf(s,1.0f) < 0.01f)
-            DrawText(TextFormat("%.0f", s), (int)tx+2, (int)(y+h-14), 10, (Color){110,116,128,255});
-    }
-
     Vector2 mouse = GetMousePosition();
     bool ctrl  = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
     bool shift = IsKeyDown(KEY_LEFT_SHIFT)   || IsKeyDown(KEY_RIGHT_SHIFT);
     bool press = !zen.guiLocked && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
     bool keyHit = false;
 
+    // ZOOM / PAN. The window is resolved BEFORE the macros are defined, so
+    // everything below - gridlines, keys, playhead, hit-tests - sees one
+    // consistent view for the whole frame.
+    ZenTimelineClampView(dur);
+    {
+        bool overTl = !zen.guiLocked &&
+                      CheckCollisionPointRec(mouse, (Rectangle){ x, y-4, w, h+8 });
+        float wheel = overTl ? GetMouseWheelMove() : 0.0f;
+
+        // Ctrl+wheel zooms about the cursor; Ctrl+arrows zoom about the
+        // playhead. Both keep their anchor time pinned to its pixel.
+        float zoomN = 0.0f, anchorT = zen.playhead, anchorX = -1.0f;
+        if (ctrl && wheel != 0.0f)
+        {
+            zoomN   = wheel;
+            anchorX = mouse.x;
+            anchorT = zen.tlViewT0 + (mouse.x - trackLeft)/trackW * zen.tlViewSpan;
+        }
+        else if (overTl && ctrl)
+        {
+            if (IsKeyPressed(KEY_UP)   || IsKeyPressedRepeat(KEY_UP))   zoomN =  1.0f;
+            if (IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN)) zoomN = -1.0f;
+            // playhead anchor: hold it where it currently sits on screen, so
+            // the bar grows around it instead of jumping.
+            if (zoomN != 0.0f)
+                anchorX = trackLeft +
+                          trackW * ((zen.playhead - zen.tlViewT0)/zen.tlViewSpan);
+        }
+
+        if (zoomN != 0.0f)
+        {
+            zen.tlViewSpan *= powf(ZEN_TL_ZOOM_STEP, zoomN);
+            ZenTimelineClampView(dur);      // clamp span before solving for T0
+            float f = ZenClampF((anchorX - trackLeft)/trackW, 0.0f, 1.0f);
+            zen.tlViewT0 = anchorT - f * zen.tlViewSpan;
+            ZenTimelineClampView(dur);
+        }
+        else if (wheel != 0.0f && !ctrl)    // plain wheel pans
+        {
+            // A kick to the velocity rather than a jump to the position: the
+            // decay below spreads one notch over ~1/DAMP seconds, so repeated
+            // notches blend instead of stepping.
+            zen.tlPanVel -= wheel * zen.tlViewSpan * ZEN_TL_PAN_STEP * ZEN_TL_PAN_DAMP;
+        }
+
+        // PAN GUTTERS. Two hover strips inside the ends of the track area.
+        // They sit ON the track, not beside it, so a key dragged into one is
+        // still on screen and still under the cursor.
+        float dt = GetFrameTime();
+        bool  canPan = (zen.tlViewSpan < dur) && !zen.guiLocked && !thin;
+        Rectangle gutL = { trackLeft,                          y, ZEN_TL_EDGE_W, h };
+        Rectangle gutR = { trackLeft + trackW - ZEN_TL_EDGE_W, y, ZEN_TL_EDGE_W, h };
+
+        zen.tlEdgeHot = -1;
+        if (canPan)
+        {
+            // At a wall that side has nothing left to show, so it offers nothing.
+            if (zen.tlViewT0 > 0.0f && CheckCollisionPointRec(mouse, gutL))
+                zen.tlEdgeHot = 0;
+            else if (zen.tlViewT0 < dur - zen.tlViewSpan &&
+                     CheckCollisionPointRec(mouse, gutR))
+                zen.tlEdgeHot = 1;
+        }
+
+        // Held = actually panning. Hovering alone only lights the gutter; the
+        // button must be down, whether that is a click on the gutter itself or
+        // a key/marker/playhead drag carried into it.
+        bool edgeHeld = (zen.tlEdgeHot >= 0) && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+        zen.tlEdgeRamp = ZenClampF(zen.tlEdgeRamp +
+                                   (edgeHeld ? dt : -dt) * ZEN_TL_EDGE_RAMP, 0.0f, 1.0f);
+        if (edgeHeld)
+        {
+            // depth: 0 at the inner lip, 1 at the outer edge. This is the whole
+            // feel of the thing - speed follows how far in you push.
+            float depth = (zen.tlEdgeHot == 0)
+                        ? (gutL.x + gutL.width - mouse.x) / ZEN_TL_EDGE_W
+                        : (mouse.x - gutR.x) / ZEN_TL_EDGE_W;
+            depth = ZenClampF(depth, 0.0f, 1.0f);
+            float dir = (zen.tlEdgeHot == 0) ? -1.0f : 1.0f;
+            zen.tlPanVel = dir * zen.tlViewSpan * ZEN_TL_EDGE_SPEED *
+                           zen.tlEdgeRamp * depth;
+        }
+
+        // ONE integrator for both sources, so they can never fight mid-frame.
+        if (zen.tlPanVel != 0.0f)
+        {
+            zen.tlViewT0 += zen.tlPanVel * dt;
+            ZenTimelineClampView(dur);
+            // Hitting a wall kills the velocity outright: left running it would
+            // buzz against the clamp and read as a stutter.
+            if (zen.tlViewT0 <= 0.0f || zen.tlViewT0 >= dur - zen.tlViewSpan)
+                zen.tlPanVel = 0.0f;
+            else if (!edgeHeld)
+            {
+                zen.tlPanVel *= expf(-ZEN_TL_PAN_DAMP * dt);
+                if (fabsf(zen.tlPanVel) < 1e-4f) zen.tlPanVel = 0.0f;
+            }
+        }
+
+        // Follow the playhead once it nears the edge of the window. Runs for
+        // playback and scrubbing alike; a no-op when fully zoomed out. It must
+        // stand down while the user is driving the view themselves, or the two
+        // pull opposite ways every frame - that was the old snap-back.
+        bool userPanning = (zen.tlEdgeHot >= 0) || zen.tlPanVel != 0.0f ||
+                           zen.dragPlayhead || zen.dragKeyGroup >= 0 ||
+                           zen.dragIntro || zen.dragOutro || zen.dragPause >= 0;
+        if (zen.tlFollow && zen.tlViewSpan < dur && !userPanning)
+        {
+            float lo = zen.tlViewT0 + zen.tlViewSpan*0.10f;
+            float hi = zen.tlViewT0 + zen.tlViewSpan*0.90f;
+            if (zen.playhead < lo || zen.playhead > hi)
+            {
+                // Ease in rather than snap: a half-span jump mid-playback is
+                // exactly the lurch this rework is meant to remove.
+                float want = ZenClampF(zen.playhead - zen.tlViewSpan*0.5f,
+                                       0.0f, dur - zen.tlViewSpan);
+                float k = 1.0f - expf(-ZEN_TL_FOLLOW_EASE * dt);
+                zen.tlViewT0 += (want - zen.tlViewT0) * k;
+                ZenTimelineClampView(dur);
+            }
+        }
+    }
+    float v0 = zen.tlViewT0, vs = zen.tlViewSpan;
+
+    #define T2X(t) (trackLeft + (trackW) * (((t) - v0)/vs))
+    #define X2T(px) (v0 + ((px) - trackLeft)/trackW * vs)
+
+    // Adaptive gridlines: the finest step whose on-screen spacing still reads.
+    Rectangle tlClip = { trackLeft, y-4, trackW, h+8 };
+    {
+        static const float steps[] = { 0.1f, 0.25f, 0.5f, 1.0f, 2.0f, 5.0f, 10.0f };
+        int si = (int)(sizeof(steps)/sizeof(steps[0])) - 1;
+        for (int i = 0; i < (int)(sizeof(steps)/sizeof(steps[0])); i++)
+            if (trackW * (steps[i]/vs) >= 28.0f) { si = i; break; }
+        float step = steps[si];
+        // 0.25 lands on .25/.75 so it needs two decimals; 0.1 and 0.5 need one.
+        const char *fmt = (step < 1.0f) ? ((step == 0.25f) ? "%.2f" : "%.1f")
+                                        : "%.0f";
+
+        BeginScissorMode((int)tlClip.x, (int)tlClip.y, (int)tlClip.width, (int)tlClip.height);
+        float first = floorf(v0/step) * step;
+        for (float s = first; s <= v0 + vs + step*0.001f; s += step)
+        {
+            if (s < -0.001f || s > dur + 0.001f) continue;
+            float tx = T2X(s);
+            // second boundaries stay brighter, so the ruler reads at a glance
+            bool onSec = fabsf(s - roundf(s)) < step*0.01f;
+            DrawLine((int)tx, (int)y+2, (int)tx, (int)(y+h-16),
+                     onSec ? (Color){ 50,54,62,255 } : (Color){ 38,41,48,255 });
+            if (onSec || step < 1.0f)
+                DrawText(TextFormat(fmt, s), (int)tx+2, (int)(y+h-14), 10,
+                         onSec ? (Color){110,116,128,255} : (Color){82,88,98,255});
+        }
+        EndScissorMode();
+    }
+
     // intro / outro trim dead zones.
     float inEnd = AnimDocIntroEnd(&zen.doc), outStart = AnimDocOutroStart(&zen.doc);
     float inX = T2X(inEnd), outX = T2X(outStart);
-    if (inEnd > 0.0f)
-        DrawRectangleRec((Rectangle){ trackLeft, y+1, inX-trackLeft, h-2 },
-                         (Color){ 90, 140, 200, 26 });
-    if (outStart < dur)
-        DrawRectangleRec((Rectangle){ outX, y+1, x+w-padR-outX, h-2 },
-                         (Color){ 0, 0, 0, 120 });
+    // The dead zones are time-mapped, so zoom can push their edges off the
+    // track; clamp the painted span rather than bleeding over the gutter.
+    {
+        float trackR = trackLeft + trackW;
+        float inClip  = ZenClampF(inX,  trackLeft, trackR);
+        float outClip = ZenClampF(outX, trackLeft, trackR);
+        if (inEnd > 0.0f && inClip > trackLeft)
+            DrawRectangleRec((Rectangle){ trackLeft, y+1, inClip-trackLeft, h-2 },
+                             (Color){ 90, 140, 200, 26 });
+        if (outStart < dur && outClip < trackR)
+            DrawRectangleRec((Rectangle){ outClip, y+1, trackR-outClip, h-2 },
+                             (Color){ 0, 0, 0, 120 });
+    }
 
     // lane layout, kept for the scrub handler below (which lane is the cursor
     // in, so scrubbing can follow the swimlane it passes over).
@@ -1108,6 +1393,10 @@ static void DrawTimeline(float x, float y, float w, float h)
             {
                 float t = times[i];
                 float kx = T2X(t);
+                // Scrolled out of the window: don't draw it over the gutter,
+                // and above all don't let its hit rect claim clicks.
+                if (kx < trackLeft - 12.0f || kx > trackLeft + trackW + 12.0f)
+                    continue;
                 Rectangle hit = { kx-10, ry-10, 20, 20 };
                 bool hot = CheckCollisionPointRec(mouse, hit);
                 if (hot && !zen.guiLocked) { keyHotGroup = gi; keyHotTime = t; }
@@ -1119,8 +1408,11 @@ static void DrawTimeline(float x, float y, float w, float h)
                 if (colorProp >= 0)
                 { Color c = AnimElemColorProp(e, colorProp, t); fill = (Color){c.r,c.g,c.b,255}; }
                 else fill = sel ? (Color){255,255,255,255} : (Color){120,180,240,255};
+                BeginScissorMode((int)tlClip.x, (int)tlClip.y,
+                                 (int)tlClip.width, (int)tlClip.height);
                 DrawDiamond(kx, ry, r + 2.0f, ring);
                 DrawDiamond(kx, ry, r, fill);
+                EndScissorMode();
 
                 if (hot && press)
                 {
@@ -1130,10 +1422,27 @@ static void DrawTimeline(float x, float y, float w, float h)
                         ZenSelKey(zen.selElem, gi, t, true);
                         ZenTrackModalOpen(zen.selElem, gi);
                     }
+                    else if (zen.selKeyCount > 1 && ZenKeyIsSelected(zen.selElem, gi, t))
+                    {
+                        // Grabbing a key that is already part of a multi-key
+                        // selection drags the WHOLE set. ZenSelKey is
+                        // deliberately NOT called: it would collapse the set to
+                        // this one key. The times are snapshotted here and the
+                        // per-frame move is a rigid shift off that snapshot.
+                        ZenUndoPush();                 // once per drag gesture
+                        zen.dragKeyGroup = gi; zen.dragKeyTime = t;
+                        zen.dragKeySet = true; zen.dragKeyAnchor = t;
+                        zen.dragKeyOrigCount = zen.selKeyCount;
+                        for (int s = 0; s < zen.selKeyCount; s++)
+                            zen.dragKeyOrig[s] = zen.selKeys[s];
+                        ZenTrackModalOpen(zen.selElem, gi);
+                        zen.scrollToSelKey = true;
+                    }
                     else
                     {
                         ZenUndoPush();                 // once per drag gesture
                         zen.dragKeyGroup = gi; zen.dragKeyTime = t;
+                        zen.dragKeySet = false;
                         ZenSelKey(zen.selElem, gi, t, false);
                         ZenTrackModalOpen(zen.selElem, gi);
                         zen.scrollToSelKey = true;
@@ -1154,6 +1463,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     bool clockHeld = sigLive || zen.pausedOnMarker;
     float phx = T2X(zen.playhead);
     Color phCol = clockHeld ? (Color){ 150, 90, 90, 255 } : (Color){ 255, 90, 90, 255 };
+    BeginScissorMode((int)tlClip.x, (int)tlClip.y, (int)tlClip.width, (int)tlClip.height);
     DrawLine((int)phx, (int)y, (int)phx, (int)(y+h), phCol);
     DrawRectangleRec((Rectangle){ phx-6, y-2, 12, 10 }, phCol);
     if (clockHeld)
@@ -1161,21 +1471,27 @@ static void DrawTimeline(float x, float y, float w, float h)
         DrawRectangleRec((Rectangle){ phx-3, y, 2, 6 }, (Color){ 30, 30, 34, 255 });
         DrawRectangleRec((Rectangle){ phx+1, y, 2, 6 }, (Color){ 30, 30, 34, 255 });
     }
+    EndScissorMode();
 
     if (sigLive) DrawSignalOverlay(x, y, w, h, trackLeft, trackW);
 
     // trim markers (hit-tested BEFORE the bar scrub).
     Color introCol = (Color){ 120, 190, 255, 255 };
     Color outroCol = (Color){ 255, 160, 90, 255 };
-    if (inEnd > 0.0f)    DrawDottedV(inX,  y+2, y+h-2, introCol);
-    if (outStart < dur)  DrawDottedV(outX, y+2, y+h-2, outroCol);
+    bool introVis = (inX  >= trackLeft - 12.0f && inX  <= trackLeft + trackW + 12.0f);
+    bool outroVis = (outX >= trackLeft - 12.0f && outX <= trackLeft + trackW + 12.0f);
 
     Rectangle introHit = { inX-9,  y,      18, 14 };
     Rectangle outroHit = { outX-9, y+h-14, 18, 14 };
-    bool introHot = CheckCollisionPointRec(mouse, introHit);
-    bool outroHot = CheckCollisionPointRec(mouse, outroHit);
-    DrawMarkerTriangle(inX,  y+1.0f,   introHot ? 9.0f : 7.0f, true,  introCol);
-    DrawMarkerTriangle(outX, y+h-1.0f, outroHot ? 9.0f : 7.0f, false, outroCol);
+    bool introHot = introVis && CheckCollisionPointRec(mouse, introHit);
+    bool outroHot = outroVis && CheckCollisionPointRec(mouse, outroHit);
+
+    BeginScissorMode((int)tlClip.x, (int)tlClip.y, (int)tlClip.width, (int)tlClip.height);
+    if (inEnd > 0.0f)    DrawDottedV(inX,  y+2, y+h-2, introCol);
+    if (outStart < dur)  DrawDottedV(outX, y+2, y+h-2, outroCol);
+    if (introVis) DrawMarkerTriangle(inX,  y+1.0f,   introHot ? 9.0f : 7.0f, true,  introCol);
+    if (outroVis) DrawMarkerTriangle(outX, y+h-1.0f, outroHot ? 9.0f : 7.0f, false, outroCol);
+    EndScissorMode();
 
     if (press && (introHot || outroHot))
     {
@@ -1197,6 +1513,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     for (int i = 0; i < zen.doc.pauseCount; i++)
     {
         float px = T2X(zen.doc.pauses[i].t);
+        if (px < trackLeft - 12.0f || px > trackLeft + trackW + 12.0f) continue;
         Rectangle hit = { px-7, y, 14, 12 };
         bool hot = !zen.guiLocked && CheckCollisionPointRec(mouse, hit);
         if (hot) pauseHot = i;
@@ -1205,12 +1522,14 @@ static void DrawTimeline(float x, float y, float w, float h)
         bool lit  = hot || held || (zen.selPause == i);
         Color pc = lit ? (Color){ 150, 240, 165, 255 } : (Color){ 110, 210, 130, 255 };
 
+        BeginScissorMode((int)tlClip.x, (int)tlClip.y, (int)tlClip.width, (int)tlClip.height);
         DrawDottedV(px, y+2, y+h-2, pc);
         if (lit) DrawDottedV(px+1, y+2, y+h-2, pc);   // thicken, don't recolour
         DrawRectangleRec((Rectangle){ px-6, y, 12, 8 }, pc);
         // the pause glyph itself: two bars, same idiom as the frozen playhead
         DrawRectangleRec((Rectangle){ px-3, y+2, 2, 4 }, (Color){ 24, 26, 30, 255 });
         DrawRectangleRec((Rectangle){ px+1, y+2, 2, 4 }, (Color){ 24, 26, 30, 255 });
+        EndScissorMode();
 
         ZenTip(hit, zen.doc.pauses[i].once
             ? "Pause marker (first pass only) - drag to retime, right-click to delete"
@@ -1264,9 +1583,39 @@ static void DrawTimeline(float x, float y, float w, float h)
                  zen.doc.pauseCount ? (Color){ 110, 210, 130, 255 }
                                     : (Color){ 90, 94, 104, 255 });
 
+    // Zoom readout, so the state is discoverable. Hidden at 1x, where the
+    // window IS the doc and there is nothing to report.
+    if (!thin && vs < dur)
+    {
+        const char *zt = TextFormat("%.1fx  %s", dur/vs,
+                                    zen.tlFollow ? "follow" : "free");
+        DrawText(zt, (int)(x + w - padR - MeasureText(zt, 10) - 2),
+                 (int)(y + h - 14), 10, (Color){ 140, 170, 210, 255 });
+    }
+
     // bar scrub. Plain scrub re-points the track modal at whatever lane the
     // cursor is in; Shift+scrub sweeps keys into the selection as it crosses
     // them (the quick way to grab a run of keys without clicking each).
+    // PAN GUTTERS. Velocity was already resolved up in the zoom/pan block (it
+    // has to land before v0/vs are snapshotted, or the pan lags a frame behind
+    // whatever is being dragged); all that is left here is to paint them and to
+    // claim a bare press so clicking the arrow does not also start a scrub.
+    // Keys and markers still win - they have set keyHit by now.
+    if (zen.tlEdgeHot >= 0)
+    {
+        Rectangle gut = (zen.tlEdgeHot == 0)
+                      ? (Rectangle){ trackLeft, y, ZEN_TL_EDGE_W, h }
+                      : (Rectangle){ trackLeft + trackW - ZEN_TL_EDGE_W, y,
+                                     ZEN_TL_EDGE_W, h };
+        bool held = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+        BeginScissorMode((int)tlClip.x, (int)tlClip.y, (int)tlClip.width, (int)tlClip.height);
+        DrawTimelinePanGutter(gut, zen.tlEdgeHot == 0, held, zen.tlEdgeRamp);
+        EndScissorMode();
+        ZenTip(gut, "Pan the timeline - click and hold, or drag a key in here");
+
+        if (press && !keyHit) { AudioPlayButton(); keyHit = true; }
+    }
+
     if (press && !keyHit &&
         CheckCollisionPointRec(mouse, (Rectangle){ x, y-4, w, h+4 }))
     {
@@ -1280,9 +1629,41 @@ static void DrawTimeline(float x, float y, float w, float h)
         float nt = ZenClampF(X2T(mouse.x), 0.0f, dur);
         // Ctrl snaps the key to the tick grid while dragging.
         if (ctrl) nt = ZenClampF(roundf(nt / ZEN_TIMELINE_SNAP) * ZEN_TIMELINE_SNAP, 0.0f, dur);
-        ZenGroupMoveKeyTo(de, zen.dragKeyGroup, zen.dragKeyTime, nt);
-        zen.dragKeyTime = nt;
-        if (zen.selKeyCount == 1) zen.selKeys[0] = nt;
+
+        if (zen.dragKeySet)
+        {
+            // Rigid shift of the whole selection. The grabbed key chases the
+            // cursor (and the Ctrl grid); everyone else keeps their offset to
+            // it, so the set never squashes - it just blocks at 0 / dur.
+            int   sn = zen.dragKeyOrigCount;
+            float delta = nt - zen.dragKeyAnchor;
+            float lo = zen.dragKeyOrig[0], hi = zen.dragKeyOrig[0];
+            for (int s = 1; s < sn; s++)
+            {
+                if (zen.dragKeyOrig[s] < lo) lo = zen.dragKeyOrig[s];
+                if (zen.dragKeyOrig[s] > hi) hi = zen.dragKeyOrig[s];
+            }
+            delta = ZenClampF(delta, -lo, dur - hi);
+
+            // The keys sit where LAST frame put them, so that is what the
+            // lookup must match; the target stays anchored to the press-time
+            // snapshot so rounding cannot accumulate over a long drag.
+            // One atomic pass, because a per-key loop would let a member
+            // sliding past another key be re-grabbed by time.
+            float cur[ZEN_GROUP_TIMES_MAX];
+            for (int s = 0; s < sn; s++) cur[s] = zen.selKeys[s];
+            ZenGroupMoveKeySetTo(de, zen.dragKeyGroup, cur, zen.dragKeyOrig, sn, delta);
+
+            for (int s = 0; s < sn; s++) zen.selKeys[s] = zen.dragKeyOrig[s] + delta;
+            zen.selKeyCount = sn;
+            zen.dragKeyTime = zen.dragKeyAnchor + delta;
+        }
+        else
+        {
+            ZenGroupMoveKeyTo(de, zen.dragKeyGroup, zen.dragKeyTime, nt);
+            zen.dragKeyTime = nt;
+            if (zen.selKeyCount == 1) zen.selKeys[0] = nt;
+        }
         ZenTrackModalSync();
     }
     else if (zen.dragPlayhead && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
@@ -1349,6 +1730,7 @@ static void DrawTimeline(float x, float y, float w, float h)
     }
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
     { zen.dragPlayhead = false; zen.dragKeyGroup = -1;
+      zen.dragKeySet = false; zen.dragKeyOrigCount = 0;
       zen.dragIntro = false; zen.dragOutro = false; zen.dragPause = -1; }
 
     #undef T2X

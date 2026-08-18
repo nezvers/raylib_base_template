@@ -235,8 +235,16 @@ void ZenCloneGui(void)
         int extras = 0;
         if (n >= 0)
         {
-            if (canShape && s_copyShapeKind && dst->shapeKind != src->shapeKind)
-            { dst->shapeKind = src->shapeKind; extras++; }
+            // shapeName travels WITH shapeKind: copying SHAPE_CUSTOM alone would
+            // leave the destination pointing at whatever shape it had before.
+            if (canShape && s_copyShapeKind &&
+                (dst->shapeKind != src->shapeKind ||
+                 !TextIsEqual(dst->shapeName, src->shapeName)))
+            {
+                dst->shapeKind = src->shapeKind;
+                TextCopy(dst->shapeName, src->shapeName);
+                extras++;
+            }
         }
 
         if (n < 0)

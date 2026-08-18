@@ -419,6 +419,9 @@ static void Enter()
     ZenRescanAnims();
     AnimLibraryLoad(&zen.library, ZEN_LIB_PATH);
     AnimCustomEasesLoad(ZenAnimPath("_easings"));   // before any doc load
+    // Also before any doc load, and for the same reason: a document's shape
+    // references resolve by NAME against the live pool as it is read.
+    AnimShapePoolLoadAll(ANIM_SHAPE_RES_DIR, ANIM_SHAPE_USER_DIR);
 
     // Reopen the animation last left (this run only), else the first saved
     // one, else start on a demo. A remembered anim deleted since just misses.
@@ -466,8 +469,13 @@ static void Enter()
     zen.trackModal = (ZenTrackModal){0};
     zen.trackModal.sig = -1;
     zen.easeDropOpen = false; zen.addTrackOpen = false; zen.addTrackSel = 0;
-    zen.strDropOpen = false;
+    zen.strDropOpen = false; zen.shapeDropOpen = false;
+    // Timeline zoom is per-visit: it survives playback and element switches,
+    // but leaving the editor drops it. span 0 => the clamp helper snaps to full.
+    zen.tlViewT0 = 0.0f; zen.tlViewSpan = 0.0f; zen.tlFollow = true;
+    zen.tlPanVel = 0.0f; zen.tlEdgeHot = -1; zen.tlEdgeRamp = 0.0f;
     zen.dragPlayhead = false; zen.dragKeyGroup = -1;
+    zen.dragKeySet = false; zen.dragKeyOrigCount = 0;
     zen.dragIntro = zen.dragOutro = false;
     zen.dragPause = -1; zen.selPause = -1;
     zen.pausedOnMarker = false; zen.heldPause = -1;
@@ -492,6 +500,9 @@ static void Exit()
 
     ZenGuideStop();     // never leave a tour holding a stage slot behind us
     AnimSignalUnregister(&zen.doc, &zen.preview);
+    // Drop the baked shape stencils. They rebake lazily on the next draw, so
+    // this costs nothing but keeps the GPU handles owned by whoever is running.
+    AnimShapePoolUnloadTextures();
 }
 
 static void Update()
@@ -583,12 +594,15 @@ static void Update()
         else if (zen.libOpen)               zen.libOpen = false;
         else if (zen.openListOpen)          zen.openListOpen = false;
         else if (zen.easeDropOpen || zen.addTrackOpen || zen.strDropOpen ||
-                 zen.sigDropMode != 0)
+                 zen.shapeDropOpen || zen.sigDropMode != 0)
         { zen.easeDropOpen = false; zen.addTrackOpen = false;
-          zen.strDropOpen = false; ZenSigCloseDrops(); }
+          zen.strDropOpen = false; zen.shapeDropOpen = false; ZenSigCloseDrops(); }
         else if (ZenTimelineCtxOpen())      ZenTimelineCtxClose();
         else if (ZenViewCtxOpen())          ZenViewCtxClose();
-        else if (zen.trackModal.open)       zen.trackModal.open = false;
+        // ...but only while it is actually on screen: hidden by playback it must
+        // not silently eat the press that the user meant for the editor.
+        else if (zen.trackModal.open && ZenTrackModalVisible())
+                                            zen.trackModal.open = false;
         else if (zen.sigModalIdx >= 0)
         { zen.sigModalIdx = -1; zen.edSigIdx = -1; ZenSigClearKeySel(); }
         else if (zen.menuOpen >= 0 || zen.hotkeyNav)
@@ -666,7 +680,7 @@ static void Gui()
          CheckCollisionPointRec(mouse, zen.sigModalRect)) ||
         (ZenExportOpen() && CheckCollisionPointRec(mouse, ZenExportRect()));
     bool dropOpen = zen.menuOpen >= 0 || zen.easeDropOpen || zen.addTrackOpen
-                 || zen.strDropOpen
+                 || zen.strDropOpen || zen.shapeDropOpen
                  || zen.sigDropMode != 0 || ZenViewCtxOpen() || ZenTimelineCtxOpen();
     bool fullModal = ZenMenuModalOpen() || ZenEasingModalOpen() || ZenCloneOpen()
                   || ZenStringPoolOpen();
@@ -690,7 +704,7 @@ static void Gui()
     // per modal while the other one owns the gesture.
     bool floatLock = fullModal
                   || zen.easeDropOpen || zen.addTrackOpen || zen.strDropOpen
-                  || zen.sigDropMode != 0;
+                  || zen.shapeDropOpen || zen.sigDropMode != 0;
     bool sigLock = floatLock || !ZenLayerActive(ZEN_LAYER_FLOAT_SIG);
     bool trkLock = floatLock || !ZenLayerActive(ZEN_LAYER_FLOAT_TRACK);
 
@@ -717,6 +731,7 @@ static void Gui()
     ZenSignalOverlaysGui();
     ZenEaseDropOverlayGui();
     ZenStringDropOverlayGui();
+    ZenShapeDropOverlayGui();
     ZenMenuOverlaysGui();
     ZenEasingGui();
     ZenCloneGui();

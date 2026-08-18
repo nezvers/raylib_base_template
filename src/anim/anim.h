@@ -33,6 +33,7 @@
 
 #include "raylib.h"
 #include "signal.h"   // SignalParams (per-emit position parameter)
+#include "anim_shape_pool.h"  // ANIM_SHAPE_NAME_MAX (SHAPE_CUSTOM element field)
 #include <stdbool.h>
 
 // ---------------------------------------------------------------------------
@@ -87,6 +88,12 @@
 #define ANIM_TRACKS_MAX    12   // tracks (animated properties) per element
                                 // (>= the largest per-kind property count, so
                                 //  every property of an element is trackable)
+                                // EXACTLY FULL FOR BOTH: SHAPE and TEXT each
+                                // have 12 properties, so a 13th prop on either
+                                // must raise this too, or that prop silently
+                                // becomes untrackable once the other 12 have
+                                // tracks. tests/anim_tests.c TestGroupCoverage
+                                // asserts the fit.
 #define ANIM_ELEMS_MAX     12   // elements per document
 #define ANIM_SIGNALS_MAX    4   // signals per document (a signal is the single
                                 // largest sub-struct, ~3.4 KB each)
@@ -148,6 +155,13 @@ typedef enum {
     AP_T_ALPHA,         // 0..1 opacity
     AP_T_ROT,           // whole-text rotation, degrees
     AP_T_CRUMBLE,       // 0..1 per-glyph crumble amount (0 = intact)
+    // The SHAPE of that crumble, animatable alongside the amount above. Each
+    // one's rest pose (no track) is the element's matching crumble* field, so a
+    // document that never keys them behaves exactly as before they existed.
+    AP_T_CRUMBLE_DIR,   // travel direction, degrees (90 = down)
+    AP_T_CRUMBLE_SPREAD,// cone width around the direction, degrees
+    AP_T_CRUMBLE_DIST,  // travel distance at crumble=1, fraction of game HEIGHT
+    AP_T_CRUMBLE_SPIN,  // per-glyph tumble at crumble=1, degrees (+/- per glyph)
     AP_T_COLOR,         // RGBA tint; keys use AnimKey.cval, not value
     AP_T_STRING,        // WHICH STRING is shown: the key's value is an INDEX
                         // into AnimDoc.strings (see AnimString). STEPPED, never
@@ -169,6 +183,14 @@ typedef enum {
     AP_S_SCALE,         // uniform size MULTIPLIER on top of w/h (1 = authored
                         // size). The one-track way to grow/shrink a shape
                         // without keeping w and h in proportion by hand.
+    AP_S_SHAPE,         // SHAPE_CUSTOM only: WHICH PIXEL SHAPE is drawn. The
+                        // key's value is a slot INDEX into the global shape pool
+                        // (anim_shape_pool.h), exactly as AP_T_STRING indexes
+                        // AnimDoc.strings. STEPPED, never interpolated - there
+                        // is no midpoint between two shapes, so the left key's
+                        // shape holds until the next key SNAPS to the new one
+                        // (AnimPropIsStepped). Documents store the NAME, not
+                        // this index; see anim_io.c's shape_ref lines.
 
     // GLOBAL (200..) --------------------------------------------------------
     AP_G_FADE = 200,    // whole-screen fade-to-color amount, 0..1
@@ -204,10 +226,18 @@ typedef enum { AE_TEXT = 0, AE_SHAPE, AE_GLOBAL } AnimElemKind;
 //   RHOMBUS  diamond with diagonals w (horizontal) and h (vertical)
 //   TRIANGLE isosceles pointing up: apex at -h/2, base w wide at +h/2
 //   LINE     segment of length game.x * w, thickness game.y * h; fill colour
+//   CUSTOM   hand-authored pixel bitmap from the global shape pool, stretched
+//            into the w x h box. WHICH shape comes from AnimElem.shapeName
+//            (rest pose) or an AP_S_SHAPE track (stepped). The bitmap stores no
+//            colour: its FILL cells take AP_S_COLOR and its OUTLINE cells take
+//            AP_S_OUTLINE_COLOR, so it recolours and animates like any other
+//            shape. AP_S_OUTLINE (thickness) is unused - the outline is pixels.
 // Order is the stable .cfg representation (anim_io.c) - do not reorder.
+// APPENDING is fine; anything else silently remaps existing documents.
 typedef enum {
     SHAPE_RECT = 0, SHAPE_CIRCLE, SHAPE_SQUARE,
     SHAPE_RHOMBUS, SHAPE_TRIANGLE, SHAPE_LINE,
+    SHAPE_CUSTOM,
     SHAPE_KIND_COUNT
 } AnimShapeKind;
 
@@ -233,6 +263,11 @@ typedef struct {
                                        // upright. Lets a static shape be rotated
                                        // (and a line be authored by endpoints).
     int     shapeKind;                 // AnimShapeKind (AE_SHAPE only)
+    char    shapeName[ANIM_SHAPE_NAME_MAX]; // SHAPE_CUSTOM: rest-pose pool shape,
+                                       // by NAME (pool slot indices are runtime
+                                       // only). Empty or unresolvable draws the
+                                       // missing-shape placeholder. An AP_S_SHAPE
+                                       // track overrides this when it has keys.
     Color   outlineColor;              // AE_SHAPE: outline tint (rest pose)
     float   outlineFrac;               // AE_SHAPE: outline thickness, fraction
                                        // of game height; 0 = no outline
@@ -267,6 +302,27 @@ typedef struct {
                                        // (FLAG_MSAA_4X_HINT in main.c) to smooth
                                        // all edges app-wide, or pixel-snap the
                                        // crisp draw to match the baked look.
+
+    // AE_TEXT: the REST POSE of the crumble scatter's shape. The AP_T_CRUMBLE
+    // track says how far ALONG the effect is (0 intact, 1 gone); these say what
+    // it looks like while it gets there. Each has a matching AP_T_CRUMBLE_*
+    // track and behaves like rotBase does for AP_T_ROT: the field is what the
+    // element uses until a track drives that param. Angles are screen-space
+    // degrees: 0 = right, turning CLOCKWISE (screen y is down), so 90 = straight
+    // down. The defaults reproduce the look the effect had when it was
+    // hardcoded - see AnimElemInit.
+    float   crumbleRot;                // per-glyph tumble at crumble=1, in
+                                       // degrees; each glyph gets its own
+                                       // amount between -this and +this, so 0
+                                       // keeps every letter upright.
+    float   crumbleDir;                // travel direction, degrees (90 = down)
+    float   crumbleSpread;             // cone width around crumbleDir, degrees;
+                                       // 0 = every glyph travels the same way,
+                                       // 360 = scattered in all directions
+    float   crumbleDist;               // travel distance at crumble=1, as a
+                                       // fraction of game HEIGHT (both axes, so
+                                       // the scatter keeps its shape whatever
+                                       // the aspect ratio)
 
     AnimTrack tracks[ANIM_TRACKS_MAX];
     int       trackCount;

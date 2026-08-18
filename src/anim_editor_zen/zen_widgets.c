@@ -48,6 +48,23 @@ float ZenTextW(const char *text)
            sp * (float)TextLength(text);
 }
 
+// Case-insensitive substring test, for the search boxes that filter a list of
+// animation names (File > Open, the export chain's picker). ASCII only: the
+// names come from filenames this editor itself writes, so `| 32` is the whole
+// of the case folding needed.
+bool ZenStrContainsCI(const char *hay, const char *needle)
+{
+    if (!needle[0]) return true;
+    for (; *hay; hay++)
+    {
+        const char *h = hay, *n = needle;
+        while (*h && *n &&
+               (*h | 32) == (*n | 32)) { h++; n++; }   // ascii lowercase both
+        if (!*n) return true;
+    }
+    return false;
+}
+
 // Plain-language description of an animatable property. The short .cfg names
 // (AnimPropName: "rot", "w", "fade") are the file format and stay as they are;
 // this is what the UI explains on hover.
@@ -60,7 +77,11 @@ const char *ZenPropDesc(int prop)
         case AP_T_SIZE:  return "Font size, as a fraction of the screen height - so text keeps its proportions on any display";
         case AP_T_ALPHA: return "Opacity of the text: 0 is fully transparent, 1 is fully opaque";
         case AP_T_ROT:   return "Rotation of the whole text block, in degrees (positive turns clockwise)";
-        case AP_T_CRUMBLE: return "Per-glyph crumble: 0 leaves the text intact, 1 scatters the letters apart";
+        case AP_T_CRUMBLE: return "Per-glyph crumble: 0 leaves the text intact, 1 scatters the letters apart. Every crumble key also carries the four rows below it, so the shape of the scatter can change as it happens";
+        case AP_T_CRUMBLE_DIR: return "Which way the letters travel, in degrees. 0 throws them right and the angle turns clockwise, so 90 is straight down, 180 left, 270 up";
+        case AP_T_CRUMBLE_SPREAD: return "How wide the scatter fans out around that direction, in degrees. 0 sends every letter the same way; 360 throws them in all directions";
+        case AP_T_CRUMBLE_DIST: return "How far the letters travel once the crumble reaches 1, as a fraction of the screen height. The motion accelerates, so most of it happens late";
+        case AP_T_CRUMBLE_SPIN: return "How much each letter tumbles by the time the crumble reaches 1, in degrees. Each letter gets its own amount between plus and minus this, so 0 keeps them all upright";
         case AP_T_COLOR: return "Text colour. Keyed as RGB, so a key blends between colours over time";
 
         case AP_S_POS_X: return "Horizontal position of the shape's center, as a fraction of the screen width (0 = left edge, 1 = right edge)";
@@ -133,7 +154,8 @@ static ZenLayer LayerAtCursor(Vector2 m)
     // click, so they own the cursor wherever it is.
     if (ZenMenuModalOpen() || ZenEasingModalOpen() || ZenCloneOpen() ||
         ZenStringPoolOpen() || zen.menuOpen >= 0 || zen.easeDropOpen ||
-        zen.addTrackOpen || zen.strDropOpen || zen.sigDropMode != 0 ||
+        zen.addTrackOpen || zen.strDropOpen || zen.shapeDropOpen ||
+        zen.sigDropMode != 0 ||
         ZenViewCtxOpen() || ZenTimelineCtxOpen())
         return ZEN_LAYER_OVERLAY;
 
@@ -507,6 +529,59 @@ float ZenColorRGBRows(float x, float y, float w, AnimElem *e, int prop,
             ZenAutoKeyFocus(ElemIndex(e), prop, zen.playhead);
         }
     }
+    return y;
+}
+
+// How the letters come apart, as a REST POSE: the value each param holds where
+// no crumble key drives it (the same relationship rot has with the 'rot' track).
+// This is what you set up BEFORE keying a crumble, and what an element that
+// never keys the scatter uses throughout. To make the shape CHANGE during the
+// effect, key it on the crumble track - every crumble key carries all four.
+// ZenEditSlider pushes its own undo snapshot per gesture, so these write
+// straight to the field.
+float ZenCrumbleRows(float x, float y, float w, float rh, float gap, AnimElem *e)
+{
+    if (!e || e->kind != AE_TEXT) return y;
+
+    GuiLine((Rectangle){ x, y, w, 8 }, "crumble (rest pose)"); y += 12;
+
+    Rectangle cdR = { x+44, y, w-44-50, rh };
+    ZenEditSlider(cdR, "", &e->crumbleDir, 0.0f, 360.0f);
+    ZenLabelTip((Rectangle){ x, y, 44, rh }, "dir",
+                "Which way the letters travel, in degrees, where no crumble "
+                "key says otherwise. 0 throws them right and the angle turns "
+                "clockwise, so 90 is straight down (the default), 180 left, "
+                "270 up");
+    y += rh + gap;
+
+    Rectangle csR = { x+44, y, w-44-50, rh };
+    ZenEditSlider(csR, "", &e->crumbleSpread, 0.0f, 360.0f);
+    ZenLabelTip((Rectangle){ x, y, 44, rh }, "spread",
+                "How wide the scatter fans out around that direction, in "
+                "degrees, where no crumble key says otherwise. 0 sends every "
+                "letter the same way; 360 throws them in all directions");
+    y += rh + gap;
+
+    Rectangle cnR = { x+44, y, w-44-50, rh };
+    ZenEditSlider(cnR, "", &e->crumbleDist, 0.0f, 2.0f);
+    ZenLabelTip((Rectangle){ x, y, 44, rh }, "dist",
+                "How far the letters travel once the crumble reaches 1, as a "
+                "fraction of the screen height, where no crumble key says "
+                "otherwise. The motion accelerates, so most of it happens "
+                "late");
+    y += rh + gap;
+
+    // "spin", not "rot": the rotation row elsewhere is this element's own
+    // AP_T_ROT, and two rows labelled rot is a bug report waiting to happen.
+    Rectangle crR = { x+44, y, w-44-50, rh };
+    ZenEditSlider(crR, "", &e->crumbleRot, -720.0f, 720.0f);
+    ZenLabelTip((Rectangle){ x, y, 44, rh }, "spin",
+                "How much each letter tumbles by the time the crumble reaches "
+                "1, in degrees, where no crumble key says otherwise. Each letter "
+                "gets its own amount between plus and minus this, so 0 keeps "
+                "them all upright");
+    y += rh + gap;
+
     return y;
 }
 

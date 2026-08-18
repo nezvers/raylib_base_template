@@ -197,6 +197,8 @@ static void ActVwTimeline(void)  { zen.showTimeline = !zen.showTimeline; }
 static bool ChkVwTimeline(void)  { return zen.showTimeline; }
 static void ActVwZoom(void)      { zen.zoomFull = !zen.zoomFull; }
 static bool ChkVwZoom(void)      { return zen.zoomFull; }
+static void ActVwFollow(void)    { zen.tlFollow = !zen.tlFollow; }
+static bool ChkVwFollow(void)    { return zen.tlFollow; }
 
 // -- Easing -----------------------------------------------------------------
 static void ActEaBrowse(void)    { ZenEasingBrowserOpen(); }
@@ -295,6 +297,7 @@ static void MenusInit(void)
     AddItem(m, "Timeline panel",  'T', ActVwTimeline,  NULL, ChkVwTimeline,  "Show / hide the TIMELINE panel");
     AddItem(m, "-",               0,   NULL,           NULL, NULL,           NULL);
     AddItem(m, "Edit at 1:1 zoom",'Z', ActVwZoom,      NULL, ChkVwZoom,      "Edit at actual screen size instead of zoomed out");
+    AddItem(m, "Follow playhead", 'F', ActVwFollow,    NULL, ChkVwFollow,    "Keep the playhead in frame while the timeline is zoomed in");
 
     m = &s_menus[s_menuCount++]; *m = (ZenMenu){ "Easing", 'G' };
     AddItem(m, "Browse easings...", 'B', ActEaBrowse, NULL, NULL, "View, hide and create easing curves");
@@ -460,19 +463,6 @@ static void DrawMenuDropdown(void)
 }
 
 // File > Open: centered searchable, scrollable list of every saved animation.
-static bool StrContainsCI(const char *hay, const char *needle)
-{
-    if (!needle[0]) return true;
-    for (; *hay; hay++)
-    {
-        const char *h = hay, *n = needle;
-        while (*h && *n &&
-               (*h | 32) == (*n | 32)) { h++; n++; }   // ascii lowercase both
-        if (!*n) return true;
-    }
-    return false;
-}
-
 static void DrawOpenList(void)
 {
     if (!zen.openListOpen) return;
@@ -496,7 +486,7 @@ static void DrawOpenList(void)
     // filter first so scroll bounds match what's shown
     int vis[ZEN_ANIM_LIST_MAX], nvis = 0;
     for (int i = 0; i < zen.animCount; i++)
-        if (StrContainsCI(zen.animList[i], s_openSearch)) vis[nvis++] = i;
+        if (ZenStrContainsCI(zen.animList[i], s_openSearch)) vis[nvis++] = i;
 
     Rectangle list = { m.x+12, m.y+64, mw-24, mh-64-46 };
     if (CheckCollisionPointRec(GetMousePosition(), list))
@@ -556,28 +546,47 @@ static void DrawPromptModal(void)
     {
     case ZEN_PROMPT_SAVE_THEN_SWITCH:
     case ZEN_PROMPT_SAVE_THEN_EXIT:
+    case ZEN_PROMPT_SAVE_THEN_EXPORT:
     {
-        bool exiting = zen.prompt == ZEN_PROMPT_SAVE_THEN_EXIT;
-        GuiLabel(msg, TextFormat("Save changes to \"%s\"?",
-                                 zen.animCurrent >= 0 ? zen.animList[zen.animCurrent]
-                                                      : "*unsaved"));
+        bool exiting   = zen.prompt == ZEN_PROMPT_SAVE_THEN_EXIT;
+        // The export reads every animation from its .cfg, so an unsaved edit
+        // would silently not appear in the output. Same three choices, but
+        // neither branch leaves the current document - it just has to be on
+        // disk (or knowingly not) before the job may read it.
+        bool exporting = zen.prompt == ZEN_PROMPT_SAVE_THEN_EXPORT;
+        const char *nm = zen.animCurrent >= 0 ? zen.animList[zen.animCurrent]
+                                              : "*unsaved";
+        GuiLabel(msg, exporting
+            ? TextFormat("Export reads \"%s\" from disk. Save changes first?", nm)
+            : TextFormat("Save changes to \"%s\"?", nm));
         if (GuiButton((Rectangle){ m.x+16, by, bw, bh }, "Save"))
         {   // saving rescans (list may reorder): re-find the target by name.
             AudioPlayButton();
             char target[ANIM_NAME_MAX] = {0};
-            if (!exiting) TextCopy(target, zen.animList[zen.promptTargetIdx]);
+            if (!exiting && !exporting)
+                TextCopy(target, zen.animList[zen.promptTargetIdx]);
             ZenSaveCurrent();
             zen.prompt = ZEN_PROMPT_NONE;
-            if (exiting) ZenExitEditor();
+            if (exporting)   ZenExportStartAfterSave();
+            else if (exiting) ZenExitEditor();
             else ZenLoadAnimByIndex(ZenAnimFind(target));
         }
-        if (GuiButton((Rectangle){ m.x+(mw-bw)/2, by, bw, bh }, "Discard"))
+        // "Discard" is wrong for the export: nothing is thrown away, the job
+        // just reads what is already on disk.
+        if (GuiButton((Rectangle){ m.x+(mw-bw)/2, by, bw, bh },
+                      exporting ? "Use saved" : "Discard"))
         {
             AudioPlayButton();
-            zen.docDirty = false;
+            // Discard for switch/exit means throwing the edits away, so the
+            // dirty flag goes with them. For an export it means only "do not
+            // write them to the file first" - the document is not being closed
+            // and the edits are still in it, so it stays DIRTY or the next Open
+            // would drop them without asking.
+            if (!exporting) zen.docDirty = false;
             int t = zen.promptTargetIdx;
             zen.prompt = ZEN_PROMPT_NONE;
-            if (exiting) ZenExitEditor();
+            if (exporting)   ZenExportStartAfterSave();
+            else if (exiting) ZenExitEditor();
             else ZenLoadAnimByIndex(t);
         }
         if (GuiButton((Rectangle){ m.x+mw-bw-16, by, bw, bh }, "Cancel"))
@@ -940,6 +949,15 @@ static const char *k_helpLines[] = {
     "  outro sections.",
     "  Right-click anywhere on the bar to add or remove a pause marker, and",
     "  see the marker count in the bottom-left (see PAUSE MARKERS).",
+    "  ZOOM: on a long animation a second is only a few pixels wide, so keys",
+    "  are hard to place. Ctrl+Wheel over the bar zooms about the cursor, and",
+    "  Ctrl+Up / Ctrl+Down zoom about the playhead. Gridlines subdivide as you",
+    "  go in, down to 0.1s. Plain wheel over the bar pans, and dragging a key",
+    "  or marker to either edge pans the view after it. The zoom factor shows",
+    "  in the bottom-right whenever you are zoomed in.",
+    "  Zoom survives playback and switching elements; leaving the editor",
+    "  resets it. View > Follow playhead decides whether the window chases the",
+    "  playhead when it runs off the edge.",
     "",
     "TRACK MODAL",
     "  Drag its title bar to move it; the editor stays usable underneath.",

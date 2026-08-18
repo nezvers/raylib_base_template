@@ -20,10 +20,16 @@
 #include "zen_internal.h"
 #include "../screen_state/screen_state.h"
 #include "../audio_state/audio_state.h"
+#include "../shape_editor/shape_editor.h"
 #include <math.h>
 #include <stdlib.h>
 
-#define TM_W        300.0f
+// Width is set by the WIDEST thing the modal has to say: a crumble member row
+// is "crumble_spread" + a usable slider + the value readout, and at 300px the
+// name column clipped to "crumbl..." while the slider had no room to aim with.
+#define TM_W        420.0f
+#define TM_LBL      104.0f      // property-name column, left of every slider
+#define TM_VALW      50.0f      // ZenEditSlider's readout, right of every slider
 #define TM_TITLE_H   24.0f
 #define TM_RH        24.0f
 #define TM_GAP        6.0f
@@ -82,7 +88,10 @@ void ZenTrackModalSync(void)
     ZenTrackModal *tm = &zen.trackModal;
     if (tm->sig >= 0) return;               // signal mode edits live, no staging
     AnimElem *e = ModalElem();
-    if (!e || zen.selGroup < 0) { tm->open = false; return; }
+    if (!e) { tm->open = false; return; }
+    // No group is the empty state, not a reason to close: there is simply
+    // nothing to stage. Still rescope, or the tree keeps the old element's rows.
+    if (zen.selGroup < 0) { ScopeCapture(); return; }
 
     float times[ZEN_GROUP_TIMES_MAX];
     int nt = BulkTimes(e, times);
@@ -187,12 +196,12 @@ static void DrawBadge(Rectangle r, const char *text, Color c)
              (int)(r.y + (r.height - fs)*0.5f), fs, (Color){ 20, 21, 25, 255 });
 }
 
-// One-line summary of a key: the first two scalar members at that time.
+// One-line summary of a key: the first three scalar members at that time.
 static const char *KeySummary(AnimElem *e, const AnimPropGroup *g, float t)
 {
     const char *out = "";
     int shown = 0;
-    for (int m = 0; g && m < g->propCount && shown < 2; m++)
+    for (int m = 0; g && m < g->propCount && shown < 3; m++)
     {
         if (AnimPropIsColor(g->props[m])) continue;
         out = TextFormat("%s%s%s %.0f", out, shown ? "  " : "",
@@ -371,7 +380,7 @@ static void SigModeGui(ZenTrackModal *tm)
         TextFormat("SIGNAL KEY  %s . %s . %s", sg->name, el->name, g->name));
     if (!tm->open) return;
 
-    float x = m.x + 10, w = m.width - 20 - 50;
+    float x = m.x + 10, w = m.width - 20 - TM_VALW;
     float y = m.y + TM_TITLE_H + 2;
     Rectangle banner = { x, y, m.width - 20, 18 };
     DrawRectangleRec(banner, (Color){ 58, 62, 74, 255 });
@@ -384,9 +393,9 @@ static void SigModeGui(ZenTrackModal *tm)
     y += 22;
 
     // u: moves the whole group key.
-    GuiLabel((Rectangle){ x, y, 44, TM_RH }, "u");
+    GuiLabel((Rectangle){ x, y, TM_LBL, TM_RH }, "u");
     float u = zen.sigSelU;
-    if (ZenEditSlider((Rectangle){ x + 44, y, w - 44, TM_RH }, "", &u, 0.0f, 1.0f))
+    if (ZenEditSlider((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "", &u, 0.0f, 1.0f))
     {
         ZenSigGroupMoveKeyTo(sg, zen.sigSelElem, zen.sigSelGroup, zen.sigSelU, u);
         zen.sigSelU = u; zen.sigLastU = u;
@@ -419,23 +428,23 @@ static void SigModeGui(ZenTrackModal *tm)
         }
         else
         {
-            ZenLabelTip((Rectangle){ x, y, 44, TM_RH }, AnimPropName(prop),
-                        AnimPropName(prop));
+            ZenLabelTip((Rectangle){ x, y, TM_LBL, TM_RH }, AnimPropName(prop),
+                        ZenPropDesc(prop));
             if (k >= 0)
             {
                 float v = tg->keys[k].value, lo, hi;
                 ZenPropRange(el, prop, &lo, &hi);
-                if (ZenEditSlider((Rectangle){ x + 44, y, w - 44, TM_RH }, "", &v, lo, hi))
+                if (ZenEditSlider((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "", &v, lo, hi))
                     tg->keys[k].value = v;
             }
-            else GuiLabel((Rectangle){ x + 44, y, w - 44, TM_RH }, "(no key)");
+            else GuiLabel((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "(no key)");
             y += TM_RH + TM_GAP;
         }
     }
 
     // ease (header; the shared overlay applies it in signal mode).
-    GuiLabel((Rectangle){ x, y, 44, TM_RH }, "ease");
-    zen.easeDropRect = (Rectangle){ x + 44, y, w - 44, TM_RH };
+    GuiLabel((Rectangle){ x, y, TM_LBL, TM_RH }, "ease");
+    zen.easeDropRect = (Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH };
     int ease = ZenSigGroupEase(sg, zen.sigSelElem, zen.sigSelGroup, zen.sigSelU);
     if (GuiButton(zen.easeDropRect, TextFormat("%s  v", AnimEaseName(ease))))
     { AudioPlayButton(); zen.easeDropOpen = !zen.easeDropOpen; }
@@ -473,14 +482,74 @@ static void CopyKeyValues(AnimElem *e, int gi, float src, float dst)
     }
 }
 
+// The element has nothing to edit. Rather than closing - which is what made the
+// modal feel like it kept vanishing while clicking through elements - it stays
+// put and offers the one thing that fixes the situation. Adding a SPECIFIC
+// group stays the inspector's job: its +track dropdown is single-instance
+// (zen.addTrackOpen / addTrackRect, drawn in the panels overlay pass), so a
+// second copy driven from here would fight it. Group 0 covers the common case.
+static void EmptyGui(ZenTrackModal *tm, AnimElem *e)
+{
+    float bodyH = TM_TITLE_H + TM_RH*2 + TM_GAP + 10;
+    Rectangle m = { tm->pos.x, tm->pos.y, TM_W, bodyH };
+
+    Vector2 screen = ScreenStateSize();
+    if (m.x < 0) m.x = 0; if (m.y < 0) m.y = 0;
+    if (m.x + m.width  > screen.x) m.x = screen.x - m.width;
+    if (m.y + m.height > screen.y) m.y = screen.y - m.height;
+    tm->pos = (Vector2){ m.x, m.y };
+    tm->rect = m;
+
+    Rectangle title = { m.x, m.y, m.width - 24, TM_TITLE_H };
+    ZenModalDrag(title, &tm->pos, (Vector2){ m.x, m.y },
+                 &tm->dragging, &tm->dragOff, ZEN_LAYER_FLOAT_TRACK);
+
+    DrawRectangleRec(m, (Color){ 40, 42, 48, 252 });
+    DrawRectangleLinesEx(m, 1.0f, (Color){ 110, 114, 126, 255 });
+    DrawRectangleRec(title, (Color){ 52, 56, 66, 255 });
+    ZenLabelTip((Rectangle){ m.x + 8, m.y + 3, title.width - 8, 18 },
+                TextFormat("TRACK  %s . (none)", e->name),
+                "Drag this bar to move the modal");
+    if (GuiButton((Rectangle){ m.x + m.width - 22, m.y + 2, 20, 20 }, "x"))
+    { AudioPlayButton(); tm->open = false; return; }
+
+    float x = m.x + 10, w = m.width - 20;
+    float y = m.y + TM_TITLE_H + 2;
+    GuiLabel((Rectangle){ x, y, w, TM_RH }, "no tracks on this element");
+    y += TM_RH + TM_GAP;
+
+    const AnimPropGroup *g0 = AnimGroupAt(e->kind, 0);
+    if (GuiButton((Rectangle){ x, y, w, TM_RH },
+                  TextFormat("+ track  %s  @ %.2fs", g0 ? g0->name : "?", zen.playhead)))
+    {
+        AudioPlayButton(); ZenUndoPush();
+        ZenGroupWriteKey(e, 0, zen.playhead);
+        ZenSelKey(zen.selElem, 0, zen.playhead, false);
+        ZenTrackModalOpen(zen.selElem, 0);
+    }
+}
+
+// Open is not the same as on screen: playback is for watching, so the modal
+// HIDES rather than closes and is back - same element, same key - the moment
+// the clock stops. The ESC chain asks too, so a hidden modal does not eat the
+// press. Matches the `playbackUi` predicate the panels slide on.
+bool ZenTrackModalVisible(void)
+{
+    return zen.trackModal.open && !zen.playing && !zen.playPending
+        && AnimSignalPlayerDone(&zen.preview);
+}
+
 void ZenTrackModalGui(void)
 {
     ZenTrackModal *tm = &zen.trackModal;
-    if (!tm->open) { tm->rect = (Rectangle){0}; return; }
+    // Clearing the rect matters as much as skipping the draw: ZenLayerAt() hit
+    // tests it, and a stale one would keep claiming clicks over the viewport.
+    if (!ZenTrackModalVisible()) { tm->rect = (Rectangle){0}; return; }
     if (tm->sig >= 0) { SigModeGui(tm); return; }
     AnimElem *e = ModalElem();
-    if (!e || zen.selGroup < 0 || !ZenGroupHasTrack(e, zen.selGroup))
-    { tm->open = false; tm->rect = (Rectangle){0}; return; }
+    if (!e) { tm->open = false; tm->rect = (Rectangle){0}; return; }
+    if (zen.selGroup < 0 || !ZenGroupHasTrack(e, zen.selGroup))
+    { EmptyGui(tm, e); return; }
 
     const AnimPropGroup *g = AnimGroupAt(e->kind, zen.selGroup);
     int cp = ZenGroupColorProp(e->kind, zen.selGroup);
@@ -529,7 +598,7 @@ void ZenTrackModalGui(void)
     if (GuiButton((Rectangle){ m.x + m.width - 22, m.y + 2, 20, 20 }, "x"))
     { AudioPlayButton(); tm->open = false; return; }
 
-    float x = m.x + 10, w = m.width - 20 - 50;
+    float x = m.x + 10, w = m.width - 20 - TM_VALW;
     float y = m.y + TM_TITLE_H + 2;
 
     // tree: the scope banner plus a row per key the edits will hit.
@@ -540,8 +609,8 @@ void ZenTrackModalGui(void)
     // --- single-key: time row -----------------------------------------------
     if (single)
     {
-        GuiLabel((Rectangle){ x, y, 40, TM_RH }, "time");
-        if (GuiTextBox((Rectangle){ x + 44, y, w - 44, TM_RH }, tm->timeBuf,
+        GuiLabel((Rectangle){ x, y, TM_LBL, TM_RH }, "time");
+        if (GuiTextBox((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, tm->timeBuf,
                        sizeof(tm->timeBuf), tm->edTime))
         {
             if (!tm->edTime) tm->edTime = true;
@@ -569,7 +638,7 @@ void ZenTrackModalGui(void)
         if (AnimPropIsColor(prop)) continue;        // colour block below
         float lo, hi; ZenPropRange(e, prop, &lo, &hi);
 
-        ZenLabelTip((Rectangle){ x, y, 44, TM_RH }, AnimPropName(prop),
+        ZenLabelTip((Rectangle){ x, y, TM_LBL, TM_RH }, AnimPropName(prop),
                     ZenPropDesc(prop));
 
         // A string key holds a POOL INDEX, not a quantity: dragging a slider
@@ -592,7 +661,7 @@ void ZenTrackModalGui(void)
                 words = s ? s : "(missing string)";
             }
 
-            Rectangle sr = { x + 44, y, w - 44, TM_RH };
+            Rectangle sr = { x + TM_LBL, y, w - TM_LBL, TM_RH };
             zen.strDropRect = sr;
             if (k < 0) GuiDisable();
             if (GuiButton(sr, TextFormat("%s  v", ZenTextPreview(words, 24))))
@@ -600,6 +669,38 @@ void ZenTrackModalGui(void)
             if (k < 0) GuiEnable();
             ZenTip(sr, k >= 0
                 ? "The words this key switches to. Click to pick another string "
+                  "from the pool - it changes THIS key only, at this time."
+                : "No key at this time, so there is nothing to assign. Use +key "
+                  "to make one here first.");
+            y += TM_RH + TM_GAP;
+            continue;
+        }
+
+        // Same story one pool over: a shape key holds a pool SLOT, so it gets a
+        // picker rather than a slider.
+        if (prop == AP_S_SHAPE)
+        {
+            const char *nm = "(no key here)";
+            AnimTrack *tr = AnimElemFindTrack(e, prop);
+            int k = -1;
+            for (int j = 0; tr && j < tr->keyCount; j++)
+                if (fabsf(tr->keys[j].t - refT) <= ZEN_AUTOKEY_EPS) { k = j; break; }
+            if (k >= 0)
+            {
+                const AnimShapeDef *sd =
+                    AnimShapePoolGet((int)(tr->keys[k].value + 0.5f));
+                nm = sd ? sd->name : "(missing shape)";
+            }
+
+            Rectangle sr = { x + TM_LBL, y, w - TM_LBL, TM_RH };
+            zen.shapeDropRect = sr;
+            if (k < 0) GuiDisable();
+            if (GuiButton(sr, TextFormat("%s  v", ZenTextPreview(nm, 24))))
+            { AudioPlayButton(); zen.shapeDropOpen = !zen.shapeDropOpen;
+              zen.shapeDropScroll = 0.0f; }       // reopen at the top of the list
+            if (k < 0) GuiEnable();
+            ZenTip(sr, k >= 0
+                ? "The pixel shape this key switches to. Click to pick another "
                   "from the pool - it changes THIS key only, at this time."
                 : "No key at this time, so there is nothing to assign. Use +key "
                   "to make one here first.");
@@ -616,18 +717,18 @@ void ZenTrackModalGui(void)
             if (k >= 0)
             {
                 float v = tr->keys[k].value;
-                if (ZenEditSlider((Rectangle){ x + 44, y, w - 44, TM_RH }, "", &v, lo, hi))
+                if (ZenEditSlider((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "", &v, lo, hi))
                     tr->keys[k].value = v;
             }
-            else GuiLabel((Rectangle){ x + 44, y, w - 44, TM_RH }, "(no key)");
+            else GuiLabel((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "(no key)");
         }
         else
         {
             float v = tm->vals[mi];
-            if (ZenEditSlider((Rectangle){ x + 44, y, w - 44, TM_RH }, "", &v, lo, hi))
+            if (ZenEditSlider((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "", &v, lo, hi))
             { tm->vals[mi] = v; tm->dVals[mi] = true; }
             if (tm->dVals[mi])                      // dirty marker
-                DrawCircle((int)(x + w + 40), (int)(y + TM_RH/2), 3,
+                DrawCircle((int)(x + w + TM_VALW - 10), (int)(y + TM_RH/2), 3,
                            (Color){ 255, 210, 90, 255 });
         }
         y += TM_RH + TM_GAP;
@@ -647,7 +748,7 @@ void ZenTrackModalGui(void)
         ZenDrawSwatch((Rectangle){ m.x + m.width - 30, y + 3, 18, 18 },
                       (Color){ cc.r, cc.g, cc.b, 255 });
         if (!single && tm->dCval)
-            DrawCircle((int)(x + w + 40), (int)(y + TM_RH/2), 3,
+            DrawCircle((int)(x + w + TM_VALW - 10), (int)(y + TM_RH/2), 3,
                        (Color){ 255, 210, 90, 255 });
         y += TM_RH;
         float cr = cc.r, cg = cc.g, cb = cc.b;
@@ -672,21 +773,23 @@ void ZenTrackModalGui(void)
     bool stepped = zen.selGroup >= 0 && ZenGroupIsStepped(e->kind, zen.selGroup);
     if (stepped)
     {
-        GuiLabel((Rectangle){ x, y, 44, TM_RH }, "ease");
-        GuiLabel((Rectangle){ x + 44, y, w - 44, TM_RH }, "steps - no easing");
-        ZenTip((Rectangle){ x, y, w, TM_RH },
-               "Text snaps at each key and holds those words until the next one. "
-               "There is no midpoint between two strings, so nothing to ease.");
+        GuiLabel((Rectangle){ x, y, TM_LBL, TM_RH }, "ease");
+        GuiLabel((Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH }, "steps - no easing");
+        ZenTip((Rectangle){ x, y, w, TM_RH }, e->kind == AE_SHAPE
+               ? "The shape snaps at each key and holds until the next one. There "
+                 "is no midpoint between two shapes, so nothing to ease."
+               : "Text snaps at each key and holds those words until the next one. "
+                 "There is no midpoint between two strings, so nothing to ease.");
         zen.easeDropOpen = false;
     }
     else
     {
-    GuiLabel((Rectangle){ x, y, 44, TM_RH }, "ease");
-    zen.easeDropRect = (Rectangle){ x + 44, y, w - 44, TM_RH };
+    GuiLabel((Rectangle){ x, y, TM_LBL, TM_RH }, "ease");
+    zen.easeDropRect = (Rectangle){ x + TM_LBL, y, w - TM_LBL, TM_RH };
     if (GuiButton(zen.easeDropRect, TextFormat("%s  v", AnimEaseName(tm->ease))))
     { AudioPlayButton(); zen.easeDropOpen = !zen.easeDropOpen; }
     if (!single && tm->dEase)
-        DrawCircle((int)(x + w + 40), (int)(y + TM_RH/2), 3,
+        DrawCircle((int)(x + w + TM_VALW - 10), (int)(y + TM_RH/2), 3,
                    (Color){ 255, 210, 90, 255 });
     }
     y += TM_RH + TM_GAP;
@@ -744,8 +847,7 @@ void ZenTrackModalGui(void)
         if (ZenButton((Rectangle){ x, y, bw, TM_RH }, "delete keys"))
         {
             AudioPlayButton(); ZenUndoPush();
-            for (int i = 0; i < zen.selKeyCount; i++)
-                ZenGroupDeleteKeyAt(e, zen.selGroup, zen.selKeys[i]);
+            ZenGroupDeleteKeySet(e, zen.selGroup, zen.selKeys, zen.selKeyCount);
             zen.selKeyCount = 0;
             ZenSelValidate();
         }
@@ -929,4 +1031,120 @@ void ZenStringDropOverlayGui(void)
         !CheckCollisionPointRec(GetMousePosition(), bg) &&
         !CheckCollisionPointRec(GetMousePosition(), hdr))
         zen.strDropOpen = false;
+}
+
+// ---------------------------------------------------------------------------
+//  Shape-pool list for the AP_S_SHAPE row. The pool is GLOBAL, not part of the
+//  document, so unlike the string list this one is not bounded by the doc - but
+//  it is just as sparse (a deleted shape leaves its slot free) and is walked the
+//  same way. The row it edits is opened from the inspector too, so this serves
+//  BOTH: the inspector sets the element's rest-pose shapeName, the track modal
+//  sets one key.
+// ---------------------------------------------------------------------------
+void ZenShapeDropOverlayGui(void)
+{
+    if (!zen.shapeDropOpen) return;
+
+    // Which of the two callers opened it: a track key (modal open on a shape
+    // group) or the inspector's rest-pose row.
+    AnimTrack *tr = NULL;
+    int k = -1;
+    AnimElem *e = NULL;
+
+    if (zen.trackModal.open && zen.trackModal.sig < 0 && zen.selGroup >= 0)
+    {
+        e = ModalElem();
+        if (e) tr = AnimElemFindTrack(e, AP_S_SHAPE);
+        if (tr)
+        {
+            float times[ZEN_GROUP_TIMES_MAX];
+            int   n = ZenGroupKeyTimes(e, zen.selGroup, times);
+            float refT = (zen.selKeyCount == 1) ? zen.selKeys[0]
+                                                : (n ? times[0] : 0.0f);
+            for (int j = 0; j < tr->keyCount; j++)
+                if (fabsf(tr->keys[j].t - refT) <= ZEN_AUTOKEY_EPS) { k = j; break; }
+            if (k < 0) tr = NULL;               // no key here: fall back to base
+        }
+    }
+    if (!e) e = (zen.selElem >= 0 && zen.selElem < zen.doc.elemCount)
+              ? &zen.doc.elems[zen.selElem] : NULL;
+    if (!e || e->kind != AE_SHAPE) { zen.shapeDropOpen = false; return; }
+
+    int cur = tr ? (int)(tr->keys[k].value + 0.5f)
+                 : AnimShapePoolFindByName(e->shapeName);
+
+    int ids[ANIM_SHAPE_POOL_MAX], m = 0;
+    for (int i = 0; i < ANIM_SHAPE_POOL_MAX; i++)
+        if (AnimShapeIdValid(i)) ids[m++] = i;
+
+    Vector2 screen = ScreenStateSize();
+    Rectangle hdr = zen.shapeDropRect;
+    // The pool holds up to ANIM_SHAPE_POOL_MAX shapes (512 on desktop), so the
+    // list is CAPPED and scrolls. An uncapped one would be taller than the
+    // window and put its own rows off screen.
+    float ih = 20.0f;
+    int   vis = (m < ZEN_SHAPE_DROP_ROWS) ? m : ZEN_SHAPE_DROP_ROWS;
+    float rowsH = ih * vis;
+    float listH = rowsH + ih;                    // +1 row for "new shape"
+    float ly = (hdr.y + hdr.height + listH <= screen.y - 4.0f)
+             ? hdr.y + hdr.height : hdr.y - listH;
+    if (ly < 4.0f) ly = 4.0f;
+    Rectangle bg = { hdr.x, ly, hdr.width, listH };
+    DrawRectangleRec(bg, (Color){ 32, 34, 40, 255 });
+    DrawRectangleLinesEx(bg, 1.0f, (Color){ 70, 74, 84, 255 });
+
+    Rectangle rowsBox = { bg.x, bg.y, bg.width, rowsH };
+    if (CheckCollisionPointRec(GetMousePosition(), rowsBox))
+        zen.shapeDropScroll += GetMouseWheelMove() * ih;
+    float maxScroll = m * ih - rowsH;
+    if (maxScroll < 0.0f) maxScroll = 0.0f;
+    if (zen.shapeDropScroll < -maxScroll) zen.shapeDropScroll = -maxScroll;
+    if (zen.shapeDropScroll > 0.0f) zen.shapeDropScroll = 0.0f;
+
+    BeginScissorMode((int)rowsBox.x, (int)rowsBox.y,
+                     (int)rowsBox.width, (int)rowsBox.height);
+    for (int row = 0; row < m; row++)
+    {
+        int i = ids[row];
+        const AnimShapeDef *sd = AnimShapePoolGet(i);
+        Rectangle rr = { bg.x, bg.y + row*ih + zen.shapeDropScroll, bg.width, ih };
+        // Skipped rather than merely clipped: an offscreen GuiButton still
+        // reads the mouse and would fire from behind the timeline.
+        if (rr.y + ih < rowsBox.y || rr.y > rowsBox.y + rowsBox.height) continue;
+        if (GuiButton(rr, TextFormat("%s  %dx%d", sd->name, sd->w, sd->h)))
+        {
+            AudioPlayButton();
+            zen.shapeDropOpen = false;
+            ZenUndoPush();
+            if (tr)
+            {
+                tr->keys[k].value = (float)i;
+                // The element's own shapeName is the fallback when the track is
+                // gone, so mirror only the FIRST key - past that the shape
+                // changes over time and no single one stands for it.
+                if (k == 0) TextCopy(e->shapeName, sd->name);
+            }
+            else TextCopy(e->shapeName, sd->name);
+            zen.docDirty = true;
+            ZenTrackModalSync();
+        }
+        if (i == cur) DrawRectangleRec(rr, (Color){ 90, 140, 220, 60 });
+    }
+    EndScissorMode();
+
+    // Shapes are drawn in their own editor; this list only chooses among them.
+    // Pinned below the scrolling rows, so it is always reachable.
+    Rectangle nr = { bg.x, bg.y + rowsH, bg.width, ih };
+    if (GuiButton(nr, "+ new shape..."))
+    {
+        AudioPlayButton();
+        zen.shapeDropOpen = false;
+        ShapeEditorOpen("");
+        AppStateTransition(&app_state_shape_editor);
+    }
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+        !CheckCollisionPointRec(GetMousePosition(), bg) &&
+        !CheckCollisionPointRec(GetMousePosition(), hdr))
+        zen.shapeDropOpen = false;
 }

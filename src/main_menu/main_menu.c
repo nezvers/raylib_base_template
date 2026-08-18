@@ -10,6 +10,7 @@
 
 #include "raylib.h"
 #include "../app_state/app_state.h"
+#include "../shape_editor/shape_editor.h"
 #include "../screen_state/screen_state.h"
 #include "../settings_state/settings_state.h"
 #include "../audio_state/audio_state.h"
@@ -314,6 +315,14 @@ static void Gui()
         {
             AudioPlayButton();
             AppStateTransition(&app_state_anim_editor_zen);
+        }
+        // Second left-side tool. Also outside LAYOUT_UNITS: the left column is
+        // not auto-scaled, so it advances by its own y and nothing else moves.
+        if (GuiButton((Rectangle){ xLeft, y + h + gap, w, h }, "SHAPE EDITOR"))
+        {
+            AudioPlayButton();
+            ShapeEditorOpen("");
+            AppStateTransition(&app_state_shape_editor);
         }
 
         // -- Label: static text, no interaction ------------------------------

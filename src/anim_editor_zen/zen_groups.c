@@ -82,6 +82,30 @@ bool ZenGroupHasTrack(AnimElem *e, int gi)
     return false;
 }
 
+// The group key time AT `t`, or -1 when the group has none there. Deliberately
+// NOT the nearest-key rule the same-name carry uses: landing on an unrelated
+// track because the old one had no counterpart should not fake a key selection
+// out of whatever happens to be closest.
+static bool GroupKeyTimeAt(AnimElem *e, int gi, float t, float *out)
+{
+    float times[ZEN_GROUP_TIMES_MAX];
+    int nt = ZenGroupKeyTimes(e, gi, times);
+    int k = KeyIndexNear(times, nt, sizeof(float), t, ZEN_AUTOKEY_EPS);
+    if (k < 0) return false;
+    *out = times[k];
+    return true;
+}
+
+// Which pool slot a SHAPE_CUSTOM element shows at t: the track's stepped value
+// if it has one, else the element's rest-pose name. ANIM_SHAPE_MISSING (-1) when
+// neither resolves - the caller treats that as "nothing to key".
+static int ShapeIdxAt(const AnimElem *e, float t)
+{
+    float v = AnimElemProp(e, AP_S_SHAPE, t);
+    if (v >= 0.0f) return (int)(v + 0.5f);
+    return AnimShapePoolFindByName(e->shapeName);
+}
+
 // Write a group key at t: every member gets one, seeded from the element's
 // current value there (creating member tracks + a zero key as needed).
 void ZenGroupWriteKey(AnimElem *e, int gi, float t)
@@ -102,15 +126,28 @@ void ZenGroupWriteKey(AnimElem *e, int gi, float t)
         }
         else if (AnimPropIsStepped(prop))
         {
-            // A string key holds a POOL INDEX, not a quantity. Seeding it the
+            // A stepped key holds a POOL INDEX, not a quantity. Seeding it the
             // way the branch below does would write the -1 "no pool entry" base
-            // value and the key would resolve to nothing; carry the words the
-            // element actually shows instead. Both indices are read BEFORE any
-            // key is added, since adding one changes what is sampled.
-            int idx = AnimDocStringIdxAt(&zen.doc, e, t);
-            int zero = (t > ZEN_AUTOKEY_EPS && tr->keyCount == 0)
+            // value and the key would resolve to nothing; carry what the element
+            // actually shows instead. Both indices are read BEFORE any key is
+            // added, since adding one changes what is sampled.
+            int idx, zero;
+            if (prop == AP_S_SHAPE)
+            {
+                // The shape pool is global, so unlike the string pool there is
+                // nothing to intern - the element's name either resolves or the
+                // element has no shape to key yet.
+                idx  = ShapeIdxAt(e, t);
+                zero = (t > ZEN_AUTOKEY_EPS && tr->keyCount == 0)
+                     ? ShapeIdxAt(e, 0.0f) : -1;
+            }
+            else
+            {
+                idx  = AnimDocStringIdxAt(&zen.doc, e, t);
+                zero = (t > ZEN_AUTOKEY_EPS && tr->keyCount == 0)
                      ? AnimDocStringIdxAt(&zen.doc, e, 0.0f) : -1;
-            if (idx < 0) continue;              // pool full - leave the track be
+            }
+            if (idx < 0) continue;              // nothing to key - leave the track be
             // ZenEnsureZeroKey cannot serve here: it seeds through AnimElemProp,
             // which is exactly the sentinel this branch exists to avoid.
             if (zero >= 0) AnimTrackAddKey(tr, 0.0f, (float)zero, ANIM_EASE_LINEAR);
@@ -147,6 +184,32 @@ void ZenGroupDeleteKeyAt(AnimElem *e, int gi, float t)
     }
 }
 
+// Delete a SET of group keys in one pass. Same reasoning as
+// ZenGroupMoveKeySetTo: resolve every source index before removing anything,
+// since each removal shifts the array under the times still to be matched.
+void ZenGroupDeleteKeySet(AnimElem *e, int gi, const float *times, int n)
+{
+    if (n > ZEN_GROUP_TIMES_MAX) n = ZEN_GROUP_TIMES_MAX;
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+
+        int idx[ZEN_GROUP_TIMES_MAX];
+        for (int s = 0; s < n; s++)
+            idx[s] = KeyIndexNear(tr->keys, tr->keyCount, sizeof(AnimKey),
+                                  times[s], ZEN_AUTOKEY_EPS);
+        // descending, so a removal never renumbers an index still pending.
+        for (int a = 0; a < n; a++)
+            for (int b = a + 1; b < n; b++)
+                if (idx[b] > idx[a]) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
+        for (int s = 0; s < n; s++)
+            if (idx[s] >= 0)
+                KeyRemoveAt(tr->keys, &tr->keyCount, sizeof(AnimKey), idx[s]);
+    }
+}
+
 // Copy the member key at srcT onto dstT, verbatim - value, colour AND ease.
 // Unlike ZenGroupWriteKey this does NOT sample the element at the destination:
 // the point of a clone is to restate an earlier pose exactly, so an eased
@@ -180,6 +243,64 @@ bool ZenGroupCloneKeyTo(AnimElem *e, int gi, float srcT, float dstT)
     return any;
 }
 
+// Clone a SET of group keys, keeping their spacing: the EARLIEST key in the
+// set lands on dstT and every other keeps its offset from it. That is what
+// "clone the selection to the playhead" has to mean - a set is a rhythm, not a
+// bag of times, and re-anchoring it anywhere else would rewrite that rhythm.
+//
+// Every member key is snapshotted BEFORE the first write, because a write
+// inserts into the same array the remaining sources are read from. Sources are
+// read by index (resolved up front) for the reason ZenGroupMoveKeySetTo spells
+// out: a freshly written clone landing within ZEN_AUTOKEY_EPS of a pending
+// source would otherwise be picked up as that source.
+//
+// Returns how many group keys wrote at least one member.
+int ZenGroupCloneKeySet(AnimElem *e, int gi, const float *srcT, int n, float dstT)
+{
+    if (n <= 0) return 0;
+    if (n > ZEN_GROUP_TIMES_MAX) n = ZEN_GROUP_TIMES_MAX;
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    if (!g) return 0;
+
+    float first = srcT[0];
+    for (int s = 1; s < n; s++) if (srcT[s] < first) first = srcT[s];
+    if (fabsf(first - dstT) <= ZEN_AUTOKEY_EPS) return 0;   // already there
+
+    bool wrote[ZEN_GROUP_TIMES_MAX] = { 0 };
+    for (int m = 0; m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+
+        AnimKey snap[ZEN_GROUP_TIMES_MAX];
+        bool    have[ZEN_GROUP_TIMES_MAX];
+        for (int s = 0; s < n; s++)
+        {
+            int k = KeyIndexNear(tr->keys, tr->keyCount, sizeof(AnimKey),
+                                 srcT[s], ZEN_AUTOKEY_EPS);
+            have[s] = (k >= 0);
+            if (have[s]) snap[s] = tr->keys[k];
+        }
+        for (int s = 0; s < n; s++)
+        {
+            if (!have[s]) continue;
+            float t = dstT + (srcT[s] - first);
+            AnimKey *dst = AnimPropIsColor(g->props[m])
+                         ? AnimTrackWriteColorKeyAt(tr, t, snap[s].cval, ZEN_AUTOKEY_EPS)
+                         : AnimTrackWriteKeyAt(tr, t, snap[s].value, ZEN_AUTOKEY_EPS);
+            if (!dst) continue;                 // track full
+            dst->value = snap[s].value;
+            dst->cval  = snap[s].cval;
+            dst->ease  = snap[s].ease;
+            wrote[s] = true;
+        }
+    }
+
+    int done = 0;
+    for (int s = 0; s < n; s++) if (wrote[s]) done++;
+    return done;
+}
+
 // The group key at or before t, excluding one sitting on t itself. -1 when the
 // group has nothing to the left (its first key is later than t).
 float ZenGroupKeyTimeLeftOf(AnimElem *e, int gi, float t)
@@ -202,6 +323,44 @@ void ZenGroupMoveKeyTo(AnimElem *e, int gi, float oldT, float newT)
                                   oldT, ZEN_AUTOKEY_EPS) : -1;
         if (k < 0) continue;
         tr->keys[k].t = newT;
+        KeySortByT(tr->keys, tr->keyCount, sizeof(AnimKey));
+    }
+}
+
+// Shift a SET of group keys, as a single atomic pass. Keys are FOUND at
+// curT[s] and LANDED at baseT[s] + delta.
+//
+// The two arrays are separate on purpose. A drag re-applies the shift every
+// frame: the keys sit where the last frame left them (curT), while the target
+// stays measured from the press-time snapshot (baseT) so a long drag cannot
+// accumulate rounding. Passing the snapshot as the lookup instead - the obvious
+// one-array version - matches nothing after the first frame, and the set stops
+// following the cursor.
+//
+// Not a loop over ZenGroupMoveKeyTo either: that resolves one key at a time, so
+// a member sliding within ZEN_AUTOKEY_EPS of a key it is passing (one outside
+// the set, or one this same pass already moved) gets re-grabbed by the next
+// lookup. Resolving EVERY source index up front, before a single write, removes
+// the ambiguity - indices cannot collide the way times can.
+void ZenGroupMoveKeySetTo(AnimElem *e, int gi, const float *curT,
+                          const float *baseT, int n, float delta)
+{
+    if (n > ZEN_GROUP_TIMES_MAX) n = ZEN_GROUP_TIMES_MAX;
+    const AnimPropGroup *g = AnimGroupAt(e->kind, gi);
+    for (int m = 0; g && m < g->propCount; m++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(e, g->props[m]);
+        if (!tr) continue;
+
+        // resolve first ...
+        int idx[ZEN_GROUP_TIMES_MAX];
+        for (int s = 0; s < n; s++)
+            idx[s] = KeyIndexNear(tr->keys, tr->keyCount, sizeof(AnimKey),
+                                  curT[s], ZEN_AUTOKEY_EPS);
+        // ... then write, so no lookup ever sees a half-shifted track.
+        for (int s = 0; s < n; s++)
+            if (idx[s] >= 0) tr->keys[idx[s]].t = baseT[s] + delta;
+
         KeySortByT(tr->keys, tr->keyCount, sizeof(AnimKey));
     }
 }
@@ -265,6 +424,11 @@ const char *ZenGroupKeyLabel(AnimElem *e, int gi, float t)
         {
             Color c = AnimElemColorProp(e, prop, t);
             one = TextFormat("#%02X%02X%02X", c.r, c.g, c.b);
+        }
+        else if (prop == AP_S_SHAPE)
+        {
+            const AnimShapeDef *sd = AnimShapePoolGet(ShapeIdxAt(e, t));
+            one = ZenTextPreview(sd ? sd->name : "(none)", 16);
         }
         else if (AnimPropIsStepped(prop))
         {
@@ -518,6 +682,75 @@ void ZenSelClear(void)
     zen.selGroup = -1;
     zen.selKeyCount = 0;
     zen.trackModal.open = false;
+}
+
+// Switch the selected element WITHOUT throwing away what is being edited.
+// Closing the track modal on every element click made comparing two similar
+// elements a reopen-and-re-find chore, so an open doc-track modal FOLLOWS the
+// selection. Three landings, in order of how much of the edit survives:
+//
+//   1. the same group BY NAME (indices differ across kinds), if the new element
+//      actually tracks it - keeps the closest thing to what was in hand, so it
+//      lands on the key nearest the one being edited;
+//   2. otherwise the element's first tracked group, since carrying a `crumble`
+//      to a shape (or any track the target simply hasn't been given yet) used
+//      to close the modal outright. Nothing carried over means nothing to be
+//      near, so a key is only selected when one sits ON the playhead - the
+//      whole track otherwise, which is the honest scope;
+//   3. no tracks at all - selGroup goes to -1 and the modal draws its empty
+//      state. Deliberately NOT ZenSelClear(), which would close it.
+void ZenSelSwitchElem(int elem)
+{
+    if (elem < 0 || elem >= zen.doc.elemCount || elem == zen.selElem) return;
+
+    AnimElem *old = (zen.selElem >= 0 && zen.selElem < zen.doc.elemCount)
+                  ? &zen.doc.elems[zen.selElem] : NULL;
+    const AnimPropGroup *og = (old && zen.selGroup >= 0)
+                            ? AnimGroupAt(old->kind, zen.selGroup) : NULL;
+    // An open modal follows even from the empty state (og == NULL): the element
+    // it was parked on having no tracks is no reason to drop the next one.
+    bool carry = zen.trackModal.open && zen.trackModal.sig < 0;
+    float refT = (carry && zen.selKeyCount == 1) ? zen.selKeys[0] : zen.playhead;
+
+    zen.selElem = elem;
+    if (!carry) { ZenSelClear(); return; }
+
+    AnimElem *e = &zen.doc.elems[elem];
+    int gi = -1;
+    for (int i = 0, n = AnimGroupCountFor(e->kind); i < n && gi < 0; i++)
+    {
+        const AnimPropGroup *g = AnimGroupAt(e->kind, i);
+        if (og && g && TextIsEqual(g->name, og->name) && ZenGroupHasTrack(e, i)) gi = i;
+    }
+    bool sameName = gi >= 0;
+    for (int i = 0, n = AnimGroupCountFor(e->kind); i < n && gi < 0; i++)
+        if (ZenGroupHasTrack(e, i)) gi = i;
+
+    zen.selGroup = gi;
+    zen.selKeyCount = 0;
+    if (gi < 0) { ZenMouseReflow(); ZenTrackModalSync(); return; }   // empty state
+
+    if (sameName)
+    {
+        // Nearest key rather than the first: scrubbing to a moment and flipping
+        // through elements should keep showing THAT moment on each of them.
+        float times[ZEN_GROUP_TIMES_MAX];
+        int nt = ZenGroupKeyTimes(e, gi, times);
+        if (nt > 0)
+        {
+            int best = 0;
+            for (int i = 1; i < nt; i++)
+                if (fabsf(times[i] - refT) < fabsf(times[best] - refT)) best = i;
+            zen.selKeys[0] = times[best];
+            zen.selKeyCount = 1;
+        }
+    }
+    else if (GroupKeyTimeAt(e, gi, zen.playhead, &zen.selKeys[0])) zen.selKeyCount = 1;
+
+    // The modal relays out around the new key (row counts differ per group),
+    // sliding its sliders under the still-down button that picked the element.
+    ZenMouseReflow();
+    ZenTrackModalSync();        // keeps the modal open, re-baselines its fields
 }
 
 // Select a whole track (no individual keys): the modal bulk-edits every key.

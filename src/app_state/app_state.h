@@ -33,6 +33,7 @@ extern AppState app_state_main_menu;    // learning demo: main menu
 extern AppState app_state_platformer;   // original: launch platformer
 extern AppState app_state_strategy;     // RTS test: units, resources, factions
 extern AppState app_state_anim_editor_zen;  // animation editor (menu bar, zoomed viewport)
+extern AppState app_state_shape_editor;     // pixel-shape editor (the global shape pool)
 
 
 #endif // APP_STATE_H

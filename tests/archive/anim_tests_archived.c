@@ -16,6 +16,7 @@
 #include "../src/anim/anim_signal.h"
 #include "../src/anim/anim_stage.h"
 #include "../src/anim/anim_scene.h"
+#include "../src/anim/anim_shape_pool.h"
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -1503,6 +1504,125 @@ static void TestIOIdempotent(void)
     remove(p1); remove(p2);
 }
 
+// A crumble key carries the whole state of the effect - the amount AND the four
+// params that shape the scatter - on one line. Round-trips through save/load,
+// and a re-save is byte-identical (the wide form has to be stable too).
+static void TestIOCrumbleKeys(void)
+{
+    const char *p1 = "anim_tests_crumble1.cfg", *p2 = "anim_tests_crumble2.cfg";
+
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    TextCopy(doc.name, "crumble");
+    doc.duration = 2.0f;
+
+    AnimElem *t = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(t->name, "title");
+    TextCopy(t->text, "GONE");
+
+    // the five members keyed as a group would key them: same two times.
+    const int props[5] = { AP_T_CRUMBLE, AP_T_CRUMBLE_DIR, AP_T_CRUMBLE_SPREAD,
+                           AP_T_CRUMBLE_DIST, AP_T_CRUMBLE_SPIN };
+    const float v0[5] = { 0.0f,  90.0f,  12.0f, 0.5f,  90.0f };
+    const float v1[5] = { 1.0f, 270.0f, 180.0f, 1.5f, 360.0f };
+    for (int i = 0; i < 5; i++)
+    {
+        AnimTrack *tr = AnimElemAddTrack(t, props[i]);
+        CHECK(tr != NULL);
+        AnimTrackAddKey(tr, 0.0f, v0[i], ANIM_EASE_LINEAR);
+        AnimTrackAddKey(tr, 1.0f, v1[i], ANIM_EASE_SINE_OUT);
+    }
+
+    CHECK(AnimDocSave(&doc, p1));
+
+    AnimDoc back;
+    CHECK(AnimDocLoad(&back, p1));
+    CHECK(back.elemCount == 1);
+    CHECK(back.elems[0].trackCount == 5);
+    for (int i = 0; i < 5; i++)
+    {
+        AnimTrack *tr = AnimElemFindTrack(&back.elems[0], props[i]);
+        CHECK(tr != NULL);
+        if (!tr) continue;
+        CHECK(tr->keyCount == 2);
+        CHECK_NEAR(tr->keys[0].value, v0[i]);
+        CHECK_NEAR(tr->keys[1].value, v1[i]);
+        CHECK(tr->keys[0].ease == ANIM_EASE_LINEAR);
+        CHECK(tr->keys[1].ease == ANIM_EASE_SINE_OUT);
+    }
+    // and the shape is genuinely animated, not stuck on the element's rest pose
+    // (mid-segment, so eased - the bound is what matters, not the exact value)
+    float midDir = AnimElemProp(&back.elems[0], AP_T_CRUMBLE_DIR, 0.5f);
+    CHECK(midDir > 90.0f && midDir < 270.0f);
+    CHECK_NEAR(AnimElemProp(&back.elems[0], AP_T_CRUMBLE_DIR, 1.0f), 270.0f);
+
+    CHECK(AnimDocSave(&back, p2));
+    FILE *f1 = fopen(p1, "rb"), *f2 = fopen(p2, "rb");
+    CHECK(f1 && f2);
+    if (f1 && f2)
+    {
+        int c1, c2, same = 1;
+        do { c1 = fgetc(f1); c2 = fgetc(f2); if (c1 != c2) { same = 0; break; } }
+        while (c1 != EOF);
+        CHECK(same);
+    }
+    if (f1) fclose(f1);
+    if (f2) fclose(f2);
+    remove(p1); remove(p2);
+}
+
+// A crumble track with only the AMOUNT keyed still writes the wide line: the
+// four shape members come from the element's rest pose. This is what migrated
+// every pre-existing document, so a param nobody keyed keeps its authored look.
+static void TestIOCrumbleRestPoseFill(void)
+{
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    TextCopy(doc.name, "crumblefill");
+    doc.duration = 2.0f;
+
+    AnimElem *e = AnimDocAddElem(&doc, AE_TEXT);
+    TextCopy(e->name, "title");
+    TextCopy(e->text, "GONE");
+    e->crumbleDir = 270.0f; e->crumbleSpread = 30.0f;
+    e->crumbleDist = 1.25f; e->crumbleRot    = 45.0f;
+    AnimTrack *tr = AnimElemAddTrack(e, AP_T_CRUMBLE);
+    AnimTrackAddKey(tr, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 1.0f, 1.0f, ANIM_EASE_LINEAR);
+
+    const char *path = "anim_tests_crumble_fill.cfg";
+    CHECK(AnimDocSave(&doc, path));
+
+    AnimDoc back;
+    CHECK(AnimDocLoad(&back, path));
+    CHECK(back.elemCount == 1);
+    AnimElem *b = &back.elems[0];
+    CHECK(b->trackCount == 5);                      // all five members now exist
+    CHECK_NEAR(AnimElemProp(b, AP_T_CRUMBLE, 1.0f), 1.0f);
+    // the rest pose was baked into every key, so it reads back unchanged
+    CHECK_NEAR(AnimElemProp(b, AP_T_CRUMBLE_DIR,    0.5f), 270.0f);
+    CHECK_NEAR(AnimElemProp(b, AP_T_CRUMBLE_SPREAD, 0.5f),  30.0f);
+    CHECK_NEAR(AnimElemProp(b, AP_T_CRUMBLE_DIST,   0.5f),   1.25f);
+    CHECK_NEAR(AnimElemProp(b, AP_T_CRUMBLE_SPIN,   0.5f),  45.0f);
+
+    // and the fill is stable: a second save is byte-identical to the first
+    const char *out = "anim_tests_crumble_fill2.cfg";
+    CHECK(AnimDocSave(&back, out));
+    FILE *f1 = fopen(path, "rb"), *f2 = fopen(out, "rb");
+    CHECK(f1 && f2);
+    if (f1 && f2)
+    {
+        int c1, c2, same = 1;
+        do { c1 = fgetc(f1); c2 = fgetc(f2); if (c1 != c2) { same = 0; break; } }
+        while (c1 != EOF);
+        CHECK(same);
+    }
+    if (f1) fclose(f1);
+    if (f2) fclose(f2);
+    remove(out);
+    remove(path);
+}
+
 // ---------------------------------------------------------------------------
 //  Element library: CRUD + round-trip through the shared elem grammar
 // ---------------------------------------------------------------------------
@@ -2846,6 +2966,248 @@ static void TestTextEscapeIO(void)
     remove(p);
 }
 
+// ---------------------------------------------------------------------------
+//  Pixel shape pool  (anim_shape_pool.c)
+//
+//  Textures are never touched here: baking is lazy and lives on the draw path,
+//  so this runs without a GL context like the rest of the suite.
+// ---------------------------------------------------------------------------
+static void TestShapePool(void)
+{
+    const char *root = "anim_tests_shapes/";
+
+    // -- slots ---------------------------------------------------------------
+    AnimShapePoolLoadAll(NULL, NULL);                   // wipe
+    CHECK(AnimShapePoolCount() == 0);
+
+    int a = AnimShapePoolAdd("fangs_upper", 6, 4);
+    CHECK(a >= 0);
+    CHECK(AnimShapeIdValid(a));
+    CHECK(AnimShapePoolFindByName("fangs_upper") == a);
+    CHECK(AnimShapePoolFindByName("nope") == ANIM_SHAPE_MISSING);
+    CHECK(AnimShapePoolAdd("fangs_upper", 4, 4) == ANIM_SHAPE_MISSING);  // dupe
+    CHECK(AnimShapePoolAdd("has space", 4, 4) == ANIM_SHAPE_MISSING);
+    CHECK(AnimShapePoolAdd("", 4, 4) == ANIM_SHAPE_MISSING);
+
+    // Oversize dims clamp rather than overrun the fixed grid.
+    int big = AnimShapePoolAdd("big", 9999, -3);
+    CHECK(AnimShapePoolGet(big)->w == ANIM_SHAPE_GRID_MAX);
+    CHECK(AnimShapePoolGet(big)->h == 1);
+    AnimShapePoolDelete(big, NULL);
+    CHECK(!AnimShapeIdValid(big));
+
+    // -- pixels --------------------------------------------------------------
+    AnimShapeDef *s = AnimShapePoolGet(a);
+    AnimShapeSetPx(s, 0, 0, ANIM_PX_FILL);
+    AnimShapeSetPx(s, 5, 3, ANIM_PX_OUTLINE);
+    AnimShapeSetPx(s, 99, 99, ANIM_PX_FILL);            // out of bounds: ignored
+    CHECK(AnimShapePx(s, 0, 0) == ANIM_PX_FILL);
+    CHECK(AnimShapePx(s, 5, 3) == ANIM_PX_OUTLINE);
+    CHECK(AnimShapePx(s, 1, 1) == ANIM_PX_EMPTY);
+    CHECK(AnimShapePx(s, 99, 99) == ANIM_PX_EMPTY);     // reads clamp too
+
+    // -- round trip ----------------------------------------------------------
+    CHECK(AnimShapePoolSaveOne(a, root));
+    AnimShapePoolLoadAll(NULL, root);
+    int b = AnimShapePoolFindByName("fangs_upper");
+    CHECK(b >= 0);
+    AnimShapeDef *r = AnimShapePoolGet(b);
+    CHECK(r->w == 6 && r->h == 4);
+    CHECK(AnimShapePx(r, 0, 0) == ANIM_PX_FILL);
+    CHECK(AnimShapePx(r, 5, 3) == ANIM_PX_OUTLINE);
+    CHECK(AnimShapePx(r, 2, 2) == ANIM_PX_EMPTY);
+    CHECK(!r->builtin);                                 // came from the user root
+
+    // -- resize preserves the overlap ---------------------------------------
+    AnimShapeResize(r, 3, 2);
+    CHECK(r->w == 3 && r->h == 2);
+    CHECK(AnimShapePx(r, 0, 0) == ANIM_PX_FILL);        // still inside
+    AnimShapeResize(r, 6, 4);
+    CHECK(AnimShapePx(r, 5, 3) == ANIM_PX_EMPTY);       // shrink really dropped it
+
+    // -- unknown keys skip, per the forward-compat contract ------------------
+    const char *odd = "anim_tests_shapes/odd.shp";
+    FILE *f = fopen(odd, "w");
+    CHECK(f != NULL);
+    fprintf(f, "# a comment line\n");
+    fprintf(f, "future_field 42\n");                    // unknown: skipped
+    fprintf(f, "shape odd\nsize 3 2\nrows\n#.#\n.O.\nend\n");
+    fclose(f);
+
+    AnimShapePoolLoadAll(NULL, root);
+    int o = AnimShapePoolFindByName("odd");
+    CHECK(o >= 0);
+    CHECK(AnimShapePoolGet(o)->w == 3 && AnimShapePoolGet(o)->h == 2);
+    CHECK(AnimShapePx(AnimShapePoolGet(o), 0, 0) == ANIM_PX_FILL);
+    CHECK(AnimShapePx(AnimShapePoolGet(o), 1, 1) == ANIM_PX_OUTLINE);
+    CHECK(AnimShapePoolCount() == 2);
+
+    // -- delete removes the file too ----------------------------------------
+    CHECK(AnimShapePoolDelete(o, root));
+    CHECK(!FileExists(odd));
+    AnimShapePoolLoadAll(NULL, root);
+    CHECK(AnimShapePoolCount() == 1);
+
+    remove("anim_tests_shapes/fangs_upper.shp");
+
+    // -- the pool fills at ANIM_SHAPE_POOL_MAX, wherever that is set ----------
+    // The count is a BUILD-TIME knob (8 on web, 512 on desktop - see
+    // anim_shape_pool.h), so this asserts the boundary rather than a number:
+    // every slot up to the limit must be claimable and addressable, and the one
+    // past it must fail. Guards the old hardcoded 8 from creeping back in as an
+    // array bound somewhere.
+    AnimShapePoolLoadAll(NULL, NULL);
+    bool allAdded = true, allAddressable = true;
+    for (int i = 0; i < ANIM_SHAPE_POOL_MAX; i++)
+    {
+        int slot = AnimShapePoolAdd(TextFormat("bulk_%d", i), 2, 2);
+        if (slot == ANIM_SHAPE_MISSING) { allAdded = false; break; }
+        AnimShapeSetPx(AnimShapePoolGet(slot), 1, 1, ANIM_PX_FILL);
+    }
+    CHECK(allAdded);
+    CHECK(AnimShapePoolCount() == ANIM_SHAPE_POOL_MAX);
+    for (int i = 0; i < ANIM_SHAPE_POOL_MAX; i++)
+    {
+        int slot = AnimShapePoolFindByName(TextFormat("bulk_%d", i));
+        if (slot < 0 || AnimShapePx(AnimShapePoolGet(slot), 1, 1) != ANIM_PX_FILL)
+        { allAddressable = false; break; }
+    }
+    CHECK(allAddressable);
+    CHECK(AnimShapePoolAdd("one_too_many", 2, 2) == ANIM_SHAPE_MISSING);
+
+    AnimShapePoolLoadAll(NULL, NULL);
+}
+
+// ---------------------------------------------------------------------------
+//  Shape references survive pool renumbering
+//
+//  A saved AP_S_SHAPE key holds a runtime slot index, which means nothing on the
+//  next run. The .cfg carries `shape_ref <idx> <name>` so the reader can put the
+//  key back on the right SHAPE rather than the right NUMBER.
+// ---------------------------------------------------------------------------
+static void TestShapeRefIO(void)
+{
+    const char *path = "anim_tests_shaperef.cfg";
+
+    AnimShapePoolLoadAll(NULL, NULL);
+    int alpha = AnimShapePoolAdd("alpha", 2, 2);
+    int beta  = AnimShapePoolAdd("beta",  2, 2);
+    CHECK(alpha == 0 && beta == 1);                 // first two free slots
+
+    AnimDoc doc;
+    AnimDocInit(&doc);
+    AnimElem *e = AnimDocAddElem(&doc, AE_SHAPE);
+    e->shapeKind = SHAPE_CUSTOM;
+    TextCopy(e->shapeName, "beta");
+    AnimTrack *tr = AnimElemAddTrack(e, AP_S_SHAPE);
+    AnimTrackAddKey(tr, 0.0f, (float)alpha, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(tr, 1.0f, (float)beta,  ANIM_EASE_LINEAR);
+    CHECK(AnimDocSave(&doc, path));
+
+    // Rebuild the pool with the names in the OTHER order, as a differently
+    // sorted shapes/ directory would.
+    AnimShapePoolLoadAll(NULL, NULL);
+    int beta2  = AnimShapePoolAdd("beta",  2, 2);
+    int alpha2 = AnimShapePoolAdd("alpha", 2, 2);
+    CHECK(beta2 == 0 && alpha2 == 1);               // indices genuinely swapped
+
+    AnimDoc back;
+    CHECK(AnimDocLoad(&back, path));
+    CHECK(back.elems[0].shapeKind == SHAPE_CUSTOM);
+    CHECK(TextIsEqual(back.elems[0].shapeName, "beta"));
+    AnimTrack *bt = NULL;
+    for (int i = 0; i < back.elems[0].trackCount; i++)
+        if (back.elems[0].tracks[i].prop == AP_S_SHAPE) bt = &back.elems[0].tracks[i];
+    CHECK(bt != NULL);
+    // The keys follow the NAMES, not the numbers they were saved as.
+    CHECK((int)bt->keys[0].value == alpha2);
+    CHECK((int)bt->keys[1].value == beta2);
+
+    // A name the pool no longer has resolves to MISSING (placeholder), never to
+    // whatever shape inherited that slot number.
+    AnimShapePoolLoadAll(NULL, NULL);
+    AnimShapePoolAdd("beta", 2, 2);                 // "alpha" is gone
+    CHECK(AnimDocLoad(&back, path));
+    bt = NULL;
+    for (int i = 0; i < back.elems[0].trackCount; i++)
+        if (back.elems[0].tracks[i].prop == AP_S_SHAPE) bt = &back.elems[0].tracks[i];
+    CHECK(bt != NULL);
+    CHECK((int)bt->keys[0].value == ANIM_SHAPE_MISSING);
+    CHECK((int)bt->keys[1].value == AnimShapePoolFindByName("beta"));
+
+    // AP_S_SHAPE is stepped: it snaps at each key rather than interpolating
+    // between two pool indices, which would land on an unrelated third shape.
+    CHECK(AnimPropIsStepped(AP_S_SHAPE));
+    AnimTrack st = { AP_S_SHAPE, {{0}}, 0 };
+    AnimTrackAddKey(&st, 0.0f, 0.0f, ANIM_EASE_LINEAR);
+    AnimTrackAddKey(&st, 1.0f, 2.0f, ANIM_EASE_LINEAR);
+    CHECK_NEAR(AnimTrackEval(&st, 0.5f, 0), 0.0f);  // holds, no midpoint
+    CHECK_NEAR(AnimTrackEval(&st, 1.0f, 0), 2.0f);  // snaps
+
+    // "custom" round-trips as a shape kind name.
+    CHECK(TextIsEqual(AnimShapeKindName(SHAPE_CUSTOM), "custom"));
+    CHECK(AnimShapeKindByName("custom") == SHAPE_CUSTOM);
+
+    remove(path);
+
+    // -- a saved index this build could never allocate ------------------------
+    // The pool size differs per platform (8 on web, 512 on desktop), so a .cfg
+    // written by a desktop build carries slot numbers a web build has no slot
+    // for. Those lines must still resolve BY NAME: the index is only a handle
+    // into the file's own shape_ref table, never a bound on this pool. Written
+    // by hand, since no build can save an index beyond its own pool.
+    const char *far = "anim_tests_shaperef_far.cfg";
+    AnimShapePoolLoadAll(NULL, NULL);
+    int gamma = AnimShapePoolAdd("gamma", 2, 2);
+    CHECK(gamma == 0);
+
+    FILE *cf = fopen(far, "w");
+    CHECK(cf != NULL);
+    fprintf(cf, "doc far 1.000000 0.000000 1.000000 0.300000 0\n");
+    fprintf(cf, "elem shape blob\n");
+    fprintf(cf, "  shape custom\n");
+    fprintf(cf, "  shape_name gamma\n");
+    fprintf(cf, "  shape_ref %d gamma\n", ANIM_SHAPE_REF_MAX - 1);
+    fprintf(cf, "  track shape_id 1\n");
+    fprintf(cf, "    key 0.000000 %d linear\n", ANIM_SHAPE_REF_MAX - 1);
+    fprintf(cf, "  end\n");
+    fclose(cf);
+
+    AnimDoc farDoc;
+    CHECK(AnimDocLoad(&farDoc, far));
+    CHECK(farDoc.elemCount == 1);
+    AnimTrack *ft = NULL;
+    for (int i = 0; i < farDoc.elems[0].trackCount; i++)
+        if (farDoc.elems[0].tracks[i].prop == AP_S_SHAPE) ft = &farDoc.elems[0].tracks[i];
+    CHECK(ft != NULL);
+    CHECK((int)ft->keys[0].value == gamma);         // resolved by NAME, not index
+    remove(far);
+
+    // Past ANIM_SHAPE_REF_MAX there is no table entry to hold the name, so the
+    // key resolves to MISSING (the placeholder) instead of reading off the end.
+    cf = fopen(far, "w");
+    CHECK(cf != NULL);
+    fprintf(cf, "doc far 1.000000 0.000000 1.000000 0.300000 0\n");
+    fprintf(cf, "elem shape blob\n");
+    fprintf(cf, "  shape custom\n");
+    fprintf(cf, "  shape_name gamma\n");
+    fprintf(cf, "  shape_ref %d gamma\n", ANIM_SHAPE_REF_MAX);
+    fprintf(cf, "  track shape_id 1\n");
+    fprintf(cf, "    key 0.000000 %d linear\n", ANIM_SHAPE_REF_MAX);
+    fprintf(cf, "  end\n");
+    fclose(cf);
+
+    CHECK(AnimDocLoad(&farDoc, far));
+    ft = NULL;
+    for (int i = 0; i < farDoc.elems[0].trackCount; i++)
+        if (farDoc.elems[0].tracks[i].prop == AP_S_SHAPE) ft = &farDoc.elems[0].tracks[i];
+    CHECK(ft != NULL);
+    CHECK((int)ft->keys[0].value == ANIM_SHAPE_MISSING);
+
+    remove(far);
+    AnimShapePoolLoadAll(NULL, NULL);
+}
+
 int main(void)
 {
     TestEval();
@@ -2878,6 +3240,8 @@ int main(void)
     TestPauseMarkers();
     TestPlayerSeek();
     TestIOIdempotent();
+    TestIOCrumbleKeys();
+    TestIOCrumbleRestPoseFill();
     TestIOSignalOrphanTarget();
     TestIOSignalGroupTargets();
     TestLibrary();
@@ -2900,6 +3264,8 @@ int main(void)
     TestMultiSegmentEases();
     TestAutoKeyStartsTrack();
     TestTextEscapeIO();
+    TestShapePool();
+    TestShapeRefIO();
 
     printf("anim_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails ? 1 : 0;
