@@ -216,6 +216,12 @@ typedef struct {
     // span <= 0 means "uninitialised" - ZenTimelineClampView snaps it to full.
     float tlViewT0, tlViewSpan;
     bool  tlFollow;                 // keep the playhead in frame (View menu)
+    // Pan is velocity-driven, not a per-notch jump: the wheel kicks tlPanVel
+    // and it decays, the edge gutters hold it. One integrator, so the two
+    // sources can never fight each other mid-frame.
+    float tlPanVel;                 // pan velocity, seconds of doc time / sec
+    int   tlEdgeHot;                // pan gutter under the cursor: -1/0=L/1=R
+    float tlEdgeRamp;               // 0..1 ease-in, so entering never lurches
 
     // -- timeline drag state ------------------------------------------------
     bool  dragPlayhead;

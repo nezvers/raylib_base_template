@@ -33,7 +33,14 @@
 #define ZEN_TL_MIN_SPAN   0.2f
 #define ZEN_TL_ZOOM_STEP  0.85f    // span multiplier per wheel notch / arrow press
 #define ZEN_TL_PAN_STEP   0.15f    // pan per wheel notch, as a fraction of span
-#define ZEN_TL_EDGE_PAD   24.0f    // drag this close to an edge and the view pans
+// Pan gutters: hover strips at the two ends of the track area. Speed ramps with
+// how deep the cursor sits in the strip, so touching the inner lip crawls and
+// pinning the outer edge runs flat out - no binary "you are near the edge" lurch.
+#define ZEN_TL_EDGE_W     28.0f    // width of a pan gutter, pixels
+#define ZEN_TL_EDGE_SPEED 0.90f    // full-tilt edge pan, as a fraction of span/sec
+#define ZEN_TL_EDGE_RAMP  6.0f     // ease-in/out rate of that speed, 1/sec
+#define ZEN_TL_PAN_DAMP   12.0f    // pan velocity decay, 1/sec (wheel glide)
+#define ZEN_TL_FOLLOW_EASE 10.0f   // playhead-follow recentre rate, 1/sec
 // How close the scrubbing playhead counts as "on" a key. Wider than
 // ZEN_AUTOKEY_EPS so a sweep reliably catches keys at normal mouse speed, and
 // wide enough that near-coincident keys are picked up together.
@@ -814,6 +821,34 @@ static void DrawMarkerTriangle(float cx, float cy, float r, bool down, Color c)
     else      DrawTriangle((Vector2){cx,cy},(Vector2){cx-r,cy+r},(Vector2){cx+r,cy+r}, c);
 }
 
+// A pan gutter: invisible until hovered, then a soft glow bleeding in from the
+// end of the track with a chevron pointing the way the view will travel.
+// Brightens as the ramp builds, so the speed you are getting is visible.
+static void DrawTimelinePanGutter(Rectangle g, bool left, bool held, float ramp)
+{
+    Color accent = held ? (Color){ 150, 240, 165, 255 }
+                        : (Color){ 150, 220, 160, 255 };
+    // strongest at the outer edge, fading to nothing inward
+    Color hot = Fade(accent, 0.22f + 0.38f * (held ? ramp : 0.0f));
+    Color cold = Fade(accent, 0.0f);
+    Color oL = left ? hot : cold, oR = left ? cold : hot;
+    // corners run top-left, bottom-left, bottom-right, top-right
+    DrawRectangleGradientEx(g, oL, oL, oR, oR);
+
+    // Sideways triangle, wound counter-clockwise so raylib does not cull it.
+    float cy = g.y + g.height*0.5f;
+    float cx = left ? g.x + 9.0f : g.x + g.width - 9.0f;
+    float r  = held ? 9.0f : 7.0f;
+    float tip  = left ? cx - r*0.6f : cx + r*0.6f;
+    float back = left ? cx + r*0.4f : cx - r*0.4f;
+    if (left) DrawTriangle((Vector2){ tip,  cy      },
+                           (Vector2){ back, cy + r  },
+                           (Vector2){ back, cy - r  }, accent);
+    else      DrawTriangle((Vector2){ tip,  cy      },
+                           (Vector2){ back, cy - r  },
+                           (Vector2){ back, cy + r  }, accent);
+}
+
 static void DrawDottedV(float x, float y0, float y1, Color c)
 {
     for (float yy = y0; yy < y1; yy += 8.0f)
@@ -1122,21 +1157,6 @@ void ZenTimelineClampView(float dur)
     zen.tlViewT0 = ZenClampF(zen.tlViewT0, 0.0f, dur - zen.tlViewSpan);
 }
 
-// Dragging something to the edge of a zoomed window pans the view after it, so
-// a key can be carried past what is currently on screen. Returns nothing: the
-// next frame's X2T reads the shifted window and the drag continues into it.
-static void TimelineEdgePan(float mx, float trackLeft, float trackW, float dur)
-{
-    if (zen.tlViewSpan >= dur) return;              // nothing to pan
-    float dt = GetFrameTime();
-    if (mx < trackLeft + ZEN_TL_EDGE_PAD)
-        zen.tlViewT0 -= zen.tlViewSpan * dt;
-    else if (mx > trackLeft + trackW - ZEN_TL_EDGE_PAD)
-        zen.tlViewT0 += zen.tlViewSpan * dt;
-    else return;
-    ZenTimelineClampView(dur);
-}
-
 static void DrawTimeline(float x, float y, float w, float h)
 {
     bool thin = h < 60.0f;
@@ -1194,19 +1214,85 @@ static void DrawTimeline(float x, float y, float w, float h)
         }
         else if (wheel != 0.0f && !ctrl)    // plain wheel pans
         {
-            zen.tlViewT0 -= wheel * zen.tlViewSpan * ZEN_TL_PAN_STEP;
+            // A kick to the velocity rather than a jump to the position: the
+            // decay below spreads one notch over ~1/DAMP seconds, so repeated
+            // notches blend instead of stepping.
+            zen.tlPanVel -= wheel * zen.tlViewSpan * ZEN_TL_PAN_STEP * ZEN_TL_PAN_DAMP;
+        }
+
+        // PAN GUTTERS. Two hover strips inside the ends of the track area.
+        // They sit ON the track, not beside it, so a key dragged into one is
+        // still on screen and still under the cursor.
+        float dt = GetFrameTime();
+        bool  canPan = (zen.tlViewSpan < dur) && !zen.guiLocked && !thin;
+        Rectangle gutL = { trackLeft,                          y, ZEN_TL_EDGE_W, h };
+        Rectangle gutR = { trackLeft + trackW - ZEN_TL_EDGE_W, y, ZEN_TL_EDGE_W, h };
+
+        zen.tlEdgeHot = -1;
+        if (canPan)
+        {
+            // At a wall that side has nothing left to show, so it offers nothing.
+            if (zen.tlViewT0 > 0.0f && CheckCollisionPointRec(mouse, gutL))
+                zen.tlEdgeHot = 0;
+            else if (zen.tlViewT0 < dur - zen.tlViewSpan &&
+                     CheckCollisionPointRec(mouse, gutR))
+                zen.tlEdgeHot = 1;
+        }
+
+        // Held = actually panning. Hovering alone only lights the gutter; the
+        // button must be down, whether that is a click on the gutter itself or
+        // a key/marker/playhead drag carried into it.
+        bool edgeHeld = (zen.tlEdgeHot >= 0) && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+        zen.tlEdgeRamp = ZenClampF(zen.tlEdgeRamp +
+                                   (edgeHeld ? dt : -dt) * ZEN_TL_EDGE_RAMP, 0.0f, 1.0f);
+        if (edgeHeld)
+        {
+            // depth: 0 at the inner lip, 1 at the outer edge. This is the whole
+            // feel of the thing - speed follows how far in you push.
+            float depth = (zen.tlEdgeHot == 0)
+                        ? (gutL.x + gutL.width - mouse.x) / ZEN_TL_EDGE_W
+                        : (mouse.x - gutR.x) / ZEN_TL_EDGE_W;
+            depth = ZenClampF(depth, 0.0f, 1.0f);
+            float dir = (zen.tlEdgeHot == 0) ? -1.0f : 1.0f;
+            zen.tlPanVel = dir * zen.tlViewSpan * ZEN_TL_EDGE_SPEED *
+                           zen.tlEdgeRamp * depth;
+        }
+
+        // ONE integrator for both sources, so they can never fight mid-frame.
+        if (zen.tlPanVel != 0.0f)
+        {
+            zen.tlViewT0 += zen.tlPanVel * dt;
             ZenTimelineClampView(dur);
+            // Hitting a wall kills the velocity outright: left running it would
+            // buzz against the clamp and read as a stutter.
+            if (zen.tlViewT0 <= 0.0f || zen.tlViewT0 >= dur - zen.tlViewSpan)
+                zen.tlPanVel = 0.0f;
+            else if (!edgeHeld)
+            {
+                zen.tlPanVel *= expf(-ZEN_TL_PAN_DAMP * dt);
+                if (fabsf(zen.tlPanVel) < 1e-4f) zen.tlPanVel = 0.0f;
+            }
         }
 
         // Follow the playhead once it nears the edge of the window. Runs for
-        // playback and scrubbing alike; a no-op when fully zoomed out.
-        if (zen.tlFollow && zen.tlViewSpan < dur)
+        // playback and scrubbing alike; a no-op when fully zoomed out. It must
+        // stand down while the user is driving the view themselves, or the two
+        // pull opposite ways every frame - that was the old snap-back.
+        bool userPanning = (zen.tlEdgeHot >= 0) || zen.tlPanVel != 0.0f ||
+                           zen.dragPlayhead || zen.dragKeyGroup >= 0 ||
+                           zen.dragIntro || zen.dragOutro || zen.dragPause >= 0;
+        if (zen.tlFollow && zen.tlViewSpan < dur && !userPanning)
         {
             float lo = zen.tlViewT0 + zen.tlViewSpan*0.10f;
             float hi = zen.tlViewT0 + zen.tlViewSpan*0.90f;
             if (zen.playhead < lo || zen.playhead > hi)
             {
-                zen.tlViewT0 = zen.playhead - zen.tlViewSpan*0.5f;
+                // Ease in rather than snap: a half-span jump mid-playback is
+                // exactly the lurch this rework is meant to remove.
+                float want = ZenClampF(zen.playhead - zen.tlViewSpan*0.5f,
+                                       0.0f, dur - zen.tlViewSpan);
+                float k = 1.0f - expf(-ZEN_TL_FOLLOW_EASE * dt);
+                zen.tlViewT0 += (want - zen.tlViewT0) * k;
                 ZenTimelineClampView(dur);
             }
         }
@@ -1415,7 +1501,6 @@ static void DrawTimeline(float x, float y, float w, float h)
     }
     if ((zen.dragIntro || zen.dragOutro) && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
     {
-        TimelineEdgePan(mouse.x, trackLeft, trackW, dur);
         float nt = ZenClampF(X2T(mouse.x), 0.0f, dur);
         if (zen.dragIntro) zen.doc.introEnd   = (nt > outStart) ? outStart : nt;
         else               zen.doc.outroStart = (nt < inEnd)    ? inEnd    : nt;
@@ -1463,7 +1548,6 @@ static void DrawTimeline(float x, float y, float w, float h)
     {
         if (zen.dragPause < zen.doc.pauseCount)
         {
-            TimelineEdgePan(mouse.x, trackLeft, trackW, dur);
             float nt = ZenClampF(X2T(mouse.x), 0.0f, dur);
             if (ctrl) nt = ZenClampF(roundf(nt / ZEN_TIMELINE_SNAP) * ZEN_TIMELINE_SNAP,
                                      0.0f, dur);
@@ -1512,6 +1596,26 @@ static void DrawTimeline(float x, float y, float w, float h)
     // bar scrub. Plain scrub re-points the track modal at whatever lane the
     // cursor is in; Shift+scrub sweeps keys into the selection as it crosses
     // them (the quick way to grab a run of keys without clicking each).
+    // PAN GUTTERS. Velocity was already resolved up in the zoom/pan block (it
+    // has to land before v0/vs are snapshotted, or the pan lags a frame behind
+    // whatever is being dragged); all that is left here is to paint them and to
+    // claim a bare press so clicking the arrow does not also start a scrub.
+    // Keys and markers still win - they have set keyHit by now.
+    if (zen.tlEdgeHot >= 0)
+    {
+        Rectangle gut = (zen.tlEdgeHot == 0)
+                      ? (Rectangle){ trackLeft, y, ZEN_TL_EDGE_W, h }
+                      : (Rectangle){ trackLeft + trackW - ZEN_TL_EDGE_W, y,
+                                     ZEN_TL_EDGE_W, h };
+        bool held = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+        BeginScissorMode((int)tlClip.x, (int)tlClip.y, (int)tlClip.width, (int)tlClip.height);
+        DrawTimelinePanGutter(gut, zen.tlEdgeHot == 0, held, zen.tlEdgeRamp);
+        EndScissorMode();
+        ZenTip(gut, "Pan the timeline - click and hold, or drag a key in here");
+
+        if (press && !keyHit) { AudioPlayButton(); keyHit = true; }
+    }
+
     if (press && !keyHit &&
         CheckCollisionPointRec(mouse, (Rectangle){ x, y-4, w, h+4 }))
     {
@@ -1522,7 +1626,6 @@ static void DrawTimeline(float x, float y, float w, float h)
     if (zen.dragKeyGroup >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
     {
         AnimElem *de = &zen.doc.elems[zen.selElem];
-        TimelineEdgePan(mouse.x, trackLeft, trackW, dur);
         float nt = ZenClampF(X2T(mouse.x), 0.0f, dur);
         // Ctrl snaps the key to the tick grid while dragging.
         if (ctrl) nt = ZenClampF(roundf(nt / ZEN_TIMELINE_SNAP) * ZEN_TIMELINE_SNAP, 0.0f, dur);
@@ -1566,7 +1669,6 @@ static void DrawTimeline(float x, float y, float w, float h)
     else if (zen.dragPlayhead && IsMouseButtonDown(MOUSE_BUTTON_LEFT))
     {
         float prevHead = zen.playhead;
-        TimelineEdgePan(mouse.x, trackLeft, trackW, dur);
         zen.playhead = ZenClampF(X2T(mouse.x), 0.0f, dur);
         zen.playing = false; zen.playPending = false;
         zen.preview.playing = false;

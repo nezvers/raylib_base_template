@@ -473,6 +473,7 @@ static void Enter()
     // Timeline zoom is per-visit: it survives playback and element switches,
     // but leaving the editor drops it. span 0 => the clamp helper snaps to full.
     zen.tlViewT0 = 0.0f; zen.tlViewSpan = 0.0f; zen.tlFollow = true;
+    zen.tlPanVel = 0.0f; zen.tlEdgeHot = -1; zen.tlEdgeRamp = 0.0f;
     zen.dragPlayhead = false; zen.dragKeyGroup = -1;
     zen.dragKeySet = false; zen.dragKeyOrigCount = 0;
     zen.dragIntro = zen.dragOutro = false;
