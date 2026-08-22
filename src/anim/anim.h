@@ -41,15 +41,21 @@
 //  ARRAY DIMENSION: raising one grows sizeof(AnimDoc) immediately, and grows it
 //  MULTIPLICATIVELY, since the capacities nest (doc > elems > tracks > keys).
 //
-//  Measured sizes at the current values (x86-64; 4-byte float/int, Color = 4B):
+//  TWO TIERS. Four of the caps below (KEYS/TRACKS/ELEMS/STRINGS) are #ifndef-
+//  guarded and RAISED BY CMake on every non-Web build; the values written in
+//  this file are the WEB tier. Measured (x86-64; 4-byte float/int, Color = 4B):
 //
-//      AnimKey            16 B
-//      AnimTrack         384 B   =  24 keys x 16 B  + prop/count
-//      AnimElem        4,608 B   =  12 tracks x 384 B + base props
-//      AnimSigTarget     140 B   =   8 keys x 16 B  + idx/prop/count
-//      AnimSignal      4,524 B   =  32 targets x 140 B + name/length/terminal
-//      AnimDoc        59,172 B   =  12 elems x 4,608 B + 4 signals x 4,524 B
-//                                =  ~57 KB
+//                        WEB tier          DESKTOP tier
+//      AnimKey              16 B                 16 B
+//      AnimTrack           392 B  (24 keys)   1,032 B  (64 keys)
+//      AnimElem          5,344 B  (12 trk)   25,408 B  (24 trk)
+//      AnimSignal        5,264 B              5,264 B  (unchanged)
+//      AnimDoc          97,660 B  (~95 KB)  968,740 B  (~946 KB)
+//      x24 copies         ~2.2 MB              ~22 MB
+//
+//  So the desktop tier costs ~20 MB more of static memory - nothing on desktop,
+//  and far past what the Web build's fixed heap can hold, which is the whole
+//  reason for the split.
 //
 //  WHICH KNOBS COST THE MOST, per +1 of each (all else unchanged):
 //
@@ -83,10 +89,16 @@
 #define ANIM_TEXT_LEN_MAX 512   // a TEXT element's string buffer (multi-line:
                                 // holds ~8 lines; see the x24 note above -
                                 // this one costs ~129 KB across the build)
+// The four caps below are the WEB floor, and CMakeLists.txt raises them on every
+// non-Web build (see "Anim document capacities" there). Keep the #ifndef guards:
+// the fallback value in this file is what a Web build gets, so the numbers here
+// must stay the ones that fit the 128 MB emscripten heap.
+#ifndef ANIM_KEYS_MAX
 #define ANIM_KEYS_MAX      24   // keyframes per track (deepest nesting: this
-                                // one multiplies by tracks AND elems)
+#endif                          // one multiplies by tracks AND elems)
+#ifndef ANIM_TRACKS_MAX
 #define ANIM_TRACKS_MAX    12   // tracks (animated properties) per element
-                                // (>= the largest per-kind property count, so
+#endif                          // (>= the largest per-kind property count, so
                                 //  every property of an element is trackable)
                                 // EXACTLY FULL FOR BOTH: SHAPE and TEXT each
                                 // have 12 properties, so a 13th prop on either
@@ -94,14 +106,17 @@
                                 // becomes untrackable once the other 12 have
                                 // tracks. tests/anim_tests.c TestGroupCoverage
                                 // asserts the fit.
+#ifndef ANIM_ELEMS_MAX
 #define ANIM_ELEMS_MAX     12   // elements per document
+#endif
 #define ANIM_SIGNALS_MAX    4   // signals per document (a signal is the single
                                 // largest sub-struct, ~3.4 KB each)
 #define ANIM_PAUSES_MAX    12   // pause markers per document. Cheap next to the
                                 // rest: 12 x 8 B = 96 B per doc, ~2.3 KB across
                                 // the x24 copies noted above.
+#ifndef ANIM_STRINGS_MAX
 #define ANIM_STRINGS_MAX   24   // shared text strings per document (see
-                                // AnimString). 24 x 512 B = 12 KB/doc, which is
+#endif                          // AnimString). 24 x 512 B = 12 KB/doc, which is
                                 // +0.28 MB across the build - the price of
                                 // ANIMATED TEXT.
                                 //
@@ -332,8 +347,13 @@ typedef enum { ANIM_FWD = 0, ANIM_REV } AnimPlayDir;
 
 // These two are capacities like the ones at the top of the file, and carry the
 // same cost rules - see the memory notes there before raising either.
+// TIERED with ANIM_ELEMS_MAX (CMakeLists.txt raises both off Web) - the
+// invariant below is >= ANIM_ELEMS_MAX, so raising elems alone would make some
+// elements undrivable by a signal. tests/archive asserts the fit. Cheap: 140 B
+// x ANIM_SIGNALS_MAX per +1, ~0.6 KB/doc, nothing like the nested caps above.
+#ifndef ANIM_SIG_TARGETS_MAX
 #define ANIM_SIG_TARGETS_MAX 32   // (element, property) pairs a signal drives
-                                  // (>= ANIM_ELEMS_MAX so every element can be
+#endif                            // (>= ANIM_ELEMS_MAX so every element can be
                                   //  driven, with several properties each)
                                   // 140 B each; the bulk of AnimSignal's 4.5 KB
                                   // The editor authors targets in property

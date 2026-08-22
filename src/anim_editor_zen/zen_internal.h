@@ -59,6 +59,9 @@ typedef enum {
     ZEN_PROMPT_DURATION,            // Editor > Duration: type an exact length
     ZEN_PROMPT_LIB_SAVE_NAME,       // Element > Save to library: entry name
     ZEN_PROMPT_LIB_RENAME,          // library modal: rename an entry
+    ZEN_PROMPT_TRUNCATED,           // the opened .cfg exceeds THIS build's anim
+                                    // capacities and loaded partially (only the
+                                    // Web build can hit this - see anim.h)
 } ZenPromptKind;
 
 // A scrolling panel view (content taller than the panel scrolls under the
@@ -152,6 +155,11 @@ typedef struct {
     int  prompt;
     int  promptTargetIdx;           // anim index a prompt acts on
     char nameBuf[ANIM_NAME_MAX];    // prompt textbox buffer
+    // ZEN_PROMPT_TRUNCATED body: the per-capacity breakdown from
+    // AnimDocLoadTruncMessage, captured at load because the next AnimDocLoad
+    // (the export's scratch reads, say) resets the loader's counters.
+    char truncMsg[256];
+    char truncAnim[ANIM_NAME_MAX];  // which animation was truncated
     bool edNameBuf;                 // its raygui edit-mode flag
 
     // -- element library modal ----------------------------------------------

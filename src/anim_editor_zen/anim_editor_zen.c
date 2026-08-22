@@ -194,6 +194,19 @@ void ZenRescanAnims(void)
     UnloadDirectoryFiles(fl);
 }
 
+// A document authored with the DESKTOP capacities can exceed what a web build
+// can hold (see the capacity notes in anim.h): AnimDocLoad still succeeds, but
+// quietly drops whatever did not fit. Capture that breakdown NOW - the next
+// AnimDocLoad resets the loader's counters - and raise the info prompt, so a
+// half-loaded animation reads as a build limit rather than a corrupt file.
+static void NoteLoadTruncation(const char *animName)
+{
+    if (!AnimDocLoadTruncated()) return;
+    AnimDocLoadTruncMessage(zen.truncMsg, (int)sizeof zen.truncMsg);
+    TextCopy(zen.truncAnim, animName ? animName : "?");
+    zen.prompt = ZEN_PROMPT_TRUNCATED;
+}
+
 void ZenLoadAnimByIndex(int idx)
 {
     if (idx < 0 || idx >= zen.animCount) return;
@@ -202,6 +215,7 @@ void ZenLoadAnimByIndex(int idx)
         RememberSelElem(zen.animList[zen.animCurrent], zen.selElem);
     AnimSignalUnregister(&zen.doc, &zen.preview);
     if (!AnimDocLoad(&zen.doc, ZenAnimPath(zen.animList[idx]))) MakeStarterDoc();
+    else NoteLoadTruncation(zen.animList[idx]);
     AnimSignalRegister(&zen.doc, &zen.preview, &zen.playhead);
     zen.animCurrent = idx;
     zen.docDirty = false;                       // freshly loaded == clean
@@ -431,7 +445,10 @@ static void Enter()
     if (zen.animCount > 0 &&
         AnimDocLoad(&zen.doc, ZenAnimPath(zen.animList[openIdx])) &&
         zen.doc.elemCount > 0)
+    {
         zen.animCurrent = openIdx;
+        NoteLoadTruncation(zen.animList[openIdx]);
+    }
     else
         MakeStarterDoc();
     zen.docDirty = false;

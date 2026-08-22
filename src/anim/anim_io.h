@@ -25,6 +25,36 @@
 bool AnimDocSave(const AnimDoc *doc, const char *path);
 bool AnimDocLoad(AnimDoc *doc, const char *path);
 
+// --- did the last load FIT? -------------------------------------------------
+// The capacities in anim.h are a TWO-TIER build setting: CMakeLists.txt raises
+// KEYS/TRACKS/ELEMS/STRINGS on desktop and leaves the Web build on the smaller
+// values that fit its fixed 128 MB emscripten heap. So a document authored in
+// the desktop editor can legitimately be too big for the web build, and
+// AnimDocLoad still returns TRUE for it - it loads what fits and DROPS the
+// rest, which without this would be a silently mangled animation.
+//
+// Call AnimDocLoadTruncated() right after a successful AnimDocLoad to find out,
+// and AnimDocLoadTruncMessage() to render what was lost for the user. Valid
+// only until the next AnimDocLoad (each one resets the counts).
+typedef struct {
+    int elems;       // elements past ANIM_ELEMS_MAX (with everything inside)
+    int tracks;      // tracks past ANIM_TRACKS_MAX
+    int keys;        // keyframes past ANIM_KEYS_MAX
+    int strings;     // shared strings whose saved index is >= ANIM_STRINGS_MAX
+    int signals;     // signals past ANIM_SIGNALS_MAX
+    int sigTargets;  // signal targets past ANIM_SIG_TARGETS_MAX
+    int pauses;      // pause markers past ANIM_PAUSES_MAX
+} AnimLoadTrunc;
+
+bool AnimDocLoadTruncated(void);          // true if ANY of the above is nonzero
+const AnimLoadTrunc *AnimDocLoadTrunc(void);   // the per-capacity breakdown
+void AnimDocLoadTruncReset(void);         // AnimDocLoad calls this itself
+
+// Renders the breakdown into `out` as one "<n> <what> (max <cap>)" line per
+// exceeded capacity. Returns the length written (0, with out[0]='\0', when the
+// last load fit).
+int AnimDocLoadTruncMessage(char *out, int cap);
+
 // --- shared `elem ... end` grammar (one writer, one reader) -----------------
 // Used by AnimDocSave/Load AND by the element library (anim_library.*), so an
 // element serializes identically wherever it is stored.

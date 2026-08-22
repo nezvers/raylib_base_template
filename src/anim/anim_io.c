@@ -642,6 +642,69 @@ static void FixupShapeRefs(AnimElem *e)
     for (int i = 0; i < ANIM_SHAPE_REF_MAX; i++) s_shapeRefUsed[i] = false;
 }
 
+// ---------------------------------------------------------------------------
+//  TRUNCATION REPORT. The capacities in anim.h are a two-tier build setting:
+//  CMake raises KEYS/TRACKS/ELEMS/STRINGS on desktop and leaves the Web build
+//  on the smaller values that fit its fixed 128 MB heap. A document authored on
+//  desktop can therefore exceed what a Web build can hold, and every over-cap
+//  add below returns NULL/-1 and is DROPPED - which used to be silent, so a
+//  half-loaded animation looked like a corrupt one.
+//
+//  These counters record what the last AnimDocLoad had to drop, so a caller
+//  (the zen editor) can say "this animation needs the desktop build" instead of
+//  showing a mangled document with no explanation. Reset at the top of every
+//  AnimDocLoad; file-static and not thread-safe, in keeping with this reader.
+//
+//  NOTE ON `tracks`: it cannot fire TODAY. The Web tier's ANIM_TRACKS_MAX (12)
+//  exactly equals the largest per-kind property count (TEXT has 12), which is
+//  the invariant anim.h documents and the archived suite asserts - so no
+//  well-formed .cfg can present a 13th track. It is counted anyway because a
+//  new property would break that tie, and a silent drop is exactly what this
+//  whole mechanism exists to prevent.
+// ---------------------------------------------------------------------------
+static AnimLoadTrunc s_trunc;
+
+void AnimDocLoadTruncReset(void) { s_trunc = (AnimLoadTrunc){ 0 }; }
+
+const AnimLoadTrunc *AnimDocLoadTrunc(void) { return &s_trunc; }
+
+bool AnimDocLoadTruncated(void)
+{
+    return s_trunc.elems || s_trunc.tracks || s_trunc.keys || s_trunc.strings ||
+           s_trunc.signals || s_trunc.sigTargets || s_trunc.pauses;
+}
+
+int AnimDocLoadTruncMessage(char *out, int cap)
+{
+    if (!out || cap <= 0) return 0;
+    out[0] = '\0';
+    if (!AnimDocLoadTruncated()) return 0;
+
+    // One line per exceeded capacity, "<n> <what> (max <cap>)", so the reader
+    // learns BOTH how much was lost and which limit to blame.
+    struct { int n; const char *what; int cap; } rows[] = {
+        { s_trunc.elems,      "elements",       ANIM_ELEMS_MAX       },
+        { s_trunc.tracks,     "tracks",         ANIM_TRACKS_MAX      },
+        { s_trunc.keys,       "keyframes",      ANIM_KEYS_MAX        },
+        { s_trunc.strings,    "text strings",   ANIM_STRINGS_MAX     },
+        { s_trunc.signals,    "signals",        ANIM_SIGNALS_MAX     },
+        { s_trunc.sigTargets, "signal targets", ANIM_SIG_TARGETS_MAX },
+        { s_trunc.pauses,     "pause markers",  ANIM_PAUSES_MAX      },
+    };
+    int len = 0;
+    for (int i = 0; i < (int)(sizeof rows / sizeof rows[0]); i++)
+    {
+        if (rows[i].n <= 0) continue;
+        const char *line = TextFormat("%s%d %s (max %d)", len ? "\n" : "",
+                                      rows[i].n, rows[i].what, rows[i].cap);
+        int add = TextLength(line);
+        if (len + add >= cap) break;            // out of room: stop cleanly
+        TextCopy(out + len, line);
+        len += add;
+    }
+    return len;
+}
+
 bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
                           AnimTrack **curTrack)
 {
@@ -768,7 +831,17 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
         if (fscanf(f, "%31s %d", propName, &keyCount) == 2 && curElem)
         {
             int prop = AnimPropByName(propName, curElem->kind);
-            if (prop >= 0) *curTrack = AnimElemAddTrack(curElem, prop);
+            if (prop >= 0)
+            {
+                *curTrack = AnimElemAddTrack(curElem, prop);
+                // AnimElemAddTrack also returns NULL for a DUPLICATE property,
+                // which is a malformed file, not a capacity problem - so the
+                // count is gated on the cap itself. Either way the track is
+                // dropped and its `key` lines fall into the no-open-track
+                // branch below, which swallows them safely.
+                if (!*curTrack && curElem->trackCount >= ANIM_TRACKS_MAX)
+                    s_trunc.tracks++;
+            }
         }
     }
     else if (TextIsEqual(key, "key"))
@@ -805,23 +878,29 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
                         mt = AnimElemFindTrack(curElem, k_crumbleProps[i]);
                         if (!mt) mt = AnimElemAddTrack(curElem, k_crumbleProps[i]);
                     }
-                    if (mt) AnimTrackAddKey(mt, t, v[i], ease);
+                    if (mt && !AnimTrackAddKey(mt, t, v[i], ease))
+                        s_trunc.keys++;         // ANIM_KEYS_MAX full
+                    else if (!mt && curElem &&
+                             curElem->trackCount >= ANIM_TRACKS_MAX)
+                        s_trunc.tracks++;       // ANIM_TRACKS_MAX full
                 }
             }
         }
         else if (AnimPropIsColor(tr->prop))
         {
             float t; int r, g, b; char easeName[32];
-            if (fscanf(f, "%f %d %d %d %31s", &t, &r, &g, &b, easeName) == 5)
-                AnimTrackAddColorKey(tr, t, (Color){ (unsigned char)r,
-                                     (unsigned char)g, (unsigned char)b, 255 },
-                                     AnimEaseByName(easeName));
+            if (fscanf(f, "%f %d %d %d %31s", &t, &r, &g, &b, easeName) == 5 &&
+                !AnimTrackAddColorKey(tr, t, (Color){ (unsigned char)r,
+                                      (unsigned char)g, (unsigned char)b, 255 },
+                                      AnimEaseByName(easeName)))
+                s_trunc.keys++;                 // ANIM_KEYS_MAX full
         }
         else
         {
             float t, v; char easeName[32];
-            if (fscanf(f, "%f %f %31s", &t, &v, easeName) == 3)
-                AnimTrackAddKey(tr, t, v, AnimEaseByName(easeName));
+            if (fscanf(f, "%f %f %31s", &t, &v, easeName) == 3 &&
+                !AnimTrackAddKey(tr, t, v, AnimEaseByName(easeName)))
+                s_trunc.keys++;                 // ANIM_KEYS_MAX full
         }
     }
     else if (TextIsEqual(key, "end"))
@@ -843,6 +922,7 @@ bool AnimElemReadCfgToken(FILE *f, const char *key, AnimElem *curElem,
 bool AnimDocLoad(AnimDoc *doc, const char *path)
 {
     AnimDocInit(doc);   // empty + defaults; stays this way if the file is absent
+    AnimDocLoadTruncReset();
 
     FILE *f = fopen(path, "r");
     if (!f) return false;
@@ -894,6 +974,8 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
                 curElem  = AnimDocAddElem(doc, ElemKindByName(kindStr));
                 curTrack = NULL;
                 if (curElem) TextCopy(curElem->name, nm);
+                else s_trunc.elems++;   // ANIM_ELEMS_MAX full: this element and
+                                        // every token in it are dropped
             }
         }
         else if (TextIsEqual(key, "string"))
@@ -905,8 +987,9 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
 
             int idx = -1;
             char enc[ANIM_TEXT_LEN_MAX * 2];
-            if (fscanf(f, "%d %" ANIM_TEXT_ENC_WIDTH "s", &idx, enc) == 2 &&
-                idx >= 0 && idx < ANIM_STRINGS_MAX)
+            int scanned = fscanf(f, "%d %" ANIM_TEXT_ENC_WIDTH "s", &idx, enc);
+            if (scanned == 2 && idx >= ANIM_STRINGS_MAX) s_trunc.strings++;
+            if (scanned == 2 && idx >= 0 && idx < ANIM_STRINGS_MAX)
             {
                 DecodeText(enc);
                 // Placed AT its stored index, holes and all - the indices are
@@ -935,6 +1018,7 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
                     AnimPause *p = AnimDocAddPause(doc, t, 1e-4f);
                     if (p) p->once = (n >= 2) && (once != 0);
                 }
+                else if (n >= 1) s_trunc.pauses++;   // ANIM_PAUSES_MAX full
             }
         }
         else if (TextIsEqual(key, "signal"))
@@ -951,6 +1035,8 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
             {
                 int n = sscanf(rest, "%f %d %d %d %d", &len, &term, &uspos,
                                &panch, &rep);
+                if (n >= 1 && doc->signalCount >= ANIM_SIGNALS_MAX)
+                    s_trunc.signals++;               // ANIM_SIGNALS_MAX full
                 if (n >= 1 && doc->signalCount < ANIM_SIGNALS_MAX)
                 {
                     curSig = &doc->signals[doc->signalCount++];
@@ -1059,7 +1145,8 @@ bool AnimDocLoad(AnimDoc *doc, const char *path)
             curTgt = NULL; curPos = NULL;
             if (fscanf(f, "%31s %31s", en, pn) == 2 && fgets(rest, sizeof(rest), f) &&
                 sscanf(rest, "%d", &kc) >= 1 && curSig &&
-                curSig->targetCount < ANIM_SIG_TARGETS_MAX)
+                (curSig->targetCount < ANIM_SIG_TARGETS_MAX ||
+                 (s_trunc.sigTargets++, false)))    // full: count it, drop it
             {
                 int ei = -1;
                 for (int i = 0; i < doc->elemCount; i++)

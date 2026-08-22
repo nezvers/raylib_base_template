@@ -531,7 +531,11 @@ static void DrawPromptModal(void)
 
     ScreenState *ss = ScreenStateGet();
     float W = (float)ss->width, H = (float)ss->height;
-    float mw = 320, mh = 120;
+    // The truncation notice carries a multi-line breakdown plus an explanation
+    // of WHY (a desktop-tier document in a web build), so it gets a bigger box
+    // than the one-line prompts.
+    bool isTrunc = (zen.prompt == ZEN_PROMPT_TRUNCATED);
+    float mw = isTrunc ? 460 : 320, mh = isTrunc ? 260 : 120;
     Rectangle m = { (W-mw)/2, (H-mh)/2, mw, mh };
     DrawRectangle(0, 0, (int)W, (int)H, (Color){ 0, 0, 0, 120 });
     DrawRectangleRec(m, (Color){ 40, 42, 48, 255 });
@@ -590,6 +594,42 @@ static void DrawPromptModal(void)
             else ZenLoadAnimByIndex(t);
         }
         if (GuiButton((Rectangle){ m.x+mw-bw-16, by, bw, bh }, "Cancel"))
+        { AudioPlayButton(); zen.prompt = ZEN_PROMPT_NONE; }
+        break;
+    }
+    case ZEN_PROMPT_TRUNCATED:
+    {
+        // INFO ONLY - there is nothing to undo or retry. The document in memory
+        // is the part that fit, and SAVING IT WOULD WRITE THE LOSS BACK to the
+        // .cfg, so the text says so plainly rather than offering a fix this
+        // build cannot perform.
+        int fs = GuiGetStyle(DEFAULT, TEXT_SIZE);
+        Color warn = (Color){ 235, 180, 90, 255 };
+        Color dim  = (Color){ 170, 175, 185, 255 };
+
+        DrawText(TextFormat("\"%s\" is too large for this build",
+                            zen.truncAnim),
+                 (int)(m.x + 16), (int)(m.y + 14), fs + 2, warn);
+
+        DrawText("It opened PARTIALLY. Dropped:",
+                 (int)(m.x + 16), (int)(m.y + 44), fs, RAYWHITE);
+        DrawText(zen.truncMsg, (int)(m.x + 26), (int)(m.y + 66), fs, dim);
+
+        // The line count is what pushes the footer down; the breakdown is at
+        // most one line per capacity, so measuring it beats a fixed offset.
+        int lines = 1;
+        for (const char *c = zen.truncMsg; *c; c++) if (*c == '\n') lines++;
+        float fy = m.y + 66 + (float)lines * (fs + 4) + 12;
+
+        DrawText("The web build links a fixed 128 MB heap, so it holds\n"
+                 "smaller animations than the desktop build. Open this\n"
+                 "one in the desktop editor to edit it in full.",
+                 (int)(m.x + 16), (int)fy, fs, dim);
+        DrawText("Do NOT save from here - it would write the loss to disk.",
+                 (int)(m.x + 16), (int)(fy + 3 * (fs + 4) + 8), fs,
+                 (Color){ 230, 120, 120, 255 });
+
+        if (GuiButton((Rectangle){ m.x+mw-bw-16, by, bw, bh }, "OK") || enter)
         { AudioPlayButton(); zen.prompt = ZEN_PROMPT_NONE; }
         break;
     }

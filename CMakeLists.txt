@@ -165,6 +165,80 @@ if (TARGET zen_tests)
     target_compile_definitions(zen_tests PUBLIC ANIM_SHAPE_POOL_MAX=${ANIM_SHAPE_POOL_MAX})
 endif()
 
+# ---------------------------------------------------------------------------
+#  Anim document capacities (src/anim/anim.h)
+#
+#  Every one of these is an ARRAY DIMENSION in a fixed-capacity, heap-free
+#  AnimDoc, and they NEST (doc > elems > tracks > keys), so raising them grows
+#  sizeof(AnimDoc) multiplicatively. Docs are held BY VALUE in bulk (16 zen undo
+#  slots + 8 anim_stage slots + export scratch, ~24 copies), so each change
+#  lands in the build multiplied by ~24:
+#
+#      Web tier      AnimDoc  ~95 KB  ->  ~2.2 MB across the build
+#      Desktop tier  AnimDoc ~949 KB  ->  ~22 MB across the build
+#
+#  Web CANNOT take the desktop tier: it links a FIXED 128 MB emscripten heap
+#  (-sTOTAL_MEMORY above) with no ALLOW_MEMORY_GROWTH, and these buffers are
+#  static, spent before main() runs, alongside raylib/Box2D/preloaded resources.
+#  Overshoot is an abort, not a slowdown. So Web keeps the modest defaults
+#  written in anim.h and desktop gets the raised ones from here.
+#
+#  A document authored at desktop capacities will therefore load TRUNCATED in
+#  the web build; AnimDocLoad reports that (see AnimDocLoadTruncated) and the
+#  zen editor surfaces it as a message rather than failing silently.
+#
+#  Plain variables, NOT cache entries - same reason as ANIM_SHAPE_POOL_MAX
+#  above: reconfiguring one build dir from desktop to Web must recompute these,
+#  not reuse a cached desktop value and blow the heap. An explicit -D still wins.
+# ---------------------------------------------------------------------------
+if (NOT "${PLATFORM}" STREQUAL "Web")
+    if (NOT DEFINED ANIM_KEYS_MAX)    # anim.h Web default: 24
+        set(ANIM_KEYS_MAX 64)
+    endif()
+    if (NOT DEFINED ANIM_TRACKS_MAX)  # anim.h Web default: 12
+        set(ANIM_TRACKS_MAX 24)
+    endif()
+    if (NOT DEFINED ANIM_ELEMS_MAX)   # anim.h Web default: 12
+        set(ANIM_ELEMS_MAX 36)
+    endif()
+    if (NOT DEFINED ANIM_STRINGS_MAX) # anim.h Web default: 24
+        set(ANIM_STRINGS_MAX 64)
+    endif()
+    # MUST follow ANIM_ELEMS_MAX: anim.h requires ANIM_SIG_TARGETS_MAX >= it, or
+    # elements past the 32nd cannot be driven by a signal at all (the archived
+    # suite asserts this). Kept at the Web tier's ~1.33x ratio, because the
+    # editor authors targets in property GROUPS and one authored track spends
+    # several slots. Cheap next to the nested caps: ~0.6 KB/doc per +1.
+    if (NOT DEFINED ANIM_SIG_TARGETS_MAX)   # anim.h Web default: 32
+        set(ANIM_SIG_TARGETS_MAX 72)
+    endif()
+endif()
+
+# Applied to the game AND both test executables, so the tests exercise the same
+# capacities the desktop game ships with.
+function(anim_apply_caps target)
+    foreach(cap ANIM_KEYS_MAX ANIM_TRACKS_MAX ANIM_ELEMS_MAX ANIM_STRINGS_MAX
+                ANIM_SIG_TARGETS_MAX)
+        if (DEFINED ${cap})
+            target_compile_definitions(${target} PUBLIC ${cap}=${${cap}})
+        endif()
+    endforeach()
+endfunction()
+
+if ("${PLATFORM}" STREQUAL "Web")
+    message(STATUS " - - - anim capacities: WEB tier (anim.h defaults)")
+else()
+    message(STATUS " - - - anim capacities: keys=${ANIM_KEYS_MAX} tracks=${ANIM_TRACKS_MAX} elems=${ANIM_ELEMS_MAX} strings=${ANIM_STRINGS_MAX} sigTargets=${ANIM_SIG_TARGETS_MAX}")
+endif()
+
+anim_apply_caps(${PROJECT_NAME})
+if (TARGET anim_tests)
+    anim_apply_caps(anim_tests)
+endif()
+if (TARGET zen_tests)
+    anim_apply_caps(zen_tests)
+endif()
+
 # Setting RESOURCES_PATH
 if (${PLATFORM} STREQUAL "Web")
   # Wasm builds have resources directory copied next to it

@@ -12,6 +12,7 @@
 
 #include "raylib.h"
 #include "../src/anim/anim.h"
+#include "../src/anim/anim_io.h"
 #include "../src/anim_editor_zen/zen_internal.h"
 #include <stdio.h>
 #include <string.h>
@@ -524,6 +525,88 @@ static void TestCloneSetAtOwnAnchorIsNoop(void)
     CHECK(ZenGroupKeyTimes(e, gi, t) == 2);
 }
 
+// ---------------------------------------------------------------------------
+//  Load truncation reporting (anim_io.c).
+//
+//  The anim capacities are a TWO-TIER build setting: CMake raises them off Web,
+//  so a desktop-authored .cfg can exceed what a web build holds. AnimDocLoad
+//  still returns true there and drops the overflow, and the editor needs to
+//  know in order to say so instead of showing a mangled document.
+//
+//  This binary IS a desktop build, so it cannot overflow its own caps from a
+//  file it wrote. Instead it writes a .cfg with MORE elements than this build
+//  allows and checks the report - which exercises the same code path a web
+//  build hits on a desktop-authored file.
+// ---------------------------------------------------------------------------
+static void WriteOverCapDoc(const char *path, int elems)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "doc trunctest 5.0 0.0 5.0 0.300000 1\n");
+    for (int i = 0; i < elems; i++)
+        fprintf(f, "elem text e%d\n  text hi\n  track alpha 1\n"
+                   "  key 0.0 1.0 linear\nend\n", i);
+    fclose(f);
+}
+
+static void TestLoadTruncationReported(void)
+{
+    const char *path = "zen_trunc_test.cfg";
+    // Two elements past whatever this build allows: the count must be exact,
+    // not merely nonzero, or a miscount would still "report truncation".
+    WriteOverCapDoc(path, ANIM_ELEMS_MAX + 2);
+
+    AnimDoc doc;
+    CHECK(AnimDocLoad(&doc, path));            // over-cap is NOT a load failure
+    CHECK(doc.elemCount == ANIM_ELEMS_MAX);    // filled to the brim
+    CHECK(AnimDocLoadTruncated());
+    CHECK(AnimDocLoadTrunc()->elems == 2);
+    CHECK(AnimDocLoadTrunc()->keys == 0);      // the kept elements' keys all fit
+
+    char msg[256];
+    int n = AnimDocLoadTruncMessage(msg, (int)sizeof msg);
+    CHECK(n > 0);
+    CHECK(strstr(msg, "2 elements") != NULL);
+
+    remove(path);
+}
+
+// A document that FITS must report nothing - otherwise the editor would raise
+// the "too large for this build" notice on every ordinary open.
+static void TestFittingLoadReportsNothing(void)
+{
+    const char *path = "zen_trunc_fit.cfg";
+    WriteOverCapDoc(path, 2);
+
+    AnimDoc doc;
+    CHECK(AnimDocLoad(&doc, path));
+    CHECK(doc.elemCount == 2);
+    CHECK(!AnimDocLoadTruncated());
+
+    char msg[256];
+    CHECK(AnimDocLoadTruncMessage(msg, (int)sizeof msg) == 0);
+    CHECK(msg[0] == '\0');
+
+    remove(path);
+}
+
+// The counters describe the LAST load only - the editor reads them right after
+// one, and an export's scratch reads must not leave a stale notice behind.
+static void TestTruncationResetsPerLoad(void)
+{
+    const char *big = "zen_trunc_big.cfg", *small = "zen_trunc_small.cfg";
+    WriteOverCapDoc(big, ANIM_ELEMS_MAX + 2);
+    WriteOverCapDoc(small, 1);
+
+    AnimDoc doc;
+    CHECK(AnimDocLoad(&doc, big));
+    CHECK(AnimDocLoadTruncated());
+    CHECK(AnimDocLoad(&doc, small));
+    CHECK(!AnimDocLoadTruncated());            // reset, not accumulated
+
+    remove(big); remove(small);
+}
+
 int main(void)
 {
     TestSetShiftRight();
@@ -547,6 +630,9 @@ int main(void)
     TestCloneSetCopiesValuesAndEase();
     TestCloneSetOverlappingDest();
     TestCloneSetAtOwnAnchorIsNoop();
+    TestLoadTruncationReported();
+    TestFittingLoadReportsNothing();
+    TestTruncationResetsPerLoad();
 
     printf("zen_tests: %d checks, %d failed\n", s_checks, s_fails);
     return s_fails ? 1 : 0;
