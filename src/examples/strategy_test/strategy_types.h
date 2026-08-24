@@ -84,6 +84,7 @@ typedef enum {
     NODE_ROCK,          // yields RES_STONE
     NODE_WHEAT,         // yields RES_FOOD
     NODE_CORPSE,        // yields RES_FOOD (left behind by hunted animals)
+    NODE_KIND_COUNT,    // sentinel: iterate every node kind (asset showcase)
 } NodeKind;
 
 typedef enum {

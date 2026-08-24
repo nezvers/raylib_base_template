@@ -2033,6 +2033,8 @@ static void DrawNode(const ResourceNode *n)
             Vector3 body = (Vector3){ n->pos.x, 0.12f, n->pos.z };
             DrawCube(body, 0.7f, 0.24f, 0.5f, (Color){ 140, 60, 50, 255 });
         } break;
+
+        default: break;     // NODE_KIND_COUNT is a sentinel, never a node
     }
 }
 

@@ -339,10 +339,12 @@ static void Gui()
         }
         y += h + gap;
 
+        // Goes to the asset showcase, which carries its own PLAY button on to
+        // the game. Same row, same LAYOUT_UNITS - only the destination moved.
         if (GuiButton((Rectangle){ x, y, w, h }, "STRATEGY (-> RTS test)"))
         {
             AudioPlayButton();
-            StartGameTransition(&app_state_strategy);
+            StartGameTransition(&app_state_strategy_showcase);
         }
         y += h + gap;
 
