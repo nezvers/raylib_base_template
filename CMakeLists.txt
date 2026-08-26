@@ -145,6 +145,7 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
         src/strategy_asset/strategy_asset_io.c
         src/strategy_asset/strategy_asset_ease.c
         src/strategy_asset/strategy_bindings.c
+        src/strategy_asset/strategy_catalog.c
         ${ANIM_TEST_SRC})
     target_link_libraries(sga_tests raylib)
 endif()

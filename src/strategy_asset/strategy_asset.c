@@ -732,10 +732,77 @@ done:
 // ---------------------------------------------------------------------------
 //  Drawing
 // ---------------------------------------------------------------------------
-void StrategyAssetDraw(const SgaAsset *a, int faction, Vector3 pos, float yawDeg,
-                       float alpha, int state, float time)
+// ---------------------------------------------------------------------------
+//  Several states at once
+// ---------------------------------------------------------------------------
+int StrategyAssetStatePriority(int state)
+{
+    // Urgency order. Dying outranks everything because nothing a unit was doing
+    // still matters once it is dead; a fresh wound outranks a swing because the
+    // hit is the newer news; and IDLE sits at the floor so it only ever drives
+    // the parts nothing else claimed.
+    switch (state)
+    {
+        case SGA_STATE_DIE:       return 5;
+        case SGA_STATE_DAMAGED:   return 4;
+        case SGA_STATE_HEALED:    return 3;
+        case SGA_STATE_ATTACKING: return 2;
+        case SGA_STATE_MOVING:    return 1;
+        case SGA_STATE_IDLE:      return 0;
+        default:                  return -1;
+    }
+}
+
+void StrategyAssetStateSetInit(SgaStateSet *set)
+{
+    if (set == NULL) return;
+    memset(set, 0, sizeof(*set));
+    for (int i = 0; i < SGA_STATE_COUNT; i++) set->slot[i].state = i;
+}
+
+void StrategyAssetStateSetAdd(SgaStateSet *set, int state, float time)
+{
+    if (set == NULL) return;
+    if ((state < 0) || (state >= SGA_STATE_COUNT)) return;
+
+    set->slot[state].state  = state;
+    set->slot[state].time   = time;
+    set->slot[state].active = true;
+}
+
+int StrategyAssetResolvePartState(const SgaAsset *a, int partIndex,
+                                  const SgaStateSet *set)
+{
+    if ((a == NULL) || (set == NULL)) return -1;
+    if ((partIndex < 0) || (partIndex >= a->partCount)) return -1;
+
+    const SgaPart *p = &a->parts[partIndex];
+
+    // The whole conflict rule in one loop: of the states that are ACTIVE and
+    // actually have keys on THIS part, take the highest-priority one. A part
+    // only one state animates is never contested, so it plays that state no
+    // matter how low it ranks - which is what keeps a head bobbing on IDLE
+    // while the legs walk on MOVING.
+    int best = -1;
+    int bestPri = -1;
+
+    for (int st = 0; st < SGA_STATE_COUNT; st++)
+    {
+        if (!set->slot[st].active) continue;
+        if (p->anim[st].keyCount <= 0) continue;
+
+        int pri = StrategyAssetStatePriority(st);
+        if (pri > bestPri) { bestPri = pri; best = st; }
+    }
+
+    return best;
+}
+
+void StrategyAssetDrawStates(const SgaAsset *a, int faction, Vector3 pos,
+                             float yawDeg, float alpha, const SgaStateSet *set)
 {
     if (a == NULL) return;
+
 
     // The matrix is what lets any of this rotate at all: DrawCube and friends
     // are axis-aligned and take world coordinates, so the only way to spin a
@@ -750,8 +817,14 @@ void StrategyAssetDraw(const SgaAsset *a, int faction, Vector3 pos, float yawDeg
         if (!p->visible) continue;
         if (p->kind == SGA_PATH) continue;      // never geometry
 
+        // Each part asks independently which state owns it, so one model can
+        // be mid-walk on its legs and mid-swing on its arm in the same frame.
+        int    ps = StrategyAssetResolvePartState(a, i, set);
+        float  pt = (ps >= 0) ? set->slot[ps].time : 0.0f;
+        if (ps < 0) ps = SGA_STATE_IDLE;    // rest pose: no active state has keys
+
         Vector3 aoff, arot, ascl;
-        StrategyAssetPartPose(a, i, state, time, &aoff, &arot, &ascl);
+        StrategyAssetPartPose(a, i, ps, pt, &aoff, &arot, &ascl);
 
         Color c = StrategyAssetPartColor(p, faction, alpha);
 
@@ -804,6 +877,18 @@ void StrategyAssetDraw(const SgaAsset *a, int faction, Vector3 pos, float yawDeg
     }
 
     rlPopMatrix();
+}
+
+void StrategyAssetDraw(const SgaAsset *a, int faction, Vector3 pos, float yawDeg,
+                       float alpha, int state, float time)
+{
+    // The single-state call is just the multi-state one with one slot lit, so
+    // there is exactly one draw loop to keep correct. The forge and the
+    // showcase inspector still come through here.
+    SgaStateSet set;
+    StrategyAssetStateSetInit(&set);
+    StrategyAssetStateSetAdd(&set, state, time);
+    StrategyAssetDrawStates(a, faction, pos, yawDeg, alpha, &set);
 }
 
 void StrategyAssetDrawPath(const SgaPath *path, Vector3 pos, float yawDeg, Color c)

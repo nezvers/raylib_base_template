@@ -152,6 +152,44 @@ typedef enum {
 
 const char *StrategyAssetStateName(int state);      // bad id -> "IDLE"
 
+// ---------------------------------------------------------------------------
+//  Several states at once
+//
+//  A unit can truthfully be walking, swinging and freshly wounded in the same
+//  frame. Because animation is authored PER PART, those do not have to fight:
+//  if MOVING drives the legs and IDLE drives the head, both play at once and
+//  the model reads as one motion rather than a slideshow of poses.
+//
+//  A conflict is narrower than it sounds - it is two ACTIVE states with keys on
+//  the SAME part. Only then does priority decide, and the loser is silenced for
+//  that part alone, not for the whole model. This is why an unconflicted part
+//  keeps playing its own state no matter how low that state ranks.
+//
+//  The ladder is FIXED and lives in code, not in the file: it encodes urgency
+//  (dying outranks being hit, which outranks swinging) and every asset wants
+//  the same answer. Keeping it out of the format also means no version bump.
+// ---------------------------------------------------------------------------
+typedef struct {
+    int32_t state;      // SgaState
+    float   time;       // seconds into THIS state; each state clocks separately
+    bool    active;
+} SgaStateSlot;
+
+typedef struct {
+    // Indexed BY state, so a state can never be listed twice with two clocks -
+    // the ambiguity is designed out rather than checked for.
+    SgaStateSlot slot[SGA_STATE_COUNT];
+} SgaStateSet;
+
+// Higher wins a contested part: DIE > DAMAGED > HEALED > ATTACKING > MOVING > IDLE.
+int  StrategyAssetStatePriority(int state);
+
+// Clears the set, then turns one state on. The common case, and it keeps
+// callers from having to remember that the array is indexed by state.
+void StrategyAssetStateSetInit(SgaStateSet *set);
+void StrategyAssetStateSetAdd(SgaStateSet *set, int state, float time);
+
+
 // One keyframe. `ease` shapes the segment ENDING at this key - the same rule
 // AnimTrack uses, so the two editors never disagree about what a curve means.
 typedef struct {
@@ -314,6 +352,18 @@ float StrategyAssetEase(const SgaAsset *a, int index, float p);
 // reference model rides on.
 void StrategyAssetDraw(const SgaAsset *a, int faction, Vector3 pos, float yawDeg,
                        float alpha, int state, float time);
+
+// Draw with several states live at once. Each part independently plays the
+// highest-priority ACTIVE state that has keys on it; a part no active state
+// animates holds its rest pose. This is the entry point the game draws through.
+void StrategyAssetDrawStates(const SgaAsset *a, int faction, Vector3 pos,
+                             float yawDeg, float alpha, const SgaStateSet *set);
+
+// Which state should drive this part, or -1 for "none active animates it", in
+// which case the part holds its rest pose. Exposed for the tests, which check
+// the resolution rules directly rather than through a draw call.
+int  StrategyAssetResolvePartState(const SgaAsset *a, int partIndex,
+                                   const SgaStateSet *set);
 
 // Draw one path as a wire loop - the forge's direct-manipulation handle. Not
 // part of the model; never called by the showcase.

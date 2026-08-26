@@ -13,6 +13,9 @@
 // ============================================================================
 
 #include "strategy_world.h"
+#include "strategy_entity_anim.h"
+#include "strategy_models.h"
+#include "../../strategy_asset/strategy_catalog.h"
 #include "../../screen_state/screen_state.h"
 #include "../../settings_state/settings_state.h"
 #include "raymath.h"
@@ -210,6 +213,13 @@ void StrategyWorldInit(void)
     world.selectedBuilding = -1;
     world.gameOver         = -1;
     EffectsReset();
+
+    // Authored assets, if any. The catalog is shared with the showcase and the
+    // forge, so this is a no-op when one of them already loaded it; it is here
+    // so the game can be entered first and still draw bound roles.
+    StrategyAssetSetFactionTint(StrategyFactionTint);
+    StrategyBindingsSetRoleCounts(UNIT_KIND_COUNT, BLD_COUNT, NODE_KIND_COUNT);
+    StrategyCatalogLoad();
 
     // Difficulty mods BEFORE any spawn (UnitSpawn reads them). The player and
     // neutral rows stay identity; only the AI faction is scaled. Hard is the
@@ -1297,6 +1307,11 @@ static void MoveToward(Unit *u, Vector3 dest, float dt)
     float step = u->moveSpeed*dt;
     if (step > dist) step = dist;
     u->pos = Vector3Add(u->pos, Vector3Scale(delta, step/dist));
+
+    // The one place a unit's heading is known without recomputing it. Also
+    // where "is it actually walking" becomes true, which is what separates the
+    // walk from the work inside GATHER / BUILD / REPAIR / FARM.
+    StrategyEntityFace(u, delta);
 }
 
 // Nearest own building that ACCEPTS what the unit is carrying - wood only
@@ -1343,9 +1358,53 @@ static int NearestHostile(const Unit *u, float range)
 
 // Kill a unit. A hunted animal leaves a food corpse node behind, and a worker
 // that did the killing immediately starts harvesting it (hunting loop).
+// A corpse borrows the unit's look for as long as its DIE animation runs. When
+// the pool is full the OLDEST is recycled: a death that cannot be shown is
+// better than dropping the newest one, which is the one the player is watching.
+static void CorpseSpawn(const Unit *u)
+{
+    int slot = -1;
+    float oldest = -1.0f;
+
+    for (int i = 0; i < STRAT_MAX_CORPSES; i++)
+    {
+        if (!world.corpses[i].active) { slot = i; break; }
+        if (world.corpses[i].t > oldest) { oldest = world.corpses[i].t; slot = i; }
+    }
+    if (slot < 0) return;
+
+    world.corpses[slot] = (UnitCorpse){
+        .active = true, .kind = u->kind, .faction = u->faction,
+        .pos = u->pos, .yaw = u->anim.yaw, .t = 0.0f
+    };
+}
+
+static void CorpsesUpdate(float dt)
+{
+    for (int i = 0; i < STRAT_MAX_CORPSES; i++)
+    {
+        UnitCorpse *c = &world.corpses[i];
+        if (!c->active) continue;
+
+        c->t += dt;
+
+        // Retired against the ASSET's own DIE length, so an author lengthening
+        // the animation lengthens the corpse without touching this code. No
+        // asset, or nothing authored, means there is nothing to wait for.
+        const SgaAsset *a = StrategyCatalogForRole(SGB_ROLE_UNIT, c->kind);
+        float dur = (a != NULL) ? a->duration[SGA_STATE_DIE] : 0.0f;
+        if ((dur <= 0.0f) || (c->t >= dur)) c->active = false;
+    }
+}
+
 static void UnitKill(int index, Unit *killer)
 {
     Unit *u = &world.units[index];
+
+    // Copy the look out BEFORE the slot is freed. The slot itself is released
+    // on the very next line, exactly as it always was.
+    CorpseSpawn(u);
+
     u->active   = false;
     u->selected = false;
 
@@ -1421,6 +1480,10 @@ static bool UnitDamage(int victimIndex, Unit *attacker, float damage)
 {
     Unit *v = &world.units[victimIndex];
     v->hp -= damage;
+
+    // Before the death test on purpose: a killing blow should read as a death,
+    // not as a flinch that is immediately replaced by one.
+    if (v->hp > 0.0f) StrategyEntityAnimEvent(v, SGA_STATE_DAMAGED);
 
     if (v->kind == KIND_ANIMAL_WEAK)        AnimalPanic(victimIndex, attacker->pos);
     else if (v->kind == KIND_ANIMAL_STRONG) AnimalRetaliate(victimIndex, attacker);
@@ -1905,6 +1968,7 @@ static void UnitUpdate(int index, float dt)
                         break;      // broke: keep following, try again later
                     world.stockpile[u->faction][RES_PROVIDENCE] -= STRAT_HEAL_COST;
                     t->hp = fminf(t->maxHp, t->hp + STRAT_HEAL_AMOUNT);
+                    StrategyEntityAnimEvent(t, SGA_STATE_HEALED);
                 }
                 else world.stockpile[u->faction][RES_PROVIDENCE] += 1;
 
@@ -1981,6 +2045,18 @@ void StrategyWorldUpdate(float dt)
         if (world.units[i].active) UnitUpdate(i, dt);
     }
     UnitSeparation();
+
+    // After the sim, so the animation reflects the move that just happened
+    // rather than last frame's.
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    {
+        Unit *u = &world.units[i];
+        if (!u->active) continue;
+
+        StrategyEntityAnimUpdate(u, dt);
+        StrategyEntityAnimRetire(u, StrategyCatalogForRole(SGB_ROLE_UNIT, u->kind));
+    }
+    CorpsesUpdate(dt);
     BuildingsUpdate(dt);
 
     // Enemy + animal brains live in strategy_ai.c (orders-only).
@@ -1999,6 +2075,16 @@ void StrategyWorldUpdate(float dt)
 // ----------------------------------------------------------------------------
 static void DrawNode(const ResourceNode *n)
 {
+    const SgaAsset *asset = StrategyCatalogForRole(SGB_ROLE_NODE, n->kind);
+    if (asset != NULL)
+    {
+        SgaStateSet set;
+        StrategyAssetStateSetInit(&set);
+        StrategyAssetStateSetAdd(&set, SGA_STATE_IDLE, (float)GetTime());
+        StrategyAssetDrawStates(asset, FACTION_NEUTRAL, n->pos, 0.0f, 1.0f, &set);
+        return;
+    }
+
     switch (n->kind)
     {
         case NODE_TREE:
@@ -2040,6 +2126,22 @@ static void DrawNode(const ResourceNode *n)
 
 static void DrawBuilding(BuildingKind kind, int faction, Vector3 pos, Color tint)
 {
+    // Same fork as DrawUnit. Buildings have no state machine, so they get one
+    // IDLE slot - which is still enough for an authored building to breathe,
+    // turn a wheel or flicker a fire.
+    const SgaAsset *asset = StrategyCatalogForRole(SGB_ROLE_BUILDING, kind);
+    if (asset != NULL)
+    {
+        // Alpha rides in tint.a here (the placement ghost and the scaffold both
+        // fade that way), so it is passed through as the asset's alpha rather
+        // than being lost.
+        SgaStateSet set;
+        StrategyAssetStateSetInit(&set);
+        StrategyAssetStateSetAdd(&set, SGA_STATE_IDLE, (float)GetTime());
+        StrategyAssetDrawStates(asset, faction, pos, 0.0f, tint.a/255.0f, &set);
+        return;
+    }
+
     switch (kind)
     {
         case BLD_HOUSE:
@@ -2145,7 +2247,18 @@ static void DrawUnit(const Unit *u)
         DrawCircle3D(ring, 0.55f, (Vector3){ 1.0f, 0.0f, 0.0f }, 90.0f, GREEN);
     }
 
-    switch (u->kind)
+    // THE FORK. A role with a binding draws its authored asset; everything else
+    // falls through to the hand-built primitives below, unchanged. That is what
+    // makes this safe to land before a single asset exists: with no bindings,
+    // every branch below is the one that runs.
+    const SgaAsset *asset = StrategyCatalogForRole(SGB_ROLE_UNIT, u->kind);
+    if (asset != NULL)
+    {
+        SgaStateSet set;
+        StrategyEntityAnimSet(u, asset, &set);
+        StrategyAssetDrawStates(asset, u->faction, u->pos, u->anim.yaw, 1.0f, &set);
+    }
+    else switch (u->kind)
     {
         case KIND_WORKER:
         {
@@ -2153,21 +2266,6 @@ static void DrawUnit(const Unit *u)
             Vector3 head = (Vector3){ u->pos.x, 0.95f, u->pos.z };
             DrawSphere(head, 0.18f, ColorBrightness(color, 0.3f));
 
-            // Tending workers wear a "hat" shaped like the resource they plant:
-            // a green cone (forestry -> wood) or a golden cone (farm -> wheat).
-            // Only worn once equipped (after the trip back to the building).
-            if (u->state == UNIT_FARM && u->tendEquipped && u->targetBuilding >= 0)
-            {
-                const BuildingDef *tb =
-                    StrategyBuildingDef(world.buildings[u->targetBuilding].kind);
-                if (tb->tendNode >= 0)
-                {
-                    Color hat = (tb->tendNode == NODE_TREE)
-                        ? (Color){ 60, 140, 60, 255 } : (Color){ 220, 190, 90, 255 };
-                    Vector3 cap = (Vector3){ u->pos.x, 1.12f, u->pos.z };
-                    DrawCylinder(cap, 0.0f, 0.16f, 0.28f, 6, hat);
-                }
-            }
         } break;
 
         case KIND_SOLDIER:
@@ -2218,6 +2316,27 @@ static void DrawUnit(const Unit *u)
         } break;
 
         default: break;
+    }
+
+    // Decorations sit OUTSIDE the fork: they describe what a unit is doing, not
+    // what it looks like, so they belong to every unit whether its model is
+    // authored or built in.
+    //
+    // Tending workers wear a "hat" shaped like the resource they plant: a green
+    // cone (forestry -> wood) or a golden cone (farm -> wheat). Only worn once
+    // equipped (after the trip back to the building).
+    if (u->kind == KIND_WORKER && u->state == UNIT_FARM &&
+        u->tendEquipped && u->targetBuilding >= 0)
+    {
+        const BuildingDef *tb =
+            StrategyBuildingDef(world.buildings[u->targetBuilding].kind);
+        if (tb->tendNode >= 0)
+        {
+            Color hat = (tb->tendNode == NODE_TREE)
+                ? (Color){ 60, 140, 60, 255 } : (Color){ 220, 190, 90, 255 };
+            Vector3 cap = (Vector3){ u->pos.x, 1.12f, u->pos.z };
+            DrawCylinder(cap, 0.0f, 0.16f, 0.28f, 6, hat);
+        }
     }
 
     // Carried resources float above the head, tinted by kind.
@@ -2280,6 +2399,24 @@ void StrategyWorldDraw3D(void)
     for (int i = 0; i < STRAT_MAX_UNITS; i++)
     {
         if (world.units[i].active) DrawUnit(&world.units[i]);
+
+    // Corpses finish their DIE animation after the slot is gone. Drawn with the
+    // units so they sort the same way; a corpse whose role lost its binding
+    // simply stops drawing, since there is no built-in death pose to fall back
+    // on.
+    for (int i = 0; i < STRAT_MAX_CORPSES; i++)
+    {
+        const UnitCorpse *c = &world.corpses[i];
+        if (!c->active) continue;
+
+        const SgaAsset *ca = StrategyCatalogForRole(SGB_ROLE_UNIT, c->kind);
+        if (ca == NULL) continue;
+
+        SgaStateSet set;
+        StrategyAssetStateSetInit(&set);
+        StrategyAssetStateSetAdd(&set, SGA_STATE_DIE, c->t);
+        StrategyAssetDrawStates(ca, c->faction, c->pos, c->yaw, 1.0f, &set);
+    }
     }
 
     // Placement ghost: green when the spot is valid, red when not.

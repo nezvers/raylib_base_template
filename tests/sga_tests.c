@@ -1122,6 +1122,197 @@ static void TestBindingsMissingFileIsFine(void)
     BindRestore();
 }
 
+
+// ===========================================================================
+//  Phase 5: concurrent per-part states
+// ===========================================================================
+
+// Gives `part` a two-key animation in `state`, which is all the resolver looks
+// at - it asks whether a part has keys, never what they contain.
+static void GiveKeys(SgaAsset *a, int part, int state)
+{
+    SgaPartAnim *an = &a->parts[part].anim[state];
+    an->keyCount = 2;
+    an->keys[0].t = 0.0f;
+    an->keys[1].t = 1.0f;
+    an->keys[0].scale = an->keys[1].scale = (Vector3){ 1.0f, 1.0f, 1.0f };
+    a->duration[state] = 1.0f;
+}
+
+// The ladder has to be a strict total order. Two states sharing a rank would
+// make the winner depend on iteration order - stable today, silently different
+// the day the enum is reordered.
+static void TestStatePriorityIsTotalOrder(void)
+{
+    for (int i = 0; i < SGA_STATE_COUNT; i++)
+        for (int j = 0; j < SGA_STATE_COUNT; j++)
+        {
+            if (i == j) continue;
+            CHECK(StrategyAssetStatePriority(i) != StrategyAssetStatePriority(j));
+        }
+
+    // The order the design calls for, spelled out so a reshuffle fails here
+    // rather than in someone's playtest.
+    CHECK(StrategyAssetStatePriority(SGA_STATE_DIE) >
+          StrategyAssetStatePriority(SGA_STATE_DAMAGED));
+    CHECK(StrategyAssetStatePriority(SGA_STATE_DAMAGED) >
+          StrategyAssetStatePriority(SGA_STATE_HEALED));
+    CHECK(StrategyAssetStatePriority(SGA_STATE_HEALED) >
+          StrategyAssetStatePriority(SGA_STATE_ATTACKING));
+    CHECK(StrategyAssetStatePriority(SGA_STATE_ATTACKING) >
+          StrategyAssetStatePriority(SGA_STATE_MOVING));
+    CHECK(StrategyAssetStatePriority(SGA_STATE_MOVING) >
+          StrategyAssetStatePriority(SGA_STATE_IDLE));
+}
+
+// THE point of the phase: two states driving two different parts both play.
+static void TestConcurrentStatesDoNotFight(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "concurrent");
+    a.partCount = 2;
+
+    GiveKeys(&a, 0, SGA_STATE_IDLE);        // the head bobs
+    GiveKeys(&a, 1, SGA_STATE_MOVING);      // the legs walk
+
+    SgaStateSet set;
+    StrategyAssetStateSetInit(&set);
+    StrategyAssetStateSetAdd(&set, SGA_STATE_IDLE, 0.0f);
+    StrategyAssetStateSetAdd(&set, SGA_STATE_MOVING, 0.0f);
+
+    // Neither part is contested, so each keeps its own state - even though
+    // MOVING outranks IDLE, it never touches the head.
+    CHECK(StrategyAssetResolvePartState(&a, 0, &set) == SGA_STATE_IDLE);
+    CHECK(StrategyAssetResolvePartState(&a, 1, &set) == SGA_STATE_MOVING);
+}
+
+// A part both states animate is the only case priority decides.
+static void TestConflictGoesToPriority(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "conflict");
+    a.partCount = 1;
+
+    GiveKeys(&a, 0, SGA_STATE_IDLE);
+    GiveKeys(&a, 0, SGA_STATE_ATTACKING);
+
+    SgaStateSet set;
+    StrategyAssetStateSetInit(&set);
+    StrategyAssetStateSetAdd(&set, SGA_STATE_IDLE, 0.0f);
+    StrategyAssetStateSetAdd(&set, SGA_STATE_ATTACKING, 0.0f);
+    CHECK(StrategyAssetResolvePartState(&a, 0, &set) == SGA_STATE_ATTACKING);
+
+    // Drop the louder state and the part falls back rather than freezing.
+    StrategyAssetStateSetInit(&set);
+    StrategyAssetStateSetAdd(&set, SGA_STATE_IDLE, 0.0f);
+    CHECK(StrategyAssetResolvePartState(&a, 0, &set) == SGA_STATE_IDLE);
+}
+
+// An active state with no keys on a part must not claim it - otherwise a unit
+// that starts walking would freeze every part the walk does not animate.
+static void TestUnanimatedPartFallsToRest(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "rest");
+    a.partCount = 2;
+    GiveKeys(&a, 0, SGA_STATE_MOVING);      // part 1 is animated by nothing
+
+    SgaStateSet set;
+    StrategyAssetStateSetInit(&set);
+    StrategyAssetStateSetAdd(&set, SGA_STATE_MOVING, 0.0f);
+
+    CHECK(StrategyAssetResolvePartState(&a, 0, &set) == SGA_STATE_MOVING);
+    CHECK(StrategyAssetResolvePartState(&a, 1, &set) == -1);
+
+    // -1 means rest pose, and rest is identity - the draw path relies on this.
+    Vector3 off, rot, scl;
+    StrategyAssetPartPose(&a, 1, SGA_STATE_MOVING, 0.5f, &off, &rot, &scl);
+    CHECK_NEAR(off.x, 0.0f); CHECK_NEAR(off.y, 0.0f); CHECK_NEAR(off.z, 0.0f);
+    CHECK_NEAR(scl.x, 1.0f); CHECK_NEAR(scl.y, 1.0f); CHECK_NEAR(scl.z, 1.0f);
+}
+
+// A one-shot must hand the part back when it ends, not hold it forever.
+static void TestOneShotReleasesPart(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "oneshot");
+    a.partCount = 1;
+    GiveKeys(&a, 0, SGA_STATE_IDLE);
+    GiveKeys(&a, 0, SGA_STATE_DAMAGED);
+
+    SgaStateSet set;
+    StrategyAssetStateSetInit(&set);
+    StrategyAssetStateSetAdd(&set, SGA_STATE_IDLE, 0.0f);
+    StrategyAssetStateSetAdd(&set, SGA_STATE_DAMAGED, 0.0f);
+    CHECK(StrategyAssetResolvePartState(&a, 0, &set) == SGA_STATE_DAMAGED);
+
+    StrategyAssetStateSetInit(&set);
+    StrategyAssetStateSetAdd(&set, SGA_STATE_IDLE, 0.0f);
+    CHECK(StrategyAssetResolvePartState(&a, 0, &set) == SGA_STATE_IDLE);
+}
+
+// An empty set is not a crash and not a random pose - every part rests.
+static void TestEmptySetRestsEverything(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "empty");
+    a.partCount = 2;
+    GiveKeys(&a, 0, SGA_STATE_IDLE);
+
+    SgaStateSet set;
+    StrategyAssetStateSetInit(&set);
+    CHECK(StrategyAssetResolvePartState(&a, 0, &set) == -1);
+    CHECK(StrategyAssetResolvePartState(&a, 1, &set) == -1);
+
+    // Out-of-range parts and a NULL asset resolve to rest too, since the draw
+    // loop calls this for every part without pre-checking.
+    CHECK(StrategyAssetResolvePartState(&a, -1, &set) == -1);
+    CHECK(StrategyAssetResolvePartState(&a, 99, &set) == -1);
+    CHECK(StrategyAssetResolvePartState(NULL, 0, &set) == -1);
+}
+
+// The single-state draw is implemented in terms of the multi-state one, so the
+// old entry point has to keep behaving exactly as it did.
+static void TestSingleStateSetMatchesLegacy(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "legacy");
+    a.partCount = 1;
+    GiveKeys(&a, 0, SGA_STATE_MOVING);
+
+    SgaStateSet set;
+    StrategyAssetStateSetInit(&set);
+    StrategyAssetStateSetAdd(&set, SGA_STATE_MOVING, 0.25f);
+
+    CHECK(StrategyAssetResolvePartState(&a, 0, &set) == SGA_STATE_MOVING);
+    CHECK_NEAR(set.slot[SGA_STATE_MOVING].time, 0.25f);
+    CHECK(set.slot[SGA_STATE_MOVING].active);
+    CHECK(!set.slot[SGA_STATE_IDLE].active);
+}
+
+// The catalog is the game's only route to an asset, so its miss cases matter as
+// much as its hits: every one of them means "draw the built-in".
+static void TestCatalogRoleResolution(void)
+{
+    StrategyBindingsClear();
+
+    static SgaAsset assets[2];
+    StrategyAssetInit(&assets[0], "alpha");
+    StrategyAssetInit(&assets[1], "beta");
+
+    CHECK(StrategyBindingResolve(SGB_ROLE_UNIT, 0, assets, 2) == NULL);
+
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 0, "beta"));
+    CHECK(StrategyBindingResolve(SGB_ROLE_UNIT, 0, assets, 2) == &assets[1]);
+
+    // Bound to something not on this machine: falls back, keeps the binding.
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 1, "ghost"));
+    CHECK(StrategyBindingResolve(SGB_ROLE_UNIT, 1, assets, 2) == NULL);
+    CHECK(StrategyBindingIsBound(SGB_ROLE_UNIT, 1));
+
+    StrategyBindingsClear();
+}
+
 int main(void)
 {
     SetTraceLogLevel(LOG_ERROR);    // the version test logs an expected warning
@@ -1157,6 +1348,16 @@ int main(void)
     TestBindingsRoundTrip();
     TestBindingsVersionMismatch();
     TestBindingsMissingFileIsFine();
+
+    // Phase 5: concurrent per-part state resolution.
+    TestStatePriorityIsTotalOrder();
+    TestConcurrentStatesDoNotFight();
+    TestConflictGoesToPriority();
+    TestUnanimatedPartFallsToRest();
+    TestOneShotReleasesPart();
+    TestEmptySetRestsEverything();
+    TestSingleStateSetMatchesLegacy();
+    TestCatalogRoleResolution();
 
     printf("sga_tests: %d checks, %d failures\n", s_checks, s_fails);
     return (s_fails == 0) ? 0 : 1;

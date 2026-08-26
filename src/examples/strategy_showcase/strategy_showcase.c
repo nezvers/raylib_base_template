@@ -36,6 +36,7 @@
 #include "../../strategy_asset/strategy_asset.h"
 #include "../../strategy_asset/strategy_asset_io.h"
 #include "../../strategy_asset/strategy_bindings.h"
+#include "../../strategy_asset/strategy_catalog.h"
 #include "../../strategy_forge/strategy_forge.h"
 #include "../strategy_test/strategy_world.h"
 #include "../strategy_test/strategy_defs.h"
@@ -78,7 +79,8 @@ typedef enum {
 typedef struct {
     AssetCategory cat;
     int           kind;         // UnitKind / BuildingKind / NodeKind
-    SgaAsset     *asset;        // CAT_CUSTOM only; NULL for built-ins
+    const SgaAsset *asset;      // CAT_CUSTOM only; NULL for built-ins. Borrowed
+                                //   from strategy_catalog.c - never freed here.
 } CatalogEntry;
 
 #define CATALOG_MAX (UNIT_KIND_COUNT + BLD_COUNT + NODE_KIND_COUNT + SGA_ASSETS_MAX)
@@ -170,8 +172,10 @@ static struct {
     // Authored assets, loaded from disk on Enter. Held by value because a
     // CatalogEntry points INTO this array - a reload rebuilds both together
     // (CatalogBuild), so no entry can outlive the asset it names.
-    SgaAsset     assets[SGA_ASSETS_MAX];
-    int          assetCount;
+    // The assets themselves live in strategy_catalog.c, shared with the forge
+    // and the live game. Holding a private copy here would be a second ~74 MB
+    // array (desktop tier) of the same models - and would drift the moment one
+    // screen reloaded and the other did not.
 
     // Catalog index awaiting a delete confirmation, -1 for none. Deleting is
     // the one destructive thing the gallery can do, so it always asks.
@@ -385,8 +389,9 @@ static void CatalogBuild(void)
     // Authored assets last, so the built-in sections keep the indices they
     // always had and a newly saved asset never renumbers the rest.
     sc.catStart[CAT_CUSTOM] = sc.catalogCount;
-    for (int k = 0; (k < sc.assetCount) && (sc.catalogCount < CATALOG_MAX); k++)
-        sc.catalog[sc.catalogCount++] = (CatalogEntry){ CAT_CUSTOM, k, &sc.assets[k] };
+    for (int k = 0; (k < StrategyCatalogCount()) && (sc.catalogCount < CATALOG_MAX); k++)
+        sc.catalog[sc.catalogCount++] =
+            (CatalogEntry){ CAT_CUSTOM, k, &StrategyCatalogAssets()[k] };
     sc.catCount[CAT_CUSTOM] = sc.catalogCount - sc.catStart[CAT_CUSTOM];
 }
 
@@ -395,10 +400,10 @@ static void CatalogBuild(void)
 static void FilterApply(void);
 
 // Rescans the asset directory and rebuilds the catalog around it. The two must
-// happen together: a CatalogEntry holds a pointer into sc.assets[].
+// happen together: a CatalogEntry holds a pointer into the shared catalog.
 static void CatalogReload(void)
 {
-    sc.assetCount = StrategyAssetLoadAll(sc.assets, SGA_ASSETS_MAX);
+    StrategyCatalogReload();
     CatalogBuild();
     FilterApply();      // the filter is over the catalog, so it is stale now
 }
@@ -417,7 +422,7 @@ static const StrategyModel *EntryModel(int index)
     }
 }
 
-static SgaAsset *EntryAsset(int index)
+static const SgaAsset *EntryAsset(int index)
 {
     return sc.catalog[index].asset;
 }
@@ -1998,7 +2003,7 @@ static void BindPickerGui(const Layout *L)
     // Row 0 is always "built-in", then one row per authored asset. Built-ins
     // are not offered as a SOURCE here: they are what a role already falls back
     // to, and remixing one into a file is how you bind its look.
-    int rows = sc.assetCount + 1;
+    int rows = StrategyCatalogCount() + 1;
     float contentH = (float)rows*rowH;
 
     if (CheckCollisionPointRec(mp, list))
@@ -2021,7 +2026,7 @@ static void BindPickerGui(const Layout *L)
         if ((row.y + row.height < list.y) || (row.y > list.y + list.height)) continue;
 
         bool isBuiltin = (r == 0);
-        const char *name = isBuiltin ? "" : sc.assets[r - 1].name;
+        const char *name = isBuiltin ? "" : StrategyCatalogAssets()[r - 1].name;
         bool active = isBuiltin ? (bound[0] == '\0') : TextIsEqual(bound, name);
 
         bool hot = CheckCollisionPointRec(mp, row) &&
@@ -2039,7 +2044,7 @@ static void BindPickerGui(const Layout *L)
         }
         else
         {
-            const SgaAsset *a = &sc.assets[r - 1];
+            const SgaAsset *a = &StrategyCatalogAssets()[r - 1];
             DrawText(a->name, (int)(row.x + 10.0f*L->s),
                      (int)(row.y + (row.height - (float)L->fsSmall)*0.5f),
                      L->fsSmall, active ? COL_TEXT : COL_TEXT_DIM);
@@ -2066,7 +2071,7 @@ static void BindPickerGui(const Layout *L)
     }
     EndScissorMode();
 
-    if (sc.assetCount == 0)
+    if (StrategyCatalogCount() == 0)
     {
         const char *msg = "No authored assets yet - CREATE one first.";
         int w = MeasureText(msg, L->fsSmall);
@@ -2094,7 +2099,7 @@ static void DrawBindings(const Layout *L)
     Vector2 mp = GetMousePosition();
     Rectangle area = L->content;
 
-    int missing = StrategyBindingsMissingCount(sc.assets, sc.assetCount);
+    int missing = StrategyBindingsMissingCount(StrategyCatalogAssets(), StrategyCatalogCount());
 
     // -- explanation band -----------------------------------------------------
     float bandH = 40.0f*L->s;
@@ -2167,7 +2172,7 @@ static void DrawBindings(const Layout *L)
             if ((row.y + row.height < list.y) || (row.y > list.y + list.height)) continue;
 
             bool isBound = StrategyBindingIsBound(f, r);
-            const SgaAsset *res = StrategyBindingResolve(f, r, sc.assets, sc.assetCount);
+            const SgaAsset *res = StrategyBindingResolve(f, r, StrategyCatalogAssets(), StrategyCatalogCount());
             bool broken = isBound && (res == NULL);
 
             bool hot = CheckCollisionPointRec(mp, row) &&
@@ -2347,7 +2352,7 @@ static void ConfirmDeleteGui(const Layout *L)
         if (ok && (StrategyBindingsRename(name, NULL) > 0)) StrategyBindingsSave();
         sc.confirmDelete = -1;
 
-        // The catalog points INTO sc.assets, so it has to be rebuilt as a whole
+        // The catalog points INTO the shared asset array, so it is rebuilt whole
         // - every entry after the deleted one has moved.
         if (ok)
         {

@@ -18,10 +18,17 @@
 #include "raylib.h"
 #include <stdbool.h>
 
+// For SGA_STATE_COUNT only. The asset module is headless and pulls in nothing
+// from the game, so the dependency runs one way and does not cycle. Sizing the
+// clock arrays off the real enum is what keeps them from silently disagreeing
+// with it if a state is ever added.
+#include "../../strategy_asset/strategy_asset.h"
+
 // -- Capacities --------------------------------------------------------------
 #define STRAT_MAX_UNITS      96
 #define STRAT_MAX_BUILDINGS  24
 #define STRAT_MAX_NODES      48
+#define STRAT_MAX_CORPSES    16     // visual-only death animations in flight
 #define UNIT_MAX_JOB_QUEUE   8      // build/repair/gather jobs one worker Shift-queues
 #define STRAT_FACTIONS       2      // 0 = player (blue), 1 = enemy (red)
 #define FACTION_NEUTRAL      2      // animals: no stockpile, no color entry -
@@ -181,6 +188,16 @@ typedef struct {
     // them. The active job is the current state + targetBuilding; these follow.
     WorkerJob    jobQueue[UNIT_MAX_JOB_QUEUE];
     int          jobQueueCount;     // 0..UNIT_MAX_JOB_QUEUE
+
+    // Presentation only. Nothing in here may ever decide a gameplay outcome -
+    // it is derived FROM the sim each frame, never the other way round.
+    // See strategy_entity_anim.h for what each field means.
+    struct {
+        float yaw, yawTarget;
+        bool  hasYaw, walking;
+        float clock[SGA_STATE_COUNT];
+        float oneShot[SGA_STATE_COUNT];
+    } anim;
 } Unit;
 
 typedef struct {
@@ -232,10 +249,25 @@ typedef struct {
     float refundBonus;          // added to building sell refund rate
 } FactionMods;
 
+// A unit that has died and is still finishing its DIE animation. PURELY
+// visual: it is not selectable, not targetable, not counted for population or
+// game-over, and occupies no unit slot. That is the whole point - death frees
+// the slot instantly, exactly as it always has, so no combat, AI or selection
+// code had to learn about dying units in order for a death animation to exist.
+typedef struct {
+    bool     active;
+    UnitKind kind;
+    int      faction;
+    Vector3  pos;
+    float    yaw;
+    float    t;             // seconds into DIE; retired past the duration
+} UnitCorpse;
+
 typedef struct {
     Unit         units[STRAT_MAX_UNITS];
     Building     buildings[STRAT_MAX_BUILDINGS];
     ResourceNode nodes[STRAT_MAX_NODES];
+    UnitCorpse   corpses[STRAT_MAX_CORPSES];
     int          stockpile[STRAT_FACTIONS][RES_COUNT];
 
     FactionMods  mods[STRAT_FACTIONS + 1];  // [FACTION_NEUTRAL] = identity
