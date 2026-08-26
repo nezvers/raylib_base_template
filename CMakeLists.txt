@@ -131,6 +131,16 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
         src/anim_editor_zen/zen_groups.c
         ${ANIM_TEST_SRC})
     target_link_libraries(zen_tests raylib)
+
+    # Authored strategy assets. The data model and its binary IO are kept free
+    # of UI calls precisely so they link headless here, the same way zen_groups.c
+    # does. simple_save.h is header-only and its IMPLEMENTATION lives in an
+    # example the tests do not link, so the suite compiles it itself.
+    add_executable(sga_tests
+        tests/sga_tests.c
+        src/strategy_asset/strategy_asset.c
+        src/strategy_asset/strategy_asset_io.c)
+    target_link_libraries(sga_tests raylib)
 endif()
 
 # Checks if OSX and links appropriate frameworks (Only required on MacOS)
@@ -237,6 +247,55 @@ if (TARGET anim_tests)
 endif()
 if (TARGET zen_tests)
     anim_apply_caps(zen_tests)
+endif()
+
+# ---------------------------------------------------------------------------
+#  Authored strategy asset capacities (src/strategy_asset/strategy_asset.h)
+#
+#  Same shape, and the same reason, as the anim caps above: an SgaAsset is a
+#  fixed-capacity, heap-free value the forge holds by value in an undo ring, so
+#  every one of these is an ARRAY DIMENSION and they NEST (asset > parts >
+#  keys-per-state). Web keeps the smaller values written in the header, because
+#  it links a FIXED 128 MB emscripten heap with no ALLOW_MEMORY_GROWTH, where
+#  overshooting is an abort at load rather than a slowdown.
+#
+#  A desktop-authored .sga can therefore be too big for the Web build. That is
+#  expected and REPORTED, not silent - see SgaLoadTrunc in strategy_asset_io.h.
+#
+#  Plain variables, NOT cache entries - same reason as the caps above.
+# ---------------------------------------------------------------------------
+if (NOT "${PLATFORM}" STREQUAL "Web")
+    if (NOT DEFINED SGA_PARTS_MAX)    # strategy_asset.h Web default: 24
+        set(SGA_PARTS_MAX 64)
+    endif()
+    if (NOT DEFINED SGA_KEYS_MAX)     # strategy_asset.h Web default: 12
+        set(SGA_KEYS_MAX 32)
+    endif()
+    if (NOT DEFINED SGA_EASES_MAX)    # strategy_asset.h Web default: 16
+        set(SGA_EASES_MAX 32)
+    endif()
+    if (NOT DEFINED SGA_ASSETS_MAX)   # strategy_asset.h Web default: 64
+        set(SGA_ASSETS_MAX 128)
+    endif()
+endif()
+
+function(sga_apply_caps target)
+    foreach(cap SGA_PARTS_MAX SGA_KEYS_MAX SGA_EASES_MAX SGA_ASSETS_MAX)
+        if (DEFINED ${cap})
+            target_compile_definitions(${target} PUBLIC ${cap}=${${cap}})
+        endif()
+    endforeach()
+endfunction()
+
+if ("${PLATFORM}" STREQUAL "Web")
+    message(STATUS " - - - strategy asset capacities: WEB tier (header defaults)")
+else()
+    message(STATUS " - - - strategy asset capacities: parts=${SGA_PARTS_MAX} keys=${SGA_KEYS_MAX} eases=${SGA_EASES_MAX} assets=${SGA_ASSETS_MAX}")
+endif()
+
+sga_apply_caps(${PROJECT_NAME})
+if (TARGET sga_tests)
+    sga_apply_caps(sga_tests)
 endif()
 
 # Setting RESOURCES_PATH

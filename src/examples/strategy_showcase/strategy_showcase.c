@@ -33,6 +33,9 @@
 #include "rlgl.h"           // rlViewport: aim a 3D pass at one tile
 #include "strategy_showcase.h"
 #include "../strategy_test/strategy_models.h"
+#include "../../strategy_asset/strategy_asset.h"
+#include "../../strategy_asset/strategy_asset_io.h"
+#include "../../strategy_forge/strategy_forge.h"
 #include "../strategy_test/strategy_world.h"
 #include "../strategy_test/strategy_defs.h"
 #include "../../screen_state/screen_state.h"
@@ -61,14 +64,23 @@ AppState app_state_strategy_showcase = {Enter, Exit, Update, Draw, Gui,
 //  the last unit lands on the first building instead of dead-ending, and the
 //  gallery still groups by category because each entry remembers its own.
 // ============================================================================
-typedef enum { CAT_UNIT = 0, CAT_BUILDING, CAT_NODE, CAT_COUNT } AssetCategory;
+typedef enum {
+    CAT_UNIT = 0, CAT_BUILDING, CAT_NODE,
+    CAT_CUSTOM,             // authored .sga files - see strategy_asset.h
+    CAT_COUNT
+} AssetCategory;
 
+// A catalog entry is EITHER a built-in (compiled part table, addressed by
+// `kind`) OR an authored asset (a loaded .sga, addressed by `asset`). The two
+// never mix: `asset` is NULL for every built-in, and that NULL is the test
+// every accessor branches on.
 typedef struct {
     AssetCategory cat;
     int           kind;         // UnitKind / BuildingKind / NodeKind
+    SgaAsset     *asset;        // CAT_CUSTOM only; NULL for built-ins
 } CatalogEntry;
 
-#define CATALOG_MAX (UNIT_KIND_COUNT + BLD_COUNT + NODE_KIND_COUNT)
+#define CATALOG_MAX (UNIT_KIND_COUNT + BLD_COUNT + NODE_KIND_COUNT + SGA_ASSETS_MAX)
 
 typedef enum { VIEW_GALLERY = 0, VIEW_INSPECT, VIEW_MAP } ShowcaseView;
 
@@ -108,8 +120,11 @@ static const Color categoryAccent[CAT_COUNT] = {
     {  90, 190, 255, 255 },     // units      - cyan
     { 255, 170,  70, 255 },     // buildings  - amber
     { 120, 220, 130, 255 },     // resources  - green
+    { 200, 150, 255, 255 },     // authored   - violet
 };
-static const char *categoryName[CAT_COUNT] = { "UNITS", "BUILDINGS", "RESOURCES" };
+static const char *categoryName[CAT_COUNT] = {
+    "UNITS", "BUILDINGS", "RESOURCES", "AUTHORED"
+};
 
 // ============================================================================
 //  State
@@ -129,6 +144,11 @@ static struct {
     int          faction;                // 0, 1 or FACTION_NEUTRAL
     int          inspectIndex;
 
+    // Which animation state the inspector is playing, and its clock. Only
+    // authored assets have anything but IDLE; a built-in ignores both.
+    int          inspectState;
+    float        stateClock;
+
     Vector2      scroll;
     float        contentH;
 
@@ -142,6 +162,16 @@ static struct {
 
     // Tooltip recorded this frame, painted last (see ShowcaseTipDraw).
     char         tipText[TIP_TEXT_MAX];
+
+    // Authored assets, loaded from disk on Enter. Held by value because a
+    // CatalogEntry points INTO this array - a reload rebuilds both together
+    // (CatalogBuild), so no entry can outlive the asset it names.
+    SgaAsset     assets[SGA_ASSETS_MAX];
+    int          assetCount;
+
+    // Catalog index awaiting a delete confirmation, -1 for none. Deleting is
+    // the one destructive thing the gallery can do, so it always asks.
+    int          confirmDelete;
 } sc;
 
 // ============================================================================
@@ -268,6 +298,39 @@ static void WipButton(Rectangle r, const char *label, const char *why)
     ShowcaseTip(r, why);
 }
 
+// A live action button in the showcase's own palette. Disabled is a real state
+// here rather than a placeholder: DELETE is off for built-ins, and the tooltip
+// is the only place that can say why - a disabled raygui control never takes
+// focus, so it never shows a raygui tooltip.
+// Set while the confirm modal paints its own controls, so those stay live while
+// everything behind them goes inert. Guarding on "a modal is open" alone would
+// kill the modal's own buttons too.
+static bool sc_inModal = false;
+
+static bool SheetButton(Rectangle r, const char *label, bool enabled,
+                        const char *tip, int fontSize)
+{
+    Vector2 mp = GetMousePosition();
+    bool blocked = (sc.confirmDelete >= 0) && !sc_inModal;
+    bool hot = enabled && !blocked && CheckCollisionPointRec(mp, r);
+
+    // Enabled must read as enabled at REST, not only under the cursor - an
+    // available action drawn in the dim text colour is indistinguishable from
+    // the disabled one beside it until you happen to hover.
+    DrawRectangleRec(r, enabled ? (hot ? COL_PANEL_HI : Fade(COL_PANEL, 0.75f))
+                                : Fade(COL_PANEL, 0.4f));
+    DrawRectangleLinesEx(r, 1.0f, enabled ? (hot ? COL_LINE_HI : COL_LINE)
+                                          : Fade(COL_LINE, 0.5f));
+    Color tc = enabled ? COL_TEXT : Fade(COL_TEXT_DIM, 0.35f);
+    DrawText(label,
+             (int)(r.x + (r.width - (float)MeasureText(label, fontSize))*0.5f),
+             (int)(r.y + (r.height - (float)fontSize)*0.5f), fontSize, tc);
+
+    ShowcaseTip(r, tip);
+    if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { AudioPlayButton(); return true; }
+    return false;
+}
+
 // ============================================================================
 //  Catalog + model access
 // ============================================================================
@@ -277,20 +340,37 @@ static void CatalogBuild(void)
 
     sc.catStart[CAT_UNIT] = sc.catalogCount;
     for (int k = 0; k < UNIT_KIND_COUNT; k++)
-        sc.catalog[sc.catalogCount++] = (CatalogEntry){ CAT_UNIT, k };
+        sc.catalog[sc.catalogCount++] = (CatalogEntry){ CAT_UNIT, k, NULL };
     sc.catCount[CAT_UNIT] = sc.catalogCount - sc.catStart[CAT_UNIT];
 
     sc.catStart[CAT_BUILDING] = sc.catalogCount;
     for (int k = 0; k < BLD_COUNT; k++)
-        sc.catalog[sc.catalogCount++] = (CatalogEntry){ CAT_BUILDING, k };
+        sc.catalog[sc.catalogCount++] = (CatalogEntry){ CAT_BUILDING, k, NULL };
     sc.catCount[CAT_BUILDING] = sc.catalogCount - sc.catStart[CAT_BUILDING];
 
     sc.catStart[CAT_NODE] = sc.catalogCount;
     for (int k = 0; k < NODE_KIND_COUNT; k++)
-        sc.catalog[sc.catalogCount++] = (CatalogEntry){ CAT_NODE, k };
+        sc.catalog[sc.catalogCount++] = (CatalogEntry){ CAT_NODE, k, NULL };
     sc.catCount[CAT_NODE] = sc.catalogCount - sc.catStart[CAT_NODE];
+
+    // Authored assets last, so the built-in sections keep the indices they
+    // always had and a newly saved asset never renumbers the rest.
+    sc.catStart[CAT_CUSTOM] = sc.catalogCount;
+    for (int k = 0; (k < sc.assetCount) && (sc.catalogCount < CATALOG_MAX); k++)
+        sc.catalog[sc.catalogCount++] = (CatalogEntry){ CAT_CUSTOM, k, &sc.assets[k] };
+    sc.catCount[CAT_CUSTOM] = sc.catalogCount - sc.catStart[CAT_CUSTOM];
 }
 
+// Rescans the asset directory and rebuilds the catalog around it. The two must
+// happen together: a CatalogEntry holds a pointer into sc.assets[].
+static void CatalogReload(void)
+{
+    sc.assetCount = StrategyAssetLoadAll(sc.assets, SGA_ASSETS_MAX);
+    CatalogBuild();
+}
+
+// The built-in part table behind an entry, or NULL when the entry is an
+// authored asset (which has no StrategyModel at all - see EntryAsset).
 static const StrategyModel *EntryModel(int index)
 {
     const CatalogEntry *e = &sc.catalog[index];
@@ -303,11 +383,47 @@ static const StrategyModel *EntryModel(int index)
     }
 }
 
+static SgaAsset *EntryAsset(int index)
+{
+    return sc.catalog[index].asset;
+}
+
+// Display name, from whichever half of the entry owns it.
+static const char *EntryName(int index)
+{
+    const SgaAsset *a = EntryAsset(index);
+    if (a) return a->name;
+    const StrategyModel *m = EntryModel(index);
+    return m ? m->name : "";
+}
+
+// The extents a preview camera frames. Both kinds measure the same two numbers;
+// authored assets keep theirs derived (StrategyAssetMeasure) rather than typed.
+static void EntryExtents(int index, float *height, float *radius)
+{
+    const SgaAsset *a = EntryAsset(index);
+    if (a) { *height = a->height; *radius = a->radius; return; }
+
+    const StrategyModel *m = EntryModel(index);
+    *height = m ? m->height : 1.0f;
+    *radius = m ? m->radius : 0.5f;
+}
+
 // Resource nodes belong to the terrain, not to anyone - the faction switcher
 // must not pretend otherwise, so they always draw neutral.
 static int EntryFaction(int index)
 {
     const CatalogEntry *e = &sc.catalog[index];
+
+    // An authored asset says which faction it belongs to through its own
+    // category label - a "resource" reads as terrain wherever it came from.
+    if (e->cat == CAT_CUSTOM)
+    {
+        const SgaAsset *a = e->asset;
+        if (a && (a->category == SGA_RESOURCE)) return FACTION_NEUTRAL;
+        return sc.faction;
+    }
+
     if (e->cat == CAT_NODE) return FACTION_NEUTRAL;
     if ((e->cat == CAT_UNIT) &&
         ((e->kind == KIND_ANIMAL_WEAK) || (e->kind == KIND_ANIMAL_STRONG)))
@@ -317,10 +433,63 @@ static int EntryFaction(int index)
     return sc.faction;
 }
 
+// ============================================================================
+//  Forge entry points
+//
+//  The forge is opened BEFORE the transition, never after: AppStateTransition
+//  runs the new state's Enter() on the next frame, and Enter() with nothing
+//  opened falls back to a blank document. So every route below sets up the
+//  document first and transitions second.
+// ============================================================================
+static void ForgeOpen(int index, bool remix)
+{
+    StrategyForgeSetReturn(&app_state_strategy_showcase);
+
+    if (index < 0)
+    {
+        StrategyForgeOpenNew();
+    }
+    else
+    {
+        const SgaAsset *a = EntryAsset(index);
+        if (a)
+        {
+            // An authored asset: REMIX copies it under a free name, EDIT opens
+            // the file itself.
+            StrategyForgeOpenAsset(a, remix);
+        }
+        else
+        {
+            // A built-in. Always a remix - strategy_models.c is compiled in and
+            // cannot be written to - so the category is carried across and the
+            // subtype seeded from the tile's own name.
+            const CatalogEntry *e = &sc.catalog[index];
+            int cat = (e->cat == CAT_BUILDING) ? SGA_BUILDING
+                    : (e->cat == CAT_NODE)     ? SGA_RESOURCE
+                                               : SGA_UNIT;
+            StrategyForgeOpenBuiltin(EntryModel(index), EntryName(index),
+                                     cat, EntryName(index));
+        }
+    }
+    AppStateTransition(&app_state_strategy_forge);
+}
+
 // One dim line under the tile name: the stat that best identifies the asset.
 static const char *EntrySubtitle(int index)
 {
     const CatalogEntry *e = &sc.catalog[index];
+
+    // An authored asset has no balance table to quote, so it shows its own
+    // taxonomy instead - which is the thing you would filter it by anyway.
+    if (e->cat == CAT_CUSTOM)
+    {
+        const SgaAsset *a = e->asset;
+        if (a == NULL) return "";
+        return TextFormat("%s / %s   %d parts",
+                          StrategyAssetCategoryName(a->category),
+                          (a->subtype[0] ? a->subtype : "-"), a->partCount);
+    }
+
     if (e->cat == CAT_UNIT)
     {
         const UnitDef *d = StrategyUnitDef((UnitKind)e->kind);
@@ -474,10 +643,10 @@ static void PreviewEnsure(int w, int h)
 // Frame a model so it fills its tile regardless of whether it is a 0.24-tall
 // corpse or a 2.6-tall chantry. The camera looks slightly down at the model's
 // mid-height from a distance derived from its own extents.
-static Camera3D ModelCamera(const StrategyModel *m, float aspect)
+static Camera3D ModelCamera(float height, float radius, float aspect)
 {
-    float reach = m->radius;
-    if (m->height*0.5f > reach) reach = m->height*0.5f;
+    float reach = radius;
+    if (height*0.5f > reach) reach = height*0.5f;
     if (reach < 0.4f) reach = 0.4f;
 
     // Widen the pull-back on narrow tiles so nothing clips at the sides.
@@ -485,8 +654,8 @@ static Camera3D ModelCamera(const StrategyModel *m, float aspect)
     if (aspect < 1.0f) dist /= aspect;
 
     Camera3D cam = { 0 };
-    cam.position   = (Vector3){ dist*0.62f, m->height*0.85f + reach*1.5f, dist*0.62f };
-    cam.target     = (Vector3){ 0.0f, m->height*0.42f, 0.0f };
+    cam.position   = (Vector3){ dist*0.62f, height*0.85f + reach*1.5f, dist*0.62f };
+    cam.target     = (Vector3){ 0.0f, height*0.42f, 0.0f };
     cam.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
     cam.fovy       = 45.0f;
     cam.projection = CAMERA_PERSPECTIVE;
@@ -501,11 +670,22 @@ static Camera3D ModelCamera(const StrategyModel *m, float aspect)
 // would come out stretched. rlViewport is set first so raylib's own matrix
 // math sees the tile's dimensions, and BeginMode3D then does the rest
 // correctly. Scissor keeps the clear and the geometry inside the tile.
-static void PreviewDrawModel(Rectangle region, const StrategyModel *m,
-                             int faction, float yaw, bool groundShadow)
+//
+// Takes a CATALOG INDEX rather than a model pointer, because an entry may be
+// either a built-in part table or an authored asset and only the index knows
+// which. Everything else - framing, viewport, shadow - is identical for both.
+static void PreviewDrawEntry(Rectangle region, int index, int faction,
+                             float yaw, bool groundShadow, int state, float time)
 {
-    if (m == NULL) return;
+    if ((index < 0) || (index >= sc.catalogCount)) return;
     if ((region.width < 1.0f) || (region.height < 1.0f)) return;
+
+    const StrategyModel *m = EntryModel(index);
+    const SgaAsset *a = EntryAsset(index);
+    if ((m == NULL) && (a == NULL)) return;
+
+    float height, radius;
+    EntryExtents(index, &height, &radius);
 
     int rx = (int)region.x;
     int ry = (int)region.y;
@@ -513,7 +693,7 @@ static void PreviewDrawModel(Rectangle region, const StrategyModel *m,
     int rh = (int)region.height;
 
     float aspect = region.width/region.height;
-    Camera3D cam = ModelCamera(m, aspect);
+    Camera3D cam = ModelCamera(height, radius, aspect);
 
     BeginScissorMode(rx, ry, rw, rh);
     // Framebuffer Y is bottom-up; the region rect is top-down.
@@ -524,11 +704,13 @@ static void PreviewDrawModel(Rectangle region, const StrategyModel *m,
         {
             // A soft disc under the model so it reads as standing on something
             // rather than floating in the void.
-            float r = (m->radius > 0.0f) ? m->radius*1.6f : 0.6f;
+            float r = (radius > 0.0f) ? radius*1.6f : 0.6f;
             DrawCylinder((Vector3){ 0.0f, -0.005f, 0.0f }, r, r, 0.01f, 24,
                          (Color){ 0, 0, 0, 70 });
         }
-        StrategyModelDraw(m, faction, (Vector3){ 0.0f, 0.0f, 0.0f }, yaw, 1.0f);
+        if (a) StrategyAssetDraw(a, faction, (Vector3){ 0.0f, 0.0f, 0.0f },
+                                 yaw, 1.0f, state, time);
+        else   StrategyModelDraw(m, faction, (Vector3){ 0.0f, 0.0f, 0.0f }, yaw, 1.0f);
     EndMode3D();
 
     rlViewport(0, 0, sc.previewW, sc.previewH);
@@ -846,8 +1028,11 @@ static void DrawGallery(const Layout *L)
             if (!visible[i]) continue;
             Rectangle clipped = GetCollisionRec(thumbRect[i], L->content);
             if ((clipped.width < 1.0f) || (clipped.height < 1.0f)) continue;
-            PreviewDrawModel(thumbRect[i], EntryModel(i), EntryFaction(i),
-                             SpinYaw(&sc.spin[i]), true);
+            // Gallery tiles always show the IDLE rest pose: a wall of tiles
+            // each playing its own loop is noise, and idle is what a static
+            // asset already is.
+            PreviewDrawEntry(thumbRect[i], i, EntryFaction(i),
+                             SpinYaw(&sc.spin[i]), true, SGA_STATE_IDLE, 0.0f);
         }
     EndTextureMode();
 
@@ -909,9 +1094,8 @@ static void DrawGallery(const Layout *L)
 
                 PreviewBlit(thumbRect[i], thumbRect[i]);
 
-                const StrategyModel *m = EntryModel(i);
                 float ty = t.y + L->thumbH + 6.0f*L->s;
-                DrawText(m->name, (int)(t.x + 10.0f*L->s), (int)ty,
+                DrawText(EntryName(i), (int)(t.x + 10.0f*L->s), (int)ty,
                          L->fsBody, COL_TEXT);
                 DrawText(EntrySubtitle(i), (int)(t.x + 10.0f*L->s),
                          (int)(ty + (float)L->fsBody + 3.0f*L->s),
@@ -965,7 +1149,40 @@ static void ShowcaseInspect(int index)
 {
     if ((index < 0) || (index >= sc.catalogCount)) return;
     sc.inspectIndex = index;
+
+    // Every asset opens on IDLE. Carrying the previous asset's state over would
+    // land on a tab this one may not animate at all, which reads as broken.
+    sc.inspectState = SGA_STATE_IDLE;
+    sc.stateClock = 0.0f;
+
     ShowcaseSetView(VIEW_INSPECT);
+}
+
+// True when this entry has keys on `state` - what greys out an empty tab.
+static bool EntryHasState(int index, int state)
+{
+    const SgaAsset *a = EntryAsset(index);
+    if (a == NULL) return (state == SGA_STATE_IDLE);    // built-ins are idle-only
+
+    if (state == SGA_STATE_IDLE) return true;           // the rest pose always exists
+    for (int k = 0; k < a->partCount; k++)
+        if (a->parts[k].anim[state].keyCount > 0) return true;
+    return false;
+}
+
+// Advances the inspector's animation clock, looping over the state's authored
+// duration. A state with no duration holds at 0 - a still pose, not a freeze
+// at some arbitrary time.
+static void StateClockUpdate(int index, float dt)
+{
+    const SgaAsset *a = EntryAsset(index);
+    if (a == NULL) { sc.stateClock = 0.0f; return; }
+
+    float dur = a->duration[sc.inspectState];
+    if (dur <= 0.0f) { sc.stateClock = 0.0f; return; }
+
+    sc.stateClock += dt;
+    while (sc.stateClock > dur) sc.stateClock -= dur;
 }
 
 static void InspectStep(int delta)
@@ -992,6 +1209,46 @@ static void DrawInspectStats(Rectangle r, int index, const Layout *L)
             DrawRectangleRec((Rectangle){ r.x, y - lh*0.22f, r.width, 1.0f }, \
                              Fade(COL_LINE, 0.6f));                            \
         } while (0)
+
+    // An authored asset has no balance table behind it. What it does have is
+    // the shape of the thing itself, which is what an author needs to see.
+    if (e->cat == CAT_CUSTOM)
+    {
+        const SgaAsset *a = e->asset;
+        if (a == NULL) return;
+
+        STAT_ROW("CATEGORY", StrategyAssetCategoryName(a->category));
+        STAT_ROW("SUBTYPE", a->subtype[0] ? a->subtype : "-");
+        STAT_ROW("PARTS", TextFormat("%d", a->partCount));
+
+        int paths = 0;
+        for (int k = 0; k < a->partCount; k++)
+            if (a->parts[k].kind == SGA_PATH) paths++;
+        if (paths > 0) STAT_ROW("MOTION PATHS", TextFormat("%d", paths));
+
+        STAT_ROW("HEIGHT", TextFormat("%.2f", a->height));
+        STAT_ROW("WIDTH", TextFormat("%.2f", a->radius*2.0f));
+
+        // Which states carry animation - the thing the state selector steps
+        // through, listed so an empty tab is expected rather than a surprise.
+        char states[128] = { 0 };
+        int pos = 0;
+        for (int st = 0; st < SGA_STATE_COUNT; st++)
+        {
+            bool any = false;
+            for (int k = 0; (k < a->partCount) && !any; k++)
+                if (a->parts[k].anim[st].keyCount > 0) any = true;
+            if (!any) continue;
+            if (pos > 0) TextAppend(states, " ", &pos);
+            TextAppend(states, StrategyAssetStateName(st), &pos);
+        }
+        STAT_ROW("ANIMATED", (pos > 0) ? states : "none - static");
+
+        if (a->easeCount > 0)
+            STAT_ROW("BAKED CURVES", TextFormat("%d", a->easeCount));
+
+        return;     // STAT_ROW is #undef'd once, at the end of the function
+    }
 
     if (e->cat == CAT_UNIT)
     {
@@ -1089,7 +1346,6 @@ static void DrawInspect(const Layout *L)
 
     int i = sc.inspectIndex;
     const CatalogEntry *e = &sc.catalog[i];
-    const StrategyModel *m = EntryModel(i);
 
     // Stage on the left, stat sheet on the right. On a narrow window the sheet
     // gets a floor so it never collapses into an unreadable strip.
@@ -1112,10 +1368,13 @@ static void DrawInspect(const Layout *L)
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && (sc.dragTile >= 0)) ShowcaseDragEnd();
     SpinUpdate(&sc.spin[i], dt, overStage, (sc.dragTile == i));
 
+    StateClockUpdate(i, dt);
+
     // -- 3D ------------------------------------------------------------------
     BeginTextureMode(sc.preview);
         ClearBackground(BLANK);
-        PreviewDrawModel(stage, m, EntryFaction(i), SpinYaw(&sc.spin[i]), true);
+        PreviewDrawEntry(stage, i, EntryFaction(i), SpinYaw(&sc.spin[i]), true,
+                         sc.inspectState, sc.stateClock);
     EndTextureMode();
 
     PanelBG(stage, false);
@@ -1124,7 +1383,7 @@ static void DrawInspect(const Layout *L)
     PreviewBlit(stage, stage);
 
     // -- name plate over the stage -------------------------------------------
-    DrawText(m->name, (int)(stage.x + 20.0f*L->s),
+    DrawText(EntryName(i), (int)(stage.x + 20.0f*L->s),
              (int)(stage.y + stage.height - (float)L->fsHead - 30.0f*L->s),
              L->fsHead, COL_TEXT);
     DrawText(categoryName[e->cat], (int)(stage.x + 20.0f*L->s),
@@ -1144,6 +1403,55 @@ static void DrawInspect(const Layout *L)
     DrawText("drag to turn  -  release to resume spin",
              (int)(stage.x + 20.0f*L->s), (int)(stage.y + 14.0f*L->s),
              L->fsSmall, Fade(COL_TEXT_DIM, 0.75f));
+
+    // -- state tabs -----------------------------------------------------------
+    // Every asset shows all six, not just the ones it animates: the empty tabs
+    // are how an author sees what is still unauthored. A state with no keys is
+    // dimmed and says so rather than silently showing the same still pose.
+    {
+        float tabH = 22.0f*L->s;
+        float tabGap = 4.0f*L->s;
+        float tx = stage.x + 20.0f*L->s;
+        float ty = stage.y + 14.0f*L->s + (float)L->fsSmall + 10.0f*L->s;
+
+        for (int st = 0; st < SGA_STATE_COUNT; st++)
+        {
+            const char *label = StrategyAssetStateName(st);
+            float tw = (float)MeasureText(label, L->fsSmall) + 16.0f*L->s;
+            Rectangle tab = { tx, ty, tw, tabH };
+
+            bool has = EntryHasState(i, st);
+            bool on = (sc.inspectState == st);
+            bool hot = CheckCollisionPointRec(mp, tab);
+
+            DrawRectangleRec(tab, on ? Fade(categoryAccent[e->cat], 0.22f)
+                                     : Fade(COL_PANEL, hot ? 0.95f : 0.55f));
+            DrawRectangleLinesEx(tab, 1.0f,
+                                 on ? categoryAccent[e->cat]
+                                    : (hot ? COL_LINE_HI : COL_LINE));
+
+            Color tc = on ? COL_TEXT : (has ? COL_TEXT_DIM : Fade(COL_TEXT_DIM, 0.45f));
+            DrawText(label, (int)(tab.x + 8.0f*L->s),
+                     (int)(tab.y + (tabH - (float)L->fsSmall)*0.5f), L->fsSmall, tc);
+
+            if (hot)
+            {
+                ShowcaseTip(tab, has ? TextFormat("Show the %s animation.", label)
+                                     : TextFormat("%s is not animated on this "
+                                                  "asset - it shows the idle pose.",
+                                                  label));
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+                {
+                    AudioPlayButton();
+                    ShowcaseDragEnd();      // a press up here is not a grab
+                    sc.inspectState = st;
+                    sc.stateClock = 0.0f;   // restart, so the change is visible
+                }
+            }
+
+            tx += tw + tabGap;
+        }
+    }
 
     // -- prev / next ----------------------------------------------------------
     float navW = 44.0f*L->s;
@@ -1168,7 +1476,7 @@ static void DrawInspect(const Layout *L)
     Rectangle inner = { sheet.x + 18.0f*L->s, sheet.y + 18.0f*L->s,
                         sheet.width - 36.0f*L->s, sheet.height - 36.0f*L->s };
 
-    DrawText(m->name, (int)inner.x, (int)inner.y, L->fsHead, COL_TEXT);
+    DrawText(EntryName(i), (int)inner.x, (int)inner.y, L->fsHead, COL_TEXT);
     float sy = inner.y + (float)L->fsHead + 6.0f*L->s;
     DrawText(TextFormat("%d of %d", i + 1, sc.catalogCount),
              (int)inner.x, (int)sy, L->fsSmall, COL_TEXT_DIM);
@@ -1178,14 +1486,32 @@ static void DrawInspect(const Layout *L)
 
     DrawInspectStats((Rectangle){ inner.x, sy, inner.width, 0.0f }, i, L);
 
-    // WIP actions live at the bottom of the sheet.
+    // Asset actions live at the bottom of the sheet. What they mean depends on
+    // where the asset came from: an authored one can be edited in place and
+    // deleted, a built-in can only be remixed into a new file.
+    bool authored = (EntryAsset(i) != NULL);
     float bh = 30.0f*L->s;
     float by = sheet.y + sheet.height - 18.0f*L->s - bh;
     float bw = (inner.width - 8.0f*L->s)*0.5f;
-    WipButton((Rectangle){ inner.x, by, bw, bh }, "REMIX",
-              "Coming soon - editing an asset is not available yet.");
-    WipButton((Rectangle){ inner.x + bw + 8.0f*L->s, by, bw, bh }, "DELETE",
-              "Coming soon - removing an asset is not available yet.");
+
+    if (SheetButton((Rectangle){ inner.x, by, bw, bh },
+                    authored ? "EDIT" : "REMIX", true,
+                    authored ? "Open this asset in the forge."
+                             : "Copy this built-in into a new asset you can edit. "
+                               "The built-in itself is never changed.", L->fsSmall))
+    {
+        ForgeOpen(i, !authored);
+        return;                 // the state is gone; touch nothing else
+    }
+
+    if (SheetButton((Rectangle){ inner.x + bw + 8.0f*L->s, by, bw, bh }, "DELETE",
+                    authored, authored ? "Delete this asset's file."
+                                       : "Built-in assets are part of the game and "
+                                         "cannot be deleted.", L->fsSmall))
+    {
+        sc.confirmDelete = i;
+    }
+
     DrawText("ASSET ACTIONS", (int)inner.x, (int)(by - (float)L->fsSmall - 6.0f*L->s),
              L->fsSmall, COL_TEXT_DIM);
 
@@ -1327,6 +1653,69 @@ static void DrawHeader(const Layout *L)
     FactionSwitcher(sw, L->fsSmall);
 }
 
+// ============================================================================
+//  Delete confirmation
+//
+//  Deleting is the only irreversible thing the gallery can do - the file goes
+//  from disk and no undo ring in this state holds it - so it always asks, and
+//  names the asset it is about to remove rather than saying "this item".
+// ============================================================================
+static void ConfirmDeleteGui(const Layout *L)
+{
+    int i = sc.confirmDelete;
+    if (i < 0) return;
+
+    sc_inModal = true;
+
+    // The catalog can be rebuilt between the click and this draw; a stale index
+    // would confirm a delete on whatever slid into that slot.
+    if ((i >= sc.catalogCount) || (EntryAsset(i) == NULL))
+    { sc.confirmDelete = -1; sc_inModal = false; return; }
+
+    Vector2 screen = ScreenStateSize();
+    float mw = 420.0f*L->s, mh = 150.0f*L->s;
+    if (mw > screen.x - 40.0f) mw = screen.x - 40.0f;
+    Rectangle m = { (screen.x - mw)*0.5f, (screen.y - mh)*0.5f, mw, mh };
+
+    DrawRectangle(0, 0, (int)screen.x, (int)screen.y, (Color){ 0, 0, 0, 150 });
+    DrawRectangleRec(m, COL_PANEL);
+    DrawRectangleLinesEx(m, 1.0f, COL_LINE_HI);
+    DrawText("DELETE ASSET", (int)(m.x + 16.0f*L->s), (int)(m.y + 14.0f*L->s),
+             L->fsBody, COL_TEXT);
+    DrawText(TextFormat("Delete \"%s\" from disk? This cannot be undone.", EntryName(i)),
+             (int)(m.x + 16.0f*L->s), (int)(m.y + 14.0f*L->s + (float)L->fsBody + 8.0f*L->s),
+             L->fsSmall, COL_TEXT_DIM);
+
+    float bh = 26.0f*L->s;
+    float by = m.y + mh - bh - 14.0f*L->s;
+    if (SheetButton((Rectangle){ m.x + mw - 100.0f*L->s, by, 88.0f*L->s, bh },
+                    "DELETE", true, NULL, L->fsSmall))
+    {
+        const char *name = EntryName(i);
+        bool ok = StrategyAssetDelete(name);
+        sc.confirmDelete = -1;
+
+        // The catalog points INTO sc.assets, so it has to be rebuilt as a whole
+        // - every entry after the deleted one has moved.
+        if (ok)
+        {
+            CatalogReload();
+            if (sc.inspectIndex >= sc.catalogCount) sc.inspectIndex = sc.catalogCount - 1;
+            if (sc.inspectIndex < 0) sc.inspectIndex = 0;
+            if (sc.catalogCount == 0) ShowcaseSetView(VIEW_GALLERY);
+        }
+        sc_inModal = false;
+        return;
+    }
+    if (SheetButton((Rectangle){ m.x + mw - 196.0f*L->s, by, 88.0f*L->s, bh },
+                    "CANCEL", true, NULL, L->fsSmall))
+        sc.confirmDelete = -1;
+
+    if (IsKeyPressed(KEY_ESCAPE)) sc.confirmDelete = -1;
+
+    sc_inModal = false;
+}
+
 static void DrawFooter(const Layout *L)
 {
     Vector2 screen = ScreenStateSize();
@@ -1360,14 +1749,32 @@ static void DrawFooter(const Layout *L)
     }
     x += backW + L->gap;
 
-    // WIP authoring actions, disabled with an explanation on hover.
+    // Authoring actions. REMIX works on whatever the gallery is pointing at,
+    // which in the gallery view is the hovered tile and in the inspector is the
+    // asset on screen - so the button means the same thing in both.
     float wipW = 96.0f*L->s;
-    WipButton((Rectangle){ x, by, wipW, bh }, "CREATE",
-              "Coming soon - creating new assets is not available yet.");
+    if (SheetButton((Rectangle){ x, by, wipW, bh }, "CREATE", true,
+                    "Build a new asset from scratch.", L->fsSmall))
+    {
+        ForgeOpen(-1, false);
+        return;                 // the state is gone; touch nothing else
+    }
     x += wipW + 8.0f*L->s;
-    WipButton((Rectangle){ x, by, wipW, bh }, "REMIX",
-              "Coming soon - remixing an existing asset is not available yet.");
+
+    int target = (sc.view == VIEW_INSPECT) ? sc.inspectIndex
+               : ((sc.hoverTile >= 0) ? sc.hoverTile : -1);
+    bool canRemix = (target >= 0) && (target < sc.catalogCount);
+    if (SheetButton((Rectangle){ x, by, wipW, bh }, "REMIX", canRemix,
+                    canRemix ? "Copy the selected asset into a new one you can edit."
+                             : "Hover an asset first, or open one to inspect it.",
+                    L->fsSmall))
+    {
+        ForgeOpen(target, EntryAsset(target) != NULL);
+        return;
+    }
     x += wipW + 8.0f*L->s;
+
+    // Binding a look to a game role is Phase 4; the seam stays visible.
     WipButton((Rectangle){ x, by, wipW + 30.0f*L->s, bh }, "ASSIGN TO FACTION",
               "Coming soon - mapping assets to a faction or level is not "
               "available yet.");
@@ -1399,7 +1806,13 @@ static void Enter()
     ss->clear_color = COL_BG;
 
     memset(&sc, 0, sizeof(sc));
-    CatalogBuild();
+
+    // strategy_asset.c deliberately does not link the game's world (it has to
+    // stay headless-testable), so it learns the faction palette through this
+    // hook. Installed before anything draws.
+    StrategyAssetSetFactionTint(StrategyFactionTint);
+
+    CatalogReload();        // scans SGA_DIR, then builds the catalog around it
 
     sc.view = VIEW_GALLERY;
     sc.faction = 0;
@@ -1412,6 +1825,7 @@ static void Enter()
     sc.mapYaw = 35.0f;
     sc.mapPitch = 55.0f;
     sc.mapZoom = 1.25f;
+    sc.confirmDelete = -1;      // memset would leave this pointing at entry 0
 
     // Stagger the starting angles so the grid does not read as one rigid
     // block of identically-posed models.
@@ -1503,5 +1917,6 @@ static void Gui()
     DrawFooter(&L);
 
     // Last, so a tip paints over every panel it might overlap.
+    ConfirmDeleteGui(&L);
     ShowcaseTipDraw(L.fsSmall);
 }

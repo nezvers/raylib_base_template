@@ -90,3 +90,4 @@ build-web/*
 anims/exports/*
 anims/ma_*
 
+assets_strategy/*.sga
