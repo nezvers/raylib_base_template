@@ -37,7 +37,7 @@
 #include <string.h>
 
 // Bump on ANY change to SgaFile's layout.
-#define SGA_SAVE_VERSION 1
+#define SGA_SAVE_VERSION 2
 
 // ---------------------------------------------------------------------------
 //  THE ON-DISK CAPACITIES ARE FIXED, and deliberately NOT the build's tiered
@@ -80,6 +80,7 @@ typedef struct { float x, y, z; } SgaV3Disk;
 typedef struct {
     float     t;
     float     u;
+    SgaV3Disk offset;       // added in v2
     SgaV3Disk rot;
     SgaV3Disk scale;
     int32_t   ease;
@@ -140,9 +141,9 @@ typedef struct {
 // A reordered or retyped field changes these numbers. Catching it here is the
 // difference between a compile error and a file that loads as garbage.
 _Static_assert(sizeof(SgaV3Disk) == 12, "SgaV3Disk must be 3 tight floats");
-_Static_assert(sizeof(SgaKeyDisk) == 36, "SgaKeyDisk layout changed - bump SGA_SAVE_VERSION");
+_Static_assert(sizeof(SgaKeyDisk) == 48, "SgaKeyDisk layout changed - bump SGA_SAVE_VERSION");
 _Static_assert(sizeof(SgaPathDisk) == 36, "SgaPathDisk layout changed - bump SGA_SAVE_VERSION");
-_Static_assert(sizeof(SgaAnimDisk) == 8 + SGA_FILE_KEYS*36, "SgaAnimDisk has padding");
+_Static_assert(sizeof(SgaAnimDisk) == 8 + SGA_FILE_KEYS*48, "SgaAnimDisk has padding");
 _Static_assert(sizeof(SgaEaseDisk) == SGA_EASE_NAME_MAX + 4 + SGA_EASE_PTS_MAX*24,
                "SgaEaseDisk layout changed - bump SGA_SAVE_VERSION");
 _Static_assert(sizeof(SgaPartDisk) ==
@@ -301,6 +302,7 @@ bool StrategyAssetSave(const SgaAsset *a, const char *path)
             {
                 ad->keys[k].t = an->keys[k].t;
                 ad->keys[k].u = an->keys[k].u;
+                ad->keys[k].offset = V3Out(an->keys[k].offset);
                 ad->keys[k].rot = V3Out(an->keys[k].rot);
                 ad->keys[k].scale = V3Out(an->keys[k].scale);
                 ad->keys[k].ease = an->keys[k].ease;
@@ -463,6 +465,7 @@ bool StrategyAssetLoad(SgaAsset *a, const char *path)
             {
                 an->keys[k].t = ClampF(ad->keys[k].t, 0.0f, 600.0f);
                 an->keys[k].u = ClampF(ad->keys[k].u, -10.0f, 10.0f);
+                an->keys[k].offset = V3In(ad->keys[k].offset, 1000.0f);
                 an->keys[k].rot = V3In(ad->keys[k].rot, 3600.0f);
                 an->keys[k].scale = V3In(ad->keys[k].scale, 100.0f);
                 an->keys[k].ease = ((ad->keys[k].ease >= 0) &&

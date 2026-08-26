@@ -136,10 +136,16 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
     # of UI calls precisely so they link headless here, the same way zen_groups.c
     # does. simple_save.h is header-only and its IMPLEMENTATION lives in an
     # example the tests do not link, so the suite compiles it itself.
+    # strategy_asset_ease.c is the one file that bridges to src/anim/, so the
+    # suite links the anim sources too - that bridge (baking a curve so the
+    # asset stops depending on _easings.cfg) is exactly what needs testing.
     add_executable(sga_tests
         tests/sga_tests.c
         src/strategy_asset/strategy_asset.c
-        src/strategy_asset/strategy_asset_io.c)
+        src/strategy_asset/strategy_asset_io.c
+        src/strategy_asset/strategy_asset_ease.c
+        src/strategy_asset/strategy_bindings.c
+        ${ANIM_TEST_SRC})
     target_link_libraries(sga_tests raylib)
 endif()
 

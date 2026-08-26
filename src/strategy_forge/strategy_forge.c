@@ -32,6 +32,10 @@
 #include "rlgl.h"
 #include "strategy_forge.h"
 #include "../strategy_asset/strategy_asset_io.h"
+#include "../strategy_asset/strategy_bindings.h"
+#include "../strategy_asset/strategy_asset_ease.h"
+#include "../anim/anim.h"
+#include "../anim/anim_ease_custom.h"
 #include "../screen_state/screen_state.h"
 #include "../audio_state/audio_state.h"
 #include <string.h>
@@ -58,6 +62,10 @@ AppState app_state_strategy_forge = { Enter, Exit, Update, Draw, Gui, "StrategyF
 #define SF_PAD           14.0f
 #define SF_STATUS_SECS    3.0f
 #define SF_BROWSE_MAX    128
+
+#define SF_TIMELINE_H   150.0f      // lane strip + ruler + transport
+#define SF_LANE_H        18.0f      // one part's key lane
+#define SF_KEY_R          5.0f      // key diamond half-width, unscaled
 
 // Short on purpose - see the MEMORY note above.
 #define SF_UNDO_MAX       8
@@ -98,6 +106,28 @@ static bool     s_dirty = false;
 // Viewport orbit. Same gesture rules as the showcase's map view.
 static float    s_yaw = 35.0f, s_pitch = 22.0f, s_zoom = 1.0f;
 static bool     s_orbit = false;
+
+// -- playback + timeline ----------------------------------------------------
+// s_clock is the transport head. It is what the viewport poses against, so
+// scrubbing and playing are the same thing to everything downstream.
+static float    s_clock = 0.0f;         // playback time / play head
+static bool     s_playing = false;
+static bool     s_loop = true;
+static float    s_tlScroll = 0.0f;      // first visible lane
+static int      s_keySel = -1;          // selected key WITHIN the selected part
+static bool     s_keyDrag = false;
+static bool     s_keyPicked = false;    // a click chose part+key together
+static bool     s_scrubbing = false;
+static bool     s_easeOpen = false;     // easing picker modal
+static int      s_easeScroll = 0;
+
+// Part inspector scroll. The panel's content height depends on the part KIND
+// and on whether a key is selected, so it is not known until the panel has been
+// laid out - it is measured at the end of a frame and used by the next one.
+// A one-frame lag is invisible here: the clamp only matters once the content
+// actually overflows, and it settles before the wheel can move that far.
+static float    s_insScroll = 0.0f;
+static float    s_insContentH = 0.0f;
 
 static char     s_status[128];
 static float    s_statusT = 0.0f;
@@ -190,7 +220,8 @@ static bool Typing(void)
 
 static bool ModalOpen(void)
 {
-    return s_saveOpen || s_confirmDelete || s_confirmExit || s_pickOpen;
+    return s_saveOpen || s_confirmDelete || s_confirmExit || s_pickOpen ||
+           s_easeOpen;
 }
 
 // Set while a modal paints its OWN controls. Widgets consult ModalBlocks()
@@ -202,6 +233,19 @@ static bool s_inModal = false;
 
 static bool ModalBlocks(void) { return ModalOpen() && !s_inModal; }
 
+// Active clip rectangle for scrolled panels. BeginScissorMode clips PIXELS but
+// not hit testing, so a control scrolled out of a panel still answers the
+// mouse - a slider hidden above the inspector's top edge would catch drags
+// aimed at the header. Widgets consult this before treating the cursor as
+// theirs. Zero width means "no clip", which is the normal case.
+static Rectangle s_clip = { 0 };
+
+static bool ClipAllows(Vector2 mouse)
+{
+    if (s_clip.width <= 0.0f) return true;
+    return CheckCollisionPointRec(mouse, s_clip);
+}
+
 static SgaPart *SelPart(void)
 {
     if ((s_sel < 0) || (s_sel >= s_doc.partCount)) return NULL;
@@ -211,8 +255,22 @@ static SgaPart *SelPart(void)
 // Tooltip: same hand-rolled scheme as the showcase, and for the same reason -
 // raygui's own tooltips only fire on FOCUSED controls, so a disabled button
 // (exactly where the explanation matters most) never shows one.
+// The key the timeline has selected, or NULL. Guarded on the selection still
+// being in range: deleting a key, switching state or picking another part can
+// all leave s_keySel pointing past the end.
+static SgaKey *SelKey(void)
+{
+    SgaPart *p = SelPart();
+    if (p == NULL) return NULL;
+    if ((s_state < 0) || (s_state >= SGA_STATE_COUNT)) return NULL;
+    SgaPartAnim *an = &p->anim[s_state];
+    if ((s_keySel < 0) || (s_keySel >= an->keyCount)) return NULL;
+    return &an->keys[s_keySel];
+}
+
 static void Tip(Rectangle r, const char *text)
 {
+    if (!ClipAllows(GetMousePosition())) return;
     if ((text == NULL) || (text[0] == '\0')) return;
     if (ModalBlocks()) return;          // a tip from behind a modal is noise
     if (!CheckCollisionPointRec(GetMousePosition(), r)) return;
@@ -443,6 +501,21 @@ void StrategyForgeOpenBuiltin(const StrategyModel *m, const char *name,
             dst->color   = src->color;
             StrategyAssetTintFromRole((int)src->role, &dst->tintMode,
                                       &dst->tintAmount, &dst->brightness);
+
+            // A faction-driven built-in part has NO authored .color: the game's
+            // tables use designated initialisers and simply omit it for those
+            // roles, because PartColor never reads it there. It arrives here as
+            // {0,0,0,0} - fully transparent - and the moment the author pulls
+            // FACTION below 1 the part blends toward that and vanishes.
+            //
+            // Seed it with the faction colour the part is showing right now, so
+            // dropping the slider fades toward the colour it already has rather
+            // than toward nothing, and the RGB rows start on something real.
+            if (dst->color.a == 0)
+            {
+                dst->color = StrategyAssetPartColor(dst, s_faction, 1.0f);
+                dst->color.a = 255;
+            }
             for (int st = 0; st < SGA_STATE_COUNT; st++) dst->anim[st].pathPart = -1;
         }
         s_doc.partCount = n;
@@ -486,6 +559,13 @@ static bool SaveAs(const char *name)
 
     TextCopy(s_doc.name, name);
     StrategyAssetMeasure(&s_doc);
+
+    // Drop easing slots no key points at any more. A long session picking
+    // curves and moving off them fills SGA_EASES_MAX with shapes nothing uses,
+    // and then a real curve has nowhere to go. Compacting at save is the moment
+    // where the set of curves in use is exactly known.
+    StrategyAssetCompactEases(&s_doc);
+
     if (!StrategyAssetSaveNamed(&s_doc, name))
     {
         StatusWarn(TextFormat("could not write %s%s", name, SGA_EXT));
@@ -494,7 +574,17 @@ static bool SaveAs(const char *name)
 
     // Renaming: drop the file the doc used to live in, so the asset does not
     // quietly exist twice under two names.
-    if (s_file[0] && !TextIsEqual(s_file, name)) StrategyAssetDelete(s_file);
+    if (s_file[0] && !TextIsEqual(s_file, name))
+    {
+        StrategyAssetDelete(s_file);
+
+        // Bindings name their asset, so a rename orphans every role pointing
+        // at the old one. Repoint them here - the alternative is a set of
+        // bindings that silently falls back to built-ins after a rename, with
+        // nothing on screen explaining why.
+        StrategyBindingsLoad();
+        if (StrategyBindingsRename(s_file, name) > 0) StrategyBindingsSave();
+    }
 
     TextCopy(s_file, name);
     s_dirty = false;
@@ -755,7 +845,8 @@ static bool ForgeButtonEx(Rectangle r, const char *label, bool enabled,
                           const char *tip, int fs, bool primary)
 {
     Vector2 mp = GetMousePosition();
-    bool hot = enabled && !ModalBlocks() && CheckCollisionPointRec(mp, r);
+    bool hot = enabled && !ModalBlocks() && ClipAllows(mp) &&
+               CheckCollisionPointRec(mp, r);
 
     Color fill, edge, tc;
     if (!enabled)
@@ -830,10 +921,18 @@ static bool ForgeSlider(Rectangle r, const char *label, float *v,
     Rectangle bar = { r.x + 74.0f, r.y - 2.0f, r.width - 74.0f - 46.0f, r.height };
 
     // Ctrl/Shift + wheel steps the value without a drag at all, which is the
-    // only way to nudge a slider by exactly one increment.
+    // only way to nudge a slider by exactly one increment. The inspector panel
+    // deliberately does not scroll while the cursor is in this column, so the
+    // wheel reaches here instead of moving the panel out from under the bar.
     float wheel = GetMouseWheelMove();
-    if ((ctrl || shift) && (wheel != 0.0f) && CheckCollisionPointRec(mouse, bar))
+    if ((wheel != 0.0f) && ClipAllows(mouse) && CheckCollisionPointRec(mouse, bar))
     {
+        // A BARE wheel steps too, not just Ctrl/Shift. The panel behind refuses
+        // the wheel anywhere in this column, so without this the wheel would
+        // simply do nothing while the cursor sits on a bar - worse than either
+        // behaviour on its own. Ctrl is the same step (it is the snap modifier
+        // on drags, and a step already lands on the increment); Shift is the
+        // fine one, a tenth of it.
         float step = SliderStep(lo, hi);
         if (shift) step *= 0.1f;
         float nv = *v + wheel*step;
@@ -845,7 +944,8 @@ static bool ForgeSlider(Rectangle r, const char *label, float *v,
         return false;
     }
 
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, bar))
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && ClipAllows(mouse) &&
+        CheckCollisionPointRec(mouse, bar))
     { s_fineRect = bar; s_fineActive = true; s_fineBias = 0.0f; }
 
     bool fine = s_fineActive && SameRectF(s_fineRect, bar) &&
@@ -908,7 +1008,7 @@ static int ForgeChips(Rectangle r, const char **labels, int count, int active,
     {
         Rectangle c = { r.x + (float)i*(cw + 4.0f), r.y, cw, r.height };
         bool on = (i == active);
-        bool hot = !ModalBlocks() && CheckCollisionPointRec(mp, c);
+        bool hot = !ModalBlocks() && ClipAllows(mp) && CheckCollisionPointRec(mp, c);
 
         DrawRectangleRec(c, on ? Fade(accent, 0.22f) : (hot ? COL_PANEL_HI : COL_PANEL));
         DrawRectangleLinesEx(c, 1.0f, on ? accent : (hot ? COL_LINE_HI : COL_LINE));
@@ -1083,6 +1183,11 @@ static float Vec3Row(float *x, float *y, float *z, const char *label,
     return ry;
 }
 
+// The panel's body. Draws from `y0` downward and returns the Y it finished at,
+// so the caller can measure the content and decide whether it needs scrolling.
+static float PartInspectorBody(Rectangle pane, float x, float w, float y,
+                               float s, int fs, int fsSmall);
+
 static void PartInspectorGui(Rectangle pane, float s, int fs, int fsSmall)
 {
     DrawRectangleRec(pane, COL_PANEL);
@@ -1090,23 +1195,104 @@ static void PartInspectorGui(Rectangle pane, float s, int fs, int fsSmall)
 
     float x = pane.x + 12.0f*s;
     float w = pane.width - 24.0f*s;
-    float y = pane.y + 10.0f*s;
 
+    // Scroll only when it is needed. A panel that scrolls when everything
+    // already fits just loses its top row to a stray wheel click.
+    float over = s_insContentH - pane.height;
+    bool scrollable = (over > 1.0f);
+    float barW = scrollable ? 5.0f*s : 0.0f;
+
+    if (scrollable)
+    {
+        // The wheel belongs to whatever is under the cursor. Every ForgeSlider in
+        // this panel puts its bar in the same x column (see ForgeSlider: the
+        // bar starts 74px in and stops 46px short of the right edge), so the
+        // panel can tell "over a slider bar" from "over the panel" without
+        // waiting to find out which widget the cursor actually hit. Rows that
+        // are not sliders simply have nothing there to claim it.
+        Vector2 wm = GetMousePosition();
+        Rectangle sliderCol = { x + 74.0f, pane.y,
+                                (w - barW) - 74.0f - 46.0f, pane.height };
+        bool onSlider = CheckCollisionPointRec(wm, sliderCol);
+
+        if (!ModalBlocks() && !onSlider && CheckCollisionPointRec(wm, pane))
+            s_insScroll += GetMouseWheelMove()*28.0f;
+        if (s_insScroll < -over) s_insScroll = -over;
+        if (s_insScroll > 0.0f) s_insScroll = 0.0f;
+    }
+    else s_insScroll = 0.0f;
+
+    float y0 = pane.y + 10.0f*s + s_insScroll;
+
+    // Scissor clips PIXELS but not hit testing, so a control scrolled out of
+    // sight still answers the mouse. Every widget below is inside the pane's
+    // x range, so gating on the pane rect is enough to stop a hidden slider
+    // from catching a drag aimed at the viewport.
+    BeginScissorMode((int)pane.x, (int)pane.y, (int)pane.width, (int)pane.height);
+    s_clip = pane;
+    float endY = PartInspectorBody(pane, x, w - barW, y0, s, fs, fsSmall);
+    s_clip = (Rectangle){ 0 };
+    EndScissorMode();
+
+    // Measure for the NEXT frame, in content coordinates.
+    s_insContentH = (endY - y0) + 14.0f*s;
+
+    if (scrollable)
+    {
+        // A plain track-and-thumb, drawn over the clipped content so it is
+        // always visible - the only cue that there is more panel below.
+        Rectangle track = { pane.x + pane.width - barW - 3.0f*s, pane.y + 4.0f*s,
+                            barW, pane.height - 8.0f*s };
+        DrawRectangleRec(track, Fade(COL_LINE, 0.5f));
+
+        float frac = pane.height/s_insContentH;
+        if (frac > 1.0f) frac = 1.0f;
+        float thumbH = track.height*frac;
+        if (thumbH < 18.0f*s) thumbH = 18.0f*s;
+        float t = (over > 0.0f) ? (-s_insScroll/over) : 0.0f;
+        DrawRectangleRec((Rectangle){ track.x, track.y + t*(track.height - thumbH),
+                                      barW, thumbH },
+                         Fade(COL_LINE_HI, 0.85f));
+    }
+}
+
+static float PartInspectorBody(Rectangle pane, float x, float w, float y,
+                               float s, int fs, int fsSmall)
+{
+    (void)pane;
     SgaPart *p = SelPart();
     if (p == NULL)
     {
         DrawText("PART", (int)x, (int)y, fsSmall, COL_TEXT_DIM);
         y += (float)fsSmall + 10.0f*s;
         DrawText("Add a part to begin.", (int)x, (int)y, fs, Fade(COL_TEXT_DIM, 0.7f));
-        return;
+        return y + (float)fs;
     }
 
     DrawText("PART", (int)x, (int)y, fsSmall, COL_TEXT_DIM);
     y += (float)fsSmall + 6.0f*s;
 
     // -- name -----------------------------------------------------------------
-    if (GuiTextBox((Rectangle){ x, y, w, SF_RH*s }, p->name, SGA_NAME_MAX, s_edPart))
-    { s_edPart = !s_edPart; Touch(true); }
+    // raygui hit-tests inside GuiTextBox and knows nothing about the panel's
+    // scroll, so a box scrolled out of view would still take a click. Skip it
+    // entirely when its row is outside the pane rather than trying to gate it.
+    {
+        Rectangle nb = { x, y, w, SF_RH*s };
+        if ((nb.y >= s_clip.y - 1.0f) &&
+            (nb.y + nb.height <= s_clip.y + s_clip.height + 1.0f))
+        {
+            if (GuiTextBox(nb, p->name, SGA_NAME_MAX, s_edPart))
+            { s_edPart = !s_edPart; Touch(true); }
+        }
+        else
+        {
+            // Still show WHAT the part is called, just not editably.
+            DrawRectangleLinesEx(nb, 1.0f, Fade(COL_LINE, 0.6f));
+            DrawText(p->name, (int)(nb.x + 5.0f*s),
+                     (int)(nb.y + (nb.height - (float)fs)*0.5f), fs, COL_TEXT_DIM);
+            s_edPart = false;
+        }
+    }
     y += SF_RH*s + 8.0f*s;
 
     // -- kind -----------------------------------------------------------------
@@ -1166,7 +1352,77 @@ static void PartInspectorGui(Rectangle pane, float s, int fs, int fsSmall)
         y += (float)fsSmall + 2.0f*s;
         DrawText("part can travel along them.", (int)x, (int)y,
                  fsSmall, Fade(COL_TEXT_DIM, 0.75f));
-        return;                 // no colour controls: a path has no colour
+        return y + (float)fsSmall;      // no colour controls: a path has no colour
+    }
+
+    // -- the selected key -----------------------------------------------------
+    //
+    //  This band is the answer to "which thing am I editing?". Without it the
+    //  panel always edited the part's REST POSE - one value shared by every key
+    //  in every state - so moving a part while a key was selected appeared to
+    //  change every key at once, because it genuinely did.
+    //
+    //  With a key selected, these controls edit THAT KEY. The rest-pose rows
+    //  below stay visible and keep working, because both are real and an author
+    //  needs to tell them apart: the rest pose is where the part sits with no
+    //  animation, the key is what the animation does to it from there.
+    {
+        SgaKey *key = SelKey();
+        if (key != NULL)
+        {
+            Rectangle band = { x - 4.0f*s, y - 4.0f*s, w + 8.0f*s, 0 };
+            float bandTop = y;
+
+            DrawText(TextFormat("KEY %d  @ %.2fs", s_keySel + 1, (double)key->t),
+                     (int)x, (int)y, fsSmall, COL_ACCENT);
+            y += (float)fsSmall + 6.0f*s;
+
+            y = Vec3Row(&key->offset.x, &key->offset.y, &key->offset.z, "MOVE",
+                        -4.0f, 4.0f, (Rectangle){ x, y, w, 0 }, fsSmall, s) + 4.0f*s;
+            y = Vec3Row(&key->rot.x, &key->rot.y, &key->rot.z, "TURN",
+                        -180.0f, 180.0f, (Rectangle){ x, y, w, 0 }, fsSmall, s) + 4.0f*s;
+            y = Vec3Row(&key->scale.x, &key->scale.y, &key->scale.z, "SCALE",
+                        0.0f, 3.0f, (Rectangle){ x, y, w, 0 }, fsSmall, s) + 4.0f*s;
+
+            // The path binding lives here rather than on the part, because it
+            // is per-state: a unit may orbit while MOVING and sit still on IDLE.
+            {
+                SgaPartAnim *an = &p->anim[s_state];
+                const char *lbl = "PATH: none";
+                if ((an->pathPart >= 0) && (an->pathPart < s_doc.partCount))
+                    lbl = TextFormat("PATH: %s", s_doc.parts[an->pathPart].name);
+
+                if (ForgeButton((Rectangle){ x, y, w, SF_RH*s }, lbl, true,
+                                "Bind this part to a motion path for this state. "
+                                "Cycles through the asset's PATH parts.", fsSmall))
+                {
+                    Touch(true);
+                    // Cycle to the next PATH part, then back to none.
+                    int start = an->pathPart;
+                    int next = -1;
+                    for (int i = start + 1; i < s_doc.partCount; i++)
+                        if (s_doc.parts[i].kind == SGA_PATH) { next = i; break; }
+                    an->pathPart = next;
+                }
+                y += SF_RH*s + 4.0f*s;
+
+                if (an->pathPart >= 0)
+                {
+                    if (ForgeSlider((Rectangle){ x, y, w, SF_RH*s }, "ALONG",
+                                    &key->u, 0.0f, 1.0f, fsSmall)) GestureTouch();
+                    Tip((Rectangle){ x, y, w, SF_RH*s },
+                        "How far around the path this key sits, 0 to 1.");
+                    y += SF_RH*s + 4.0f*s;
+                }
+            }
+
+            band.height = y - bandTop + 4.0f*s;
+            DrawRectangleLinesEx(band, 1.0f, Fade(COL_ACCENT, 0.35f));
+            y += 8.0f*s;
+
+            DrawText("REST POSE", (int)x, (int)y, fsSmall, COL_TEXT_DIM);
+            y += (float)fsSmall + 4.0f*s;
+        }
     }
 
     y = Vec3Row(&p->offset.x, &p->offset.y, &p->offset.z, "OFFSET",
@@ -1319,6 +1575,7 @@ static void PartInspectorGui(Rectangle pane, float s, int fs, int fsSmall)
             StrategyAssetMeasure(&s_doc);
         }
     }
+    return y + 24.0f*s;
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,6 +1854,340 @@ static void HeaderGui(Rectangle bar, float s, int fs, int fsSmall)
 }
 
 // ---------------------------------------------------------------------------
+//  Timeline
+//
+//  The view model is SECONDS, not pixels: the strip always shows exactly
+//  [0, duration] for the current state. The zen editor's timeline pans and
+//  zooms because animations there run minutes; an asset state is a couple of
+//  seconds of loop, so a fixed fit is less machinery AND less to explain.
+//  Duration is a control, so "show me more time" is the same gesture as
+//  "make it longer".
+//
+//  One lane per part, including paths - a path part can be keyed too, which is
+//  how a whole orbit is made to drift. Lanes scroll when there are more parts
+//  than fit; the selected part's lane is always dragged into view.
+// ---------------------------------------------------------------------------
+static float TlDuration(void)
+{
+    float d = s_doc.duration[s_state];
+    return (d > 0.01f) ? d : 1.0f;      // never divide by a zero-length state
+}
+
+static float TlTimeToX(Rectangle track, float t)
+{
+    return track.x + (t/TlDuration())*track.width;
+}
+
+static float TlXToTime(Rectangle track, float x)
+{
+    if (track.width <= 1.0f) return 0.0f;
+    float t = ((x - track.x)/track.width)*TlDuration();
+    if (t < 0.0f) t = 0.0f;
+    if (t > TlDuration()) t = TlDuration();
+    return t;
+}
+
+// The lane strip's own scissor-and-scroll. A scissor clips PIXELS but not hit
+// testing, so every interaction below is gated on the row rect being inside the
+// visible band as well - otherwise a key scrolled out of sight still catches
+// clicks aimed at the transport underneath it.
+static void DrawKeyDiamond(float cx, float cy, float r, Color fill, Color edge)
+{
+    Vector2 a = { cx, cy - r }, b = { cx + r, cy }, c = { cx, cy + r }, d = { cx - r, cy };
+    DrawTriangle(a, d, b, fill);
+    DrawTriangle(b, d, c, fill);
+    DrawLineV(a, b, edge); DrawLineV(b, c, edge);
+    DrawLineV(c, d, edge); DrawLineV(d, a, edge);
+}
+
+static void TimelineGui(Rectangle bar, float s, int fs, int fsSmall)
+{
+    DrawRectangleRec(bar, COL_PANEL);
+    DrawRectangleRec((Rectangle){ bar.x, bar.y, bar.width, 1.0f }, COL_LINE);
+
+    Vector2 mp = GetMousePosition();
+    bool block = ModalBlocks();
+
+    float pad = 10.0f*s;
+    float x = bar.x + pad;
+    float w = bar.width - pad*2.0f;
+
+    // -- transport row --------------------------------------------------------
+    float rowH = 20.0f*s;
+    float y = bar.y + 6.0f*s;
+    float bw = 54.0f*s;
+
+    if (ForgeButtonEx((Rectangle){ x, y, bw, rowH }, s_playing ? "PAUSE" : "PLAY",
+                      true, "Play this state's animation in the viewport. SPACE.",
+                      fsSmall, s_playing))
+        s_playing = !s_playing;
+
+    if (ForgeButton((Rectangle){ x + bw + 4.0f*s, y, bw, rowH }, "STOP", true,
+                    "Stop and rewind to 0.", fsSmall))
+    { s_playing = false; s_clock = 0.0f; }
+
+    if (ForgeButtonEx((Rectangle){ x + (bw + 4.0f*s)*2.0f, y, bw, rowH }, "LOOP",
+                      true, "Repeat when the head reaches the end.", fsSmall, s_loop))
+        s_loop = !s_loop;
+
+    // Duration is here rather than in a settings panel because it IS the
+    // timeline's extent - changing it rescales what the strip shows.
+    {
+        Rectangle dr = { x + (bw + 4.0f*s)*3.0f + 10.0f*s, y + 2.0f*s,
+                         190.0f*s, rowH };
+        float d = s_doc.duration[s_state];
+        if (ForgeSlider(dr, "LENGTH", &d, 0.0f, 8.0f, fsSmall))
+        {
+            GestureTouch();
+            s_doc.duration[s_state] = d;
+        }
+        Tip(dr, "How long this state lasts, in seconds. 0 makes it a still pose.");
+    }
+
+    // Key actions operate on the SELECTED part, which is the same selection the
+    // inspector and the viewport use - one selection for the whole tool.
+    {
+        SgaPart *sp = SelPart();
+        float kx = bar.x + bar.width - pad - bw*3.0f - 8.0f*s;
+        bool canAdd = (sp != NULL);
+        bool canDel = (sp != NULL) && (s_keySel >= 0) &&
+                      (s_keySel < sp->anim[s_state].keyCount);
+
+        if (ForgeButtonEx((Rectangle){ kx, y, bw, rowH }, "+ KEY", canAdd,
+                          canAdd ? "Add a key for this part at the play head. K."
+                                 : "Select a part first.", fsSmall, true))
+        {
+            Touch(true);
+            int k = StrategyAssetAddKey(&s_doc, s_sel, s_state, s_clock);
+            if (k < 0) StatusWarn("This part is out of keys for this state.");
+            else
+            {
+                s_keySel = k;
+                // A key at 0 on a state with no length is invisible and cannot
+                // be dragged anywhere. Give the state a default span the first
+                // time it gets a key, so there is somewhere to put the second.
+                if (s_doc.duration[s_state] <= 0.01f) s_doc.duration[s_state] = 1.0f;
+            }
+        }
+
+        if (ForgeButton((Rectangle){ kx + bw + 4.0f*s, y, bw, rowH }, "DEL KEY",
+                        canDel, canDel ? "Remove the selected key. DELETE."
+                                       : "Select a key on the strip below.", fsSmall))
+        {
+            Touch(true);
+            StrategyAssetRemoveKey(&s_doc, s_sel, s_state, s_keySel);
+            s_keySel = -1;
+        }
+
+        // The ease belongs to the key, and shapes the segment ENDING at it -
+        // the same rule the zen editor uses, so the two never disagree.
+        const char *elbl = "EASE";
+        if (canDel)
+        {
+            int e = sp->anim[s_state].keys[s_keySel].ease;
+            elbl = (e < 0) ? "LINEAR" : StrategyAssetEaseName(&s_doc, e);
+        }
+        if (ForgeButton((Rectangle){ kx + (bw + 4.0f*s)*2.0f, y, bw, rowH }, elbl,
+                        canDel, canDel
+                            ? "The curve shaping the segment that ENDS at this key."
+                            : "Select a key to give it a curve.", fsSmall))
+        { s_easeOpen = true; s_easeScroll = 0; }
+    }
+
+    y += rowH + 8.0f*s;
+
+    // -- ruler ----------------------------------------------------------------
+    float nameW = 92.0f*s;
+    Rectangle track = { x + nameW, y, w - nameW, 14.0f*s };
+    DrawRectangleRec(track, (Color){ 21, 23, 30, 255 });
+    DrawRectangleLinesEx(track, 1.0f, COL_LINE);
+
+    {
+        // A tick every quarter second up to a second per tick, so the ruler
+        // stays readable whether the state is 0.5s or 8s long.
+        float dur = TlDuration();
+        float step = 0.25f;
+        while ((dur/step) > 16.0f) step *= 2.0f;
+        for (float t = 0.0f; t <= dur + 1e-4f; t += step)
+        {
+            float tx = TlTimeToX(track, t);
+            DrawLine((int)tx, (int)track.y, (int)tx, (int)(track.y + track.height),
+                     Fade(COL_LINE_HI, 0.55f));
+            DrawText(TextFormat("%.2g", (double)t), (int)(tx + 2.0f*s),
+                     (int)track.y, fsSmall, Fade(COL_TEXT_DIM, 0.75f));
+        }
+    }
+
+    DrawText("PART", (int)x, (int)(track.y + 1.0f*s), fsSmall, COL_TEXT_DIM);
+
+    // -- lanes ----------------------------------------------------------------
+    float laneTop = track.y + track.height + 3.0f*s;
+    float laneH = SF_LANE_H*s;
+    float bandH = bar.y + bar.height - laneTop - 6.0f*s;
+    int visible = (bandH > laneH) ? (int)(bandH/laneH) : 1;
+    if (visible < 1) visible = 1;
+
+    // Keep the selected part's lane on screen - the strip is useless if the
+    // part you are editing has scrolled out of it.
+    if (s_sel < s_tlScroll) s_tlScroll = (float)s_sel;
+    if (s_sel >= s_tlScroll + (float)visible) s_tlScroll = (float)(s_sel - visible + 1);
+    int maxScroll = s_doc.partCount - visible;
+    if (maxScroll < 0) maxScroll = 0;
+    if (s_tlScroll > (float)maxScroll) s_tlScroll = (float)maxScroll;
+    if (s_tlScroll < 0.0f) s_tlScroll = 0.0f;
+
+    Rectangle band = { x, laneTop, w, bandH };
+    if (!block && CheckCollisionPointRec(mp, band) && (s_doc.partCount > visible))
+    {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f)
+        {
+            s_tlScroll -= wheel;
+            if (s_tlScroll < 0.0f) s_tlScroll = 0.0f;
+            if (s_tlScroll > (float)maxScroll) s_tlScroll = (float)maxScroll;
+        }
+    }
+
+    // Did this frame's click land on a key? Anything else inside the strip is
+    // empty space, and clicking empty space clears the selection - so there is
+    // always a way OUT of editing a key, not just a way in.
+    bool hitKey = false;
+
+    int first = (int)s_tlScroll;
+    for (int i = 0; i < visible; i++)
+    {
+        int pi = first + i;
+        if (pi >= s_doc.partCount) break;
+
+        SgaPart *p = &s_doc.parts[pi];
+        SgaPartAnim *an = &p->anim[s_state];
+        float ly = laneTop + (float)i*laneH;
+        Rectangle lane = { track.x, ly, track.width, laneH - 2.0f*s };
+        Rectangle nameR = { x, ly, nameW - 6.0f*s, laneH - 2.0f*s };
+        bool selRow = (pi == s_sel);
+
+        DrawRectangleRec(lane, selRow ? Fade(COL_ACCENT, 0.07f)
+                                      : (Color){ 21, 23, 30, 255 });
+        DrawRectangleLinesEx(lane, 1.0f, selRow ? Fade(COL_ACCENT, 0.5f) : COL_LINE);
+
+        const char *nm = (p->name[0] != '\0') ? p->name : StrategyAssetKindName(p->kind);
+        DrawText(nm, (int)nameR.x, (int)(ly + (laneH - (float)fsSmall)*0.5f - 1.0f*s),
+                 fsSmall, selRow ? COL_TEXT : COL_TEXT_DIM);
+
+        // Clicking a lane's name selects the part, so the strip doubles as a
+        // second part list - the one you are already looking at while keying.
+        if (!block && CheckCollisionPointRec(mp, nameR) &&
+            IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        { AudioPlayButton(); s_sel = pi; s_keySel = -1; }
+
+        // The segments between keys, so a lane reads as a span of motion rather
+        // than as loose dots.
+        for (int k = 0; k + 1 < an->keyCount; k++)
+        {
+            float ax = TlTimeToX(lane, an->keys[k].t);
+            float bx = TlTimeToX(lane, an->keys[k + 1].t);
+            DrawRectangleRec((Rectangle){ ax, ly + laneH*0.5f - 1.5f*s,
+                                          bx - ax, 3.0f*s },
+                             selRow ? Fade(COL_ACCENT, 0.45f) : Fade(COL_LINE_HI, 0.35f));
+        }
+
+        for (int k = 0; k < an->keyCount; k++)
+        {
+            float kx = TlTimeToX(lane, an->keys[k].t);
+            float ky = ly + (laneH - 2.0f*s)*0.5f;
+            float r = SF_KEY_R*s;
+            bool kSel = selRow && (k == s_keySel);
+
+            Rectangle hit = { kx - r - 2.0f*s, ly, r*2.0f + 4.0f*s, laneH };
+            bool hot = !block && CheckCollisionPointRec(mp, hit);
+
+            DrawKeyDiamond(kx, ky, r,
+                           kSel ? COL_ACCENT : (hot ? COL_TEXT : COL_TEXT_DIM),
+                           kSel ? COL_TEXT : COL_LINE);
+
+            if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            {
+                AudioPlayButton();
+                hitKey = true;
+                s_keyPicked = true;
+                // Set the part FIRST: the stale-selection guard in Gui() keys
+                // off s_sel changing, and would clear the key we just picked if
+                // it saw the two move in the wrong order on the next frame.
+                s_sel = pi;
+                s_keySel = k;
+                s_keyDrag = true;
+                s_playing = false;      // dragging a key while it plays is a fight
+            }
+        }
+    }
+
+    if (s_doc.partCount > visible)
+        DrawText(TextFormat("%d/%d", first + visible, s_doc.partCount),
+                 (int)(x + w - 34.0f*s), (int)(bar.y + bar.height - (float)fsSmall - 3.0f*s),
+                 fsSmall, Fade(COL_TEXT_DIM, 0.6f));
+
+    // Empty space inside the lane band deselects. Deliberately NOT the whole
+    // bar: the transport row and the ruler have their own jobs, and clearing
+    // the selection when you reach for PLAY would be its own bug.
+    if (!block && !hitKey && !s_keyDrag &&
+        CheckCollisionPointRec(mp, band) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        s_keySel = -1;
+
+    // -- key drag -------------------------------------------------------------
+    // Dragging is resolved AFTER the lanes are drawn so a key that jumps past a
+    // neighbour (and so changes index) does not skip a frame of feedback.
+    if (s_keyDrag)
+    {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+        {
+            SgaPart *sp = SelPart();
+            if ((sp != NULL) && (s_keySel >= 0) && (s_keySel < sp->anim[s_state].keyCount))
+            {
+                float t = TlXToTime(track, mp.x);
+                bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+                if (ctrl) t = roundf(t/0.05f)*0.05f;    // same snap idiom as the sliders
+                if (fabsf(t - sp->anim[s_state].keys[s_keySel].t) > 1e-5f)
+                {
+                    GestureTouch();
+                    s_keySel = StrategyAssetMoveKey(&s_doc, s_sel, s_state, s_keySel, t);
+                    s_clock = t;        // the head follows the key, so the pose previews
+                }
+            }
+        }
+        else s_keyDrag = false;
+    }
+
+    // -- play head ------------------------------------------------------------
+    // Drawn over the lanes, and scrubbable anywhere on the ruler.
+    if (!block && !s_keyDrag && CheckCollisionPointRec(mp, track) &&
+        IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+    { s_scrubbing = true; s_playing = false; }
+    if (s_scrubbing)
+    {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) s_clock = TlXToTime(track, mp.x);
+        else s_scrubbing = false;
+    }
+
+    {
+        float hx = TlTimeToX(track, s_clock);
+        DrawLine((int)hx, (int)track.y, (int)hx, (int)(bar.y + bar.height - 4.0f*s),
+                 COL_WARN);
+        DrawKeyDiamond(hx, track.y + 3.0f*s, 4.0f*s, COL_WARN, COL_WARN);
+    }
+
+    Tip(track, "Click or drag to scrub. The viewport poses to the head.");
+
+    // Empty states teach rather than sit blank.
+    if (!StrategyAssetStateHasKeys(&s_doc, s_state))
+    {
+        const char *msg = TextFormat("No %s animation. Select a part, move the head, "
+                                     "then + KEY.", StrategyAssetStateName(s_state));
+        DrawText(msg, (int)(track.x + 10.0f*s),
+                 (int)(laneTop + 4.0f*s), fsSmall, Fade(COL_TEXT_DIM, 0.55f));
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  State tabs. Phase 3 fills these with a timeline; for now they select which
 //  animation the viewport plays, which is enough to author against.
 // ---------------------------------------------------------------------------
@@ -1865,13 +2456,140 @@ static void ModalsGui(float s, int fs)
             s_confirmExit = false;
     }
 
+    // -- easing picker --------------------------------------------------------
+    //  Lists the builtins AND the custom curves from _easings.cfg, honouring
+    //  the hidden flag the way the zen editor's dropdown does. Whatever is
+    //  chosen is BAKED into the asset on the spot (see strategy_asset_ease.c),
+    //  so the .sga keeps playing that shape even if the .cfg later changes.
+    if (s_easeOpen)
+    {
+        Rectangle m = ModalFrame("EASING", "Shapes the segment ending at this key.",
+                                 s, fs, 460.0f*s, 380.0f*s);
+
+        SgaPart *sp = SelPart();
+        SgaKey *key = NULL;
+        if ((sp != NULL) && (s_keySel >= 0) && (s_keySel < sp->anim[s_state].keyCount))
+            key = &sp->anim[s_state].keys[s_keySel];
+
+        float rowH = 20.0f*s;
+        float lx = m.x + 16.0f*s;
+        float lw = m.width*0.5f - 24.0f*s;
+        float ly = m.y + 66.0f*s;
+        float listH = m.height - 66.0f*s - 46.0f*s;
+        int rows = (int)(listH/rowH);
+        if (rows < 1) rows = 1;
+
+        // Build the visible id list first: the runtime range is SPARSE (unused
+        // custom slots are invalid ids), so it cannot be indexed directly.
+        int ids[ANIM_EASE_COUNT + ANIM_CUSTOM_EASE_MAX + 1];
+        int n = 0;
+        ids[n++] = -1;                  // linear, which is "no curve" here
+        int range = AnimEaseIdRange();
+        for (int i = 1; i < range; i++)
+        {
+            if (!AnimEaseIdValid(i)) continue;
+            if (AnimEaseIsHidden(i)) continue;
+            if (n < (int)(sizeof(ids)/sizeof(ids[0]))) ids[n++] = i;
+        }
+
+        if (s_easeScroll > n - rows) s_easeScroll = n - rows;
+        if (s_easeScroll < 0) s_easeScroll = 0;
+
+        Rectangle listR = { lx, ly, lw, listH };
+        if (CheckCollisionPointRec(GetMousePosition(), listR))
+        {
+            float wheel = GetMouseWheelMove();
+            if (wheel != 0.0f)
+            {
+                s_easeScroll -= (int)wheel;
+                if (s_easeScroll > n - rows) s_easeScroll = n - rows;
+                if (s_easeScroll < 0) s_easeScroll = 0;
+            }
+        }
+
+        int curRuntime = -1;
+        if ((key != NULL) && (key->ease >= 0))
+            curRuntime = StrategyAssetEaseRuntimeId(&s_doc, key->ease);
+
+        for (int r = 0; r < rows; r++)
+        {
+            int i = s_easeScroll + r;
+            if (i >= n) break;
+            int id = ids[i];
+            Rectangle rr = { lx, ly + (float)r*rowH, lw, rowH - 2.0f*s };
+
+            bool on;
+            if (key == NULL) on = false;
+            else if (id < 0) on = (key->ease < 0);
+            else on = (curRuntime == id);
+
+            const char *nm = (id < 0) ? "linear" : AnimEaseName(id);
+            bool custom = (id >= ANIM_EASE_COUNT);
+
+            if (ForgeButtonEx(rr, nm, key != NULL,
+                              custom ? "A custom curve from anims/_easings.cfg. "
+                                       "Its shape is copied into this asset."
+                                     : NULL, fs, on))
+            {
+                Touch(true);
+                key->ease = (id < 0) ? -1 : StrategyAssetBakeEase(&s_doc, id);
+                if ((id >= 0) && (key->ease < 0))
+                    StatusWarn("this asset is out of easing slots");
+            }
+        }
+
+        // -- curve preview ----------------------------------------------------
+        // The shape as it will ACTUALLY play, read back out of the baked slot
+        // rather than from the live easing function - so if baking ever loses
+        // something, this is where it shows.
+        Rectangle g = { m.x + m.width*0.5f + 8.0f*s, ly, m.width*0.5f - 24.0f*s,
+                        lw*0.72f };
+        if (g.height > listH) g.height = listH;
+        DrawRectangleRec(g, (Color){ 21, 23, 30, 255 });
+        DrawRectangleLinesEx(g, 1.0f, COL_LINE);
+        DrawLine((int)g.x, (int)(g.y + g.height), (int)(g.x + g.width),
+                 (int)(g.y + g.height), Fade(COL_LINE_HI, 0.4f));
+
+        if ((key != NULL) && (key->ease >= 0))
+        {
+            Vector2 prev = { g.x, g.y + g.height };
+            for (int i = 1; i <= 48; i++)
+            {
+                float px = (float)i/48.0f;
+                float py = StrategyAssetEaseApplyBaked(&s_doc, key->ease, px);
+                // Curves overshoot (backOut, elasticOut), so the plot is scaled
+                // to a -0.25..1.25 window and clipped rather than clamped - a
+                // flattened overshoot would misrepresent the curve.
+                float ny = (py + 0.25f)/1.5f;
+                Vector2 cur = { g.x + px*g.width, g.y + g.height - ny*g.height };
+                if ((cur.y > g.y) && (cur.y < g.y + g.height) &&
+                    (prev.y > g.y) && (prev.y < g.y + g.height))
+                    DrawLineEx(prev, cur, 2.0f, COL_ACCENT);
+                prev = cur;
+            }
+            DrawText(StrategyAssetEaseName(&s_doc, key->ease), (int)(g.x + 6.0f*s),
+                     (int)(g.y + 4.0f*s), fs, COL_TEXT_DIM);
+        }
+        else
+        {
+            DrawLineEx((Vector2){ g.x, g.y + g.height }, (Vector2){ g.x + g.width, g.y },
+                       2.0f, Fade(COL_ACCENT, 0.55f));
+            DrawText("linear", (int)(g.x + 6.0f*s), (int)(g.y + 4.0f*s), fs, COL_TEXT_DIM);
+        }
+
+        float bh = 26.0f*s;
+        if (ForgeButton((Rectangle){ m.x + m.width - 100.0f*s,
+                                     m.y + m.height - bh - 14.0f*s, 88.0f*s, bh },
+                        "DONE", true, NULL, fs))
+            s_easeOpen = false;
+    }
+
     s_inModal = false;
 }
 
 // ---------------------------------------------------------------------------
 //  AppState hooks
 // ---------------------------------------------------------------------------
-static float s_clock = 0.0f;    // animation playback time for the viewport
 
 static void Enter()
 {
@@ -1884,6 +2602,25 @@ static void Enter()
     // whatever the last session left in s_doc.
     if (!s_opened) StrategyForgeOpenNew();
 
+    // The custom easing set is normally loaded by the zen editor, which the
+    // user may never have opened this session - without this the picker would
+    // offer builtins only. A missing file is not an error: baked assets never
+    // needed it in the first place.
+    //
+    // Guarded on the set being EMPTY, because AnimCustomEasesLoad treats the
+    // file as the whole truth and wipes what is loaded first. Reloading it
+    // unconditionally would throw away curve edits the zen editor is holding
+    // unsaved, from a tool that has no business touching them.
+    {
+        bool anyCustom = false;
+        int range = AnimEaseIdRange();
+        for (int i = ANIM_EASE_COUNT; (i < range) && !anyCustom; i++)
+            if (AnimEaseIdValid(i)) anyCustom = true;
+        if (!anyCustom) AnimCustomEasesLoad("anims/_easings.cfg");
+    }
+
+    s_playing = false;      // never arrive mid-playback
+    s_keySel = -1;
     s_clock = 0.0f;
     s_statusT = 0.0f;
     s_tip[0] = '\0';
@@ -1898,13 +2635,26 @@ static void Exit()
 
 static void Update()
 {
-    s_clock += GetFrameTime();
     if (s_statusT > 0.0f) s_statusT -= GetFrameTime();
 
-    // Loop the clock over the state's own duration, so playback repeats the way
-    // the showcase's inspector does. Duration 0 means a static state.
-    float d = s_doc.duration[s_state];
-    if ((d > 0.0f) && (s_clock > d)) s_clock -= d*floorf(s_clock/d);
+    // The head only MOVES while playing - otherwise it is the author's cursor,
+    // parked wherever they scrubbed it to. Advancing it always would make the
+    // pose drift out from under a key they are trying to set.
+    if (s_playing)
+    {
+        s_clock += GetFrameTime();
+
+        float d = s_doc.duration[s_state];
+        if (d > 0.0f)
+        {
+            if (s_clock > d)
+            {
+                if (s_loop) s_clock -= d*floorf(s_clock/d);
+                else { s_clock = d; s_playing = false; }
+            }
+        }
+        else { s_clock = 0.0f; s_playing = false; }  // a still state has nothing to play
+    }
 }
 
 static void Draw()
@@ -1938,8 +2688,45 @@ static void Gui()
     Rectangle mid    = { leftW, headerH, screen.x - leftW - rightW,
                          screen.y - headerH - footerH };
     Rectangle tabs   = { mid.x + 8.0f*s, mid.y + 6.0f*s, mid.width - 16.0f*s, tabsH };
+
+    // The timeline spans the FULL width under the panes rather than sitting
+    // inside the middle column: key lanes need the horizontal room far more
+    // than the viewport does, and a strip that lines up with the window edge
+    // reads as one instrument instead of a box inside a box.
+    float tlH = SF_TIMELINE_H*s;
+    if (tlH > screen.y*0.34f) tlH = screen.y*0.34f;      // never crowd the model out
+    Rectangle timeline = { 0.0f, screen.y - footerH - tlH, screen.x, tlH };
+
+    left.height  -= tlH;
+    right.height -= tlH;
+    mid.height   -= tlH;
+
     Rectangle vp     = { mid.x, tabs.y + tabsH + 6.0f*s, mid.width,
                          mid.height - (tabs.y + tabsH + 6.0f*s - mid.y) };
+
+    // A key selection belongs to ONE part in ONE state. Rather than clear it at
+    // every place s_sel or s_state can change - the part list, the lane names,
+    // the tab row, TAB, the viewport - the invariant is enforced here, once:
+    // if the selection owner moved, the key selection is stale and goes.
+    {
+        static int lastSel = -1, lastState = -1;
+        if ((s_sel != lastSel) || (s_state != lastState))
+        {
+            // s_keyPicked is set by the timeline when a click selected a part
+            // and a key TOGETHER. Without it this guard would see s_sel change
+            // on the next frame and wipe the very key that click chose - the
+            // selection would flicker on for one frame and vanish.
+            if (((lastSel >= 0) || (lastState >= 0)) && !s_keyPicked) s_keySel = -1;
+            lastSel = s_sel;
+            lastState = s_state;
+        }
+        s_keyPicked = false;
+        // Deleting a key or switching to a part with fewer keys can also leave
+        // it dangling past the end.
+        SgaPart *sp = SelPart();
+        if (sp == NULL) s_keySel = -1;
+        else if (s_keySel >= sp->anim[s_state].keyCount) s_keySel = -1;
+    }
 
     // Input BEFORE drawing, so a drag started this frame is already reflected.
     ViewportInput(vp);
@@ -1949,7 +2736,15 @@ static void Gui()
     PartListGui(left, s, fsSmall);
     PartInspectorGui(right, s, fs, fsSmall);
     HeaderGui(header, s, fs, fsSmall);
+    TimelineGui(timeline, s, fs, fsSmall);
     FooterGui(footer, s, fs, fsSmall);
+
+    // The footer's BACK / SAVE-and-close leave the forge, and AppStateTransition
+    // switches synchronously - the showcase has already painted its own frame by
+    // now. Everything below draws forge furniture and reads forge hotkeys, so
+    // running it would both flash this tool over the screen we left and let a
+    // keypress edit a document that is no longer open.
+    if (!AppStateIsCurrent(&app_state_strategy_forge)) return;
 
     // Hints in the viewport's corner: an empty-ish tool should teach.
     if (s_doc.partCount <= 1)
@@ -1979,6 +2774,53 @@ static void Gui()
             }
             if (IsKeyPressed(KEY_TAB) && (s_doc.partCount > 0))
                 s_sel = (s_sel + 1) % s_doc.partCount;
+
+            // -- transport ----------------------------------------------------
+            if (IsKeyPressed(KEY_SPACE)) s_playing = !s_playing;
+
+            if (IsKeyPressed(KEY_K) && (SelPart() != NULL))
+            {
+                Touch(true);
+                int k = StrategyAssetAddKey(&s_doc, s_sel, s_state, s_clock);
+                if (k < 0) StatusWarn("This part is out of keys for this state.");
+                else
+                {
+                    s_keySel = k;
+                    if (s_doc.duration[s_state] <= 0.01f) s_doc.duration[s_state] = 1.0f;
+                }
+            }
+
+            if (IsKeyPressed(KEY_DELETE))
+            {
+                SgaPart *sp = SelPart();
+                if ((sp != NULL) && (s_keySel >= 0) &&
+                    (s_keySel < sp->anim[s_state].keyCount))
+                {
+                    Touch(true);
+                    StrategyAssetRemoveKey(&s_doc, s_sel, s_state, s_keySel);
+                    s_keySel = -1;
+                }
+            }
+
+            // Step between the selected part's keys. Landing exactly ON a key is
+            // what makes editing one possible - eyeballing a drag never does.
+            if (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT))
+            {
+                SgaPart *sp = SelPart();
+                if (sp != NULL)
+                {
+                    const SgaPartAnim *an = &sp->anim[s_state];
+                    bool fwd = IsKeyPressed(KEY_RIGHT);
+                    int best = -1;
+                    for (int i = 0; i < an->keyCount; i++)
+                    {
+                        float dt = an->keys[i].t - s_clock;
+                        if (fwd ? (dt > 1e-4f) : (dt < -1e-4f))
+                        { best = i; if (fwd) break; }
+                    }
+                    if (best >= 0) { s_keySel = best; s_clock = an->keys[best].t; }
+                }
+            }
         }
     }
 
@@ -1988,7 +2830,8 @@ static void Gui()
     // the same frame, so ESC appeared to do nothing at all in the forge.
     if (IsKeyPressed(KEY_ESCAPE))
     {
-        if (s_pickOpen)             s_pickOpen = false;
+        if (s_easeOpen)             s_easeOpen = false;
+        else if (s_pickOpen)        s_pickOpen = false;
         else if (s_confirmDelete)   s_confirmDelete = false;
         else if (s_confirmExit)     s_confirmExit = false;
         else if (s_saveOpen)      { s_saveOpen = false; s_edSaveName = false; }

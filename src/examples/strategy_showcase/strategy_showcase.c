@@ -35,6 +35,7 @@
 #include "../strategy_test/strategy_models.h"
 #include "../../strategy_asset/strategy_asset.h"
 #include "../../strategy_asset/strategy_asset_io.h"
+#include "../../strategy_asset/strategy_bindings.h"
 #include "../../strategy_forge/strategy_forge.h"
 #include "../strategy_test/strategy_world.h"
 #include "../strategy_test/strategy_defs.h"
@@ -82,7 +83,10 @@ typedef struct {
 
 #define CATALOG_MAX (UNIT_KIND_COUNT + BLD_COUNT + NODE_KIND_COUNT + SGA_ASSETS_MAX)
 
-typedef enum { VIEW_GALLERY = 0, VIEW_INSPECT, VIEW_MAP } ShowcaseView;
+typedef enum {
+    VIEW_GALLERY = 0, VIEW_INSPECT, VIEW_MAP,
+    VIEW_BIND,          // which asset stands in for which game role
+} ShowcaseView;
 
 // -- Rotation state, one per catalog entry -----------------------------------
 typedef struct {
@@ -172,6 +176,31 @@ static struct {
     // Catalog index awaiting a delete confirmation, -1 for none. Deleting is
     // the one destructive thing the gallery can do, so it always asks.
     int          confirmDelete;
+
+    // -- Filter --------------------------------------------------------------
+    // The catalog itself is NEVER reordered or shortened by a filter - every
+    // index the rest of this file holds (inspectIndex, dragTile, confirmDelete,
+    // the spin array) would shift under it. Instead `shown` is the list of
+    // catalog indices that pass the filter, and the gallery walks that. A
+    // filtered-out asset is still fully addressable, which is what lets the
+    // inspector step through everything while the grid shows a subset.
+    int          shown[CATALOG_MAX];
+    int          shownCount;
+    int          shownStart[CAT_COUNT];  // first SHOWN index of each category
+    int          shownCat[CAT_COUNT];    // how many of that category survived
+
+    bool         catFilter[CAT_COUNT];   // all false = show everything
+    char         search[64];
+    bool         searchEdit;
+
+    // -- Binding view --------------------------------------------------------
+    // Which role row is open for picking, as (family, role); -1 for none. The
+    // picker is a list of every asset, so it is drawn as an overlay rather
+    // than inline - a row that grew by twenty entries would push the rest of
+    // the table off screen.
+    int          bindFamily, bindRole;
+    float        bindScroll;
+    float        bindPickScroll;
 } sc;
 
 // ============================================================================
@@ -361,12 +390,17 @@ static void CatalogBuild(void)
     sc.catCount[CAT_CUSTOM] = sc.catalogCount - sc.catStart[CAT_CUSTOM];
 }
 
+// Defined below, with the rest of the filter: it reads the entry accessors,
+// which in turn need the catalog this file builds first.
+static void FilterApply(void);
+
 // Rescans the asset directory and rebuilds the catalog around it. The two must
 // happen together: a CatalogEntry holds a pointer into sc.assets[].
 static void CatalogReload(void)
 {
     sc.assetCount = StrategyAssetLoadAll(sc.assets, SGA_ASSETS_MAX);
     CatalogBuild();
+    FilterApply();      // the filter is over the catalog, so it is stale now
 }
 
 // The built-in part table behind an entry, or NULL when the entry is an
@@ -509,6 +543,95 @@ static const char *EntrySubtitle(int index)
         case NODE_WHEAT:  return "yields FOOD";
         case NODE_CORPSE: return "yields FOOD";
         default:          return "";
+    }
+}
+
+// ============================================================================
+//  Filtering
+//
+//  A filter changes WHAT IS ON SCREEN, never what exists. sc.shown is rebuilt
+//  from the catalog whenever the query changes; every other index in this file
+//  keeps meaning the same thing it always did.
+// ============================================================================
+
+// Case-insensitive substring, the same helper shape as ZenStrContainsCI. An
+// empty needle matches everything, so an empty search box is not a filter.
+static bool ShowcaseContainsCI(const char *hay, const char *needle)
+{
+    if ((needle == NULL) || (needle[0] == '\0')) return true;
+    if ((hay == NULL) || (hay[0] == '\0')) return false;
+
+    for (int i = 0; hay[i] != '\0'; i++)
+    {
+        int j = 0;
+        while (needle[j] != '\0')
+        {
+            char a = hay[i + j], b = needle[j];
+            if ((a >= 'A') && (a <= 'Z')) a = (char)(a - 'A' + 'a');
+            if ((b >= 'A') && (b <= 'Z')) b = (char)(b - 'A' + 'a');
+            if (a != b) break;
+            j++;
+        }
+        if (needle[j] == '\0') return true;
+    }
+    return false;
+}
+
+// True when no category chip is lit - which means "no category filter", not
+// "hide everything". Turning every chip off by clicking them one by one has to
+// land back on showing all, or the grid empties for no stated reason.
+static bool FilterCatAll(void)
+{
+    for (int c = 0; c < CAT_COUNT; c++) if (sc.catFilter[c]) return false;
+    return true;
+}
+
+static bool FilterAny(void)
+{
+    return !FilterCatAll() || (sc.search[0] != '\0');
+}
+
+// Does this entry survive the current query? Text matches on name, category
+// label and - for an authored asset - its subtype, so "unit", "quarry" and
+// "oak" all find something without the user knowing which field holds what.
+static bool FilterAccepts(int index)
+{
+    const CatalogEntry *e = &sc.catalog[index];
+
+    if (!FilterCatAll() && !sc.catFilter[e->cat]) return false;
+    if (sc.search[0] == '\0') return true;
+
+    if (ShowcaseContainsCI(EntryName(index), sc.search)) return true;
+    if (ShowcaseContainsCI(categoryName[e->cat], sc.search)) return true;
+
+    const SgaAsset *a = EntryAsset(index);
+    if (a != NULL)
+    {
+        if (ShowcaseContainsCI(a->subtype, sc.search)) return true;
+        if (ShowcaseContainsCI(StrategyAssetCategoryName(a->category), sc.search))
+            return true;
+    }
+    return false;
+}
+
+// A text box has the keyboard. Every hotkey in this state has to stand down
+// while it does, or typing "map" in the search box jumps to the battlefield on
+// the M - the same Typing() gate the forge and the zen editor use.
+static bool ShowcaseTyping(void)
+{
+    return sc.searchEdit;
+}
+
+static void FilterApply(void)
+{
+    sc.shownCount = 0;
+
+    for (int c = 0; c < CAT_COUNT; c++)
+    {
+        sc.shownStart[c] = sc.shownCount;
+        for (int i = sc.catStart[c]; i < sc.catStart[c] + sc.catCount[c]; i++)
+            if (FilterAccepts(i)) sc.shown[sc.shownCount++] = i;
+        sc.shownCat[c] = sc.shownCount - sc.shownStart[c];
     }
 }
 
@@ -858,6 +981,7 @@ typedef struct {
     float headerH, footerH;
     int   cols;
     Rectangle content;          // the scrolling region
+    Rectangle filter;           // the filter strip, ABOVE content (gallery only)
     float mapW, mapH;           // map panel size
     bool  mapRail;              // is there room for the panel beside the grid?
 } Layout;
@@ -887,6 +1011,19 @@ static Layout LayoutCompute(void)
     L.content = (Rectangle){ L.pad, L.headerH,
                              screen.x - 2.0f*L.pad,
                              screen.y - L.headerH - L.footerH };
+
+    // The filter strip is carved off the TOP of the content area rather than
+    // added to the header, so it scrolls away with nothing and stays pinned
+    // above the grid. Only the gallery has it - filtering means nothing while
+    // inspecting one asset or looking at the battlefield.
+    L.filter = (Rectangle){ L.content.x, L.content.y, L.content.width, 0.0f };
+    if (sc.view == VIEW_GALLERY)
+    {
+        L.filter.height = 34.0f*L.s;
+        L.content.y      += L.filter.height + L.gap*0.5f;
+        L.content.height -= L.filter.height + L.gap*0.5f;
+    }
+
     if (L.content.height < 80.0f) L.content.height = 80.0f;
 
     // The map panel gets its own rail down the right so it never sits on top
@@ -895,6 +1032,10 @@ static Layout LayoutCompute(void)
     L.mapH = 140.0f*L.s;
     L.mapRail = (L.content.width - L.mapW - L.gap) > 360.0f*L.s;
     if (L.mapRail) L.content.width -= L.mapW + L.gap*1.5f;
+
+    // Matched to the grid AFTER the rail has taken its cut, so the strip ends
+    // where the tiles do instead of running under the map panel.
+    L.filter.width = L.content.width;
 
     // Tiles want to be about 190 logical px wide; fit as many as the row holds
     // and let them share out the remainder, so the grid never leaves a ragged
@@ -917,7 +1058,7 @@ static Layout LayoutCompute(void)
         int waste = 0;
         for (int k = 0; k < CAT_COUNT; k++)
         {
-            int n = sc.catCount[k];
+            int n = sc.shownCat[k];
             if (n <= 0) continue;
             int rem = n%c;
             if (rem != 0) waste += (c - rem);
@@ -942,6 +1083,134 @@ static Layout LayoutCompute(void)
 // ============================================================================
 //  Gallery
 // ============================================================================
+// ============================================================================
+//  Filter bar
+//
+//  Category chips plus a search box, pinned above the grid. The chips are a
+//  MULTI-select: clicking three of them shows three categories, and clicking
+//  the last lit one back off returns to showing everything rather than showing
+//  nothing. "None selected" and "all selected" are the same state on purpose -
+//  it is the only reading that makes an empty bar mean an unfiltered gallery.
+// ============================================================================
+static void DrawFilterBar(const Layout *L)
+{
+    Rectangle bar = L->filter;
+    if (bar.height <= 0.0f) return;
+
+    Vector2 mp = GetMousePosition();
+    bool before[CAT_COUNT];
+    for (int c = 0; c < CAT_COUNT; c++) before[c] = sc.catFilter[c];
+    char searchBefore[sizeof(sc.search)];
+    TextCopy(searchBefore, sc.search);
+
+    // -- category chips -------------------------------------------------------
+    float x = bar.x;
+    float chipH = bar.height;
+    bool all = FilterCatAll();
+
+    for (int c = 0; c < CAT_COUNT; c++)
+    {
+        const char *label = categoryName[c];
+        float w = (float)MeasureText(label, L->fsSmall) + 26.0f*L->s;
+        Rectangle chip = { x, bar.y, w, chipH };
+        bool hot = CheckCollisionPointRec(mp, chip) && !sc_inModal;
+        bool on  = sc.catFilter[c];
+
+        // An unfiltered bar shows every chip in its accent at low strength:
+        // "all of these are showing", not "none of these are selected".
+        Color accent = categoryAccent[c];
+        DrawRectangleRec(chip, on ? Fade(accent, 0.22f)
+                                  : (hot ? COL_PANEL_HI : COL_PANEL));
+        DrawRectangleLinesEx(chip, on ? 2.0f : 1.0f,
+                             on ? accent : (hot ? COL_LINE_HI : COL_LINE));
+        DrawText(label, (int)(chip.x + 13.0f*L->s),
+                 (int)(bar.y + (chipH - (float)L->fsSmall)*0.5f), L->fsSmall,
+                 on ? COL_TEXT : (all ? Fade(accent, 0.75f) : COL_TEXT_DIM));
+
+        ShowcaseTip(chip, on ? "Showing this category. Click to stop filtering by it."
+                             : "Show only this category. Chips add up, and turning "
+                               "them all off shows everything again.");
+
+        if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        {
+            AudioPlayButton();
+            ShowcaseDragEnd();      // a press up here is not a grab on a model
+            sc.catFilter[c] = !sc.catFilter[c];
+        }
+        x += w + 6.0f*L->s;
+    }
+
+    // -- search ---------------------------------------------------------------
+    x += 6.0f*L->s;
+    float clearW = (sc.search[0] != '\0') ? 24.0f*L->s : 0.0f;
+    float searchW = bar.x + bar.width - x - clearW;
+    if (searchW > 320.0f*L->s) searchW = 320.0f*L->s;
+
+    if (searchW > 60.0f*L->s)
+    {
+        Rectangle box = { x, bar.y, searchW, chipH };
+
+        GuiSetStyle(DEFAULT, TEXT_SIZE, L->fsSmall);
+        if (GuiTextBox(box, sc.search, (int)sizeof(sc.search), sc.searchEdit))
+            sc.searchEdit = !sc.searchEdit;
+
+        // The placeholder says WHICH fields are searched. Otherwise a miss on
+        // "quarry" reads as a broken search rather than as a subtype nobody
+        // typed on that asset.
+        if ((sc.search[0] == '\0') && !sc.searchEdit)
+        {
+            DrawText("search name, category or subtype",
+                     (int)(box.x + 8.0f*L->s),
+                     (int)(box.y + (chipH - (float)L->fsSmall)*0.5f),
+                     L->fsSmall, Fade(COL_TEXT_DIM, 0.7f));
+        }
+        ShowcaseTip(box, "Matches an asset's name, its category, or the subtype "
+                         "an authored asset was labelled with.");
+
+        if (clearW > 0.0f)
+        {
+            Rectangle clr = { box.x + searchW + 2.0f*L->s, bar.y, clearW - 2.0f*L->s, chipH };
+            bool hot = CheckCollisionPointRec(mp, clr) && !sc_inModal;
+            DrawRectangleRec(clr, hot ? COL_PANEL_HI : COL_PANEL);
+            DrawRectangleLinesEx(clr, 1.0f, hot ? COL_LINE_HI : COL_LINE);
+            DrawText("x", (int)(clr.x + (clr.width - (float)MeasureText("x", L->fsSmall))*0.5f),
+                     (int)(bar.y + (chipH - (float)L->fsSmall)*0.5f), L->fsSmall,
+                     hot ? COL_TEXT : COL_TEXT_DIM);
+            ShowcaseTip(clr, "Clear the search.");
+            if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+            {
+                AudioPlayButton();
+                sc.search[0] = '\0';
+                sc.searchEdit = false;
+            }
+        }
+    }
+
+    // -- result count, right-aligned -----------------------------------------
+    if (FilterAny())
+    {
+        const char *msg = (sc.shownCount == 0)
+                        ? "nothing matches"
+                        : TextFormat("%d of %d", sc.shownCount, sc.catalogCount);
+        int w = MeasureText(msg, L->fsSmall);
+        DrawText(msg, (int)(bar.x + bar.width - (float)w),
+                 (int)(bar.y + (chipH - (float)L->fsSmall)*0.5f), L->fsSmall,
+                 (sc.shownCount == 0) ? COL_LINE_HI : COL_TEXT_DIM);
+    }
+
+    // Rebuild only on a real change. FilterApply walks the whole catalog and
+    // there is no reason to pay for it on a frame where nothing was typed.
+    bool changed = !TextIsEqual(searchBefore, sc.search);
+    for (int c = 0; (c < CAT_COUNT) && !changed; c++)
+        changed = (before[c] != sc.catFilter[c]);
+
+    if (changed)
+    {
+        FilterApply();
+        sc.scroll.y = 0.0f;     // the old offset means nothing over a new list
+    }
+}
+
 static void DrawGallery(const Layout *L)
 {
     Vector2 mp = GetMousePosition();
@@ -954,25 +1223,35 @@ static void DrawGallery(const Layout *L)
     // 3D pass and the 2D pass can never disagree about where a tile is.
     Rectangle tileRect[CATALOG_MAX];
     Rectangle thumbRect[CATALOG_MAX];
-    bool      visible[CATALOG_MAX];
+
+    // Cleared, not just filled: pass 1 now only writes the entries the FILTER
+    // let through, and passes 2 and 3 walk the whole catalog. A filtered-out
+    // entry has to read as "not visible" rather than as whatever was on the
+    // stack, which would blit a tile at a garbage rectangle.
+    bool      visible[CATALOG_MAX] = { 0 };
 
     float y = L->content.y - sc.scroll.y;
-    int idx = 0;
 
+    bool first = true;
     for (int c = 0; c < CAT_COUNT; c++)
     {
-        y += (c == 0) ? 0.0f : L->gap*1.6f;
-        float sectionHeaderY = y;
+        // A category the filter emptied contributes NOTHING - not a header, not
+        // a gap. Four empty bands stacked above the one section that matched
+        // would read as "the gallery broke", not as "nothing else matched".
+        if (sc.shownCat[c] <= 0) continue;
+
+        y += first ? 0.0f : L->gap*1.6f;
+        first = false;
         y += 26.0f*L->s;        // section header band
 
-        int rows = (sc.catCount[c] + L->cols - 1)/L->cols;
+        int rows = (sc.shownCat[c] + L->cols - 1)/L->cols;
         for (int r = 0; r < rows; r++)
         {
             for (int col = 0; col < L->cols; col++)
             {
                 int within = r*L->cols + col;
-                if (within >= sc.catCount[c]) break;
-                int i = sc.catStart[c] + within;
+                if (within >= sc.shownCat[c]) break;
+                int i = sc.shown[sc.shownStart[c] + within];
 
                 Rectangle t = { L->content.x + (float)col*(L->tileW + L->gap),
                                 y, L->tileW, L->tileH };
@@ -984,11 +1263,9 @@ static void DrawGallery(const Layout *L)
                 bool hot = visible[i] && CheckCollisionPointRec(mp, t) &&
                            CheckCollisionPointRec(mp, L->content);
                 if (hot) sc.hoverTile = i;
-                idx++;
             }
             y += L->tileH + L->gap;
         }
-        (void)sectionHeaderY;
     }
 
     sc.contentH = y + sc.scroll.y - L->content.y;
@@ -1041,9 +1318,15 @@ static void DrawGallery(const Layout *L)
                      (int)L->content.width, (int)L->content.height);
 
     y = L->content.y - sc.scroll.y;
+    first = true;
     for (int c = 0; c < CAT_COUNT; c++)
     {
-        y += (c == 0) ? 0.0f : L->gap*1.6f;
+        // Skipped on exactly the same test as pass 1, or the two passes would
+        // disagree about where every tile below this point sits.
+        if (sc.shownCat[c] <= 0) continue;
+
+        y += first ? 0.0f : L->gap*1.6f;
+        first = false;
 
         // Section header: accent rule + label + count. This is the "colored
         // separation for types" - a band of color owned by the category,
@@ -1064,7 +1347,7 @@ static void DrawGallery(const Layout *L)
                  (int)(y + (bandH - (float)L->fsBody)*0.5f),
                  L->fsBody, categoryAccent[c]);
 
-        const char *count = TextFormat("%d", sc.catCount[c]);
+        const char *count = TextFormat("%d", sc.shownCat[c]);
         int cw = MeasureText(count, L->fsSmall);
         DrawRectangleRec((Rectangle){ L->content.x + L->content.width - (float)cw - 16.0f*L->s,
                                       y, (float)cw + 16.0f*L->s, bandH }, COL_BG);
@@ -1074,14 +1357,14 @@ static void DrawGallery(const Layout *L)
                  L->fsSmall, COL_TEXT_DIM);
         y += bandH;
 
-        int rows = (sc.catCount[c] + L->cols - 1)/L->cols;
+        int rows = (sc.shownCat[c] + L->cols - 1)/L->cols;
         for (int r = 0; r < rows; r++)
         {
             for (int col = 0; col < L->cols; col++)
             {
                 int within = r*L->cols + col;
-                if (within >= sc.catCount[c]) break;
-                int i = sc.catStart[c] + within;
+                if (within >= sc.shownCat[c]) break;
+                int i = sc.shown[sc.shownStart[c] + within];
                 if (!visible[i]) continue;
 
                 Rectangle t = tileRect[i];
@@ -1128,6 +1411,27 @@ static void DrawGallery(const Layout *L)
                           4.0f*L->s, thumbH };
         DrawRectangleRec(bar, Fade(COL_LINE_HI, 0.7f));
     }
+
+    // An empty grid must say WHY it is empty and how to leave that state -
+    // a blank slab teaches nothing, and the filter that caused it is the one
+    // thing the user cannot see from here.
+    if (sc.shownCount == 0)
+    {
+        const char *msg = "No asset matches this filter.";
+        const char *hint = "Clear the search, or turn a category chip back off.";
+        int w1 = MeasureText(msg, L->fsBody);
+        int w2 = MeasureText(hint, L->fsSmall);
+        float cy = L->content.y + L->content.height*0.38f;
+        DrawText(msg, (int)(L->content.x + (L->content.width - (float)w1)*0.5f),
+                 (int)cy, L->fsBody, COL_TEXT_DIM);
+        DrawText(hint, (int)(L->content.x + (L->content.width - (float)w2)*0.5f),
+                 (int)(cy + (float)L->fsBody + 8.0f*L->s), L->fsSmall,
+                 Fade(COL_TEXT_DIM, 0.75f));
+    }
+
+    // LAST, and outside the scissor: the strip is pinned above the grid, and
+    // its raygui text box would be clipped by the content region it sits over.
+    DrawFilterBar(L);
 }
 
 // ============================================================================
@@ -1515,9 +1819,13 @@ static void DrawInspect(const Layout *L)
     DrawText("ASSET ACTIONS", (int)inner.x, (int)(by - (float)L->fsSmall - 6.0f*L->s),
              L->fsSmall, COL_TEXT_DIM);
 
-    // Keyboard: arrows step, ESC backs out.
-    if (IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D)) InspectStep(1);
-    if (IsKeyPressed(KEY_LEFT)  || IsKeyPressed(KEY_A)) InspectStep(-1);
+    // Keyboard: arrows step, ESC backs out. A/D are letters, so they stand
+    // down while a text box has the keyboard.
+    if (!ShowcaseTyping())
+    {
+        if (IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D)) InspectStep(1);
+        if (IsKeyPressed(KEY_LEFT)  || IsKeyPressed(KEY_A)) InspectStep(-1);
+    }
 }
 
 // ============================================================================
@@ -1591,6 +1899,344 @@ static void DrawMapFull(const Layout *L)
 }
 
 // The small always-visible map panel in the gallery footer area.
+// ============================================================================
+//  Binding view: which asset stands in for which game role
+//
+//  Every role in the game listed against the asset currently standing in for
+//  it, and any asset assignable to any role. That freedom is the point, not an
+//  oversight - a warrior may look like a worker, a town hall like a tree - so
+//  the picker offers the WHOLE catalog with no category filtering, and the
+//  header says as much rather than leaving it looking like a missing check.
+//
+//  This drives the SHOWCASE PREVIEW only. strategy_world.c still draws the game
+//  from its own tables; wiring bindings into live gameplay is deliberately out
+//  of scope, which keeps a bad binding from being able to break the game.
+// ============================================================================
+
+// The built-in model for a role, which is both the fallback look and where the
+// role's display name comes from - so a role is never a bare enum number.
+static const StrategyModel *BindRoleModel(int family, int role)
+{
+    switch (family)
+    {
+        case SGB_ROLE_UNIT:     return StrategyUnitModel((UnitKind)role);
+        case SGB_ROLE_BUILDING: return StrategyBuildingModel((BuildingKind)role);
+        case SGB_ROLE_NODE:     return StrategyNodeModel((NodeKind)role);
+        default:                return NULL;
+    }
+}
+
+static const char *BindRoleName(int family, int role)
+{
+    const StrategyModel *m = BindRoleModel(family, role);
+    return m ? m->name : "?";
+}
+
+// The accent a family borrows from the gallery, so the two screens agree about
+// what colour a unit is.
+static Color BindFamilyAccent(int family)
+{
+    switch (family)
+    {
+        case SGB_ROLE_BUILDING: return categoryAccent[CAT_BUILDING];
+        case SGB_ROLE_NODE:     return categoryAccent[CAT_NODE];
+        default:                return categoryAccent[CAT_UNIT];
+    }
+}
+
+static void BindPickerOpen(int family, int role)
+{
+    sc.bindFamily = family;
+    sc.bindRole = role;
+    sc.bindPickScroll = 0.0f;
+}
+
+static void BindPickerClose(void)
+{
+    sc.bindFamily = -1;
+    sc.bindRole = -1;
+}
+
+static bool BindPickerOpenNow(void)
+{
+    return (sc.bindFamily >= 0) && (sc.bindRole >= 0);
+}
+
+// ---------------------------------------------------------------------------
+//  The picker overlay: every authored asset, plus "use the built-in".
+// ---------------------------------------------------------------------------
+static void BindPickerGui(const Layout *L)
+{
+    if (!BindPickerOpenNow()) return;
+
+    sc_inModal = true;
+
+    Vector2 screen = ScreenStateSize();
+    Vector2 mp = GetMousePosition();
+
+    float mw = 420.0f*L->s, mh = 380.0f*L->s;
+    if (mw > screen.x - 40.0f) mw = screen.x - 40.0f;
+    if (mh > screen.y - 40.0f) mh = screen.y - 40.0f;
+    Rectangle m = { (screen.x - mw)*0.5f, (screen.y - mh)*0.5f, mw, mh };
+
+    DrawRectangle(0, 0, (int)screen.x, (int)screen.y, (Color){ 0, 0, 0, 165 });
+    DrawRectangleRec(m, COL_PANEL);
+    DrawRectangleLinesEx(m, 1.0f, COL_LINE_HI);
+
+    float pad = 14.0f*L->s;
+    DrawText(TextFormat("ASSET FOR %s", BindRoleName(sc.bindFamily, sc.bindRole)),
+             (int)(m.x + pad), (int)(m.y + pad), L->fsBody, COL_TEXT);
+    DrawText("Any asset fits any role - the category is only a label.",
+             (int)(m.x + pad), (int)(m.y + pad + (float)L->fsBody + 5.0f*L->s),
+             L->fsSmall, COL_TEXT_DIM);
+
+    float rowH = 30.0f*L->s;
+    float listY = m.y + pad + (float)L->fsBody + (float)L->fsSmall + 16.0f*L->s;
+    float listH = m.y + mh - listY - pad - rowH - 10.0f*L->s;
+    Rectangle list = { m.x + pad, listY, mw - pad*2.0f, listH };
+
+    // Row 0 is always "built-in", then one row per authored asset. Built-ins
+    // are not offered as a SOURCE here: they are what a role already falls back
+    // to, and remixing one into a file is how you bind its look.
+    int rows = sc.assetCount + 1;
+    float contentH = (float)rows*rowH;
+
+    if (CheckCollisionPointRec(mp, list))
+        sc.bindPickScroll -= GetMouseWheelMove()*40.0f*L->s;
+    float maxScroll = contentH - listH;
+    if (maxScroll < 0.0f) maxScroll = 0.0f;
+    if (sc.bindPickScroll > maxScroll) sc.bindPickScroll = maxScroll;
+    if (sc.bindPickScroll < 0.0f) sc.bindPickScroll = 0.0f;
+
+    const char *bound = StrategyBindingGet(sc.bindFamily, sc.bindRole);
+
+    BeginScissorMode((int)list.x, (int)list.y, (int)list.width, (int)list.height);
+    for (int r = 0; r < rows; r++)
+    {
+        Rectangle row = { list.x, list.y + (float)r*rowH - sc.bindPickScroll,
+                          list.width, rowH - 2.0f*L->s };
+
+        // A scissor clips PIXELS but not hit-testing, so a row scrolled out of
+        // the list would still take a click from behind the panel edge.
+        if ((row.y + row.height < list.y) || (row.y > list.y + list.height)) continue;
+
+        bool isBuiltin = (r == 0);
+        const char *name = isBuiltin ? "" : sc.assets[r - 1].name;
+        bool active = isBuiltin ? (bound[0] == '\0') : TextIsEqual(bound, name);
+
+        bool hot = CheckCollisionPointRec(mp, row) &&
+                   CheckCollisionPointRec(mp, list);
+
+        DrawRectangleRec(row, active ? Fade(COL_LINE_HI, 0.28f)
+                                     : (hot ? COL_PANEL_HI : COL_PANEL));
+        if (active) DrawRectangleLinesEx(row, 1.0f, COL_LINE_HI);
+
+        if (isBuiltin)
+        {
+            DrawText("- built-in model -", (int)(row.x + 10.0f*L->s),
+                     (int)(row.y + (row.height - (float)L->fsSmall)*0.5f),
+                     L->fsSmall, active ? COL_TEXT : COL_TEXT_DIM);
+        }
+        else
+        {
+            const SgaAsset *a = &sc.assets[r - 1];
+            DrawText(a->name, (int)(row.x + 10.0f*L->s),
+                     (int)(row.y + (row.height - (float)L->fsSmall)*0.5f),
+                     L->fsSmall, active ? COL_TEXT : COL_TEXT_DIM);
+
+            const char *tag = TextFormat("%s / %s",
+                                         StrategyAssetCategoryName(a->category),
+                                         (a->subtype[0] ? a->subtype : "-"));
+            int tw = MeasureText(tag, L->fsSmall);
+            DrawText(tag, (int)(row.x + row.width - (float)tw - 10.0f*L->s),
+                     (int)(row.y + (row.height - (float)L->fsSmall)*0.5f),
+                     L->fsSmall, Fade(categoryAccent[CAT_CUSTOM], 0.85f));
+        }
+
+        if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        {
+            AudioPlayButton();
+            StrategyBindingSet(sc.bindFamily, sc.bindRole, isBuiltin ? NULL : name);
+            StrategyBindingsSave();
+            BindPickerClose();
+            EndScissorMode();
+            sc_inModal = false;
+            return;
+        }
+    }
+    EndScissorMode();
+
+    if (sc.assetCount == 0)
+    {
+        const char *msg = "No authored assets yet - CREATE one first.";
+        int w = MeasureText(msg, L->fsSmall);
+        DrawText(msg, (int)(list.x + (list.width - (float)w)*0.5f),
+                 (int)(list.y + listH*0.45f), L->fsSmall, COL_TEXT_DIM);
+    }
+
+    float by = m.y + mh - rowH - pad*0.5f;
+    if (SheetButton((Rectangle){ m.x + mw - 96.0f*L->s - pad, by, 96.0f*L->s, rowH },
+                    "CLOSE", true, NULL, L->fsSmall))
+    { BindPickerClose(); sc_inModal = false; return; }
+
+    // ESC is NOT handled here. Update() runs before Gui() and owns the whole
+    // chain, so a key handled in both places would close the picker AND the
+    // view behind it on one press.
+
+    sc_inModal = false;
+}
+
+// ---------------------------------------------------------------------------
+//  The table
+// ---------------------------------------------------------------------------
+static void DrawBindings(const Layout *L)
+{
+    Vector2 mp = GetMousePosition();
+    Rectangle area = L->content;
+
+    int missing = StrategyBindingsMissingCount(sc.assets, sc.assetCount);
+
+    // -- explanation band -----------------------------------------------------
+    float bandH = 40.0f*L->s;
+    Rectangle band = { area.x, area.y, area.width, bandH };
+    DrawRectangleRec(band, COL_PANEL);
+    DrawRectangleLinesEx(band, 1.0f, COL_LINE);
+    DrawText("Any asset can stand in for any role. A category is a label for "
+             "finding assets, never a restriction.",
+             (int)(band.x + 12.0f*L->s),
+             (int)(band.y + (bandH - (float)L->fsSmall)*0.5f - (missing ? 6.0f*L->s : 0.0f)),
+             L->fsSmall, COL_TEXT_DIM);
+
+    if (missing > 0)
+    {
+        // A binding whose asset is not on this machine is KEPT, not erased -
+        // so it has to be visible, or the role silently shows its built-in and
+        // the user thinks the binding never saved.
+        DrawText(TextFormat("%d role%s point at an asset that is not here - the "
+                            "built-in is drawn instead.",
+                            missing, (missing == 1) ? "" : "s"),
+                 (int)(band.x + 12.0f*L->s),
+                 (int)(band.y + bandH*0.5f + 2.0f*L->s),
+                 L->fsSmall, categoryAccent[CAT_BUILDING]);
+    }
+
+    Rectangle list = { area.x, area.y + bandH + L->gap*0.5f, area.width,
+                       area.height - bandH - L->gap*0.5f };
+    if (list.height < 40.0f) return;
+
+    // -- rows -----------------------------------------------------------------
+    float rowH = 30.0f*L->s;
+    float headH = 22.0f*L->s;
+
+    // Measure first so the scroll clamp is right on the frame the view opens.
+    float contentH = 0.0f;
+    for (int f = 0; f < SGB_ROLE_FAMILY_COUNT; f++)
+        contentH += headH + (float)StrategyBindingsRoleCount(f)*rowH + L->gap;
+
+    if (CheckCollisionPointRec(mp, list) && !sc_inModal)
+        sc.bindScroll -= GetMouseWheelMove()*48.0f*L->s;
+    float maxScroll = contentH - list.height;
+    if (maxScroll < 0.0f) maxScroll = 0.0f;
+    if (sc.bindScroll > maxScroll) sc.bindScroll = maxScroll;
+    if (sc.bindScroll < 0.0f) sc.bindScroll = 0.0f;
+
+    BeginScissorMode((int)list.x, (int)list.y, (int)list.width, (int)list.height);
+
+    float y = list.y - sc.bindScroll;
+    for (int f = 0; f < SGB_ROLE_FAMILY_COUNT; f++)
+    {
+        Color accent = BindFamilyAccent(f);
+
+        DrawRectangleRec((Rectangle){ list.x, y + headH*0.5f - 1.0f*L->s,
+                                      list.width, 2.0f*L->s },
+                         Fade(accent, 0.25f));
+        const char *fam = StrategyBindingsFamilyName(f);
+        int fw = MeasureText(fam, L->fsSmall);
+        DrawRectangleRec((Rectangle){ list.x, y, (float)fw + 22.0f*L->s, headH }, COL_BG);
+        DrawText(fam, (int)(list.x + 10.0f*L->s),
+                 (int)(y + (headH - (float)L->fsSmall)*0.5f), L->fsSmall, accent);
+        y += headH;
+
+        int n = StrategyBindingsRoleCount(f);
+        for (int r = 0; r < n; r++)
+        {
+            Rectangle row = { list.x, y, list.width, rowH - 2.0f*L->s };
+            y += rowH;
+
+            // Same reason as the picker: a scissor does not clip hit-testing.
+            if ((row.y + row.height < list.y) || (row.y > list.y + list.height)) continue;
+
+            bool isBound = StrategyBindingIsBound(f, r);
+            const SgaAsset *res = StrategyBindingResolve(f, r, sc.assets, sc.assetCount);
+            bool broken = isBound && (res == NULL);
+
+            bool hot = CheckCollisionPointRec(mp, row) &&
+                       CheckCollisionPointRec(mp, list) && !sc_inModal;
+
+            DrawRectangleRec(row, hot ? COL_PANEL_HI : COL_PANEL);
+            DrawRectangleRec((Rectangle){ row.x, row.y, 3.0f*L->s, row.height },
+                             Fade(accent, isBound ? 1.0f : 0.35f));
+
+            DrawText(BindRoleName(f, r), (int)(row.x + 14.0f*L->s),
+                     (int)(row.y + (row.height - (float)L->fsSmall)*0.5f),
+                     L->fsSmall, COL_TEXT);
+
+            // The bound asset, mid-row, so the eye can run down one column.
+            float valX = row.x + row.width*0.42f;
+            const char *val = isBound ? StrategyBindingGet(f, r) : "- built-in model -";
+            DrawText(val, (int)valX,
+                     (int)(row.y + (row.height - (float)L->fsSmall)*0.5f),
+                     L->fsSmall,
+                     broken ? categoryAccent[CAT_BUILDING]
+                            : (isBound ? categoryAccent[CAT_CUSTOM] : COL_TEXT_DIM));
+
+            if (broken)
+            {
+                const char *warn = "missing";
+                DrawText(warn, (int)(valX + (float)MeasureText(val, L->fsSmall) + 10.0f*L->s),
+                         (int)(row.y + (row.height - (float)L->fsSmall)*0.5f),
+                         L->fsSmall, categoryAccent[CAT_BUILDING]);
+            }
+
+            // -- actions, right-aligned ---------------------------------------
+            float bw = 76.0f*L->s;
+            Rectangle change = { row.x + row.width - bw - 6.0f*L->s, row.y + 2.0f*L->s,
+                                 bw, row.height - 4.0f*L->s };
+            if (SheetButton(change, isBound ? "CHANGE" : "ASSIGN", true,
+                            "Pick which asset is drawn for this role.", L->fsSmall))
+            { BindPickerOpen(f, r); EndScissorMode(); return; }
+
+            if (isBound)
+            {
+                Rectangle clr = { change.x - 70.0f*L->s - 6.0f*L->s, change.y,
+                                  70.0f*L->s, change.height };
+                if (SheetButton(clr, "CLEAR", true,
+                                "Go back to this role's built-in model.", L->fsSmall))
+                {
+                    StrategyBindingSet(f, r, NULL);
+                    StrategyBindingsSave();
+                    EndScissorMode();
+                    return;
+                }
+            }
+        }
+        y += L->gap;
+    }
+
+    EndScissorMode();
+
+    if (maxScroll > 0.0f)
+    {
+        float thumbH = list.height*(list.height/contentH);
+        if (thumbH < 24.0f) thumbH = 24.0f;
+        float t = sc.bindScroll/maxScroll;
+        DrawRectangleRec((Rectangle){ list.x + list.width + 4.0f*L->s,
+                                      list.y + t*(list.height - thumbH),
+                                      4.0f*L->s, thumbH },
+                         Fade(COL_LINE_HI, 0.7f));
+    }
+}
+
 static void DrawMapPanel(Rectangle r, const Layout *L)
 {
     Vector2 mp = GetMousePosition();
@@ -1639,6 +2285,7 @@ static void DrawHeader(const Layout *L)
 
     const char *sub = (sc.view == VIEW_MAP) ? "battlefield"
                     : (sc.view == VIEW_INSPECT) ? "inspecting"
+                    : (sc.view == VIEW_BIND) ? "role bindings"
                     : TextFormat("%d assets", sc.catalogCount);
     DrawText(sub, (int)(L->pad + (float)MeasureText("STRATEGY ASSETS", L->fsHead) + 14.0f*L->s),
              (int)(cy + (float)L->fsHead - (float)L->fsSmall - 1.0f),
@@ -1691,8 +2338,13 @@ static void ConfirmDeleteGui(const Layout *L)
     if (SheetButton((Rectangle){ m.x + mw - 100.0f*L->s, by, 88.0f*L->s, bh },
                     "DELETE", true, NULL, L->fsSmall))
     {
+        // The name is about to stop existing, and the binding file is a
+        // separate document - so clear the roles that pointed at it and write
+        // that out, or the next run resolves them to nothing with no
+        // explanation of what happened.
         const char *name = EntryName(i);
         bool ok = StrategyAssetDelete(name);
+        if (ok && (StrategyBindingsRename(name, NULL) > 0)) StrategyBindingsSave();
         sc.confirmDelete = -1;
 
         // The catalog points INTO sc.assets, so it has to be rebuilt as a whole
@@ -1774,10 +2426,22 @@ static void DrawFooter(const Layout *L)
     }
     x += wipW + 8.0f*L->s;
 
-    // Binding a look to a game role is Phase 4; the seam stays visible.
-    WipButton((Rectangle){ x, by, wipW + 30.0f*L->s, bh }, "ASSIGN TO FACTION",
-              "Coming soon - mapping assets to a faction or level is not "
-              "available yet.");
+    // Role binding. Named for what it does rather than "assign to faction":
+    // a binding is per-ROLE and both factions share it, so the old label
+    // promised something the file does not model.
+    {
+        float bindW = wipW + 30.0f*L->s;
+        bool inBind = (sc.view == VIEW_BIND);
+        if (SheetButton((Rectangle){ x, by, bindW, bh },
+                        inBind ? "BACK TO GALLERY" : "ROLE BINDINGS", true,
+                        inBind ? "Return to the asset gallery."
+                               : "Choose which asset is drawn for each game role.",
+                        L->fsSmall))
+        {
+            ShowcaseSetView(inBind ? VIEW_GALLERY : VIEW_BIND);
+            return;
+        }
+    }
 
     // PLAY, right-aligned: the way on into the game.
     float playW = 190.0f*L->s;
@@ -1812,6 +2476,12 @@ static void Enter()
     // hook. Installed before anything draws.
     StrategyAssetSetFactionTint(StrategyFactionTint);
 
+    // The bindings module stays headless, so it learns the game's enum sizes
+    // here rather than including strategy_types.h itself. Installed BEFORE the
+    // load, so a file written by a longer-enum build is walked correctly.
+    StrategyBindingsSetRoleCounts(UNIT_KIND_COUNT, BLD_COUNT, NODE_KIND_COUNT);
+    StrategyBindingsLoad();
+
     CatalogReload();        // scans SGA_DIR, then builds the catalog around it
 
     sc.view = VIEW_GALLERY;
@@ -1826,6 +2496,8 @@ static void Enter()
     sc.mapPitch = 55.0f;
     sc.mapZoom = 1.25f;
     sc.confirmDelete = -1;      // memset would leave this pointing at entry 0
+    sc.bindFamily = -1;         // same trap: 0/0 would read as "picker is open"
+    sc.bindRole = -1;
 
     // Stagger the starting angles so the grid does not read as one rigid
     // block of identically-posed models.
@@ -1852,8 +2524,22 @@ static void Exit()
 
 static void Update()
 {
+    if (ShowcaseTyping())
+    {
+        // ESC still works, but it means "leave the box", not "leave the view".
+        // Innermost first, the way the zen editor's ESC chain does it.
+        if (IsKeyPressed(KEY_ESCAPE)) sc.searchEdit = false;
+        return;
+    }
+
     if (IsKeyPressed(KEY_ESCAPE))
     {
+        // Innermost first, the way the zen editor's chain does it: the picker
+        // is inside the binding view, so escape closes it without also
+        // throwing away the view behind it. (BindPickerGui also handles this,
+        // but only on frames it actually draws.)
+        if (BindPickerOpenNow()) { BindPickerClose(); return; }
+
         if (sc.view == VIEW_GALLERY) AppStateTransition(&app_state_main_menu);
         else ShowcaseSetView(VIEW_GALLERY);
         return;
@@ -1909,14 +2595,30 @@ static void Gui()
         } break;
 
         case VIEW_INSPECT: DrawInspect(&L); break;
+        case VIEW_BIND: DrawBindings(&L); break;
+
         case VIEW_MAP:     DrawMapFull(&L); break;
         default: break;
     }
 
+    // A view above may have opened the forge. AppStateTransition switches
+    // states synchronously, so the forge has ALREADY painted its own full frame
+    // by the time we get here - drawing our header, footer and tooltip over the
+    // top of it would flash this screen's furniture across the forge for one
+    // frame. The views return early for the same reason; this catches the case
+    // where the transition happened several draw calls deep.
+    if (!AppStateIsCurrent(&app_state_strategy_showcase)) return;
+
     DrawHeader(&L);
     DrawFooter(&L);
 
+    // The footer's CREATE / REMIX / PLAY / BACK all transition, and a tip
+    // recorded by the button that fired would otherwise paint onto the screen
+    // we just left.
+    if (!AppStateIsCurrent(&app_state_strategy_showcase)) return;
+
     // Last, so a tip paints over every panel it might overlap.
     ConfirmDeleteGui(&L);
+    BindPickerGui(&L);
     ShowcaseTipDraw(L.fsSmall);
 }

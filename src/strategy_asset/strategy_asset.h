@@ -157,6 +157,7 @@ const char *StrategyAssetStateName(int state);      // bad id -> "IDLE"
 typedef struct {
     float   t;          // seconds
     float   u;          // position along the bound path, 0..1
+    Vector3 offset;     // ADDITIVE offset from the part's rest position
     Vector3 rot;        // ADDITIVE rotation, degrees
     Vector3 scale;      // MULTIPLICATIVE scale; {1,1,1} is rest
     int32_t ease;       // index into SgaAsset.eases, or -1 for linear
@@ -253,6 +254,32 @@ int  StrategyAssetDuplicatePart(SgaAsset *a, int index);
 // the asset is not yet saveable, so the UI can say WHICH field is missing
 // rather than leaving a button dead with no explanation.
 bool StrategyAssetValid(const SgaAsset *a, const char **why);
+
+// ---------------------------------------------------------------------------
+//  Keyframes
+//
+//  Keys are kept SORTED BY TIME at all times. Evaluation walks them in order
+//  and would read a wrong segment otherwise, so insert/move re-sort rather than
+//  trusting the caller - a key dragged past its neighbour on a timeline is the
+//  normal case, not an error.
+// ---------------------------------------------------------------------------
+// Insert a key at time t, seeded from the pose already showing at t so adding a
+// key never makes the model jump. Returns the new key's index, or -1 if full.
+// An existing key at (almost) the same time is REPLACED, not duplicated.
+int  StrategyAssetAddKey(SgaAsset *a, int partIndex, int state, float t);
+bool StrategyAssetRemoveKey(SgaAsset *a, int partIndex, int state, int keyIndex);
+
+// Move a key in time, re-sorting. Returns the index the key ENDED UP at, since
+// a drag past a neighbour changes it.
+int  StrategyAssetMoveKey(SgaAsset *a, int partIndex, int state, int keyIndex,
+                          float newT);
+
+// Longest key time across every part in a state - what the state's duration has
+// to cover. 0 when nothing is animated.
+float StrategyAssetStateExtent(const SgaAsset *a, int state);
+
+// True when any part has keys in this state.
+bool StrategyAssetStateHasKeys(const SgaAsset *a, int state);
 
 // Legacy ColorRole -> tint policy. Reproduces the built-in's colour exactly,
 // including the four brightness deltas in strategy_models.c's PartColor.

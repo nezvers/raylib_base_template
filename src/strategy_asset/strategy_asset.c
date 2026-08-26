@@ -295,6 +295,182 @@ int StrategyAssetDuplicatePart(SgaAsset *a, int index)
     return idx;
 }
 
+// ---------------------------------------------------------------------------
+//  Keyframes
+// ---------------------------------------------------------------------------
+static SgaPartAnim *AnimOf(SgaAsset *a, int partIndex, int state)
+{
+    if ((a == NULL) || (partIndex < 0) || (partIndex >= a->partCount)) return NULL;
+    if ((state < 0) || (state >= SGA_STATE_COUNT)) return NULL;
+    return &a->parts[partIndex].anim[state];
+}
+
+// Insertion sort by time. The list is at most SGA_KEYS_MAX long and is already
+// sorted except for the one key that just moved, so this is a single pass in
+// practice - and it keeps the "keys are always sorted" invariant in ONE place.
+//
+// `watch` is the key the caller cares about (the one being dragged), and the
+// index it ENDS UP at is returned so the selection follows it across a drag
+// past a neighbour. Tracking that index through the shifts by hand is easy to
+// get subtly wrong - the obvious version double-updates and reports the key's
+// old slot - so instead the watched key is TAGGED with a sentinel time nothing
+// else can hold, sorted normally, and then found again by that tag.
+static int SortKeys(SgaPartAnim *an, int watch)
+{
+    bool tagged = (watch >= 0) && (watch < an->keyCount);
+    float saved = 0.0f;
+    if (tagged)
+    {
+        saved = an->keys[watch].t;
+        an->keys[watch].t = -1.0f;      // negative times never survive the API
+    }
+
+    for (int i = 1; i < an->keyCount; i++)
+    {
+        SgaKey k = an->keys[i];
+        float kt = (k.t < 0.0f) ? saved : k.t;
+        int j = i - 1;
+        while (j >= 0)
+        {
+            float jt = (an->keys[j].t < 0.0f) ? saved : an->keys[j].t;
+            // `>` not `>=`, so equal times keep insertion order and a key never
+            // leapfrogs one it merely ties with.
+            if (jt <= kt) break;
+            an->keys[j + 1] = an->keys[j];
+            j--;
+        }
+        an->keys[j + 1] = k;
+    }
+
+    if (!tagged) return watch;
+
+    for (int i = 0; i < an->keyCount; i++)
+    {
+        if (an->keys[i].t >= 0.0f) continue;
+        an->keys[i].t = saved;
+        return i;
+    }
+    return watch;       // unreachable: the tag was written above
+}
+
+int StrategyAssetAddKey(SgaAsset *a, int partIndex, int state, float t)
+{
+    SgaPartAnim *an = AnimOf(a, partIndex, state);
+    if (an == NULL) return -1;
+    if (t < 0.0f) t = 0.0f;
+
+    // Seed from the pose ALREADY SHOWING at t, so dropping a key never moves
+    // the model. A key seeded from rest would snap a part back to origin the
+    // instant it was created, which reads as the tool breaking the animation.
+    Vector3 off, rot, scl;
+    StrategyAssetPartPose(a, partIndex, state, t, &off, &rot, &scl);
+
+    // The pose's offset includes any bound path's contribution, which is NOT
+    // the key's own offset - storing it would bake the path position into the
+    // key and then add the path again on top. Interpolate the key offsets
+    // directly instead, the same way u is.
+    Vector3 koff = { 0 };
+
+    float u = 0.0f;
+    if (an->keyCount > 0)
+    {
+        const SgaKey *lo = &an->keys[0];
+        const SgaKey *hi = &an->keys[an->keyCount - 1];
+        if (t <= lo->t)      { u = lo->u; koff = lo->offset; }
+        else if (t >= hi->t) { u = hi->u; koff = hi->offset; }
+        else
+        {
+            for (int i = 0; i < an->keyCount - 1; i++)
+            {
+                if ((t < an->keys[i].t) || (t > an->keys[i + 1].t)) continue;
+                const SgaKey *l = &an->keys[i];
+                const SgaKey *r = &an->keys[i + 1];
+                float span = r->t - l->t;
+                float k = (span > 1e-6f) ? (t - l->t)/span : 0.0f;
+                float e = StrategyAssetEase(a, r->ease, k);
+                u = l->u + (r->u - l->u)*e;
+                koff.x = l->offset.x + (r->offset.x - l->offset.x)*e;
+                koff.y = l->offset.y + (r->offset.y - l->offset.y)*e;
+                koff.z = l->offset.z + (r->offset.z - l->offset.z)*e;
+                break;
+            }
+        }
+    }
+
+    // Replace a key sitting at the same instant rather than stacking a second
+    // one there: two keys at one time make a zero-length segment that no drag
+    // can separate, and the author cannot see there are two.
+    for (int i = 0; i < an->keyCount; i++)
+    {
+        if (fabsf(an->keys[i].t - t) > 1e-4f) continue;
+        an->keys[i].u = u;
+        an->keys[i].offset = koff;
+        an->keys[i].rot = rot;
+        an->keys[i].scale = scl;
+        return i;
+    }
+
+    if (an->keyCount >= SGA_KEYS_MAX) return -1;
+
+    int idx = an->keyCount++;
+    SgaKey *k = &an->keys[idx];
+    k->t = t;
+    k->u = u;
+    k->offset = koff;
+    k->rot = rot;
+    k->scale = scl;
+    k->ease = -1;               // linear until the author picks a curve
+
+    return SortKeys(an, idx);
+}
+
+bool StrategyAssetRemoveKey(SgaAsset *a, int partIndex, int state, int keyIndex)
+{
+    SgaPartAnim *an = AnimOf(a, partIndex, state);
+    if (an == NULL) return false;
+    if ((keyIndex < 0) || (keyIndex >= an->keyCount)) return false;
+
+    for (int i = keyIndex; i < an->keyCount - 1; i++) an->keys[i] = an->keys[i + 1];
+    an->keyCount--;
+    memset(&an->keys[an->keyCount], 0, sizeof(SgaKey));
+    return true;
+}
+
+int StrategyAssetMoveKey(SgaAsset *a, int partIndex, int state, int keyIndex,
+                         float newT)
+{
+    SgaPartAnim *an = AnimOf(a, partIndex, state);
+    if (an == NULL) return -1;
+    if ((keyIndex < 0) || (keyIndex >= an->keyCount)) return -1;
+    if (newT < 0.0f) newT = 0.0f;
+
+    an->keys[keyIndex].t = newT;
+    return SortKeys(an, keyIndex);
+}
+
+float StrategyAssetStateExtent(const SgaAsset *a, int state)
+{
+    if ((a == NULL) || (state < 0) || (state >= SGA_STATE_COUNT)) return 0.0f;
+
+    float m = 0.0f;
+    for (int p = 0; p < a->partCount; p++)
+    {
+        const SgaPartAnim *an = &a->parts[p].anim[state];
+        if (an->keyCount <= 0) continue;
+        float t = an->keys[an->keyCount - 1].t;     // sorted, so the last is the max
+        if (t > m) m = t;
+    }
+    return m;
+}
+
+bool StrategyAssetStateHasKeys(const SgaAsset *a, int state)
+{
+    if ((a == NULL) || (state < 0) || (state >= SGA_STATE_COUNT)) return false;
+    for (int p = 0; p < a->partCount; p++)
+        if (a->parts[p].anim[state].keyCount > 0) return true;
+    return false;
+}
+
 bool StrategyAssetValid(const SgaAsset *a, const char **why)
 {
     if (a == NULL) { if (why) *why = "no asset"; return false; }
@@ -389,7 +565,24 @@ Color StrategyAssetPartColor(const SgaPart *p, int faction, float alpha)
         base.r = (unsigned char)((float)p->color.r + ((float)f.r - (float)p->color.r)*k);
         base.g = (unsigned char)((float)p->color.g + ((float)f.g - (float)p->color.g)*k);
         base.b = (unsigned char)((float)p->color.b + ((float)f.b - (float)p->color.b)*k);
-        base.a = p->color.a;
+
+        // Alpha comes from the FACTION side, not from p->color.
+        //
+        // A part imported from a built-in whose role was faction-driven has no
+        // meaningful .color at all: strategy_models.c uses designated
+        // initialisers and omits it for those roles, because its renderer never
+        // reads it there. It arrives as {0,0,0,0}. Taking alpha from p->color
+        // made such a part fully transparent at every blend below 1.0 and
+        // visible only at FULL, where the faction colour replaces alpha
+        // outright - the part appeared to "pop in" at exactly 1 and vanish
+        // otherwise.
+        //
+        // Interpolating alpha does not fix it either: from 0 it only reaches
+        // opaque AT k=1, so the part would still fade out as the slider moved.
+        // PARTIAL means "how much of the faction's HUE this part takes", and
+        // transparency is not part of that question - so alpha tracks the
+        // faction colour, which is what the part is being tinted by.
+        base.a = f.a;
     }
 
     if (p->brightness != 0.0f) base = ColorBrightness(base, p->brightness);
@@ -513,11 +706,20 @@ void StrategyAssetPartPose(const SgaAsset *a, int partIndex, int state, float t,
         scl.y = lo->scale.y + (hi->scale.y - lo->scale.y)*e;
         scl.z = lo->scale.z + (hi->scale.z - lo->scale.z)*e;
 
+        // The key's own offset, interpolated like everything else.
+        off.x = lo->offset.x + (hi->offset.x - lo->offset.x)*e;
+        off.y = lo->offset.y + (hi->offset.y - lo->offset.y)*e;
+        off.z = lo->offset.z + (hi->offset.z - lo->offset.z)*e;
+
+        // A bound path ADDS to that offset rather than replacing it, so a part
+        // can be moved into place by hand AND ride a path - which is how an
+        // orbit gets positioned anywhere other than the model's origin.
         int pi = an->pathPart;
         if ((pi >= 0) && (pi < a->partCount) && (a->parts[pi].kind == SGA_PATH))
         {
             float u = lo->u + (hi->u - lo->u)*e;
-            off = StrategyPathPoint(&a->parts[pi].path, u);
+            Vector3 pp = StrategyPathPoint(&a->parts[pi].path, u);
+            off.x += pp.x; off.y += pp.y; off.z += pp.z;
         }
     }
 

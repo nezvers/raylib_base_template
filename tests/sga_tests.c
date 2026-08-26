@@ -21,10 +21,19 @@
 
 #include "../src/strategy_asset/strategy_asset.h"
 #include "../src/strategy_asset/strategy_asset_io.h"
+#include "../src/strategy_asset/strategy_asset_ease.h"
+#include "../src/strategy_asset/strategy_bindings.h"
+#include "../src/anim/anim.h"
+#include "../src/anim/anim_ease_custom.h"
 
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+
+// anim.c pulls this in for AnimDocDraw, which nothing here calls. Same stub
+// zen_tests.c uses, for the same reason: the suite links the anim module for
+// its EASING tables, not for its drawing.
+Vector2 ScreenStateTargetSize(void) { return (Vector2){ 1280, 720 }; }
 
 static int s_checks = 0, s_fails = 0;
 
@@ -98,8 +107,12 @@ static void BuildSample(SgaAsset *a)
     SgaPartAnim *an = &body->anim[SGA_STATE_MOVING];
     an->pathPart = 2;
     an->keyCount = 2;
-    an->keys[0] = (SgaKey){ 0.0f, 0.0f, { 0, 0, 0 }, { 1, 1, 1 }, -1 };
-    an->keys[1] = (SgaKey){ 0.5f, 1.0f, { 0, 90.0f, 0 }, { 1, 2.0f, 1 }, 0 };
+    // Designated, not positional: adding a field to SgaKey once shifted `rot`
+    // into the new slot and quietly changed what this sample meant.
+    an->keys[0] = (SgaKey){ .t = 0.0f, .u = 0.0f, .offset = { 0, 0, 0 },
+                            .rot = { 0, 0, 0 }, .scale = { 1, 1, 1 }, .ease = -1 };
+    an->keys[1] = (SgaKey){ .t = 0.5f, .u = 1.0f, .offset = { 0.25f, 0, 0 },
+                            .rot = { 0, 90.0f, 0 }, .scale = { 1, 2.0f, 1 }, .ease = 0 };
     a->duration[SGA_STATE_MOVING] = 0.5f;
 
     StrategyAssetMeasure(a);
@@ -152,6 +165,7 @@ static void TestRoundTrip(void)
     CHECK(an->keyCount == 2);
     CHECK_NEAR(an->keys[1].t, 0.5f);
     CHECK_NEAR(an->keys[1].u, 1.0f);
+    CHECK_NEAR(an->keys[1].offset.x, 0.25f);
     CHECK_NEAR(an->keys[1].rot.y, 90.0f);
     CHECK_NEAR(an->keys[1].scale.y, 2.0f);
     CHECK(an->keys[1].ease == 0);
@@ -290,11 +304,12 @@ static void TestFileSizeIsTierIndependent(void)
     BuildSample(&src);
     CHECK(StrategyAssetSave(&src, TEST_PATH));
 
-    // 461,024 bytes at the pinned capacities (64 parts / 32 keys / 32 eases).
-    // If this number moves, the format changed and SGA_SAVE_VERSION must too -
-    // every previously saved asset is otherwise unreadable.
+    // 608,480 bytes at the pinned capacities (64 parts / 32 keys / 32 eases),
+    // as of v2 - which added a per-key offset, growing SgaKeyDisk from 36 to 48
+    // bytes. If this number moves, the format changed and SGA_SAVE_VERSION must
+    // too, or every previously saved asset is misread rather than refused.
     int len = (int)GetFileLength(TEST_PATH);
-    CHECK(len == 461024);
+    CHECK(len == 608480);
 
     // A short file must be REFUSED, not read as a full record with whatever
     // happened to be in the buffer standing in for the missing tail.
@@ -532,6 +547,581 @@ static void TestPartColor(void)
     StrategyAssetSetFactionTint(NULL);
 }
 
+// ---------------------------------------------------------------------------
+//  Baking (strategy_asset_ease.c)
+//
+//  These are the Phase 3 tests, and the reason the suite links src/anim/.
+// ---------------------------------------------------------------------------
+
+// A builtin baked into an asset must still be the SAME CURVE. This is the test
+// that justifies sampling builtins into knots rather than storing their name:
+// strategy_asset.c cannot see the builtin table, so a name-only slot would play
+// linear in the showcase while looking correct in the forge.
+static void TestBakeBuiltinKeepsShape(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "bake");
+
+    // The smooth curves should be reproduced tightly by 8 fitted knots.
+    const int smooth[] = { ANIM_EASE_SINE_INOUT, ANIM_EASE_QUAD_OUT,
+                           ANIM_EASE_CUBIC_IN, ANIM_EASE_CUBIC_INOUT,
+                           ANIM_EASE_EXPO_OUT };
+    for (int c = 0; c < (int)(sizeof(smooth)/sizeof(smooth[0])); c++)
+    {
+        int slot = StrategyAssetBakeEase(&a, smooth[c]);
+        CHECK(slot >= 0);
+
+        float worst = 0.0f;
+        for (int i = 0; i <= 20; i++)
+        {
+            float p = (float)i/20.0f;
+            float d = fabsf(StrategyAssetEase(&a, slot, p) - AnimEaseApply(smooth[c], p));
+            if (d > worst) worst = d;
+        }
+        // 2% of the curve's range: well under a pixel of motion at any size a
+        // part is drawn, and the difference is invisible in the viewport.
+        CHECK(worst < 0.02f);
+    }
+
+    // Endpoints must be exact regardless of fit quality - a curve that does not
+    // land on 1.0 leaves the part short of its keyed pose forever.
+    int s2 = StrategyAssetBakeEase(&a, ANIM_EASE_BACK_OUT);
+    CHECK(s2 >= 0);
+    CHECK_NEAR(StrategyAssetEase(&a, s2, 0.0f), 0.0f);
+    CHECK_NEAR(StrategyAssetEase(&a, s2, 1.0f), 1.0f);
+
+    // backOut overshoots past 1 on its way; a fit that clamped would flatten
+    // the character out of the motion entirely.
+    float peak = 0.0f;
+    for (int i = 0; i <= 40; i++)
+    {
+        float v = StrategyAssetEase(&a, s2, (float)i/40.0f);
+        if (v > peak) peak = v;
+    }
+    CHECK(peak > 1.02f);
+
+    // Linear is not a curve and must never consume a slot.
+    int before = a.easeCount;
+    CHECK(StrategyAssetBakeEase(&a, ANIM_EASE_LINEAR) < 0);
+    CHECK(a.easeCount == before);
+}
+
+// Baking the same curve twice must reuse the slot. Without this, every click in
+// the easing picker burns a slot and a normal session runs out.
+static void TestBakeDedupes(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "dedup");
+
+    int x = StrategyAssetBakeEase(&a, ANIM_EASE_SINE_OUT);
+    int y = StrategyAssetBakeEase(&a, ANIM_EASE_SINE_OUT);
+    int z = StrategyAssetBakeEase(&a, ANIM_EASE_QUAD_IN);
+    CHECK(x == y);
+    CHECK(z != x);
+    CHECK(a.easeCount == 2);
+}
+
+// THE standalone guarantee, on a real custom curve: bake it, then delete the
+// slot it came from, and the asset must still play the shape it was authored
+// with. This is the test the whole baking design exists to pass.
+static void TestCustomEaseSurvivesSlotDeletion(void)
+{
+    AnimEasePt pts[3];
+    pts[0] = (AnimEasePt){ 0.0f, 0.0f, 0,0, 0.10f,  0.60f };
+    pts[1] = (AnimEasePt){ 0.5f, 0.9f, -0.15f, 0.0f, 0.15f, 0.0f };
+    pts[2] = (AnimEasePt){ 1.0f, 1.0f, -0.10f, -0.05f, 0,0 };
+
+    int id = AnimCustomEaseAdd("sgaTestCurve", pts, 3);
+    CHECK(id >= ANIM_EASE_COUNT);
+
+    static SgaAsset a;
+    StrategyAssetInit(&a, "custom");
+    int slot = StrategyAssetBakeEase(&a, id);
+    CHECK(slot >= 0);
+    CHECK(strcmp(StrategyAssetEaseName(&a, slot), "sgaTestCurve") == 0);
+
+    float before[9];
+    for (int i = 0; i < 9; i++) before[i] = StrategyAssetEase(&a, slot, (float)i/8.0f);
+
+    // The curve genuinely bends, or "unchanged" would prove nothing.
+    CHECK(fabsf(before[2] - 0.25f) > 0.05f);
+
+    // Now pull the ground out: the slot is gone, exactly as if _easings.cfg had
+    // been edited or deleted on another machine.
+    CHECK(AnimCustomEaseRemove(id));
+    CHECK(AnimCustomEaseGet(id) == NULL);
+
+    for (int i = 0; i < 9; i++)
+        CHECK_NEAR(StrategyAssetEase(&a, slot, (float)i/8.0f), before[i]);
+
+    // And it survives a file round trip on top of that.
+    CHECK(StrategyAssetSave(&a, TEST_PATH));
+    static SgaAsset b;
+    CHECK(StrategyAssetLoad(&b, TEST_PATH));
+    for (int i = 0; i < 9; i++)
+        CHECK_NEAR(StrategyAssetEase(&b, slot, (float)i/8.0f), before[i]);
+
+    // With the live slot gone there is no runtime id to point back at, and the
+    // picker must say so rather than reporting a wrong curve as selected.
+    CHECK(StrategyAssetEaseRuntimeId(&b, slot) < 0);
+
+    SimpleDelete(TEST_PATH);
+}
+
+// Compaction drops unreferenced curves AND repoints the keys that survive. A
+// remap that forgot the second half would silently move keys onto other curves.
+static void TestCompactEases(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "compact");
+
+    int e0 = StrategyAssetBakeEase(&a, ANIM_EASE_SINE_IN);
+    int e1 = StrategyAssetBakeEase(&a, ANIM_EASE_QUAD_OUT);
+    int e2 = StrategyAssetBakeEase(&a, ANIM_EASE_CUBIC_INOUT);
+    CHECK(a.easeCount == 3);
+    (void)e0;
+
+    // Only the middle and last curves are actually used.
+    CHECK(StrategyAssetAddKey(&a, 0, SGA_STATE_IDLE, 0.0f) == 0);
+    CHECK(StrategyAssetAddKey(&a, 0, SGA_STATE_IDLE, 1.0f) == 1);
+    a.parts[0].anim[SGA_STATE_IDLE].keys[0].ease = e1;
+    a.parts[0].anim[SGA_STATE_IDLE].keys[1].ease = e2;
+
+    float shape1[5], shape2[5];
+    for (int i = 0; i < 5; i++)
+    {
+        shape1[i] = StrategyAssetEase(&a, e1, (float)i/4.0f);
+        shape2[i] = StrategyAssetEase(&a, e2, (float)i/4.0f);
+    }
+
+    StrategyAssetCompactEases(&a);
+    CHECK(a.easeCount == 2);        // the unreferenced first curve is gone
+
+    // The keys must still resolve to the SAME SHAPES, at their new indices.
+    int n1 = a.parts[0].anim[SGA_STATE_IDLE].keys[0].ease;
+    int n2 = a.parts[0].anim[SGA_STATE_IDLE].keys[1].ease;
+    CHECK(n1 >= 0 && n1 < a.easeCount);
+    CHECK(n2 >= 0 && n2 < a.easeCount);
+    for (int i = 0; i < 5; i++)
+    {
+        CHECK_NEAR(StrategyAssetEase(&a, n1, (float)i/4.0f), shape1[i]);
+        CHECK_NEAR(StrategyAssetEase(&a, n2, (float)i/4.0f), shape2[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Keyframes
+// ---------------------------------------------------------------------------
+static void TestKeysStaySorted(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "keys");
+
+    // Added out of order on purpose: evaluation walks the list in order and
+    // reads the wrong segment if the invariant is only maintained by luck.
+    CHECK(StrategyAssetAddKey(&a, 0, SGA_STATE_MOVING, 1.0f) >= 0);
+    CHECK(StrategyAssetAddKey(&a, 0, SGA_STATE_MOVING, 0.25f) >= 0);
+    CHECK(StrategyAssetAddKey(&a, 0, SGA_STATE_MOVING, 0.75f) >= 0);
+
+    SgaPartAnim *an = &a.parts[0].anim[SGA_STATE_MOVING];
+    CHECK(an->keyCount == 3);
+    CHECK_NEAR(an->keys[0].t, 0.25f);
+    CHECK_NEAR(an->keys[1].t, 0.75f);
+    CHECK_NEAR(an->keys[2].t, 1.0f);
+
+    // A key dragged PAST its neighbour is the normal timeline gesture, and the
+    // returned index has to follow it or the selection jumps to another key.
+    int moved = StrategyAssetMoveKey(&a, 0, SGA_STATE_MOVING, 0, 0.9f);
+    CHECK(moved == 1);
+    CHECK_NEAR(an->keys[0].t, 0.75f);
+    CHECK_NEAR(an->keys[1].t, 0.9f);
+    CHECK_NEAR(an->keys[2].t, 1.0f);
+
+    // Dragged past the far end too.
+    moved = StrategyAssetMoveKey(&a, 0, SGA_STATE_MOVING, 1, 5.0f);
+    CHECK(moved == 2);
+    CHECK_NEAR(an->keys[2].t, 5.0f);
+
+    // Negative time is clamped, not stored - it would sit before the head can
+    // ever reach it and be undraggable.
+    StrategyAssetMoveKey(&a, 0, SGA_STATE_MOVING, 0, -3.0f);
+    CHECK(an->keys[0].t >= 0.0f);
+
+    // A second key at an existing time REPLACES it: two keys at one instant is
+    // a zero-length segment the author cannot see or separate.
+    int n = an->keyCount;
+    CHECK(StrategyAssetAddKey(&a, 0, SGA_STATE_MOVING, 5.0f) >= 0);
+    CHECK(an->keyCount == n);
+
+    CHECK(StrategyAssetRemoveKey(&a, 0, SGA_STATE_MOVING, 0));
+    CHECK(an->keyCount == n - 1);
+    CHECK(!StrategyAssetRemoveKey(&a, 0, SGA_STATE_MOVING, 99));
+
+    // Keys live per STATE: authoring a walk cycle must not disturb the idle.
+    CHECK(a.parts[0].anim[SGA_STATE_IDLE].keyCount == 0);
+    CHECK(!StrategyAssetStateHasKeys(&a, SGA_STATE_IDLE));
+    CHECK(StrategyAssetStateHasKeys(&a, SGA_STATE_MOVING));
+    CHECK_NEAR(StrategyAssetStateExtent(&a, SGA_STATE_IDLE), 0.0f);
+    CHECK_NEAR(StrategyAssetStateExtent(&a, SGA_STATE_MOVING), 5.0f);
+}
+
+// A new key must adopt the pose ALREADY SHOWING at that time. Seeding from rest
+// would snap the part back to origin the moment a key is dropped, which reads
+// as the tool destroying the animation.
+static void TestAddKeySamplesCurrentPose(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "pose");
+
+    SgaPartAnim *an = &a.parts[0].anim[SGA_STATE_IDLE];
+    CHECK(StrategyAssetAddKey(&a, 0, SGA_STATE_IDLE, 0.0f) >= 0);
+    CHECK(StrategyAssetAddKey(&a, 0, SGA_STATE_IDLE, 2.0f) >= 0);
+    an->keys[0].rot = (Vector3){ 0.0f, 0.0f, 0.0f };
+    an->keys[1].rot = (Vector3){ 0.0f, 90.0f, 0.0f };
+
+    // Halfway between them the part is at 45 degrees, so a key dropped there
+    // must BE 45 degrees.
+    int mid = StrategyAssetAddKey(&a, 0, SGA_STATE_IDLE, 1.0f);
+    CHECK(mid == 1);
+    CHECK_NEAR(an->keys[1].rot.y, 45.0f);
+
+    // And the pose is genuinely unchanged by the insertion.
+    Vector3 off, rot, scl;
+    StrategyAssetPartPose(&a, 0, SGA_STATE_IDLE, 1.0f, &off, &rot, &scl);
+    CHECK_NEAR(rot.y, 45.0f);
+
+    // Scale defaults to rest, never to zero - a key seeded with a zero scale
+    // makes the part vanish.
+    CHECK_NEAR(an->keys[1].scale.x, 1.0f);
+}
+
+
+// Per-key offset (v2). Before this existed the only movable value was the
+// part's REST offset, which is shared by every key in every state - so
+// "animating" a part by moving it changed all of its keys at once.
+static void TestPerKeyOffset(void)
+{
+    static SgaAsset a;
+    StrategyAssetInit(&a, "koff");
+
+    SgaPartAnim *an = &a.parts[0].anim[SGA_STATE_IDLE];
+    CHECK(StrategyAssetAddKey(&a, 0, SGA_STATE_IDLE, 0.0f) >= 0);
+    CHECK(StrategyAssetAddKey(&a, 0, SGA_STATE_IDLE, 1.0f) >= 0);
+    an->keys[0].offset = (Vector3){ 0.0f, 0.0f, 0.0f };
+    an->keys[1].offset = (Vector3){ 2.0f, 0.0f, 0.0f };
+
+    Vector3 off, rot, scl;
+    StrategyAssetPartPose(&a, 0, SGA_STATE_IDLE, 0.5f, &off, &rot, &scl);
+    CHECK_NEAR(off.x, 1.0f);            // halfway between the two keys
+
+    // Editing ONE key must not disturb the other - the whole point.
+    an->keys[1].offset.x = 4.0f;
+    StrategyAssetPartPose(&a, 0, SGA_STATE_IDLE, 0.0f, &off, &rot, &scl);
+    CHECK_NEAR(off.x, 0.0f);
+
+    // The rest offset is a SEPARATE value and is not touched by keying.
+    CHECK_NEAR(a.parts[0].offset.x, 0.0f);
+
+    // A bound path ADDS to the key offset rather than replacing it, so a part
+    // can be positioned by hand and still ride an orbit.
+    int pi = StrategyAssetAddPart(&a, SGA_PATH);
+    CHECK(pi > 0);
+    a.parts[pi].path.radiusX = 1.0f;
+    a.parts[pi].path.radiusZ = 1.0f;
+    a.parts[pi].path.center = (Vector3){ 0.0f, 0.0f, 0.0f };
+    an = &a.parts[0].anim[SGA_STATE_IDLE];      // AddPart may move the array
+    an->pathPart = pi;
+    an->keys[0].offset = (Vector3){ 10.0f, 0.0f, 0.0f };
+    an->keys[0].u = 0.0f;
+
+    StrategyAssetPartPose(&a, 0, SGA_STATE_IDLE, 0.0f, &off, &rot, &scl);
+    Vector3 p0 = StrategyPathPoint(&a.parts[pi].path, 0.0f);
+    CHECK_NEAR(off.x, 10.0f + p0.x);
+    CHECK_NEAR(off.z, p0.z);
+
+    // And a key added mid-animation must not bake the path position into its
+    // own offset, or the path would be applied twice from then on.
+    an->keys[1].offset = (Vector3){ 10.0f, 0.0f, 0.0f };
+    an->keys[1].u = 0.5f;
+    int mid = StrategyAssetAddKey(&a, 0, SGA_STATE_IDLE, 0.5f);
+    CHECK(mid >= 0);
+    CHECK_NEAR(a.parts[0].anim[SGA_STATE_IDLE].keys[mid].offset.x, 10.0f);
+}
+
+
+// A faction-driven built-in part carries NO authored .color - strategy_models.c
+// omits it for those roles because its own renderer never reads it - so it
+// arrives as {0,0,0,0}. Blending toward that made remixed built-ins invisible
+// at every FACTION value below 1, and visible only at FULL where the faction
+// colour replaces alpha outright.
+static void TestPartialTintKeepsAlpha(void)
+{
+    StrategyAssetSetFactionTint(TestTint);
+
+    SgaPart p;
+    memset(&p, 0, sizeof(p));
+    p.color = (Color){ 0, 0, 0, 0 };        // exactly what a builtin import copies
+    p.tintMode = SGA_TINT_PARTIAL;
+    p.brightness = 0.0f;
+
+    // At every blend the part must stay opaque: the faction colour is opaque,
+    // and a transparent .color must not drag the result to invisible.
+    for (int i = 0; i <= 10; i++)
+    {
+        p.tintAmount = (float)i/10.0f;
+        CHECK(StrategyAssetPartColor(&p, 0, 1.0f).a == 255);
+    }
+
+    // PARTIAL asks "how much of the faction's HUE", so alpha follows the faction
+    // rather than the part's own colour. A part being faction-tinted is as
+    // opaque as the faction is, whatever junk alpha its .color carries.
+    p.color = (Color){ 200, 100, 50, 0 };
+    p.tintAmount = 0.5f;
+    CHECK(StrategyAssetPartColor(&p, 0, 1.0f).a == 255);
+
+    // NONE is the mode that respects an authored alpha, and must keep doing so.
+    p.tintMode = SGA_TINT_NONE;
+    CHECK(StrategyAssetPartColor(&p, 0, 1.0f).a == 0);
+    p.color.a = 128;
+    CHECK(StrategyAssetPartColor(&p, 0, 1.0f).a == 128);
+
+    // The overall alpha argument still composes on top.
+    p.tintMode = SGA_TINT_PARTIAL;
+    p.color.a = 255;
+    p.tintAmount = 1.0f;
+    CHECK(StrategyAssetPartColor(&p, 0, 0.5f).a < 200);
+
+    StrategyAssetSetFactionTint(NULL);
+}
+
+// ===========================================================================
+//  Role bindings
+//
+//  These write to the REAL bindings path - the module's path is fixed, the way
+//  settings.sav's is - so the suite moves any existing file aside first and
+//  puts it back at the end. A developer's own bindings surviving a test run is
+//  not a nicety: the file is authored work, and losing it to `ctest` would be
+//  the same class of bug as an editor that eats a document.
+// ===========================================================================
+static bool s_bindStashed = false;
+#define BIND_STASH  "assets_strategy/_sgbtest_stash.sgb"
+
+static void BindStash(void)
+{
+    s_bindStashed = false;
+    const char *path = StrategyBindingsPath();
+    if (!FileExists(path)) return;
+
+    int size = 0;
+    unsigned char *data = LoadFileData(path, &size);
+    if ((data == NULL) || (size <= 0)) return;
+
+    s_bindStashed = SaveFileData(BIND_STASH, data, size);
+    UnloadFileData(data);
+}
+
+static void BindRestore(void)
+{
+    SimpleDelete(StrategyBindingsPath());
+
+    if (!s_bindStashed) return;
+
+    int size = 0;
+    unsigned char *data = LoadFileData(BIND_STASH, &size);
+    if ((data != NULL) && (size > 0)) SaveFileData(StrategyBindingsPath(), data, size);
+    if (data != NULL) UnloadFileData(data);
+
+    SimpleDelete(BIND_STASH);
+    s_bindStashed = false;
+}
+
+static void TestBindingsSetGetClear(void)
+{
+    StrategyBindingsClear();
+    StrategyBindingsSetRoleCounts(8, 8, 4);
+
+    CHECK(StrategyBindingsRoleCount(SGB_ROLE_UNIT) == 8);
+    CHECK(StrategyBindingsRoleCount(SGB_ROLE_NODE) == 4);
+    CHECK(StrategyBindingsRoleCount(-1) == 0);
+
+    // Unbound reads as the empty string, never NULL - callers print it raw.
+    CHECK(StrategyBindingGet(SGB_ROLE_UNIT, 0)[0] == '\0');
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_UNIT, 0));
+
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 1, "watchtower"));
+    CHECK(StrategyBindingIsBound(SGB_ROLE_UNIT, 1));
+    CHECK(TextIsEqual(StrategyBindingGet(SGB_ROLE_UNIT, 1), "watchtower"));
+
+    // The three families are independent: same index, different slot.
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_BUILDING, 1));
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_NODE, 1));
+
+    // Empty and NULL both mean "back to the built-in".
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 1, ""));
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_UNIT, 1));
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 1, "x"));
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 1, NULL));
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_UNIT, 1));
+
+    // Out of range is refused rather than clamped into someone else's slot.
+    CHECK(!StrategyBindingSet(SGB_ROLE_UNIT, -1, "x"));
+    CHECK(!StrategyBindingSet(SGB_ROLE_UNIT, SGB_UNITS_MAX, "x"));
+    CHECK(!StrategyBindingSet(SGB_ROLE_FAMILY_COUNT, 0, "x"));
+    CHECK(StrategyBindingGet(SGB_ROLE_FAMILY_COUNT, 0)[0] == '\0');
+
+    StrategyBindingsClear();
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_UNIT, 1));
+}
+
+// The whole point of storing names: the mapping survives the asset list being
+// reordered underneath it, which an index could not.
+static void TestBindingResolveByName(void)
+{
+    static SgaAsset assets[3];
+    StrategyAssetInit(&assets[0], "alpha");
+    StrategyAssetInit(&assets[1], "beta");
+    StrategyAssetInit(&assets[2], "gamma");
+
+    StrategyBindingsClear();
+    StrategyBindingsSetRoleCounts(8, 8, 4);
+    CHECK(StrategyBindingSet(SGB_ROLE_BUILDING, 2, "beta"));
+
+    const SgaAsset *r = StrategyBindingResolve(SGB_ROLE_BUILDING, 2, assets, 3);
+    CHECK(r == &assets[1]);
+
+    // Reorder the list - an index-based binding would now point at "alpha".
+    SgaAsset tmp = assets[0];
+    assets[0] = assets[1];
+    assets[1] = tmp;
+
+    r = StrategyBindingResolve(SGB_ROLE_BUILDING, 2, assets, 3);
+    CHECK(r == &assets[0]);
+    CHECK(TextIsEqual(r->name, "beta"));
+
+    // Unbound resolves to NULL, meaning "draw the built-in".
+    CHECK(StrategyBindingResolve(SGB_ROLE_BUILDING, 3, assets, 3) == NULL);
+}
+
+// A name with no file behind it must be KEPT, not erased. Copying the bindings
+// without the assets is a missing file, not a decision to unbind.
+static void TestBindingMissingIsKept(void)
+{
+    static SgaAsset assets[1];
+    StrategyAssetInit(&assets[0], "alpha");
+
+    StrategyBindingsClear();
+    StrategyBindingsSetRoleCounts(4, 4, 2);
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 0, "alpha"));
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 1, "not-here"));
+
+    CHECK(StrategyBindingResolve(SGB_ROLE_UNIT, 1, assets, 1) == NULL);
+    CHECK(StrategyBindingIsBound(SGB_ROLE_UNIT, 1));    // still bound
+    CHECK(TextIsEqual(StrategyBindingGet(SGB_ROLE_UNIT, 1), "not-here"));
+
+    CHECK(StrategyBindingsMissingCount(assets, 1) == 1);
+
+    // Counting walks only the INSTALLED roles, not the whole capacity - a stale
+    // binding past the game's enum must not be reported as a missing asset.
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, SGB_UNITS_MAX - 1, "ghost"));
+    CHECK(StrategyBindingsMissingCount(assets, 1) == 1);
+}
+
+static void TestBindingsRename(void)
+{
+    StrategyBindingsClear();
+    StrategyBindingsSetRoleCounts(8, 8, 4);
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 0, "old"));
+    CHECK(StrategyBindingSet(SGB_ROLE_BUILDING, 3, "old"));
+    CHECK(StrategyBindingSet(SGB_ROLE_NODE, 1, "other"));
+
+    CHECK(StrategyBindingsRename("old", "new") == 2);
+    CHECK(TextIsEqual(StrategyBindingGet(SGB_ROLE_UNIT, 0), "new"));
+    CHECK(TextIsEqual(StrategyBindingGet(SGB_ROLE_BUILDING, 3), "new"));
+    CHECK(TextIsEqual(StrategyBindingGet(SGB_ROLE_NODE, 1), "other"));
+
+    // A delete clears rather than repoints.
+    CHECK(StrategyBindingsRename("new", NULL) == 2);
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_UNIT, 0));
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_BUILDING, 3));
+
+    CHECK(StrategyBindingsRename(NULL, "x") == 0);
+    CHECK(StrategyBindingsRename("nobody", "x") == 0);
+}
+
+static void TestBindingsRoundTrip(void)
+{
+    BindStash();
+
+    StrategyBindingsClear();
+    StrategyBindingsSetRoleCounts(8, 8, 4);
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 0, "worker-look"));
+    CHECK(StrategyBindingSet(SGB_ROLE_BUILDING, 5, "tree-look"));
+    CHECK(StrategyBindingSet(SGB_ROLE_NODE, 2, "hall-look"));
+
+    CHECK(StrategyBindingsSave());
+
+    StrategyBindingsClear();
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_UNIT, 0));
+
+    CHECK(StrategyBindingsLoad());
+    CHECK(TextIsEqual(StrategyBindingGet(SGB_ROLE_UNIT, 0), "worker-look"));
+    CHECK(TextIsEqual(StrategyBindingGet(SGB_ROLE_BUILDING, 5), "tree-look"));
+    CHECK(TextIsEqual(StrategyBindingGet(SGB_ROLE_NODE, 2), "hall-look"));
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_UNIT, 1));
+
+    // A category never restricts a binding, and the file must not start doing
+    // so quietly: a RESOURCE asset bound to a building role round-trips.
+    CHECK(StrategyBindingSet(SGB_ROLE_BUILDING, 0, "some-tree"));
+    CHECK(StrategyBindingsSave());
+    StrategyBindingsClear();
+    CHECK(StrategyBindingsLoad());
+    CHECK(TextIsEqual(StrategyBindingGet(SGB_ROLE_BUILDING, 0), "some-tree"));
+
+    BindRestore();
+}
+
+static void TestBindingsVersionMismatch(void)
+{
+    BindStash();
+
+    StrategyBindingsClear();
+    StrategyBindingsSetRoleCounts(8, 8, 4);
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 0, "keeper"));
+    CHECK(StrategyBindingsSave());
+
+    // Corrupt field zero. A version we do not know must be REFUSED, not read
+    // as though its fields meant what this build thinks they mean.
+    FILE *f = fopen(StrategyBindingsPath(), "r+b");
+    CHECK(f != NULL);
+    if (f)
+    {
+        int32_t bogus = 999;
+        fwrite(&bogus, sizeof(bogus), 1, f);
+        fclose(f);
+    }
+
+    CHECK(!StrategyBindingsLoad());
+    // A refused load leaves nothing half-applied.
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_UNIT, 0));
+
+    BindRestore();
+}
+
+// No file at all is the normal first run: success, everything cleared, and no
+// alarming message in front of the user.
+static void TestBindingsMissingFileIsFine(void)
+{
+    BindStash();
+    SimpleDelete(StrategyBindingsPath());
+
+    StrategyBindingsSetRoleCounts(8, 8, 4);
+    CHECK(StrategyBindingSet(SGB_ROLE_UNIT, 0, "stale"));
+    CHECK(StrategyBindingsLoad());
+    CHECK(!StrategyBindingIsBound(SGB_ROLE_UNIT, 0));
+
+    BindRestore();
+}
+
 int main(void)
 {
     SetTraceLogLevel(LOG_ERROR);    // the version test logs an expected warning
@@ -548,6 +1138,25 @@ int main(void)
     TestValidation();
     TestPose();
     TestPartColor();
+    TestPartialTintKeepsAlpha();
+
+    // Phase 3: keyframes and easing baking.
+    TestKeysStaySorted();
+    TestPerKeyOffset();
+    TestAddKeySamplesCurrentPose();
+    TestBakeBuiltinKeepsShape();
+    TestBakeDedupes();
+    TestCustomEaseSurvivesSlotDeletion();
+    TestCompactEases();
+
+    // Phase 4: role bindings.
+    TestBindingsSetGetClear();
+    TestBindingResolveByName();
+    TestBindingMissingIsKept();
+    TestBindingsRename();
+    TestBindingsRoundTrip();
+    TestBindingsVersionMismatch();
+    TestBindingsMissingFileIsFine();
 
     printf("sga_tests: %d checks, %d failures\n", s_checks, s_fails);
     return (s_fails == 0) ? 0 : 1;
