@@ -148,6 +148,16 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
         src/strategy_asset/strategy_catalog.c
         ${ANIM_TEST_SRC})
     target_link_libraries(sga_tests raylib)
+
+    # map_tests - authored battlefields. src/strategy_map/ never calls raylib
+    # UI (that is the whole reason it is split from the map forge), so the
+    # suite links the module directly and needs no stubs.
+    add_executable(map_tests
+        tests/map_tests.c
+        src/strategy_map/strategy_map.c
+        src/strategy_map/strategy_map_io.c
+        src/strategy_map/strategy_map_catalog.c)
+    target_link_libraries(map_tests raylib)
 endif()
 
 # Checks if OSX and links appropriate frameworks (Only required on MacOS)
@@ -286,6 +296,33 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
     endif()
 endif()
 
+# ---------------------------------------------------------------------------
+#  Map capacities. Same two-tier scheme, same reasoning: Web keeps the small
+#  values written in strategy_map.h, desktop gets the raised ones. The .sgm
+#  format itself is pinned to the DESKTOP tier (SGM_FILE_GRID in
+#  strategy_map_io.c), so a desktop-authored map always fits on disk and a Web
+#  build reports what it had to crop instead of misreading it.
+# ---------------------------------------------------------------------------
+if (NOT "${PLATFORM}" STREQUAL "Web")
+    if (NOT DEFINED SGM_GRID_MAX)     # strategy_map.h Web default: 128
+        set(SGM_GRID_MAX 256)
+    endif()
+    if (NOT DEFINED SGM_PLACES_MAX)   # strategy_map.h Web default: 128
+        set(SGM_PLACES_MAX 512)
+    endif()
+    if (NOT DEFINED SGM_MAPS_MAX)     # strategy_map.h Web default: 32
+        set(SGM_MAPS_MAX 64)
+    endif()
+endif()
+
+function(sgm_apply_caps target)
+    foreach(cap SGM_GRID_MAX SGM_PLACES_MAX SGM_MAPS_MAX)
+        if (DEFINED ${cap})
+            target_compile_definitions(${target} PUBLIC ${cap}=${${cap}})
+        endif()
+    endforeach()
+endfunction()
+
 function(sga_apply_caps target)
     foreach(cap SGA_PARTS_MAX SGA_KEYS_MAX SGA_EASES_MAX SGA_ASSETS_MAX)
         if (DEFINED ${cap})
@@ -303,6 +340,17 @@ endif()
 sga_apply_caps(${PROJECT_NAME})
 if (TARGET sga_tests)
     sga_apply_caps(sga_tests)
+endif()
+
+if ("${PLATFORM}" STREQUAL "Web")
+    message(STATUS " - - - strategy map capacities: WEB tier (header defaults)")
+else()
+    message(STATUS " - - - strategy map capacities: grid=${SGM_GRID_MAX} places=${SGM_PLACES_MAX} maps=${SGM_MAPS_MAX}")
+endif()
+
+sgm_apply_caps(${PROJECT_NAME})
+if (TARGET map_tests)
+    sgm_apply_caps(map_tests)
 endif()
 
 # Setting RESOURCES_PATH

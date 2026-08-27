@@ -38,6 +38,10 @@
 #include "../../strategy_asset/strategy_bindings.h"
 #include "../../strategy_asset/strategy_catalog.h"
 #include "../../strategy_forge/strategy_forge.h"
+#include "../../strategy_map/strategy_map.h"
+#include "../../strategy_map/strategy_map_io.h"
+#include "../../strategy_map/strategy_map_catalog.h"
+#include "../../map_forge/map_forge.h"
 #include "../strategy_test/strategy_world.h"
 #include "../strategy_test/strategy_defs.h"
 #include "../../screen_state/screen_state.h"
@@ -86,9 +90,16 @@ typedef struct {
 #define CATALOG_MAX (UNIT_KIND_COUNT + BLD_COUNT + NODE_KIND_COUNT + SGA_ASSETS_MAX)
 
 typedef enum {
-    VIEW_GALLERY = 0, VIEW_INSPECT, VIEW_MAP,
+    VIEW_GALLERY = 0, VIEW_INSPECT,
+    VIEW_MAP,           // the authored-battlefield browser (see DrawMapFull)
     VIEW_BIND,          // which asset stands in for which game role
 } ShowcaseView;
+
+// How many maps the browser can list: every authored .sgm plus the built-in
+// layout, which is offered as an entry of its own rather than as a special case
+// at every call site.
+#define MAP_LIST_MAX (SGM_MAPS_MAX + 1)
+#define MAP_BUILTIN_INDEX 0     // "default" is always first: it always exists
 
 // -- Rotation state, one per catalog entry -----------------------------------
 typedef struct {
@@ -158,10 +169,20 @@ static struct {
     Vector2      scroll;
     float        contentH;
 
-    // Map view: orbit around the battlefield center.
+    // Map view: orbit around the selected battlefield's center.
     float        mapYaw, mapPitch, mapZoom;
     bool         mapDragging;
     SpinState    mapPanelSpin;           // the small panel slowly turns too
+
+    // -- the authored-map browser ------------------------------------------
+    // Which entry of the list is shown in the preview. 0 is the built-in
+    // layout; 1.. are the catalog's maps, in catalog order.
+    int          mapSel;
+    float        mapListScroll;
+    // Selected map awaiting a delete confirmation, -1 for none. Held by NAME,
+    // not by index: SgmCatalogReload can move a map to a different slot, and a
+    // stale index would delete the wrong file.
+    char         mapConfirmDelete[SGM_NAME_MAX];
 
     RenderTexture2D preview;             // scratch target for every 3D preview
     int             previewW, previewH;
@@ -839,6 +860,181 @@ static void PreviewDrawEntry(Rectangle region, int index, int faction,
         if (a) StrategyAssetDraw(a, faction, (Vector3){ 0.0f, 0.0f, 0.0f },
                                  yaw, 1.0f, state, time);
         else   StrategyModelDraw(m, faction, (Vector3){ 0.0f, 0.0f, 0.0f }, yaw, 1.0f);
+    EndMode3D();
+
+    rlViewport(0, 0, sc.previewW, sc.previewH);
+    EndScissorMode();
+}
+
+// ============================================================================
+//  The authored-map browser's data
+//
+//  The list is "the built-in layout, then every .sgm in the catalog". The
+//  built-in is an entry rather than a special case because every action below
+//  (PLAY, REMIX, EDIT, DELETE) has to answer "and what about the default?"
+//  anyway, and an entry answers it once.
+//
+//  A list index is NOT a catalog index - index 0 is the built-in and has no
+//  SgmMap behind it. MapEntry() is the only place that arithmetic lives, and it
+//  returns NULL for the built-in, which is what every caller branches on.
+// ============================================================================
+static int MapListCount(void)
+{
+    int n = SgmCatalogCount();
+    if (n > SGM_MAPS_MAX) n = SGM_MAPS_MAX;
+    return n + 1;                       // +1 for the built-in
+}
+
+// NULL means "the built-in layout", not "error" - callers must branch, which is
+// the whole reason this returns a pointer rather than filling a struct.
+static const SgmMap *MapEntry(int listIndex)
+{
+    if (listIndex <= MAP_BUILTIN_INDEX) return NULL;
+    int ci = listIndex - 1;
+    if (ci >= SgmCatalogCount()) return NULL;
+    return &SgmCatalogMaps()[ci];
+}
+
+static const char *MapEntryName(int listIndex)
+{
+    const SgmMap *m = MapEntry(listIndex);
+    return m ? m->name : "default";
+}
+
+// Keep the selection on a real row after a reload dropped rows beneath it.
+static void MapSelClamp(void)
+{
+    int n = MapListCount();
+    if (sc.mapSel >= n) sc.mapSel = n - 1;
+    if (sc.mapSel < 0)  sc.mapSel = 0;
+}
+
+// The colours the forge paints terrain in. Duplicated deliberately: the forge's
+// table is static to map_forge.c, which is an AppState and must not be linked
+// into a preview path. Keeping them in step is a look-alike concern, not a
+// correctness one - a drifted shade shows a slightly different green, it cannot
+// misreport whether a tile blocks.
+static const Color mapTerrainCol[SGM_TERRAIN_COUNT] = {
+    {  96, 116,  84, 255 },     // ground
+    {  84, 124,  72, 255 },     // grass
+    { 126, 106,  76, 255 },     // dirt
+    {  92, 140, 160, 255 },     // shallow
+    {  46,  84, 122, 255 },     // water
+    { 104, 104, 110, 255 },     // rock
+    {  84,  80,  92, 255 },     // cliff
+    {  14,  15,  20, 255 },     // void
+};
+
+// The nine authorable faction colours. The game ships two (StrategyFactionTint
+// covers 0/1/neutral); a map may declare nine, so the browser needs the rest to
+// show a 6-faction map as six distinguishable sides.
+static const Color mapFactionCol[SGM_FACTIONS_MAX] = {
+    {  80, 140, 255, 255 }, { 230,  70,  70, 255 }, {  90, 200, 110, 255 },
+    { 235, 190,  70, 255 }, { 190, 110, 230, 255 }, { 240, 150,  60, 255 },
+    {  80, 210, 210, 255 }, { 240, 120, 180, 255 }, { 190, 195, 205, 255 },
+};
+
+#define MAP_HEIGHT_STEP 0.35f   // matches the forge's MF_HEIGHT_STEP
+
+static const StrategyModel *MapPlaceModel(const SgmPlacement *p)
+{
+    switch (p->family)
+    {
+        case SGM_PLACE_BUILDING: return StrategyBuildingModel((BuildingKind)p->kind);
+        case SGM_PLACE_UNIT:     return StrategyUnitModel((UnitKind)p->kind);
+        case SGM_PLACE_NODE:     return StrategyNodeModel((NodeKind)p->kind);
+        default:                 return NULL;
+    }
+}
+
+// Draw one authored map into the shared preview target, framed to fit whatever
+// extent it was authored at - a 96x96 map and a 40x40 one both fill the panel.
+//
+// Caller must already be inside BeginTextureMode(sc.preview).
+//
+// TILES ARE DRAWN AS BOXES, not as one plane: elevation is a thing this format
+// carries and the browser exists to show it. Flat tiles get a thin slab, which
+// is far cheaper and looks identical from this pitch - the same trade the forge
+// makes, for the same reason.
+static void PreviewDrawSgm(Rectangle region, const SgmMap *m,
+                           float yaw, float pitch, float zoom)
+{
+    if ((region.width < 1.0f) || (region.height < 1.0f)) return;
+    if (m == NULL) return;
+
+    int rx = (int)region.x, ry = (int)region.y;
+    int rw = (int)region.width, rh = (int)region.height;
+
+    // Frame by the map's DIAGONAL, not its width: an orbit swings the long axis
+    // across the screen, and framing on width alone would let a 96x96 map slide
+    // out of the panel halfway round.
+    float span = sqrtf((float)(m->gridW*m->gridW + m->gridH*m->gridH));
+    float dist = span*1.15f*zoom;
+    float pr = pitch*DEG2RAD, yr = yaw*DEG2RAD;
+
+    Camera3D cam = { 0 };
+    cam.position   = (Vector3){ dist*cosf(pr)*sinf(yr), dist*sinf(pr),
+                                dist*cosf(pr)*cosf(yr) };
+    cam.target     = (Vector3){ 0.0f, 0.0f, 0.0f };
+    cam.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
+    cam.fovy       = 45.0f;
+    cam.projection = CAMERA_PERSPECTIVE;
+
+    BeginScissorMode(rx, ry, rw, rh);
+    rlViewport(rx, sc.previewH - ry - rh, rw, rh);
+
+    BeginMode3D(cam);
+        for (int z = 0; z < m->gridH; z++)
+        {
+            for (int x = 0; x < m->gridW; x++)
+            {
+                const SgmTile *t = SgmTileAtConst(m, x, z);
+                if (t->terrain == SGM_TERRAIN_VOID) continue;   // a hole draws nothing
+
+                Vector3 c = SgmTileToWorld(m, x, z);
+                float top = (float)t->height*MAP_HEIGHT_STEP;
+                float h = (top > 0.001f) ? top : 0.02f;
+                DrawCube((Vector3){ c.x, h*0.5f, c.z }, 1.0f, h, 1.0f,
+                         mapTerrainCol[t->terrain]);
+            }
+        }
+
+        for (int i = 0; i < m->placeCount; i++)
+        {
+            const SgmPlacement *p = &m->places[i];
+            const StrategyModel *model = MapPlaceModel(p);
+            if (model == NULL) continue;
+
+            const SgmTile *t = SgmTileAtConst(m, p->tileX, p->tileZ);
+            Vector3 pos = SgmTileToWorld(m, p->tileX, p->tileZ);
+            if (t != NULL) pos.y = (float)t->height*MAP_HEIGHT_STEP;
+
+            // Neutral goes through the game's guarded tint; an owned placement
+            // uses the nine-colour map palette, which the game does not have.
+            int faction = (p->faction == SGM_FACTION_NEUTRAL) ? FACTION_NEUTRAL
+                                                              : (int)p->faction;
+            StrategyModelDraw(model, faction, pos, 0.0f, 1.0f);
+        }
+
+        // A banner per faction start, so a 6-faction map reads as six sides
+        // even where the bases themselves are hidden behind terrain.
+        for (int f = 0; f < m->factionCount; f++)
+        {
+            int sx = m->starts[f].tileX, sz = m->starts[f].tileZ;
+            if (!SgmInBounds(m, sx, sz)) continue;
+
+            const SgmTile *t = SgmTileAtConst(m, sx, sz);
+            Vector3 c = SgmTileToWorld(m, sx, sz);
+            float top = (t != NULL) ? (float)t->height*MAP_HEIGHT_STEP : 0.0f;
+            int ci = m->starts[f].colorIndex;
+            if ((ci < 0) || (ci >= SGM_FACTIONS_MAX)) ci = f % SGM_FACTIONS_MAX;
+            Color col = mapFactionCol[ci];
+
+            DrawLine3D((Vector3){ c.x, top, c.z }, (Vector3){ c.x, top + 2.4f, c.z }, col);
+            DrawCube((Vector3){ c.x + 0.35f, top + 2.15f, c.z }, 0.7f, 0.45f, 0.05f, col);
+            DrawCircle3D((Vector3){ c.x, top + 0.06f, c.z }, 1.6f,
+                         (Vector3){ 1.0f, 0.0f, 0.0f }, 90.0f, col);
+        }
     EndMode3D();
 
     rlViewport(0, 0, sc.previewW, sc.previewH);
@@ -1834,24 +2030,111 @@ static void DrawInspect(const Layout *L)
 }
 
 // ============================================================================
-//  Map
+//  Map browser
 //
-//  The layout shown is the REAL one: Enter() runs StrategyWorldInit() and then
-//  never ticks the simulation, so what you see is exactly the battlefield the
-//  game spawns - two mirrored bases, the resource clusters, the wildlife -
-//  frozen at t=0. Drawing it from the world's own arrays rather than
-//  hand-placing markers means it cannot drift from the game.
+//  Every battlefield the game can play, in one list: the BUILT-IN layout that
+//  StrategyWorldInit() spawns, plus every .sgm the map forge has authored. The
+//  built-in is listed as an ordinary entry rather than handled as a special
+//  case, so PLAY / REMIX / EDIT / DELETE each answer "and the default?" once.
+//
+//  The built-in is drawn from the LIVE WORLD: Enter() runs StrategyWorldInit()
+//  and then never ticks the simulation, so what you see is exactly what the
+//  game spawns, frozen at t=0. Drawing it from the world's own arrays rather
+//  than hand-placing markers means it cannot drift from the game. An authored
+//  map is drawn from its own grid instead (PreviewDrawSgm) - it has terrain and
+//  elevation, which the world has no way to represent yet.
+//
+//  This is where map authoring is reached from. The main menu keeps its
+//  FORGE - MAP shortcut, but CREATE / REMIX / EDIT here are the route that has
+//  a map in front of you when you press them, which is what makes REMIX mean
+//  anything.
 // ============================================================================
+
+// Open the map forge on a list entry and go. Same open-then-transition contract
+// as ForgeOpen above, and the same reason: AppStateTransition runs the new
+// state's Enter() synchronously, so the document must be set up first.
+static void MapForgeGo(int listIndex, bool remix)
+{
+    MapForgeSetReturn(&app_state_strategy_showcase);
+
+    const SgmMap *m = MapEntry(listIndex);
+    if (m == NULL) MapForgeOpenNew();   // the built-in: nothing to open, so CREATE
+    else           MapForgeOpenMap(m, remix);
+
+    AppStateTransition(&app_state_map_forge);
+}
+
+// The delete confirmation, drawn over the browser. Modelled on the gallery's
+// asset-delete modal: deleting a file is not undoable, and the map forge's undo
+// ring cannot reach a file that is already gone.
+static void MapConfirmGui(const Layout *L)
+{
+    if (sc.mapConfirmDelete[0] == '\0') return;
+
+    Vector2 screen = ScreenStateSize();
+    DrawRectangleRec((Rectangle){ 0.0f, 0.0f, screen.x, screen.y }, Fade(BLACK, 0.6f));
+
+    float mw = 420.0f*L->s, mh = 150.0f*L->s;
+    Rectangle m = { (screen.x - mw)*0.5f, (screen.y - mh)*0.5f, mw, mh };
+    DrawRectangleRec(m, COL_PANEL);
+    DrawRectangleLinesEx(m, 2.0f, COL_LINE_HI);
+
+    float pad = 18.0f*L->s;
+    DrawText("DELETE MAP", (int)(m.x + pad), (int)(m.y + pad), L->fsBody, COL_TEXT);
+    DrawText(TextFormat("\"%s\" and its file, permanently.", sc.mapConfirmDelete),
+             (int)(m.x + pad), (int)(m.y + pad + (float)L->fsBody + 10.0f*L->s),
+             L->fsSmall, COL_TEXT_DIM);
+
+    float bh = 32.0f*L->s, bw = 110.0f*L->s;
+    float by = m.y + mh - pad - bh;
+
+    // sc_inModal keeps the modal's own buttons live while everything behind
+    // them goes inert - guarding on "a modal is open" alone would kill these too.
+    sc_inModal = true;
+    if (SheetButton((Rectangle){ m.x + mw - pad - bw, by, bw, bh }, "DELETE", true,
+                    "Delete this map's file.", L->fsSmall))
+    {
+        SgmMapDelete(sc.mapConfirmDelete);
+        SgmCatalogReload();             // every pointer into the catalog is now stale
+        sc.mapConfirmDelete[0] = '\0';
+        MapSelClamp();
+    }
+    if (SheetButton((Rectangle){ m.x + mw - pad - 2.0f*bw - 8.0f*L->s, by, bw, bh },
+                    "CANCEL", true, "Keep it.", L->fsSmall))
+    {
+        sc.mapConfirmDelete[0] = '\0';
+    }
+    sc_inModal = false;
+}
+
 static void DrawMapFull(const Layout *L)
 {
     Vector2 screen = ScreenStateSize();
     Vector2 mp = GetMousePosition();
 
-    Rectangle stage = { L->pad, L->headerH,
-                        screen.x - 2.0f*L->pad,
-                        screen.y - L->headerH - L->footerH };
+    MapSelClamp();
 
-    bool over = CheckCollisionPointRec(mp, stage);
+    Rectangle body = { L->pad, L->headerH,
+                       screen.x - 2.0f*L->pad,
+                       screen.y - L->headerH - L->footerH };
+
+    // A list rail on the left, the preview filling the rest. The rail is a
+    // fraction of the width rather than a fixed size so it survives the 1x-3x
+    // GUI scale the same way the gallery's grid does.
+    float railW = body.width*0.28f;
+    if (railW < 190.0f*L->s) railW = 190.0f*L->s;
+    if (railW > 380.0f*L->s) railW = 380.0f*L->s;
+
+    Rectangle rail  = { body.x, body.y, railW, body.height };
+    Rectangle stage = { body.x + railW + L->gap, body.y,
+                        body.width - railW - L->gap, body.height };
+
+    bool modal = (sc.mapConfirmDelete[0] != '\0');
+
+    // ---- the preview -------------------------------------------------------
+    const SgmMap *sel = MapEntry(sc.mapSel);
+
+    bool over = !modal && CheckCollisionPointRec(mp, stage);
     if (over && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) sc.mapDragging = true;
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) sc.mapDragging = false;
 
@@ -1874,33 +2157,191 @@ static void DrawMapFull(const Layout *L)
 
     BeginTextureMode(sc.preview);
         ClearBackground(BLANK);
-        PreviewDrawMap(stage, sc.mapYaw, sc.mapPitch, sc.mapZoom);
+        if (sel) PreviewDrawSgm(stage, sel, sc.mapYaw, sc.mapPitch, sc.mapZoom);
+        else     PreviewDrawMap(stage, sc.mapYaw, sc.mapPitch, sc.mapZoom);
     EndTextureMode();
 
     PanelBG(stage, false);
     PreviewBlit(stage, stage);
 
-    DrawText("BATTLEFIELD", (int)(stage.x + 20.0f*L->s),
+    DrawText(MapEntryName(sc.mapSel), (int)(stage.x + 20.0f*L->s),
              (int)(stage.y + 16.0f*L->s), L->fsHead, COL_TEXT);
-    DrawText(TextFormat("%.0f x %.0f  -  drag to orbit, wheel to zoom",
-                        2.0f*STRAT_GROUND_HALF, 2.0f*STRAT_GROUND_HALF),
-             (int)(stage.x + 20.0f*L->s),
-             (int)(stage.y + 20.0f*L->s + (float)L->fsHead),
-             L->fsSmall, COL_TEXT_DIM);
 
-    // Faction legend, so the two bases are readable as sides.
-    float ly = stage.y + stage.height - 26.0f*L->s;
-    float lx = stage.x + 20.0f*L->s;
-    const char *legend[2] = { "OWN BASE", "ENEMY BASE" };
-    for (int f = 0; f < STRAT_FACTIONS; f++)
+    // One line under the title: the map's own description if it has one, else
+    // its dimensions. A description is what the author wanted said about it.
+    const char *sub;
+    if (sel) sub = (sel->desc[0] ? sel->desc
+                                 : TextFormat("%d x %d tiles", sel->gridW, sel->gridH));
+    else     sub = "The built-in layout the game spawns with.";
+    DrawText(sub, (int)(stage.x + 20.0f*L->s),
+             (int)(stage.y + 20.0f*L->s + (float)L->fsHead), L->fsSmall, COL_TEXT_DIM);
+
+    DrawText("drag to orbit, wheel to zoom",
+             (int)(stage.x + 20.0f*L->s),
+             (int)(stage.y + stage.height - (float)L->fsSmall - 14.0f*L->s),
+             L->fsSmall, Fade(COL_TEXT_DIM, 0.7f));
+
+    // ---- faction legend, bottom-right of the stage -------------------------
+    // An authored map may declare up to nine sides, so the legend is built from
+    // the map rather than from the game's two-entry palette.
     {
+        int fc = sel ? sel->factionCount : STRAT_FACTIONS;
         float sw = 10.0f*L->s;
-        DrawRectangleRec((Rectangle){ lx, ly + 2.0f*L->s, sw, sw },
-                         StrategyFactionTint(f));
-        DrawText(legend[f], (int)(lx + sw + 6.0f*L->s), (int)ly,
-                 L->fsSmall, COL_TEXT_DIM);
-        lx += (float)MeasureText(legend[f], L->fsSmall) + sw + 24.0f*L->s;
+        float ly = stage.y + stage.height - 26.0f*L->s;
+        float lx = stage.x + stage.width - 20.0f*L->s;
+
+        for (int f = fc - 1; f >= 0; f--)
+        {
+            const char *label;
+            Color col;
+            if (sel)
+            {
+                int ci = sel->starts[f].colorIndex;
+                if ((ci < 0) || (ci >= SGM_FACTIONS_MAX)) ci = f % SGM_FACTIONS_MAX;
+                col = mapFactionCol[ci];
+                label = TextFormat("F%d", f + 1);
+            }
+            else
+            {
+                col = StrategyFactionTint(f);
+                label = (f == 0) ? "OWN BASE" : "ENEMY BASE";
+            }
+            float tw = (float)MeasureText(label, L->fsSmall);
+            lx -= tw;
+            DrawText(label, (int)lx, (int)ly, L->fsSmall, COL_TEXT_DIM);
+            lx -= sw + 6.0f*L->s;
+            DrawRectangleRec((Rectangle){ lx, ly + 2.0f*L->s, sw, sw }, col);
+            lx -= 14.0f*L->s;
+        }
     }
+
+    // ---- the list rail -----------------------------------------------------
+    PanelBG(rail, false);
+
+    float pad = 12.0f*L->s;
+    float hy = rail.y + pad;
+    DrawText("BATTLEFIELDS", (int)(rail.x + pad), (int)hy, L->fsSmall, COL_TEXT_DIM);
+    hy += (float)L->fsSmall + 8.0f*L->s;
+    DrawRectangleRec((Rectangle){ rail.x + pad, hy, rail.width - 2.0f*pad, 1.0f }, COL_LINE);
+    hy += 8.0f*L->s;
+
+    // Actions sit at the FOOT of the rail, so the list above them can scroll
+    // without ever pushing them off screen.
+    float bh = 28.0f*L->s;
+    float actionsH = 2.0f*bh + 8.0f*L->s + pad;
+    Rectangle list = { rail.x + pad, hy, rail.width - 2.0f*pad,
+                       rail.y + rail.height - actionsH - hy };
+
+    int n = MapListCount();
+    float rowH = 44.0f*L->s;
+    float contentH = (float)n*rowH;
+    float maxScroll = contentH - list.height;
+    if (maxScroll < 0.0f) maxScroll = 0.0f;
+
+    if (!modal && CheckCollisionPointRec(mp, list))
+    {
+        sc.mapListScroll -= GetMouseWheelMove()*rowH*0.9f;
+        if (sc.mapListScroll < 0.0f) sc.mapListScroll = 0.0f;
+        if (sc.mapListScroll > maxScroll) sc.mapListScroll = maxScroll;
+    }
+    if (sc.mapListScroll > maxScroll) sc.mapListScroll = maxScroll;
+
+    BeginScissorMode((int)list.x, (int)list.y, (int)list.width, (int)list.height);
+    for (int i = 0; i < n; i++)
+    {
+        Rectangle row = { list.x, list.y + (float)i*rowH - sc.mapListScroll,
+                          list.width, rowH - 4.0f*L->s };
+        if (row.y + row.height < list.y) continue;
+        if (row.y > list.y + list.height) break;
+
+        bool active = (i == sc.mapSel);
+        bool hot = !modal && CheckCollisionPointRec(mp, row)
+                          && CheckCollisionPointRec(mp, list);
+
+        DrawRectangleRec(row, active ? Fade(categoryAccent[CAT_CUSTOM], 0.18f)
+                                     : (hot ? COL_PANEL_HI : Fade(COL_BG, 0.5f)));
+        DrawRectangleLinesEx(row, active ? 2.0f : 1.0f,
+                             active ? categoryAccent[CAT_CUSTOM]
+                                    : (hot ? COL_LINE_HI : COL_LINE));
+
+        const SgmMap *m = MapEntry(i);
+        DrawText(MapEntryName(i), (int)(row.x + 10.0f*L->s),
+                 (int)(row.y + 7.0f*L->s), L->fsSmall,
+                 active ? COL_TEXT : COL_TEXT_DIM);
+
+        // The second line is what tells two maps apart at a glance: extent and
+        // how many sides it seats.
+        const char *meta = m ? TextFormat("%dx%d   %d faction%s",
+                                          m->gridW, m->gridH, m->factionCount,
+                                          (m->factionCount == 1) ? "" : "s")
+                             : TextFormat("%.0fx%.0f   built in",
+                                          2.0f*STRAT_GROUND_HALF, 2.0f*STRAT_GROUND_HALF);
+        DrawText(meta, (int)(row.x + 10.0f*L->s),
+                 (int)(row.y + 9.0f*L->s + (float)L->fsSmall), L->fsSmall,
+                 Fade(COL_TEXT_DIM, 0.75f));
+
+        if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
+        {
+            AudioPlayButton();
+            sc.mapSel = i;
+        }
+    }
+    EndScissorMode();
+
+    if (maxScroll > 0.0f)
+    {
+        float thumbH = list.height*(list.height/contentH);
+        if (thumbH < 24.0f) thumbH = 24.0f;
+        float t = sc.mapListScroll/maxScroll;
+        DrawRectangleRec((Rectangle){ list.x + list.width - 4.0f*L->s,
+                                      list.y + t*(list.height - thumbH),
+                                      4.0f*L->s, thumbH },
+                         Fade(COL_LINE_HI, 0.7f));
+    }
+
+    // ---- authoring actions, at the foot of the rail ------------------------
+    // What each one means depends on what is selected, exactly as in the asset
+    // inspector: the built-in cannot be edited or deleted (it is compiled in),
+    // but it CAN be remixed - that is the only way to get its layout into a
+    // file you own.
+    bool authored = (sel != NULL);
+    float bw = (list.width - 8.0f*L->s)*0.5f;
+    float by = rail.y + rail.height - pad - 2.0f*bh - 8.0f*L->s;
+
+    if (SheetButton((Rectangle){ list.x, by, bw, bh }, "CREATE", true,
+                    "Author a new battlefield from scratch.", L->fsSmall))
+    {
+        MapForgeGo(-1, false);
+        return;                 // the state is gone; touch nothing else
+    }
+    if (SheetButton((Rectangle){ list.x + bw + 8.0f*L->s, by, bw, bh }, "REMIX", true,
+                    authored ? "Copy this map into a new one you can edit. "
+                               "The original is never changed."
+                             : "Copy the built-in layout into a map file you can edit.",
+                    L->fsSmall))
+    {
+        MapForgeGo(sc.mapSel, true);
+        return;
+    }
+    by += bh + 8.0f*L->s;
+
+    if (SheetButton((Rectangle){ list.x, by, bw, bh }, "EDIT", authored,
+                    authored ? "Open this map in the forge."
+                             : "The built-in layout is part of the game and cannot be "
+                               "edited. REMIX it into a file first.", L->fsSmall))
+    {
+        MapForgeGo(sc.mapSel, false);
+        return;
+    }
+    if (SheetButton((Rectangle){ list.x + bw + 8.0f*L->s, by, bw, bh }, "DELETE",
+                    authored, authored ? "Delete this map's file."
+                                       : "The built-in layout cannot be deleted.",
+                    L->fsSmall))
+    {
+        TextCopy(sc.mapConfirmDelete, sel->name);
+    }
+
+    MapConfirmGui(L);
 }
 
 // The small always-visible map panel in the gallery footer area.
@@ -2259,11 +2700,11 @@ static void DrawMapPanel(Rectangle r, const Layout *L)
     PreviewBlit(r, r);
     DrawRectangleLinesEx(r, hot ? 2.0f : 1.0f, hot ? COL_LINE_HI : COL_LINE);
 
-    DrawText("MAP", (int)(r.x + 10.0f*L->s), (int)(r.y + 8.0f*L->s),
+    DrawText("MAPS", (int)(r.x + 10.0f*L->s), (int)(r.y + 8.0f*L->s),
              L->fsSmall, COL_TEXT);
     if (hot)
     {
-        DrawText("click to open", (int)(r.x + 10.0f*L->s),
+        DrawText("click to browse", (int)(r.x + 10.0f*L->s),
                  (int)(r.y + r.height - (float)L->fsSmall - 8.0f*L->s),
                  L->fsSmall, COL_TEXT);
     }
@@ -2288,7 +2729,7 @@ static void DrawHeader(const Layout *L)
     float cy = (L->headerH - (float)L->fsHead)*0.5f;
     DrawText("STRATEGY ASSETS", (int)L->pad, (int)cy, L->fsHead, COL_TEXT);
 
-    const char *sub = (sc.view == VIEW_MAP) ? "battlefield"
+    const char *sub = (sc.view == VIEW_MAP) ? TextFormat("%d battlefields", MapListCount())
                     : (sc.view == VIEW_INSPECT) ? "inspecting"
                     : (sc.view == VIEW_BIND) ? "role bindings"
                     : TextFormat("%d assets", sc.catalogCount);
@@ -2448,19 +2889,30 @@ static void DrawFooter(const Layout *L)
         }
     }
 
-    // PLAY, right-aligned: the way on into the game.
-    float playW = 190.0f*L->s;
+    // PLAY, right-aligned: the way on into the game. The footer is shared by
+    // every view, but WHICH battlefield it starts is the MAPS selection - so it
+    // names that map rather than saying a bare "PLAY", which would leave a
+    // selection made in MAPS invisible from the gallery.
+    const SgmMap *playMap = MapEntry(sc.mapSel);
+    const char *pl = playMap ? TextFormat("PLAY  %s", playMap->name) : "PLAY STRATEGY";
+    float playW = (float)MeasureText(pl, L->fsBody) + 34.0f*L->s;
+    if (playW < 190.0f*L->s) playW = 190.0f*L->s;
     Rectangle play = { screen.x - L->pad - playW, by, playW, bh };
     bool playHot = CheckCollisionPointRec(mp, play);
     Color accent = StrategyFactionTint(0);
     DrawRectangleRec(play, playHot ? Fade(accent, 0.85f) : Fade(accent, 0.55f));
     DrawRectangleLinesEx(play, 1.0f, accent);
-    const char *pl = "PLAY STRATEGY";
     DrawText(pl, (int)(play.x + (playW - (float)MeasureText(pl, L->fsBody))*0.5f),
              (int)(by + (bh - (float)L->fsBody)*0.5f), L->fsBody, COL_TEXT);
     if (playHot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
     {
         AudioPlayButton();
+        // Which battlefield PLAY starts is the MAPS view's selection. Selected
+        // BEFORE the transition, because AppStateTransition runs Enter() - and
+        // therefore StrategyWorldInit() - synchronously. MapEntry returns NULL
+        // for the built-in, and StrategyMapSelect(NULL) means exactly that.
+        const SgmMap *sel = MapEntry(sc.mapSel);
+        StrategyMapSelect(sel ? sel->name : NULL);
         AppStateTransition(&app_state_strategy);
         return;
     }
@@ -2489,6 +2941,11 @@ static void Enter()
 
     CatalogReload();        // scans SGA_DIR, then builds the catalog around it
 
+    // The authored battlefields, for the map browser. Load, not Reload: a
+    // second call is a no-op, so this screen does not have to know whether the
+    // forge already scanned the folder.
+    SgmCatalogLoad();
+
     sc.view = VIEW_GALLERY;
     sc.faction = 0;
     sc.dragTile = -1;
@@ -2500,6 +2957,7 @@ static void Enter()
     sc.mapYaw = 35.0f;
     sc.mapPitch = 55.0f;
     sc.mapZoom = 1.25f;
+    sc.mapSel = MAP_BUILTIN_INDEX;      // the one entry that always exists
     sc.confirmDelete = -1;      // memset would leave this pointing at entry 0
     sc.bindFamily = -1;         // same trap: 0/0 would read as "picker is open"
     sc.bindRole = -1;
@@ -2513,6 +2971,13 @@ static void Enter()
     // calls StrategyWorldUpdate, so nothing moves and nothing fights. The
     // real strategy state re-inits the world in its own Enter(), so a world
     // left dirty here cannot leak into a game.
+    //
+    // Forced to the BUILT-IN layout first. StrategyWorldInit now honours the
+    // pending map selection, and the "default" list entry previews this frozen
+    // world - so without this, coming back from playing an authored map would
+    // rebuild that map here and the entry labelled "default" would show
+    // something else entirely.
+    StrategyMapSelect(NULL);
     StrategyWorldInit();
 }
 
@@ -2544,6 +3009,10 @@ static void Update()
         // throwing away the view behind it. (BindPickerGui also handles this,
         // but only on frames it actually draws.)
         if (BindPickerOpenNow()) { BindPickerClose(); return; }
+
+        // Same rule for the map browser's delete confirmation: ESC means
+        // "never mind that", not "leave the browser".
+        if (sc.mapConfirmDelete[0]) { sc.mapConfirmDelete[0] = '\0'; return; }
 
         if (sc.view == VIEW_GALLERY) AppStateTransition(&app_state_main_menu);
         else ShowcaseSetView(VIEW_GALLERY);

@@ -324,6 +324,14 @@ static void Gui()
             ShapeEditorOpen("");
             AppStateTransition(&app_state_shape_editor);
         }
+        // NO "FORGE - MAP" BUTTON HERE, deliberately. Map authoring lives in
+        // STRATEGY -> MAPS, which is the only route in: it lists what exists,
+        // shows a preview, and CREATE / REMIX / EDIT / DELETE all act on that
+        // selection. A menu shortcut could only ever mean "new map" - it had no
+        // way to name which map to edit - so it was a second, weaker door into
+        // the same room, and the map it made landed in a list the button could
+        // not show. Reaching the forge through the browser is one step longer
+        // and always says what is being edited.
 
         // -- Label: static text, no interaction ------------------------------
         GuiLabel((Rectangle){ x, y, w, h }, "--- raygui widgets ---");

@@ -45,6 +45,7 @@ extern AppState app_state_strategy_showcase;    // RTS asset gallery (menu -> he
 extern AppState app_state_anim_editor_zen;  // animation editor (menu bar, zoomed viewport)
 extern AppState app_state_shape_editor;     // pixel-shape editor (the global shape pool)
 extern AppState app_state_strategy_forge;   // RTS asset forge (showcase -> here -> back)
+extern AppState app_state_map_forge;        // RTS map forge (menu -> here -> back)
 
 
 #endif // APP_STATE_H

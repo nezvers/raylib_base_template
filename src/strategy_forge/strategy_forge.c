@@ -36,6 +36,7 @@
 #include "../strategy_asset/strategy_asset_ease.h"
 #include "../anim/anim.h"
 #include "../anim/anim_ease_custom.h"
+#include "../strategy_ui/strategy_ui.h"
 #include "../screen_state/screen_state.h"
 #include "../audio_state/audio_state.h"
 #include <string.h>
@@ -70,16 +71,18 @@ AppState app_state_strategy_forge = { Enter, Exit, Update, Draw, Gui, "StrategyF
 // Short on purpose - see the MEMORY note above.
 #define SF_UNDO_MAX       8
 
-#define COL_BG        (Color){  18,  20,  26, 255 }
-#define COL_PANEL     (Color){  26,  29,  37, 255 }
-#define COL_PANEL_HI  (Color){  33,  37,  47, 255 }
-#define COL_LINE      (Color){  52,  57,  70, 255 }
-#define COL_LINE_HI   (Color){ 110, 120, 145, 255 }
-#define COL_TEXT      (Color){ 232, 236, 245, 255 }
-#define COL_TEXT_DIM  (Color){ 138, 146, 166, 255 }
-#define COL_ACCENT    (Color){ 200, 150, 255, 255 }     // the CUSTOM violet
-#define COL_WARN      (Color){ 255, 170,  90, 255 }
-#define COL_TIP_BG    (Color){  14,  15,  20, 245 }
+// The palette now has ONE owner (strategy_ui.h); these are the local spellings
+// the ~200 call sites below already use.
+#define COL_BG        UI_COL_BG
+#define COL_PANEL     UI_COL_PANEL
+#define COL_PANEL_HI  UI_COL_PANEL_HI
+#define COL_LINE      UI_COL_LINE
+#define COL_LINE_HI   UI_COL_LINE_HI
+#define COL_TEXT      UI_COL_TEXT
+#define COL_TEXT_DIM  UI_COL_TEXT_DIM
+#define COL_ACCENT    UI_COL_ACCENT
+#define COL_WARN      UI_COL_WARN
+#define COL_TIP_BG    UI_COL_TIP_BG
 
 // ---------------------------------------------------------------------------
 //  State
@@ -133,7 +136,6 @@ static char     s_status[128];
 static float    s_statusT = 0.0f;
 static Color    s_statusCol;
 
-static char     s_tip[256];             // recorded this frame, painted last
 
 // raygui text boxes are stateful: each needs its own "is being edited" flag.
 static bool     s_edName = false, s_edSub = false, s_edPart = false;
@@ -169,12 +171,6 @@ static char     s_pickSearch[32];
 static bool     s_edSearch = false;
 
 // Undo ring. See the MEMORY note: short, and one push per gesture.
-// Fine-drag bookkeeping. Only one slider can be dragged at a time, so one set
-// of file-statics covers every ForgeSlider on screen.
-static Rectangle s_fineRect = { 0 };
-static bool      s_fineActive = false;
-static float     s_fineBias = 0.0f;
-
 static SgaAsset s_undo[SF_UNDO_MAX];
 static int      s_undoHead = 0, s_undoCount = 0;
 static bool     s_gestureOpen = false;
@@ -193,14 +189,7 @@ static int      s_redoCount = 0;
 // ---------------------------------------------------------------------------
 // One scale factor against a 1280-wide design, clamped so the tool stays usable
 // on a small window without the panels eating the viewport.
-static float SF_S(void)
-{
-    Vector2 sc = ScreenStateSize();
-    float s = sc.x / 1280.0f;
-    if (s < 0.72f) s = 0.72f;
-    if (s > 1.60f) s = 1.60f;
-    return s;
-}
+static float SF_S(void) { return UiScale(); }
 
 static void Status(const char *msg, Color c)
 {
@@ -224,27 +213,12 @@ static bool ModalOpen(void)
            s_easeOpen;
 }
 
-// Set while a modal paints its OWN controls. Widgets consult ModalBlocks()
-// rather than ModalOpen(): the point of the guard is to stop clicks reaching
-// the editor BEHIND a modal, and a modal's own buttons are not behind it.
-// Without this exemption the save prompt's SAVE and CANCEL are both dead and
-// only ESC closes it - which is exactly what it did.
-static bool s_inModal = false;
-
-static bool ModalBlocks(void) { return ModalOpen() && !s_inModal; }
-
-// Active clip rectangle for scrolled panels. BeginScissorMode clips PIXELS but
-// not hit testing, so a control scrolled out of a panel still answers the
-// mouse - a slider hidden above the inspector's top edge would catch drags
-// aimed at the header. Widgets consult this before treating the cursor as
-// theirs. Zero width means "no clip", which is the normal case.
-static Rectangle s_clip = { 0 };
-
-static bool ClipAllows(Vector2 mouse)
-{
-    if (s_clip.width <= 0.0f) return true;
-    return CheckCollisionPointRec(mouse, s_clip);
-}
+// The modal gate and the scroll clip now live in strategy_ui.c, because the
+// widgets that consult them do. These keep the local spelling used below;
+// UiFrameBegin() publishes ModalOpen() to the shared module once per frame.
+static void SetInModal(bool v) { UiSetInModal(v); }
+static bool ModalBlocks(void)  { return UiModalBlocks(); }
+static bool ClipAllows(Vector2 mouse) { return UiClipAllows(mouse); }
 
 static SgaPart *SelPart(void)
 {
@@ -268,38 +242,8 @@ static SgaKey *SelKey(void)
     return &an->keys[s_keySel];
 }
 
-static void Tip(Rectangle r, const char *text)
-{
-    if (!ClipAllows(GetMousePosition())) return;
-    if ((text == NULL) || (text[0] == '\0')) return;
-    if (ModalBlocks()) return;          // a tip from behind a modal is noise
-    if (!CheckCollisionPointRec(GetMousePosition(), r)) return;
-    TextCopy(s_tip, text);
-}
-
-static void TipDraw(int fontSize)
-{
-    if (!s_tip[0]) return;
-
-    Vector2 screen = ScreenStateSize();
-    float pad = 8.0f;
-    float w = (float)MeasureText(s_tip, fontSize) + 2.0f*pad;
-    float h = (float)fontSize + 2.0f*pad;
-
-    // Flip rather than clip, so a tip near an edge stays readable.
-    Vector2 mp = GetMousePosition();
-    float x = mp.x + 16.0f, y = mp.y + 20.0f;
-    if ((x + w) > (screen.x - 8.0f)) x = mp.x - 16.0f - w;
-    if ((y + h) > (screen.y - 8.0f)) y = mp.y - 8.0f - h;
-    if (x < 4.0f) x = 4.0f;
-    if (y < 4.0f) y = 4.0f;
-
-    DrawRectangleRec((Rectangle){ x, y, w, h }, COL_TIP_BG);
-    DrawRectangleLinesEx((Rectangle){ x, y, w, h }, 1.0f, COL_LINE_HI);
-    DrawText(s_tip, (int)(x + pad), (int)(y + pad), fontSize, COL_TEXT);
-
-    s_tip[0] = '\0';        // consumed; re-recorded next frame
-}
+static void Tip(Rectangle r, const char *text) { UiTip(r, text); }
+static void TipDraw(int fontSize) { UiTipDraw(fontSize); }
 
 // ---------------------------------------------------------------------------
 //  Undo
@@ -390,8 +334,9 @@ static void GestureEnd(void)
     if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT))
     {
         s_gestureOpen = false;
-        s_fineActive = false;
-        s_fineBias = 0.0f;      // a new drag starts from the cursor, not the last bias
+        // A new drag starts from the cursor, not the last bias.
+        UiCtxGet()->fineActive = false;
+        UiCtxGet()->fineBias   = 0.0f;
     }
 }
 
@@ -412,7 +357,7 @@ static void ResetView(void)
     s_refOn = true;
     s_edName = s_edSub = s_edPart = s_edSaveName = s_edSearch = false;
     s_saveOpen = s_confirmDelete = s_confirmExit = s_pickOpen = false;
-    s_tip[0] = '\0';
+    UiCtxGet()->tip[0] = '\0';
     UndoClear();
     s_opened = true;
 }
@@ -836,191 +781,29 @@ static void ViewportInput(Rectangle vp)
 // button drawn in the dim text colour is pixel-identical to a disabled one
 // until the cursor happens to cross it, which reads as "this tool is broken"
 // rather than "this action is unavailable".
-static bool SameRectF(Rectangle a, Rectangle b)
-{
-    return (a.x == b.x) && (a.y == b.y) && (a.width == b.width) && (a.height == b.height);
-}
-
 static bool ForgeButtonEx(Rectangle r, const char *label, bool enabled,
                           const char *tip, int fs, bool primary)
 {
-    Vector2 mp = GetMousePosition();
-    bool hot = enabled && !ModalBlocks() && ClipAllows(mp) &&
-               CheckCollisionPointRec(mp, r);
-
-    Color fill, edge, tc;
-    if (!enabled)
-    {
-        fill = Fade(COL_PANEL, 0.45f);
-        edge = Fade(COL_LINE, 0.5f);
-        tc   = Fade(COL_TEXT_DIM, 0.35f);
-    }
-    else if (primary)
-    {
-        fill = hot ? Fade(COL_ACCENT, 0.34f) : Fade(COL_ACCENT, 0.18f);
-        edge = COL_ACCENT;
-        tc   = COL_TEXT;
-    }
-    else
-    {
-        fill = hot ? COL_PANEL_HI : COL_PANEL;
-        edge = hot ? COL_LINE_HI : COL_LINE;
-        tc   = COL_TEXT;            // full strength: enabled must read as enabled
-    }
-
-    DrawRectangleRec(r, fill);
-    DrawRectangleLinesEx(r, 1.0f, edge);
-    DrawText(label, (int)(r.x + (r.width - (float)MeasureText(label, fs))*0.5f),
-             (int)(r.y + (r.height - (float)fs)*0.5f), fs, tc);
-
-    Tip(r, tip);
-    if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { AudioPlayButton(); return true; }
-    return false;
+    return UiButtonEx(r, label, enabled, tip, fs, primary);
 }
 
 static bool ForgeButton(Rectangle r, const char *label, bool enabled,
                         const char *tip, int fs)
 {
-    return ForgeButtonEx(r, label, enabled, tip, fs, false);
+    return UiButton(r, label, enabled, tip, fs);
 }
 
-// Snap increment for a slider, keyed on its range.
-//
-// The buckets matter more than they look. A two-way split at "range <= 2" put
-// the OFFSET and SIZE sliders (-4..4, so a range of 8) in the same bucket as
-// rotation (-180..180) and gave them a step of 5 - which snapped them to -5, 0
-// and 5 and so did nothing at all inside the range anyone actually uses. The
-// geometry sliders are the ones most in need of a round number, so they get
-// their own bucket at 0.05.
-static float SliderStep(float lo, float hi)
-{
-    float range = hi - lo;
-    if (range <= 2.5f)   return 0.05f;   // blend, squareness, brightness
-    if (range <= 12.0f)  return 0.05f;   // offsets, sizes, radii, heights (+-4)
-    if (range <= 30.0f)  return 1.0f;    // sides: an integer count
-    if (range <= 300.0f) return 5.0f;    // RGB 0..255
-    return 5.0f;                         // rotation, +-180 degrees
-}
-
-// A labelled float slider. Returns true on the frames it actually changed the
-// value, so the caller can open a gesture rather than pushing undo per frame.
-//
-// CTRL snaps to increments, SHIFT drags at a twentieth of the normal rate for
-// fine work - the same two modifiers the zen editor's sliders use.
 static bool ForgeSlider(Rectangle r, const char *label, float *v,
                         float lo, float hi, int fs)
 {
-    float before = *v;
-    Vector2 mouse = GetMousePosition();
-    bool ctrl  = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
-    bool shift = IsKeyDown(KEY_LEFT_SHIFT)   || IsKeyDown(KEY_RIGHT_SHIFT);
-
-    GuiSetStyle(DEFAULT, TEXT_COLOR_NORMAL, ColorToInt(COL_TEXT_DIM));
-    DrawText(label, (int)r.x, (int)r.y, fs, COL_TEXT_DIM);
-
-    Rectangle bar = { r.x + 74.0f, r.y - 2.0f, r.width - 74.0f - 46.0f, r.height };
-
-    // Ctrl/Shift + wheel steps the value without a drag at all, which is the
-    // only way to nudge a slider by exactly one increment. The inspector panel
-    // deliberately does not scroll while the cursor is in this column, so the
-    // wheel reaches here instead of moving the panel out from under the bar.
-    float wheel = GetMouseWheelMove();
-    if ((wheel != 0.0f) && ClipAllows(mouse) && CheckCollisionPointRec(mouse, bar))
-    {
-        // A BARE wheel steps too, not just Ctrl/Shift. The panel behind refuses
-        // the wheel anywhere in this column, so without this the wheel would
-        // simply do nothing while the cursor sits on a bar - worse than either
-        // behaviour on its own. Ctrl is the same step (it is the snap modifier
-        // on drags, and a step already lands on the increment); Shift is the
-        // fine one, a tenth of it.
-        float step = SliderStep(lo, hi);
-        if (shift) step *= 0.1f;
-        float nv = *v + wheel*step;
-        if (nv < lo) nv = lo;
-        if (nv > hi) nv = hi;
-        DrawText(TextFormat("%.2f", nv), (int)(bar.x + bar.width + 6.0f), (int)r.y,
-                 fs, COL_TEXT);
-        if (nv != *v) { *v = nv; return true; }
-        return false;
-    }
-
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && ClipAllows(mouse) &&
-        CheckCollisionPointRec(mouse, bar))
-    { s_fineRect = bar; s_fineActive = true; s_fineBias = 0.0f; }
-
-    bool fine = s_fineActive && SameRectF(s_fineRect, bar) &&
-                IsMouseButtonDown(MOUSE_BUTTON_LEFT) && shift;
-
-    if (fine)
-    {
-        // raygui keeps exclusive drag ownership of the bar, so let it run and
-        // throw its value away - otherwise releasing Shift mid-drag would jump
-        // the knob back to the cursor.
-        float raw = *v;
-        GuiSliderBar(bar, NULL, NULL, &raw, lo, hi);
-
-        float fstep = (hi - lo)*0.0005f;
-        float nv = *v + GetMouseDelta().x*fstep;
-        if (nv < lo) nv = lo;
-        if (nv > hi) nv = hi;
-        s_fineBias = nv - raw;      // drift between the fine value and the cursor
-        *v = nv;
-    }
-    else
-    {
-        float tmp = *v;
-        GuiSliderBar(bar, NULL, NULL, &tmp, lo, hi);
-
-        // Resume from where fine mode left off rather than snapping to the
-        // cursor's position on the bar.
-        if ((tmp != *v) && (s_fineBias != 0.0f))
-        {
-            tmp += s_fineBias;
-            if (tmp < lo) tmp = lo;
-            if (tmp > hi) tmp = hi;
-        }
-        if (ctrl && (tmp != *v))
-        {
-            float step = SliderStep(lo, hi);
-            tmp = roundf(tmp/step)*step;
-            if (tmp < lo) tmp = lo;
-            if (tmp > hi) tmp = hi;
-        }
-        *v = tmp;
-    }
-
-    DrawText(TextFormat("%.2f", *v), (int)(bar.x + bar.width + 6.0f), (int)r.y,
-             fs, COL_TEXT);
-
-    return (*v != before);
+    return UiSlider(r, label, v, lo, hi, fs);
 }
 
 // A row of mutually exclusive chips. Returns the newly picked index, or -1.
 static int ForgeChips(Rectangle r, const char **labels, int count, int active,
                       int fs, Color accent)
 {
-    if (count <= 0) return -1;
-    Vector2 mp = GetMousePosition();
-    float cw = (r.width - (float)(count - 1)*4.0f) / (float)count;
-    int picked = -1;
-
-    for (int i = 0; i < count; i++)
-    {
-        Rectangle c = { r.x + (float)i*(cw + 4.0f), r.y, cw, r.height };
-        bool on = (i == active);
-        bool hot = !ModalBlocks() && ClipAllows(mp) && CheckCollisionPointRec(mp, c);
-
-        DrawRectangleRec(c, on ? Fade(accent, 0.22f) : (hot ? COL_PANEL_HI : COL_PANEL));
-        DrawRectangleLinesEx(c, 1.0f, on ? accent : (hot ? COL_LINE_HI : COL_LINE));
-        int tw = MeasureText(labels[i], fs);
-        DrawText(labels[i], (int)(c.x + (cw - (float)tw)*0.5f),
-                 (int)(c.y + (c.height - (float)fs)*0.5f), fs,
-                 on ? COL_TEXT : COL_TEXT_DIM);
-
-        if (hot && IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-        { AudioPlayButton(); picked = i; }
-    }
-    return picked;
+    return UiChips(r, labels, count, active, fs, accent);
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,9 +1012,9 @@ static void PartInspectorGui(Rectangle pane, float s, int fs, int fsSmall)
     // x range, so gating on the pane rect is enough to stop a hidden slider
     // from catching a drag aimed at the viewport.
     BeginScissorMode((int)pane.x, (int)pane.y, (int)pane.width, (int)pane.height);
-    s_clip = pane;
+    UiSetClip(pane);
     float endY = PartInspectorBody(pane, x, w - barW, y0, s, fs, fsSmall);
-    s_clip = (Rectangle){ 0 };
+    UiSetClip((Rectangle){ 0 });
     EndScissorMode();
 
     // Measure for the NEXT frame, in content coordinates.
@@ -1278,8 +1061,9 @@ static float PartInspectorBody(Rectangle pane, float x, float w, float y,
     // entirely when its row is outside the pane rather than trying to gate it.
     {
         Rectangle nb = { x, y, w, SF_RH*s };
-        if ((nb.y >= s_clip.y - 1.0f) &&
-            (nb.y + nb.height <= s_clip.y + s_clip.height + 1.0f))
+        Rectangle clip = UiGetClip();
+        if ((nb.y >= clip.y - 1.0f) &&
+            (nb.y + nb.height <= clip.y + clip.height + 1.0f))
         {
             if (GuiTextBox(nb, p->name, SGA_NAME_MAX, s_edPart))
             { s_edPart = !s_edPart; Touch(true); }
@@ -2357,25 +2141,14 @@ static void FooterGui(Rectangle bar, float s, int fs, int fsSmall)
 static Rectangle ModalFrame(const char *title, const char *msg, float s, int fs,
                             float mw, float mh)
 {
-    Vector2 sc = ScreenStateSize();
-    if (mw > sc.x - 40.0f) mw = sc.x - 40.0f;
-    Rectangle m = { (sc.x - mw)*0.5f, (sc.y - mh)*0.5f, mw, mh };
-
-    DrawRectangle(0, 0, (int)sc.x, (int)sc.y, (Color){ 0, 0, 0, 150 });
-    DrawRectangleRec(m, COL_PANEL);
-    DrawRectangleLinesEx(m, 1.0f, COL_LINE_HI);
-    DrawText(title, (int)(m.x + 16.0f*s), (int)(m.y + 14.0f*s), fs, COL_TEXT);
-    if (msg && msg[0])
-        DrawText(msg, (int)(m.x + 16.0f*s), (int)(m.y + 14.0f*s + (float)fs + 8.0f*s),
-                 fs, COL_TEXT_DIM);
-    return m;
+    return UiModalFrame(title, msg, s, fs, mw, mh);
 }
 
 static void ModalsGui(float s, int fs)
 {
     // Everything drawn from here on is the modal itself, so its own controls
     // are exempt from the guard that blocks the editor behind it.
-    s_inModal = true;
+    SetInModal(true);
 
     PickGui(s, fs);
 
@@ -2440,7 +2213,7 @@ static void ModalsGui(float s, int fs)
         float by = m.y + m.height - bh - 14.0f*s;
         if (ForgeButton((Rectangle){ m.x + m.width - 100.0f*s, by, 88.0f*s, bh },
                         "DISCARD", true, NULL, fs))
-        { s_confirmExit = false; s_inModal = false; CloseForge(); return; }
+        { s_confirmExit = false; SetInModal(false); CloseForge(); return; }
         if (ForgeButtonEx((Rectangle){ m.x + m.width - 196.0f*s, by, 88.0f*s, bh },
                           "SAVE", true, NULL, fs, true))
         {
@@ -2448,7 +2221,7 @@ static void ModalsGui(float s, int fs)
             // Save straight through when the doc already has a file and is
             // valid; otherwise fall into the prompt rather than failing quietly.
             if (s_file[0] && StrategyAssetValid(&s_doc, NULL))
-            { if (SaveAs(s_file)) { s_inModal = false; CloseForge(); return; } }
+            { if (SaveAs(s_file)) { SetInModal(false); CloseForge(); return; } }
             else SaveOpen();
         }
         if (ForgeButton((Rectangle){ m.x + m.width - 292.0f*s, by, 88.0f*s, bh },
@@ -2584,7 +2357,7 @@ static void ModalsGui(float s, int fs)
             s_easeOpen = false;
     }
 
-    s_inModal = false;
+    SetInModal(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -2623,7 +2396,7 @@ static void Enter()
     s_keySel = -1;
     s_clock = 0.0f;
     s_statusT = 0.0f;
-    s_tip[0] = '\0';
+    UiCtxGet()->tip[0] = '\0';
 }
 
 static void Exit()
@@ -2671,6 +2444,11 @@ static void Gui()
     int fsSmall = (int)(11.0f*s);
     if (fs < 10) fs = 10;
     if (fsSmall < 8) fsSmall = 8;
+
+    // Publish this frame's modal state to the shared widget module BEFORE any
+    // widget runs - every one of them gates its hit testing on it. Also clears
+    // the tip, which TipDraw() at the end of this function re-consumes.
+    UiFrameBegin(ModalOpen());
 
     DrawRectangle(0, 0, (int)screen.x, (int)screen.y, COL_BG);
 

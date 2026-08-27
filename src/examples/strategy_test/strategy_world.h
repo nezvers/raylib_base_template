@@ -12,7 +12,26 @@
 
 // -- World (strategy_world.c) ------------------------------------------------
 StrategyWorld *StrategyWorldGet(void);
-void StrategyWorldInit(void);           // reset + spawn the test map
+
+// Choose the battlefield the NEXT StrategyWorldInit() builds. Follows the
+// open-then-transition convention used by the forges (StrategyForgeOpenAsset):
+// the caller selects, then transitions, because AppStateTransition runs Enter()
+// synchronously and there is no chance to pass anything afterwards.
+//
+// The name is looked up in the map catalog at init time, not here, so a map
+// saved between the selection and the transition is still picked up - and so a
+// stale name can never become a dangling pointer.
+//
+// Passing NULL (or a name no map has) selects the BUILT-IN layout: the
+// hardcoded two-base battlefield the game shipped with. That is also the state
+// before anything ever calls this, so the game still runs with no maps
+// authored.
+void StrategyMapSelect(const char *name);
+
+// The map name currently selected, or "" for the built-in layout.
+const char *StrategyMapSelected(void);
+
+void StrategyWorldInit(void);           // reset + spawn the selected map
 void StrategyWorldHandleInput(void);    // camera, picking, selection, orders
 void StrategyWorldUpdate(float dt);     // units, gathering, combat, AI, effects
 void StrategyWorldDraw3D(void);         // Begin/EndMode3D + all world geometry

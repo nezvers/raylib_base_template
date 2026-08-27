@@ -16,6 +16,8 @@
 #include "strategy_entity_anim.h"
 #include "strategy_models.h"
 #include "../../strategy_asset/strategy_catalog.h"
+#include "../../strategy_map/strategy_map.h"
+#include "../../strategy_map/strategy_map_catalog.h"
 #include "../../screen_state/screen_state.h"
 #include "../../settings_state/settings_state.h"
 #include "raymath.h"
@@ -29,9 +31,25 @@ const Color strategyFactionColor[STRAT_FACTIONS] = {
 
 static StrategyWorld world;
 
+// The battlefield the next Init builds. A NAME, not a pointer: the map catalog
+// is rebuilt whenever the forge saves, which moves maps between slots and
+// invalidates every pointer it has handed out. Empty = the built-in layout.
+static char s_selectedMap[SGM_NAME_MAX];
+
 StrategyWorld *StrategyWorldGet(void)
 {
     return &world;
+}
+
+void StrategyMapSelect(const char *name)
+{
+    if (name == NULL) { s_selectedMap[0] = '\0'; return; }
+    TextCopy(s_selectedMap, name);
+}
+
+const char *StrategyMapSelected(void)
+{
+    return s_selectedMap;
 }
 
 // ----------------------------------------------------------------------------
@@ -53,6 +71,89 @@ static void CameraRefresh(void)
 
     world.camera.target   = target;
     world.camera.position = Vector3Add(target, Vector3Scale(offset, world.camZoom));
+}
+
+// ----------------------------------------------------------------------------
+//  Authored map: terrain queries and terrain drawing
+//
+//  The world holds a BORROWED pointer to the map it was built from, or NULL for
+//  the built-in layout. Every one of these helpers answers the built-in case
+//  first and permissively - no map means no authored obstacles, which is
+//  exactly how the game behaved before maps existed.
+// ----------------------------------------------------------------------------
+
+// Can a building stand here? Snapped to the tile, matching PlacementGhost's
+// roundf, so the ghost the player sees and the rule that rejects agree.
+static bool MapBuildableAt(Vector3 pos)
+{
+    if (world.map == NULL) return true;
+    int tx, tz;
+    SgmWorldToTile(world.map, roundf(pos.x), roundf(pos.z), &tx, &tz);
+    return SgmTileBuildable(world.map, tx, tz);
+}
+
+// The colour a terrain kind draws as. Ground/grass/dirt return false: they are
+// the base plane and are not drawn as tiles at all, which keeps the common case
+// free of thousands of overlapping quads.
+static bool MapTerrainColor(int terrain, Color *out)
+{
+    switch (terrain)
+    {
+        case SGM_TERRAIN_SHALLOW: *out = (Color){  90, 150, 180, 255 }; return true;
+        case SGM_TERRAIN_WATER:   *out = (Color){  40,  80, 140, 255 }; return true;
+        case SGM_TERRAIN_ROCK:    *out = (Color){ 110, 105, 100, 255 }; return true;
+        case SGM_TERRAIN_CLIFF:   *out = (Color){  85,  75,  70, 255 }; return true;
+        default: return false;      // ground/grass/dirt: the base plane shows
+    }
+}
+
+// Draw the authored terrain: one box per non-plain tile, at its elevation.
+// VOID draws nothing at all - it is a hole, and the base plane is what would
+// show through, so a void tile is punched by simply skipping it.
+static void MapDrawTerrain(void)
+{
+    if (world.map == NULL) return;
+    const SgmMap *m = world.map;
+
+    for (int z = 0; z < m->gridH; z++)
+    {
+        for (int x = 0; x < m->gridW; x++)
+        {
+            const SgmTile *t = SgmTileAtConst(m, x, z);
+            if (t == NULL || t->terrain == SGM_TERRAIN_VOID) continue;
+
+            Color c;
+            bool paint = MapTerrainColor(t->terrain, &c);
+            if (!paint && t->height == 0) continue;     // plain ground: the plane
+
+            if (!paint) c = (Color){ 100, 120, 88, 255 };   // raised plain ground
+
+            // Elevation steps are half a world unit, so a 15-step cliff reads as
+            // tall without dwarfing the units standing beside it.
+            float h  = 0.5f*(float)t->height;
+            Vector3 p = SgmTileToWorld(m, x, z);
+
+            // Every tile is drawn from the plane UP, so a raised tile is a solid
+            // column rather than a floating lid.
+            float boxH = h + 0.12f;
+            DrawCube((Vector3){ p.x, boxH*0.5f - 0.06f, p.z }, 1.0f, boxH, 1.0f, c);
+        }
+    }
+}
+
+// The gridlines. Replaces raylib's DrawGrid(), which is a fixed LIGHTGRAY at
+// full alpha centred on the origin - it cannot express a non-square extent, and
+// its opacity is the thing being complained about. Phase 5 makes the strength
+// authored + player-tunable; for now it is a markedly lighter fixed value.
+static void DrawGroundGrid(void)
+{
+    Color line = (Color){ 255, 255, 255, 40 };
+    float hx = world.groundHalfX, hz = world.groundHalfZ;
+
+    for (float x = -hx; x <= hx + 0.001f; x += 1.0f)
+        DrawLine3D((Vector3){ x, 0.0f, -hz }, (Vector3){ x, 0.0f, hz }, line);
+    for (float z = -hz; z <= hz + 0.001f; z += 1.0f)
+        DrawLine3D((Vector3){ -hx, 0.0f, z }, (Vector3){ hx, 0.0f, z }, line);
 }
 
 // Mouse position in GAME-CANVAS pixels (the 3D scene's framebuffer space).
@@ -195,6 +296,22 @@ static void NodeSpawn(NodeKind kind, Vector3 pos, int amount)
     }
 }
 
+// How much a node yields. The built-in layout passes these amounts as literals
+// (see SpawnBuiltinLayout); an authored placement carries a per-node override,
+// and 0 - which is what the forge writes, since it does not author amounts -
+// means "use the default for this kind". There is no NodeDef table to hang
+// these on, so they live here beside the only other place they appear.
+static int NodeAmount(int kind, int authored)
+{
+    if (authored > 0) return authored;
+    switch (kind)
+    {
+        case NODE_ROCK:  return 100;
+        case NODE_WHEAT: return 8;
+        default:         return 12;    // NODE_TREE
+    }
+}
+
 static void NodeCluster(NodeKind kind, Vector3 center, int count, float spread, int amount)
 {
     for (int i = 0; i < count; i++)
@@ -206,49 +323,14 @@ static void NodeCluster(NodeKind kind, Vector3 center, int count, float spread, 
     }
 }
 
-void StrategyWorldInit(void)
+// The battlefield the game shipped with, spawned when no authored map is
+// selected. Kept verbatim so that "no map" plays exactly as it always did.
+// Runs AFTER the difficulty mods are installed, like every other spawn path.
+static void SpawnBuiltinLayout(void)
 {
-    world = (StrategyWorld){ 0 };
-    world.placing          = -1;
-    world.selectedBuilding = -1;
-    world.gameOver         = -1;
-    EffectsReset();
-
-    // Authored assets, if any. The catalog is shared with the showcase and the
-    // forge, so this is a no-op when one of them already loaded it; it is here
-    // so the game can be entered first and still draw bound roles.
-    StrategyAssetSetFactionTint(StrategyFactionTint);
-    StrategyBindingsSetRoleCounts(UNIT_KIND_COUNT, BLD_COUNT, NODE_KIND_COUNT);
-    StrategyCatalogLoad();
-
-    // Difficulty mods BEFORE any spawn (UnitSpawn reads them). The player and
-    // neutral rows stay identity; only the AI faction is scaled. Hard is the
-    // baseline; Normal/Easy weaken the AI and give the player a sell bonus.
-    FactionMods identity = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f };
-    world.mods[0] = world.mods[1] = world.mods[FACTION_NEUTRAL] = identity;
-    switch (SettingsGet()->difficulty)
-    {
-        case 0:     // Easy
-            world.mods[1] = (FactionMods){ 0.8f, 0.8f, 1.10f, 0.9f, 1.6f, 0.0f };
-            world.mods[0].refundBonus = 0.2f;
-            break;
-        case 1:     // Normal
-            world.mods[1] = (FactionMods){ 0.9f, 1.0f, 1.05f, 1.0f, 1.25f, 0.0f };
-            world.mods[0].refundBonus = 0.1f;
-            break;
-        default:    // Hard: identity
-            break;
-    }
-    world.aiPeriod = STRAT_AI_PERIOD*world.mods[1].aiPeriodMul;
-    world.aiTimer  = world.aiPeriod;
-
-    // Camera: perspective, fixed pitch; focus starts over the player base.
-    world.camera.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
-    world.camera.fovy       = 45.0f;
-    world.camera.projection = CAMERA_PERSPECTIVE;
-    world.camFocus = (Vector2){ -14.0f, -12.0f };
-    world.camZoom  = 1.0f;
-    CameraRefresh();
+    world.groundHalfX = STRAT_GROUND_HALF;
+    world.groundHalfZ = STRAT_GROUND_HALF;
+    world.camFocus    = (Vector2){ -14.0f, -12.0f };
 
     // Two rival bases in opposite corners: town hall FIRST (critical, trains
     // workers, and the AI's EnemyHome anchors to the first building), two
@@ -297,6 +379,135 @@ void StrategyWorldInit(void)
         };
         UnitSpawn(FACTION_NEUTRAL, KIND_ANIMAL_STRONG, pos);
     }
+}
+
+// Spawn an authored battlefield.
+//
+// Two ordering constraints are load-bearing and are why this is a single
+// straight-line pass rather than three loops by family:
+//
+//  1. DIFFICULTY MODS FIRST. UnitSpawn reads world.mods to resolve stats, so
+//     every spawn here must run after StrategyWorldInit has installed them.
+//     (Guaranteed by the call site, which is the last thing Init does.)
+//
+//  2. TOWN HALL FIRST, PER FACTION. strategy_ai.c anchors EnemyHome to the
+//     first building it finds for its faction, so a faction's town hall must
+//     occupy a lower buildings[] slot than its other buildings. SgmValidate
+//     enforces town-hall-first in the authored list and the map forge refuses
+//     to save a map that breaks it, so walking the list in order preserves it.
+//     Walking by family would NOT: it would spawn every faction's buildings
+//     interleaved and could seat a house ahead of a town hall.
+//
+// The runtime still plays two factions (STRAT_FACTIONS). Authored factions
+// 2..8 are stored and validated but their placements are SKIPPED here - the
+// agreed scope. Neutral placements (resource nodes, wild animals) always spawn.
+static void SpawnFromMap(const SgmMap *m)
+{
+    world.map         = m;
+    world.groundHalfX = 0.5f*(float)m->gridW;
+    world.groundHalfZ = 0.5f*(float)m->gridH;
+
+    // Focus on faction 0's start, so the player opens looking at their own base
+    // wherever the author put it.
+    if (m->factionCount > 0)
+    {
+        Vector3 home = SgmTileToWorld(m, m->starts[0].tileX, m->starts[0].tileZ);
+        world.camFocus = (Vector2){ home.x, home.z };
+    }
+
+    for (int i = 0; i < m->placeCount; i++)
+    {
+        const SgmPlacement *pl = &m->places[i];
+        Vector3 pos = SgmTileToWorld(m, pl->tileX, pl->tileZ);
+
+        // A neutral placement belongs to nobody; an owned one belongs to a
+        // faction the runtime may not be playing yet.
+        bool neutral = (pl->faction == SGM_FACTION_NEUTRAL);
+        if (!neutral && pl->faction >= STRAT_FACTIONS) continue;
+        int faction = neutral ? FACTION_NEUTRAL : (int)pl->faction;
+
+        switch (pl->family)
+        {
+            case SGM_PLACE_BUILDING:
+                // Buildings are always owned; a neutral one is meaningless and
+                // would index the stockpile at FACTION_NEUTRAL, which has no row.
+                if (neutral) break;
+                if (pl->kind < BLD_COUNT)
+                    BuildingSpawn((BuildingKind)pl->kind, faction, pos, false);
+                break;
+
+            case SGM_PLACE_UNIT:
+                if (pl->kind < UNIT_KIND_COUNT)
+                    UnitSpawn(faction, (UnitKind)pl->kind, pos);
+                break;
+
+            case SGM_PLACE_NODE:
+                // amount 0 means "the game's default for this kind", which is
+                // what the forge writes unless the author overrode it.
+                if (pl->kind < NODE_KIND_COUNT)
+                    NodeSpawn((NodeKind)pl->kind, pos, NodeAmount(pl->kind, pl->amount));
+                break;
+
+            default: break;
+        }
+    }
+}
+
+void StrategyWorldInit(void)
+{
+    world = (StrategyWorld){ 0 };
+    world.placing          = -1;
+    world.selectedBuilding = -1;
+    world.gameOver         = -1;
+    EffectsReset();
+
+    // Authored assets, if any. The catalog is shared with the showcase and the
+    // forge, so this is a no-op when one of them already loaded it; it is here
+    // so the game can be entered first and still draw bound roles.
+    StrategyAssetSetFactionTint(StrategyFactionTint);
+    StrategyBindingsSetRoleCounts(UNIT_KIND_COUNT, BLD_COUNT, NODE_KIND_COUNT);
+    StrategyCatalogLoad();
+
+    // Difficulty mods BEFORE any spawn (UnitSpawn reads them). The player and
+    // neutral rows stay identity; only the AI faction is scaled. Hard is the
+    // baseline; Normal/Easy weaken the AI and give the player a sell bonus.
+    FactionMods identity = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f };
+    world.mods[0] = world.mods[1] = world.mods[FACTION_NEUTRAL] = identity;
+    switch (SettingsGet()->difficulty)
+    {
+        case 0:     // Easy
+            world.mods[1] = (FactionMods){ 0.8f, 0.8f, 1.10f, 0.9f, 1.6f, 0.0f };
+            world.mods[0].refundBonus = 0.2f;
+            break;
+        case 1:     // Normal
+            world.mods[1] = (FactionMods){ 0.9f, 1.0f, 1.05f, 1.0f, 1.25f, 0.0f };
+            world.mods[0].refundBonus = 0.1f;
+            break;
+        default:    // Hard: identity
+            break;
+    }
+    world.aiPeriod = STRAT_AI_PERIOD*world.mods[1].aiPeriodMul;
+    world.aiTimer  = world.aiPeriod;
+
+    // Camera: perspective, fixed pitch. The FOCUS is not set here - it belongs
+    // to the battlefield (the built-in looks at its corner base, an authored map
+    // at faction 0's start), so each layout sets it and CameraRefresh runs once
+    // afterwards. Likewise the extent: groundHalf* is still zero at this point.
+    world.camera.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
+    world.camera.fovy       = 45.0f;
+    world.camera.projection = CAMERA_PERSPECTIVE;
+    world.camZoom  = 1.0f;
+
+    // The battlefield itself. An authored map is looked up by NAME here rather
+    // than held as a pointer, because the map catalog is rebuilt whenever the
+    // forge saves; a name that no longer resolves falls back to the built-in
+    // layout rather than failing to start.
+    SgmCatalogLoad();
+    const SgmMap *sel = (s_selectedMap[0] != '\0') ? SgmCatalogFind(s_selectedMap)
+                                                   : NULL;
+    if (sel != NULL) SpawnFromMap(sel);
+    else             SpawnBuiltinLayout();
+    CameraRefresh();    // the layout set camFocus; rebuild the camera from it
 
     // Starting stockpiles so building/training is possible right away. The
     // human player (faction 0) gets an easier-difficulty head start: Easy x3,
@@ -849,8 +1060,9 @@ static int NodesNear(NodeKind kind, Vector3 pos, float radius)
 // and off the map edge. Used to scatter tended nodes without overlap.
 static bool PlantSpotClear(Vector3 pos)
 {
-    float margin = STRAT_GROUND_HALF - 1.0f;
-    if (fabsf(pos.x) > margin || fabsf(pos.z) > margin) return false;
+    if (fabsf(pos.x) > world.groundHalfX - 1.0f ||
+        fabsf(pos.z) > world.groundHalfZ - 1.0f) return false;
+    if (!MapBuildableAt(pos)) return false;     // no farms in the lake
     for (int i = 0; i < STRAT_MAX_NODES; i++)
         if (world.nodes[i].active &&
             DistXZ(world.nodes[i].pos, pos) < STRAT_TEND_SPACING) return false;
@@ -946,8 +1158,8 @@ static void CameraPanZoom(void)
     if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN))  world.camFocus.y += pan;
     if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT))  world.camFocus.x -= pan;
     if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) world.camFocus.x += pan;
-    world.camFocus.x = Clamp(world.camFocus.x, -STRAT_GROUND_HALF, STRAT_GROUND_HALF);
-    world.camFocus.y = Clamp(world.camFocus.y, -STRAT_GROUND_HALF, STRAT_GROUND_HALF);
+    world.camFocus.x = Clamp(world.camFocus.x, -world.groundHalfX, world.groundHalfX);
+    world.camFocus.y = Clamp(world.camFocus.y, -world.groundHalfZ, world.groundHalfZ);
 
     float wheel = GetMouseWheelMove();
     if (wheel != 0.0f)
@@ -970,8 +1182,13 @@ static bool Affordable(int faction, BuildingKind kind)
 static bool PlacementValid(int faction, BuildingKind kind, Vector3 pos)
 {
     if (!Affordable(faction, kind)) return false;
-    float margin = STRAT_GROUND_HALF - 1.5f;
-    if (fabsf(pos.x) > margin || fabsf(pos.z) > margin) return false;
+    if (fabsf(pos.x) > world.groundHalfX - 1.5f ||
+        fabsf(pos.z) > world.groundHalfZ - 1.5f) return false;
+
+    // Authored terrain: a map may forbid building on water, cliffs and voids.
+    // Checked on the tile the building SNAPS to, which is the same rounding
+    // PlacementGhost shows the player, so the ghost and the rule agree.
+    if (!MapBuildableAt(pos)) return false;
 
     for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
     {
@@ -1445,8 +1662,8 @@ static void AnimalPanic(int victimIndex, Vector3 threat)
 
         Vector3 dest = Vector3Add(u->pos,
                                   Vector3Scale(Vector3Normalize(away), STRAT_FLEE_DIST));
-        dest.x = Clamp(dest.x, -STRAT_GROUND_HALF + 1.0f, STRAT_GROUND_HALF - 1.0f);
-        dest.z = Clamp(dest.z, -STRAT_GROUND_HALF + 1.0f, STRAT_GROUND_HALF - 1.0f);
+        dest.x = Clamp(dest.x, -world.groundHalfX + 1.0f, world.groundHalfX - 1.0f);
+        dest.z = Clamp(dest.z, -world.groundHalfZ + 1.0f, world.groundHalfZ - 1.0f);
 
         u->state          = UNIT_FLEE;
         u->target         = dest;
@@ -1998,8 +2215,8 @@ static void UnitUpdate(int index, float dt)
     }
 
     // Never leave the ground plane.
-    u->pos.x = Clamp(u->pos.x, -STRAT_GROUND_HALF, STRAT_GROUND_HALF);
-    u->pos.z = Clamp(u->pos.z, -STRAT_GROUND_HALF, STRAT_GROUND_HALF);
+    u->pos.x = Clamp(u->pos.x, -world.groundHalfX, world.groundHalfX);
+    u->pos.z = Clamp(u->pos.z, -world.groundHalfZ, world.groundHalfZ);
 }
 
 // Push overlapping units apart so groups spread instead of stacking.
@@ -2354,11 +2571,14 @@ void StrategyWorldDraw3D(void)
 {
     BeginMode3D(world.camera);
 
-    // Plane slightly below the grid lines to avoid z-fighting.
+    // Plane slightly below the grid lines to avoid z-fighting. Sized from the
+    // world's extent, so an authored map's ground reaches its own edges rather
+    // than the built-in 50x50.
     DrawPlane((Vector3){ 0.0f, -0.01f, 0.0f },
-              (Vector2){ 2.0f*STRAT_GROUND_HALF, 2.0f*STRAT_GROUND_HALF },
+              (Vector2){ 2.0f*world.groundHalfX, 2.0f*world.groundHalfZ },
               (Color){ 90, 110, 80, 255 });
-    DrawGrid((int)(2.0f*STRAT_GROUND_HALF), 1.0f);
+    MapDrawTerrain();
+    DrawGroundGrid();
 
     for (int i = 0; i < STRAT_MAX_NODES; i++)
     {

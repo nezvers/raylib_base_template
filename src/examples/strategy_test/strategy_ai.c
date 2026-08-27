@@ -81,8 +81,11 @@ static void AnimalsTick(StrategyWorld *world)
         Vector3 dest = u->pos;
         dest.x += (float)GetRandomValue(-400, 400)*0.01f;
         dest.z += (float)GetRandomValue(-400, 400)*0.01f;
-        dest.x = Clamp(dest.x, -STRAT_GROUND_HALF + 1.0f, STRAT_GROUND_HALF - 1.0f);
-        dest.z = Clamp(dest.z, -STRAT_GROUND_HALF + 1.0f, STRAT_GROUND_HALF - 1.0f);
+        // The world's authored extent, not the fixed STRAT_GROUND_HALF: on a
+        // large authored map that constant would pen the animals into the
+        // middle of the field.
+        dest.x = Clamp(dest.x, -world->groundHalfX + 1.0f, world->groundHalfX - 1.0f);
+        dest.z = Clamp(dest.z, -world->groundHalfZ + 1.0f, world->groundHalfZ - 1.0f);
         StrategyOrderMove(u, dest);
     }
 }

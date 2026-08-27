@@ -273,6 +273,25 @@ typedef struct {
     FactionMods  mods[STRAT_FACTIONS + 1];  // [FACTION_NEUTRAL] = identity
     float        aiPeriod;                  // STRAT_AI_PERIOD * enemy aiPeriodMul
 
+    // -- Battlefield extent, in world units from the origin ------------------
+    // The ground used to be a fixed STRAT_GROUND_HALF square, and that constant
+    // was read directly at the camera clamp, the placement margin, the ground
+    // plane and the gridlines. An authored map sets its own extent, so those
+    // four sites read THESE instead and the constant is now only the default
+    // for the built-in layout. Half-extents (not full width) because every one
+    // of those sites wants the distance from the origin to the edge.
+    //
+    // Set by StrategyWorldInit BEFORE anything spawns - PlacementValid and the
+    // camera clamp are both live during init.
+    float        groundHalfX;
+    float        groundHalfZ;
+
+    // The authored map this world was built from, or NULL for the built-in
+    // layout. BORROWED from the map catalog, which outlives the world; held so
+    // the passability grid can be consulted at placement time without copying
+    // 256 KB into the world struct. Never freed here.
+    const struct SgmMap *map;
+
     // Camera: fixed-pitch RTS view. The camera is DERIVED every frame from
     // focus + zoom, so panning/zooming only touch these two fields.
     Camera3D camera;
