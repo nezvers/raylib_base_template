@@ -353,6 +353,19 @@ float StrategyAssetEase(const SgaAsset *a, int index, float p);
 void StrategyAssetDraw(const SgaAsset *a, int faction, Vector3 pos, float yawDeg,
                        float alpha, int state, float time);
 
+// Draw with a reduced part set, for units far enough away that the difference
+// cannot be seen. `minSize` drops any part whose largest dimension is below it
+// (buttons, buckles, eyes - the parts that cost a matrix push each and occupy
+// under a pixel at distance), and `lowPoly` halves sphere and cylinder
+// tessellation. Pass 0 and false for exactly StrategyAssetDrawStates.
+//
+// SEPARATE ENTRY POINT ON PURPOSE. The forge and the showcase draw single
+// assets at close range and must never lose detail; only the game's unit loop,
+// which knows how far away each unit is, should be choosing to draw less.
+void StrategyAssetDrawStatesLod(const SgaAsset *a, int faction, Vector3 pos,
+                                float yawDeg, float alpha, const SgaStateSet *set,
+                                float minSize, bool lowPoly);
+
 // Draw with several states live at once. Each part independently plays the
 // highest-priority ACTIVE state that has keys on it; a part no active state
 // animates holds its rest pose. This is the entry point the game draws through.

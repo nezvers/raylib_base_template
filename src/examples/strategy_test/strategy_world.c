@@ -3643,8 +3643,71 @@ const char *StrategyRenderLodName(StrategyRenderLod lod)
     }
 }
 
+// ----------------------------------------------------------------------------
+//  Distance culling
+//
+//  THE CHEAPEST WIN IN THE RENDER OVERHAUL, and it is cheap only because this
+//  camera is constrained: fixed pitch, no rotation, zoom clamped to 0.35..1.45.
+//  A general frustum cull would need six plane tests per unit; here the visible
+//  ground is always a fixed shape around camFocus, so one squared-distance
+//  compare rejects everything outside it.
+//
+//  The radius is DERIVED, not guessed, and it is derived PER UNIT OF ZOOM. The
+//  camera offset is (0,14,10)*zoom with a 45-degree fovy, so the distance from
+//  the focus to the farthest visible ground corner is exactly linear in zoom:
+//
+//      zoom 0.35 -> 9.0      zoom 1.00 -> 25.8
+//      zoom 0.70 -> 18.0     zoom 1.45 -> 37.4      (= 25.8 * zoom throughout)
+//
+//  Hence the coefficient below, plus slack for a 16:10 window and a unit's own
+//  height. Getting this wrong in the safe direction is nearly free to write and
+//  nearly worthless: a flat 40 - the max-zoom figure, applied at every zoom -
+//  culls 0% at full zoom-out, which is the case that needs it most.
+//
+//  Measured against the maps that exist: at maximum zoom the visible ground is
+//  roughly 37x37 units, so on the 96x96 "long march" about 15% of the map is on
+//  screen. The other 85% of units currently run the full authored part loop
+//  every frame to produce nothing.
+#define CULL_RADIUS_PER_ZOOM  28.0f
+
+// Distance LOD tiers, as fractions of the SQUARED cull radius - so 0.35 is 59%
+// of the way out, and 0.65 is 81%. Expressed against the cull radius rather
+// than in world units so the tiers scale with zoom exactly as the cull does:
+// the question a tier answers is "how big is this on screen", and at this
+// camera that is entirely a function of the fraction of the view it sits at.
+#define LOD_MID_FRAC  0.35f
+#define LOD_FAR_FRAC  0.65f
+
+// Squared, recomputed once per frame by CullBegin. Seeded wide rather than to
+// zero: the HP-bar pass reads it from a DIFFERENT function than the one that
+// sets it, and a zero here would silently hide every bar in the game if the 3D
+// pass were ever skipped. Culling nothing is the safe failure.
+static float s_cullR2 = 1.0e9f;
+
+static void CullBegin(void)
+{
+    // The floor is not tuning slack - it is the guard for a camZoom that some
+    // future caller sets to zero or negative. A unit popping in at the screen
+    // edge is far worse than drawing a few extra.
+    float r = CULL_RADIUS_PER_ZOOM*world.camZoom;
+    if (r < 10.0f) r = 10.0f;
+    s_cullR2 = r*r;
+}
+
+static bool CullTest(Vector3 pos)
+{
+    float dx = pos.x - world.camFocus.x;
+    float dz = pos.z - world.camFocus.y;
+    return (dx*dx + dz*dz) <= s_cullR2;
+}
+
 static void DrawUnit(const Unit *u)
 {
+    // BEFORE the LOD fork, the colour lookup and everything else: a culled unit
+    // must cost one subtract, one multiply-add and one compare, or the cull is
+    // not paying for itself.
+    if (!CullTest(u->pos)) return;
+
     Color color = UnitColor(u);
 
     // Cheap tiers first: they skip the selection ring, the asset lookup and the
@@ -3683,16 +3746,64 @@ static void DrawUnit(const Unit *u)
     {
         SgaStateSet set;
         StrategyEntityAnimSet(u, asset, &set);
-        StrategyAssetDrawStates(asset, u->faction, u->pos, u->anim.yaw, 1.0f, &set);
+
+        // Distance LOD. The tiers are in SQUARED distance from the focus, so
+        // the whole decision costs no square root - the same reason the cull
+        // above is squared.
+        //
+        // The thresholds are fractions of the cull radius rather than absolute
+        // distances, so they follow the zoom the same way the cull does: at
+        // full zoom-out a unit two thirds of the way to the screen edge is
+        // genuinely tiny, and at full zoom-in the same fraction is a unit still
+        // large enough to want its detail.
+        float dx = u->pos.x - world.camFocus.x;
+        float dz = u->pos.z - world.camFocus.y;
+        float d2 = dx*dx + dz*dz;
+
+        float minSize = 0.0f;
+        bool  lowPoly = false;
+        if (d2 > s_cullR2*LOD_FAR_FRAC)
+        {
+            minSize = 0.18f;    // drop buttons, eyes, buckles
+            lowPoly = true;
+        }
+        else if (d2 > s_cullR2*LOD_MID_FRAC)
+        {
+            minSize = 0.08f;    // only the genuinely sub-pixel parts
+        }
+
+        StrategyAssetDrawStatesLod(asset, u->faction, u->pos, u->anim.yaw, 1.0f,
+                                   &set, minSize, lowPoly);
     }
-    else switch (u->kind)
+    // THE BUILT-IN PRIMITIVES ARE WHERE THE TRIANGLES ACTUALLY ARE, and that is
+    // the opposite of what the plan assumed. Measured on the three assets that
+    // exist: worker, soldier and ranged are each ONE visible 8-sided cylinder -
+    // 32 triangles, two draw calls. The fallback below is 2-3 draws with a
+    // DrawSphere head at raylib's default 16x16 rings, which is 512 triangles
+    // on its own, and it serves four of the seven kinds (both templars, both
+    // animals) because those have no binding.
+    //
+    // So the LOD tiers below apply to THIS path, not the authored one: a head
+    // is under a pixel at distance and costs sixteen times the body.
+    else
     {
+        float ddx = u->pos.x - world.camFocus.x;
+        float ddz = u->pos.z - world.camFocus.y;
+        float dd2 = ddx*ddx + ddz*ddz;
+        bool  lowPoly = (dd2 > s_cullR2*LOD_MID_FRAC);
+        bool  noDetail = (dd2 > s_cullR2*LOD_FAR_FRAC);
+
+        switch (u->kind)
+        {
         case KIND_WORKER:
         {
             DrawCylinder(u->pos, 0.28f, STRAT_UNIT_RADIUS, 0.8f, 8, color);
-            Vector3 head = (Vector3){ u->pos.x, 0.95f, u->pos.z };
-            DrawSphere(head, 0.18f, ColorBrightness(color, 0.3f));
-
+            if (!noDetail)
+            {
+                Vector3 head = (Vector3){ u->pos.x, 0.95f, u->pos.z };
+                if (lowPoly) DrawSphereEx(head, 0.18f, 6, 6, ColorBrightness(color, 0.3f));
+                else         DrawSphere(head, 0.18f, ColorBrightness(color, 0.3f));
+            }
         } break;
 
         case KIND_SOLDIER:
@@ -3700,8 +3811,12 @@ static void DrawUnit(const Unit *u)
             // Taller, wider, darker - reads as "military" at a glance.
             Color dark = ColorBrightness(color, -0.25f);
             DrawCylinder(u->pos, 0.34f, 0.45f, 1.1f, 8, dark);
-            Vector3 head = (Vector3){ u->pos.x, 1.28f, u->pos.z };
-            DrawSphere(head, 0.2f, color);
+            if (!noDetail)
+            {
+                Vector3 head = (Vector3){ u->pos.x, 1.28f, u->pos.z };
+                if (lowPoly) DrawSphereEx(head, 0.2f, 6, 6, color);
+                else         DrawSphere(head, 0.2f, color);
+            }
         } break;
 
         case KIND_RANGED:
@@ -3709,10 +3824,14 @@ static void DrawUnit(const Unit *u)
             // Slighter than the soldier, with a "bow" post at the side.
             Color light = ColorBrightness(color, 0.15f);
             DrawCylinder(u->pos, 0.30f, 0.40f, 1.0f, 8, light);
-            Vector3 head = (Vector3){ u->pos.x, 1.18f, u->pos.z };
-            DrawSphere(head, 0.18f, color);
-            DrawLine3D((Vector3){ u->pos.x + 0.35f, 0.25f, u->pos.z },
-                       (Vector3){ u->pos.x + 0.35f, 1.05f, u->pos.z }, DARKBROWN);
+            if (!noDetail)
+            {
+                Vector3 head = (Vector3){ u->pos.x, 1.18f, u->pos.z };
+                if (lowPoly) DrawSphereEx(head, 0.18f, 6, 6, color);
+                else         DrawSphere(head, 0.18f, color);
+                DrawLine3D((Vector3){ u->pos.x + 0.35f, 0.25f, u->pos.z },
+                           (Vector3){ u->pos.x + 0.35f, 1.05f, u->pos.z }, DARKBROWN);
+            }
         } break;
 
         case KIND_TEMPLAR:
@@ -3721,10 +3840,22 @@ static void DrawUnit(const Unit *u)
             // White robe, gold (templar) or lime (healer) head, faction band.
             Color halo = (u->kind == KIND_TEMPLAR) ? GOLD : LIME;
             DrawCylinder(u->pos, 0.26f, 0.42f, 1.0f, 8, RAYWHITE);
-            Vector3 band = (Vector3){ u->pos.x, 0.55f, u->pos.z };
-            DrawCube(band, 0.5f, 0.12f, 0.5f, color);
-            Vector3 head = (Vector3){ u->pos.x, 1.16f, u->pos.z };
-            DrawSphere(head, 0.17f, halo);
+            if (!noDetail)
+            {
+                Vector3 band = (Vector3){ u->pos.x, 0.55f, u->pos.z };
+                DrawCube(band, 0.5f, 0.12f, 0.5f, color);
+                Vector3 head = (Vector3){ u->pos.x, 1.16f, u->pos.z };
+                if (lowPoly) DrawSphereEx(head, 0.17f, 6, 6, halo);
+                else         DrawSphere(head, 0.17f, halo);
+            }
+            else
+            {
+                // The band is what makes a templar readable as YOURS at range,
+                // so it survives when the head does not - it is 12 triangles
+                // against the head's 512.
+                DrawCube((Vector3){ u->pos.x, 0.55f, u->pos.z },
+                         0.5f, 0.12f, 0.5f, color);
+            }
         } break;
 
         case KIND_ANIMAL_WEAK:
@@ -3739,10 +3870,13 @@ static void DrawUnit(const Unit *u)
             // Bigger, darker beast - reads as "don't poke it".
             Vector3 body = (Vector3){ u->pos.x, 0.34f, u->pos.z };
             DrawCube(body, 0.9f, 0.65f, 0.55f, ColorBrightness(color, -0.35f));
-            DrawCubeWires(body, 0.9f, 0.65f, 0.55f, DARKBROWN);
+            // The wireframe is pure silhouette detail and doubles this kind's
+            // draw calls; at distance it is a smudge on top of a smudge.
+            if (!noDetail) DrawCubeWires(body, 0.9f, 0.65f, 0.55f, DARKBROWN);
         } break;
 
         default: break;
+        }
     }
 
     // Decorations sit OUTSIDE the fork: they describe what a unit is doing, not
@@ -3843,6 +3977,7 @@ void StrategyWorldDraw3D(void)
     SpProfEnd(SP_PROF_DRAW_WORLD);
 
     SpProfBegin(SP_PROF_DRAW_UNITS);
+    CullBegin();        // once per frame: the radius only moves with the zoom
     for (int k = 0; k < s_activeCount; k++) DrawUnit(&world.units[s_active[k]]);
     SpProfEnd(SP_PROF_DRAW_UNITS);
 
@@ -3907,6 +4042,11 @@ void StrategyWorldDraw2DOverlay(void)
     {
         Unit *u = &world.units[s_active[k]];
         if (u->hp >= u->maxHp) continue;
+        // Same cull as the unit itself. WorldToGame is a full matrix projection
+        // per unit, so at ten thousand units this loop costs as much as the
+        // draw it annotates - and every one of those bars is for a unit that
+        // was not drawn.
+        if (!CullTest(u->pos)) continue;
 
         Vector2 sp = WorldToGame((Vector3){ u->pos.x, 1.5f, u->pos.z });
         float frac = u->hp/u->maxHp;

@@ -798,8 +798,48 @@ int StrategyAssetResolvePartState(const SgaAsset *a, int partIndex,
     return best;
 }
 
-void StrategyAssetDrawStates(const SgaAsset *a, int faction, Vector3 pos,
-                             float yawDeg, float alpha, const SgaStateSet *set)
+// Largest dimension of a part, for the LOD size cull. Kind-dependent because
+// the size fields mean different things per kind - a sphere's extent is in r0,
+// a cube's in size, a cylinder's in r0/r1/h - and reading `size` for all of
+// them would drop every sphere in the game at the first LOD tier.
+static float SgaPartExtent(const SgaPart *p)
+{
+    switch (p->kind)
+    {
+        case SGA_CUBE:
+        case SGA_CUBE_WIRES:
+        {
+            float m = p->size.x;
+            if (p->size.y > m) m = p->size.y;
+            if (p->size.z > m) m = p->size.z;
+            return m;
+        }
+        case SGA_SPHERE:
+            return p->r0*2.0f;
+
+        case SGA_CYLINDER:
+        {
+            float d = ((p->r0 > p->r1) ? p->r0 : p->r1)*2.0f;
+            return (p->h > d) ? p->h : d;
+        }
+        case SGA_CYLINDER_EX:
+        case SGA_LINE:
+        {
+            // Length of the end offset: these are defined by where they go, not
+            // by a width.
+            float len = sqrtf(p->size.x*p->size.x + p->size.y*p->size.y
+                            + p->size.z*p->size.z);
+            float d = ((p->r0 > p->r1) ? p->r0 : p->r1)*2.0f;
+            return (len > d) ? len : d;
+        }
+        default:
+            return 1.0e9f;      // unknown kind: never culled by size
+    }
+}
+
+void StrategyAssetDrawStatesLod(const SgaAsset *a, int faction, Vector3 pos,
+                                float yawDeg, float alpha, const SgaStateSet *set,
+                                float minSize, bool lowPoly)
 {
     if (a == NULL) return;
 
@@ -816,6 +856,11 @@ void StrategyAssetDrawStates(const SgaAsset *a, int faction, Vector3 pos,
         const SgaPart *p = &a->parts[i];
         if (!p->visible) continue;
         if (p->kind == SGA_PATH) continue;      // never geometry
+
+        // Size cull. Checked before the pose resolve and the matrix push,
+        // because those are most of what a small part costs - skipping only the
+        // draw call would save the cheapest third of the work.
+        if (minSize > 0.0f && SgaPartExtent(p) < minSize) continue;
 
         // Each part asks independently which state owns it, so one model can
         // be mid-walk on its legs and mid-swing on its arm in the same frame.
@@ -851,17 +896,26 @@ void StrategyAssetDrawStates(const SgaAsset *a, int faction, Vector3 pos,
                 break;
 
             case SGA_SPHERE:
-                DrawSphere(o, p->r0, c);
+                // DrawSphere is 16x16 rings by default - about 512 triangles
+                // for something that is usually a head. At 8x8 it is 128, and
+                // at the distance this tier applies it is a handful of pixels.
+                if (lowPoly) DrawSphereEx(o, p->r0, 8, 8, c);
+                else         DrawSphere(o, p->r0, c);
                 break;
 
             case SGA_CYLINDER:
-                DrawCylinder(o, p->r0, p->r1, p->h, p->sides, c);
-                break;
+            {
+                int sides = p->sides;
+                if (lowPoly && sides > 6) sides /= 2;
+                DrawCylinder(o, p->r0, p->r1, p->h, sides, c);
+            } break;
 
             case SGA_CYLINDER_EX:
             {
                 Vector3 end = { o.x + p->size.x, o.y + p->size.y, o.z + p->size.z };
-                DrawCylinderEx(o, end, p->r0, p->r1, p->sides, c);
+                int sides = p->sides;
+                if (lowPoly && sides > 6) sides /= 2;
+                DrawCylinderEx(o, end, p->r0, p->r1, sides, c);
             } break;
 
             case SGA_LINE:
@@ -877,6 +931,14 @@ void StrategyAssetDrawStates(const SgaAsset *a, int faction, Vector3 pos,
     }
 
     rlPopMatrix();
+}
+
+// Full detail: the LOD draw with both reductions switched off. One draw loop,
+// so there is exactly one place for a posing bug to live.
+void StrategyAssetDrawStates(const SgaAsset *a, int faction, Vector3 pos,
+                             float yawDeg, float alpha, const SgaStateSet *set)
+{
+    StrategyAssetDrawStatesLod(a, faction, pos, yawDeg, alpha, set, 0.0f, false);
 }
 
 void StrategyAssetDraw(const SgaAsset *a, int faction, Vector3 pos, float yawDeg,
