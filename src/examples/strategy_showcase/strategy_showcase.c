@@ -42,6 +42,9 @@
 #include "../../strategy_map/strategy_map_io.h"
 #include "../../strategy_map/strategy_map_catalog.h"
 #include "../../map_forge/map_forge.h"
+
+// strategy_path_lab.c - no header of its own (one entry point).
+void StrategyPathLabSetReturn(AppState *state);
 #include "../strategy_test/strategy_world.h"
 #include "../strategy_test/strategy_defs.h"
 #include "../../screen_state/screen_state.h"
@@ -2875,8 +2878,8 @@ static void DrawFooter(const Layout *L)
     // Role binding. Named for what it does rather than "assign to faction":
     // a binding is per-ROLE and both factions share it, so the old label
     // promised something the file does not model.
+    float bindW = wipW + 30.0f*L->s;
     {
-        float bindW = wipW + 30.0f*L->s;
         bool inBind = (sc.view == VIEW_BIND);
         if (SheetButton((Rectangle){ x, by, bindW, bh },
                         inBind ? "BACK TO GALLERY" : "ROLE BINDINGS", true,
@@ -2885,6 +2888,23 @@ static void DrawFooter(const Layout *L)
                         L->fsSmall))
         {
             ShowcaseSetView(inBind ? VIEW_GALLERY : VIEW_BIND);
+            return;
+        }
+    }
+
+    // PATH LAB: the movement stress harness. Same map selection as PLAY, but a
+    // bare shell with a profiler instead of the game - see strategy_path_lab.c.
+    {
+        float labW = 130.0f*L->s;
+        x += bindW + 8.0f*L->s;
+        if (SheetButton((Rectangle){ x, by, labW, bh }, "PATH LAB", true,
+                        "Movement stress harness: spawn thousands of units and profile them.",
+                        L->fsSmall))
+        {
+            const SgmMap *sel = MapEntry(sc.mapSel);
+            StrategyMapSelect(sel ? sel->name : NULL);
+            StrategyPathLabSetReturn(&app_state_strategy_showcase);
+            AppStateTransition(&app_state_strategy_path_lab);
             return;
         }
     }

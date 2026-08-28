@@ -35,10 +35,13 @@ static int NearestUnitOfKind(const StrategyWorld *world, Vector3 pos,
 {
     int best = -1;
     float bestDist = 1000000.0f;
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    int liveCount = 0;
+    const int *live = StrategyActiveUnits(&liveCount);
+    for (int k = 0; k < liveCount; k++)
     {
+        int i = live[k];
         const Unit *u = &world->units[i];
-        if (!u->active || u->faction != faction || u->kind != kind) continue;
+        if (u->faction != faction || u->kind != kind) continue;
 
         float d = AiDistXZ(u->pos, pos);
         if (d < bestDist)
@@ -72,10 +75,12 @@ static int NearestPlayerBuilding(const StrategyWorld *world, Vector3 pos)
 // Idle animals amble to a random nearby spot now and then.
 static void AnimalsTick(StrategyWorld *world)
 {
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    int liveCount = 0;
+    const int *live = StrategyActiveUnits(&liveCount);
+    for (int k = 0; k < liveCount; k++)
     {
-        Unit *u = &world->units[i];
-        if (!u->active || u->faction != FACTION_NEUTRAL) continue;
+        Unit *u = &world->units[live[k]];
+        if (u->faction != FACTION_NEUTRAL) continue;
         if (u->state != UNIT_IDLE || GetRandomValue(0, 99) >= 30) continue;
 
         Vector3 dest = u->pos;
@@ -96,10 +101,12 @@ static void AnimalsTick(StrategyWorld *world)
 static void EnemyTrainTick(StrategyWorld *world)
 {
     int count[UNIT_KIND_COUNT] = { 0 };
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    int liveCount = 0;
+    const int *live = StrategyActiveUnits(&liveCount);
+    for (int k = 0; k < liveCount; k++)
     {
-        Unit *u = &world->units[i];
-        if (u->active && u->faction == 1) count[u->kind]++;
+        Unit *u = &world->units[live[k]];
+        if (u->faction == 1) count[u->kind]++;
     }
 
     for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
@@ -137,10 +144,12 @@ static void EnemyWorkersTick(StrategyWorld *world)
 {
     Vector3 home = EnemyHome(world);
 
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    int liveCount = 0;
+    const int *live = StrategyActiveUnits(&liveCount);
+    for (int k = 0; k < liveCount; k++)
     {
-        Unit *u = &world->units[i];
-        if (!u->active || u->faction != 1) continue;
+        Unit *u = &world->units[live[k]];
+        if (u->faction != 1) continue;
         if (u->kind != KIND_WORKER || u->state != UNIT_IDLE) continue;
 
         if (world->stockpile[1][RES_FOOD] < 6)
@@ -203,10 +212,12 @@ static void EnemyBuildTick(StrategyWorld *world)
             Building *b = &world->buildings[i];
             if (b->active && b->faction == 1 && b->kind == BLD_CHANTRY) hasChantry = true;
         }
-        for (int i = 0; i < STRAT_MAX_UNITS; i++)
+        int liveCount = 0;
+        const int *live = StrategyActiveUnits(&liveCount);
+        for (int k = 0; k < liveCount; k++)
         {
-            Unit *u = &world->units[i];
-            if (u->active && u->faction == 1 && u->kind == KIND_WORKER) workers++;
+            Unit *u = &world->units[live[k]];
+            if (u->faction == 1 && u->kind == KIND_WORKER) workers++;
         }
         // Economy up = full worker crew and a resource buffer beyond the cost.
         if (hasChantry || workers < 5 ||
@@ -236,10 +247,12 @@ static bool AiIsFighter(const Unit *u)
 static void EnemyAttackTick(StrategyWorld *world)
 {
     int idleFighters = 0;
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    int liveCount = 0;
+    const int *live = StrategyActiveUnits(&liveCount);
+    for (int k = 0; k < liveCount; k++)
     {
-        Unit *u = &world->units[i];
-        if (u->active && u->faction == 1 && AiIsFighter(u) &&
+        Unit *u = &world->units[live[k]];
+        if (u->faction == 1 && AiIsFighter(u) &&
             u->state == UNIT_IDLE) idleFighters++;
     }
     if (idleFighters < STRAT_AI_ATTACK_SQUAD) return;
@@ -247,11 +260,10 @@ static void EnemyAttackTick(StrategyWorld *world)
     int target = NearestPlayerBuilding(world, EnemyHome(world));
     if (target < 0) return;
 
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < liveCount; k++)
     {
-        Unit *u = &world->units[i];
-        if (u->active && u->faction == 1 && AiIsFighter(u) &&
-            u->state == UNIT_IDLE)
+        Unit *u = &world->units[live[k]];
+        if (u->faction == 1 && AiIsFighter(u) && u->state == UNIT_IDLE)
         {
             StrategyOrderAttackBuilding(u, target);
         }

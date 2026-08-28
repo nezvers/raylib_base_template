@@ -9,6 +9,10 @@
 
 #include "strategy_types.h"
 #include "strategy_defs.h"
+// For SpGrid on the movement API below. strategy_path/ never includes anything
+// from here, so the dependency runs one way only: the game knows about the nav
+// module, the nav module stays headless.
+#include "../../strategy_path/strategy_path.h"
 
 // -- World (strategy_world.c) ------------------------------------------------
 StrategyWorld *StrategyWorldGet(void);
@@ -36,6 +40,31 @@ void StrategyWorldHandleInput(void);    // camera, picking, selection, orders
 void StrategyWorldUpdate(float dt);     // units, gathering, combat, AI, effects
 void StrategyWorldDraw3D(void);         // Begin/EndMode3D + all world geometry
 void StrategyWorldDraw2DOverlay(void);  // drag rect, HP bars, resource HUD (game space)
+
+// -- Active unit roster -------------------------------------------------------
+// The indices of every live unit, and how many there are. Iterate THIS instead
+// of `for (i < STRAT_MAX_UNITS)`: the pool is sized for 10,000 but a normal
+// game holds fewer than a hundred, so a full scan pays for the cap rather than
+// the population - and touches a 248-byte struct at every step to do it.
+//
+//     int n; const int *live = StrategyActiveUnits(&n);
+//     for (int k = 0; k < n; k++) { Unit *u = &world->units[live[k]]; ... }
+//
+// Every listed index is active, so the `if (!u->active) continue;` guard that
+// used to open these loops is now dead code - drop it rather than keeping it
+// "just in case", because a guard that never fires hides the day it should.
+//
+// TWO RULES. The order is NOT stable (removal swaps the last entry down), so
+// anything needing deterministic order must sort. And the array is invalidated
+// by any spawn or kill, so do not hold the pointer across one - re-fetch.
+const int *StrategyActiveUnits(int *count);
+
+// Debug builds only: set true to audit the roster invariant every frame. O(pool)
+// per frame, so it is a diagnostic, not a safety net - it clears itself after
+// tracing the first failure. Undefined in release; guard uses with NDEBUG.
+#ifndef NDEBUG
+extern bool strategyRosterAudit;
+#endif
 
 // Population: cap comes from standing houses, used counts own units.
 int StrategyPopCap(int faction);
@@ -84,9 +113,128 @@ bool StrategyQuarrySpawnStone(int bldIndex);
 // Enemy + animal think tick (strategy_ai.c), called on the world's aiTimer.
 void StrategyAiTick(void);
 
+// -- Movement (strategy_move.c) -----------------------------------------------
+//  Path following. The split of responsibility is the point:
+//    src/strategy_path/   - WHERE to go. A cost grid in, tile indices out; has
+//                           never heard of a Unit and links headless.
+//    strategy_move.c      - WHO goes there and HOW. Needs Unit, so it lives
+//                           here beside the world rather than in that module.
+//
+//  Two movers, and choosing between them is a real decision, not a style one:
+//
+//    StrategyMoveTo      - pathed. For a STATIC destination that may be far:
+//                          a clicked point, a tree, a building. Asks the path
+//                          service for a route, walks its waypoints, and falls
+//                          back to straight steering whenever it has no usable
+//                          route - queue full, search still running, no route
+//                          exists. A unit is never stationary because
+//                          pathfinding is busy.
+//    StrategyMoveDirect  - straight steering, the behaviour that predates all
+//                          of this. For a target that MOVES (chasing an enemy,
+//                          shadowing an ally) or a shuffle of a unit or two
+//                          (kiting backwards, stepping to a plant spot). A path
+//                          to a moving target is stale before it arrives, and a
+//                          path for a two-unit shuffle is a search that buys
+//                          nothing - at ten thousand units either is fatal.
+//
+//  Neither decides that the unit has ARRIVED; callers keep their own proximity
+//  tests exactly as they did when every one of these was a lerp.
+void StrategyMoveTo(Unit *u, int index, Vector3 dest, float dt);
+void StrategyMoveDirect(Unit *u, Vector3 dest, float dt);
+
+// Lifecycle, all called from strategy_world.c.
+void StrategyMoveInit(void);            // world load: drop every path
+void StrategyMoveForget(int index);     // a unit died or was recycled
+void StrategyMoveBeginFrame(void);      // refresh the per-frame repath budget
+void StrategyMoveCollect(void);         // drain finished searches into paths
+void StrategyMoveStats(void);           // overlay census
+
+// The nav grid and its version, for strategy_move.c. Read-only: obstacles are
+// stamped by strategy_world.c alone, which is what keeps "who may write the
+// grid" answerable. The version bumps on every change, so a path built against
+// an older one knows to re-ask.
+const SpGrid *StrategyNavGrid(void);
+uint32_t      StrategyNavVersion(void);
+
+// Waypoints a unit still has left to walk, in world space, for the lab's P
+// overlay. Returns how many were written.
+int StrategyMovePathOf(int index, Vector3 *out, int maxOut);
+
 // Faction colors for the GUI (defined in strategy_world.c). Costs/stats/names
 // come from the def tables in strategy_defs.h.
 extern const Color strategyFactionColor[STRAT_FACTIONS];
+
+// -- Render LOD ---------------------------------------------------------------
+// The authored draw path costs a per-part loop of immediate-mode primitives,
+// each with its own matrix push/pop, so the renderer saturates long before the
+// simulation does. The stress lab forces a cheaper tier to get the renderer out
+// of the way and measure the MOVER; the game itself never leaves AUTHORED.
+typedef enum {
+    STRAT_LOD_AUTHORED = 0,  // full authored asset - what the game ships
+    STRAT_LOD_PRIMITIVE,     // one box per unit, no matrix push, no asset lookup
+    STRAT_LOD_DOTS,          // one tiny box per unit
+    STRAT_LOD_NONE,          // units not drawn at all - sim cost in isolation
+    STRAT_LOD_COUNT
+} StrategyRenderLod;
+
+void StrategyRenderLodSet(StrategyRenderLod lod);
+StrategyRenderLod StrategyRenderLodGet(void);
+const char *StrategyRenderLodName(StrategyRenderLod lod);
+
+// Spawn `count` units of one kind for a faction, scattered in a disc around
+// `center`. Stress-test entry point: it goes through the same UnitSpawn as
+// everything else and stops early when the pool is full. Returns how many
+// actually spawned.
+int StrategyDebugSpawnUnits(int faction, UnitKind kind, Vector3 center,
+                            float radius, int count);
+
+// Deactivate every unit. Stress-test reset; leaves buildings and nodes alone.
+void StrategyDebugClearUnits(void);
+
+// Show the navigation grid as flat coloured tiles: red blocked, blue shallow,
+// amber obstacle skirt. The lab's G overlay.
+//
+// A FLAG rather than a draw call, because the tiles must land inside the
+// world's own BeginMode3D pass - the caller does not have the camera, and
+// opening a second 3D pass over the first is the pane-aspect trap all over
+// again.
+//
+// This exists to be A/B'd against the map forge's passability view: the grid is
+// derived independently of it, so if the two disagree, one of them is wrong -
+// and finding that out by eye, against an overlay that already works, is far
+// cheaper than finding it out later as a pathfinding bug.
+void StrategyDebugNavShow(bool on);
+bool StrategyDebugNavShown(void);
+
+// Live obstacle count in the nav grid: blocked tiles, and tiles raised to the
+// obstacle skirt. Lets the overlay show the grid reacting to a placement
+// without the player having to spot a colour change.
+void StrategyDebugNavStats(int *outBlocked, int *outSkirt);
+
+// Draw the route each SELECTED unit has left to walk. The lab's P overlay, and
+// a flag rather than a draw call for the same reason G is.
+//
+// Selected units only, deliberately. Every path at once, at a thousand units,
+// is a mat of lines that answers no question; a handful selected and watched is
+// what actually shows a bad route. The corner markers are the point - their
+// COUNT is the smoothing result, so a crossing that should be four hops and
+// draws twenty says string-pulling did nothing.
+void StrategyDebugPathShow(bool on);
+bool StrategyDebugPathShown(void);
+
+// Per-frame path service numbers for the overlay: how many searches are queued,
+// how many units are walking a route, how many are waiting on one, and how many
+// A* nodes the last frame cost. Counts come from the profiler counters, so they
+// are live whether or not the profiler overlay is showing.
+void StrategyDebugPathStats(int *outQueued, int *outActive,
+                            int *outPending, int *outNodes);
+
+// A* expansions allowed per frame across every queued search. The lab exposes
+// this as a slider because the claim it tests - that a low budget makes paths
+// arrive LATE but never makes a unit stand still - is the one thing about
+// time-slicing that has to be checked by eye.
+void StrategyDebugPathBudgetSet(int nodesPerFrame);
+int  StrategyDebugPathBudget(void);
 
 // -- Effects (strategy_effects.c) ---------------------------------------------
 // Small procedural pool drawn inside BeginMode3D. No textures.

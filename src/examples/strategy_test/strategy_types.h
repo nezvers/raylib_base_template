@@ -25,7 +25,19 @@
 #include "../../strategy_asset/strategy_asset.h"
 
 // -- Capacities --------------------------------------------------------------
-#define STRAT_MAX_UNITS      96
+// STRAT_MAX_UNITS is TWO-TIER, the same scheme as SGM_*/SGA_* (see CMakeLists):
+// the value here is the WEB tier, and desktop gets a raised one injected as a
+// compile definition. Web stays small as a PERFORMANCE guard, not a memory one
+// - 10k units is only 2.4 MB, which the 128 MB heap swallows, but a browser
+// cannot draw 10k procedural units at any framerate.
+//
+// Sizing note for anything added to Unit: the struct is 248 bytes and the
+// update loop walks it three times a frame. At the desktop cap that is 2.4 MB
+// per pass, so a field only earns its place if the SIM needs it. Per-unit data
+// used by one subsystem belongs in a side array indexed by slot instead.
+#ifndef STRAT_MAX_UNITS
+#define STRAT_MAX_UNITS      256    // Web tier; desktop raised via CMake
+#endif
 #define STRAT_MAX_BUILDINGS  24
 #define STRAT_MAX_NODES      48
 #define STRAT_MAX_CORPSES    16     // visual-only death animations in flight
@@ -43,6 +55,34 @@
 #define STRAT_ANIMAL_COUNT   6      // weak neutral critters spawned at init
 #define STRAT_ANIMAL_STRONG_COUNT 3 // strong neutral beasts spawned at init
 #define STRAT_AI_ATTACK_SQUAD 4     // idle enemy soldiers needed for an attack wave
+
+// -- Separation and arrival ---------------------------------------------------
+// EVERY DISTANCE HERE IS DERIVED FROM STRAT_UNIT_RADIUS, never typed as a bare
+// number. The original arrival test was a literal 0.15 against a 0.35 radius,
+// which meant a crowded unit could not physically satisfy it - the two numbers
+// had drifted apart because nothing tied them together. Deriving them makes
+// that class of mistake impossible: change the radius and the thresholds follow.
+#define STRAT_SEP_RADIUS     (2.0f*STRAT_UNIT_RADIUS)   // pair push distance
+#define STRAT_SEP_STRENGTH   6.0f    // push accel, world units/s^2 at full overlap
+#define STRAT_SEP_DAMP       8.0f    // velocity decay/s; higher = stops sooner
+#define STRAT_SEP_DEADBAND   0.02f   // push below this counts as zero (anti-shimmer)
+#define STRAT_SEP_MAX_NEIGHBORS 8    // pushers considered; beyond this the sum
+                                     //   barely turns, and the cap makes a
+                                     //   death-ball's cost flat instead of spiky
+
+#define STRAT_ARRIVE_SLOW    (3.0f*STRAT_UNIT_RADIUS)   // begin ramping speed down
+#define STRAT_ARRIVE_STOP    (1.2f*STRAT_UNIT_RADIUS)   // close enough: settle
+// Hysteresis: a settled unit only re-seeks once it is pushed WELL past the
+// slowing band, not just outside the stop radius. Set this near STOP and a unit
+// on the edge of a crowd flips between settled and seeking every few frames,
+// which looks exactly like the spiral this is meant to remove.
+#define STRAT_ARRIVE_RESUME  (2.0f*STRAT_ARRIVE_SLOW)   // shoved this far: re-seek
+#define STRAT_ARRIVE_STALL   1.25f   // seconds of no progress before settling
+#define STRAT_AGGRO_STRIDE   15      // 1 unit in N runs its sight scan per frame
+                                     //   (~0.25s worst-case reaction at 60 Hz)
+#define STRAT_SETTLE_CROWD   3       // settled neighbours that justify stopping
+                                     //   short - without this a chokepoint
+                                     //   grinds forever
 
 // Neutral animal reactions to being hit.
 #define STRAT_FLEE_PACK_RADIUS 5.0f // weak animals this close flee together
@@ -134,6 +174,26 @@ typedef enum {
     UNIT_REPAIR,        // worker restoring a damaged building (.targetBuilding)
 } UnitState;
 
+// How far through a move a unit is. This is NOT a UnitState - a unit is still
+// UNIT_MOVE while it arrives, and the state machine in UnitUpdate does not
+// branch on it. It exists to stop crowds orbiting their own destination.
+//
+// THE BUG IT FIXES. Arrival used to be a single test: within 0.15 units of the
+// target, become UNIT_IDLE. But STRAT_UNIT_RADIUS is 0.35, so in any crowd the
+// push from neighbours GUARANTEES a unit is never that close - it stays
+// UNIT_MOVE forever, driving inward while separation drives it out, and the
+// whole pile rotates. Every unit in a stuck blob is a permanent engine.
+//
+// The fix is a progression with hysteresis rather than one threshold, plus one
+// asymmetry: a SETTLED unit stops APPLYING push while still RECEIVING it. Two
+// settled neighbours therefore stop shoving each other, which is what actually
+// terminates the loop - without it a finished pile still breathes.
+typedef enum {
+    ARRIVE_SEEKING = 0, // full speed toward target
+    ARRIVE_SLOWING,     // inside the approach band; speed ramps down
+    ARRIVE_SETTLED,     // parked: no drive, no push applied, still pushable
+} ArrivalPhase;
+
 // A queued worker job (Shift-RMB chain). One building index serves all kinds;
 // gather resolves its resource node at dispatch time. See WorkerStartNextJob.
 typedef enum {
@@ -154,6 +214,33 @@ typedef struct {
     Vector3      pos;
     Vector3      target;            // move destination (UNIT_MOVE / UNIT_FLEE)
     UnitState    state;
+
+    // Separation velocity, in world units/second, y always 0. Accumulated by
+    // the push pass and integrated ONCE at the end of the frame.
+    //
+    // WHY IT IS STORED. Separation used to teleport positions inside the pair
+    // loop, so a unit's displacement depended on how many neighbors happened to
+    // be visited after it - and with a spatial hash that order changes every
+    // frame. Summing into a velocity makes the result order-independent, and
+    // keeping it between frames is what lets it be DAMPED: an undamped push
+    // that is recomputed from scratch each frame has no memory, so a crowd
+    // oscillates instead of coming to rest.
+    Vector3      vel;
+
+    // Arrival progress for UNIT_MOVE / UNIT_FLEE. See ArrivalPhase.
+    ArrivalPhase arrival;
+    float        stallTimer;        // seconds of near-zero progress while moving
+    float        lastProgressDist;  // distance to target at the last stall check
+    // Last building this unit deposited into, or -1. A CACHE, not state: it is
+    // revalidated before every use and re-searched when stale, so losing it
+    // costs one scan and never changes behaviour. It exists because UNIT_RETURN
+    // otherwise re-scans every building every frame for every carrying worker.
+    int          dropoffCache;
+
+    int          crowd;             // settled neighbours seen by the last push
+                                    //   pass; lets a unit boxed in by finished
+                                    //   units settle where it stands instead of
+                                    //   grinding at a chokepoint forever
     float        hp, maxHp;
 
     // Stats resolved at spawn (def x difficulty x building buffs); see header.
