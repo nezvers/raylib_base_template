@@ -138,13 +138,18 @@ static inline void SpProfSet(SpProfCounter c, int v) { spProfCount[c] = v; }
 static inline void SpProfAdd(SpProfCounter c, int v) { spProfCount[c] += v; }
 static inline int  SpProfGet(SpProfCounter c)        { return spProfCount[c]; }
 
-// Counters that describe THIS frame (cache hits, nodes expanded) must be zeroed
-// each frame; counters that describe current state (units active, fields live)
-// must not. Only the per-frame ones are listed here.
+// Counters that describe THIS frame (nodes expanded, units drawn) must be
+// zeroed each frame; counters that describe current state (units active, fields
+// live) must not. Only the per-frame ones are listed here.
+//
+// FLOW HIT/MISS ARE DELIBERATELY NOT RESET. They are incremented by a GROUP
+// ORDER, which happens on the frame the player clicks and on no other - zeroing
+// them per frame would leave the overlay reading `hit 0 miss 0` permanently
+// except for the single frame of the click, which nobody can see. As session
+// totals the ratio between them is the number that matters, and it is the
+// direct measure of whether goal coarsening is earning its place.
 static inline void SpProfResetFrameCounters(void)
 {
-    spProfCount[SP_COUNT_FLOW_HIT]    = 0;
-    spProfCount[SP_COUNT_FLOW_MISS]   = 0;
     spProfCount[SP_COUNT_ASTAR_NODES] = 0;
     spProfCount[SP_COUNT_DRAWN_UNITS] = 0;
 }

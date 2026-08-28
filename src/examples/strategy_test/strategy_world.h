@@ -160,6 +160,49 @@ uint32_t      StrategyNavVersion(void);
 // overlay. Returns how many were written.
 int StrategyMovePathOf(int index, Vector3 *out, int maxOut);
 
+// The flow field a unit is riding (SP_FIELD_NONE if none) and the destination
+// it was actually given - its formation slot, not the clicked point. Both feed
+// the lab's F and O overlays.
+SpFieldId StrategyMoveFieldOf(int index);
+bool      StrategyMoveGoalOf(int index, Vector3 *out);
+
+// -- Group orders -------------------------------------------------------------
+//  StrategyOrderMove stays the single-unit primitive - strategy_ai.c and every
+//  internal caller keep working untouched. This sits ABOVE it: it computes a
+//  formation, assigns each unit its own slot, and then calls StrategyOrderMove
+//  per unit. UNIT_MOVE's handler never learns that formations exist, which is
+//  what keeps the change survivable.
+//
+//  WHY A GROUP ORDER IS NOT JUST N SINGLE ORDERS. A click is one point, and 500
+//  units ordered to one point are being asked to occupy space that physically
+//  holds about six - so they queue and shove no matter how good the arrival
+//  logic is. Phase 2 measured it: 300 units to one point settle, and settle
+//  7,316 pairs deep inside each other. The identical steering code with
+//  formation slots gives ZERO overlapping pairs. The order has to become an
+//  AREA, and that is what this does.
+void StrategyOrderMoveGroup(const int *units, int count, Vector3 dest);
+
+// Units sharing a destination, above which a flow field is built instead of a
+// path each. A field is looked up FIRST regardless of size, so a lone unit sent
+// where a crowd is already headed rides theirs for free; the threshold only
+// governs whether a NEW field is worth building.
+//
+// Exposed because the A/B it enables is the most informative thing the lab can
+// show: watch one field serve 2,000 units with astar at 0 ms, then raise the
+// threshold past the group size and watch the queue pin.
+void StrategyMoveFlowThresholdSet(int n);
+int  StrategyMoveFlowThreshold(void);
+
+// Recount which flow fields are still in use. Refcounts are RECOMPUTED, never
+// hand-maintained: every exit path - death, re-order, arrival, world reset -
+// would otherwise need a decrement, and missing one leaks a field until all
+// slots pin and everything silently degrades to individual A*. A sweep is
+// O(live) and structurally cannot leak.
+void StrategyMoveFlowSweep(float now);
+
+// Fields resident right now, for the overlay's `fields n/max` line.
+int StrategyMoveFlowLive(void);
+
 // Faction colors for the GUI (defined in strategy_world.c). Costs/stats/names
 // come from the def tables in strategy_defs.h.
 extern const Color strategyFactionColor[STRAT_FACTIONS];
@@ -221,6 +264,20 @@ void StrategyDebugNavStats(int *outBlocked, int *outSkirt);
 // draws twenty says string-pulling did nothing.
 void StrategyDebugPathShow(bool on);
 bool StrategyDebugPathShown(void);
+
+// F: the direction field the first selected unit is riding, every fourth cell,
+// tinted by distance-to-goal. One field at a time on purpose - sixteen overlaid
+// arrow mats answer nothing. Nothing drawn means nothing selected is on a
+// field, which is itself the answer when a group that should share one doesn't.
+void StrategyDebugFlowShow(bool on);
+bool StrategyDebugFlowShown(void);
+
+// O: a line from each selected unit to the destination it was actually given -
+// its formation SLOT, not the clicked point. The spread of the endpoints is the
+// formation; whether the lines cross is whether slot assignment is spatially
+// coherent, which nothing else makes visible.
+void StrategyDebugSlotShow(bool on);
+bool StrategyDebugSlotShown(void);
 
 // Per-frame path service numbers for the overlay: how many searches are queued,
 // how many units are walking a route, how many are waiting on one, and how many

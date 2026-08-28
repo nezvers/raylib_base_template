@@ -138,6 +138,27 @@ static void Update()
     if (IsKeyPressed(KEY_T))     s_profView = (s_profView + 1) % 3;
     if (IsKeyPressed(KEY_G))     StrategyDebugNavShow(!StrategyDebugNavShown());
     if (IsKeyPressed(KEY_P))     StrategyDebugPathShow(!StrategyDebugPathShown());
+    if (IsKeyPressed(KEY_F))     StrategyDebugFlowShow(!StrategyDebugFlowShown());
+    if (IsKeyPressed(KEY_O))     StrategyDebugSlotShow(!StrategyDebugSlotShown());
+
+    // Flow threshold, doubling and halving for the same reason the budget does:
+    // the A/B this exists for is "one field for 2,000 units" against "2,000
+    // individual searches", and crossing a group size of thousands one unit at
+    // a time is not a control.
+    //
+    // THIS IS THE MOST INFORMATIVE KNOB IN THE LAB. Raise it past the size of
+    // the selected group and the same order that cost one field build becomes
+    // one A* search per unit - watch the queue pin and astar climb off zero.
+    if (IsKeyPressed(KEY_COMMA))
+    {
+        int t = StrategyMoveFlowThreshold()/2;
+        StrategyMoveFlowThresholdSet((t < 1) ? 1 : t);
+    }
+    if (IsKeyPressed(KEY_SLASH))
+    {
+        int t = StrategyMoveFlowThreshold()*2;
+        StrategyMoveFlowThresholdSet((t > 16384) ? 16384 : t);
+    }
 
     // A* budget, halving and doubling rather than stepping: the interesting
     // range spans three orders of magnitude (100 nodes makes paths visibly
@@ -288,6 +309,22 @@ static void DrawProfiler(Vector2 gameSize)
         y += line;
     }
 
+    // Flow fields. `fields` is what the refcount sweep is judged by: leave a
+    // long session running and it must come back DOWN as groups arrive. Pinned
+    // at the cap means a missed release, and the symptom would otherwise be
+    // silent - everything quietly degrading to individual A*.
+    {
+        int live = StrategyMoveFlowLive();
+        bool pinned = (live >= SP_FLOW_FIELDS_MAX);
+        DrawText(TextFormat("flow  fields %d/%d   threshold %d   hit %d  miss %d",
+                            live, SP_FLOW_FIELDS_MAX,
+                            StrategyMoveFlowThreshold(),
+                            SpProfGet(SP_COUNT_FLOW_HIT),
+                            SpProfGet(SP_COUNT_FLOW_MISS)),
+                 (int)x, (int)y, fs, pinned ? hot : dim);
+        y += line;
+    }
+
     if (s_profView < 2) return;
 
     for (int i = 0; i < SP_PROF_COUNT; i++)
@@ -314,7 +351,8 @@ static void Gui()
     const char *keys[] = {
         "N spawn    M two armies    C clear",
         "[ ] count    1-6 faction    L render LOD",
-        "G nav grid    P paths    - + astar budget",
+        "G nav grid    P paths    F flow    O slots",
+        "- + astar budget    , / flow threshold",
         "T profiler    SPACE pause    . step    ESC back",
     };
     int n = (int)(sizeof(keys)/sizeof(keys[0]));

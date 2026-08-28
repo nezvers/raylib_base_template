@@ -130,6 +130,9 @@ static uint32_t s_navVersion;
 // anyway. Init stamps nothing and calls NavRebuild once at the end.
 static bool s_navReady;
 
+// Paces the flow-field refcount sweep. See StrategyMoveFlowSweep.
+static float s_flowSweepTimer;
+
 // The grid must be able to hold any map the forge can author. Checked here
 // because this is the one file that sees both headers.
 _Static_assert(SP_GRID_MAX >= SGM_GRID_MAX, "nav grid smaller than map grid");
@@ -492,6 +495,7 @@ static void NavRebuild(void)
 
     SpGridBuildSkirt(&s_nav);
     s_navVersion++;
+    SpFlowSetVersion(s_navVersion);
 }
 
 // Patch after an obstacle APPEARED. Only the skirt needs redoing; the stamp
@@ -506,6 +510,10 @@ static void NavPatch(void)
 {
     SpGridBuildSkirt(&s_nav);
     s_navVersion++;
+    // Every flow field is a whole-grid answer, so one new wall retires all of
+    // them. Told here rather than at each caller: this and NavRebuild are the
+    // only two places s_navVersion moves.
+    SpFlowSetVersion(s_navVersion);
 }
 
 // Patch after an obstacle VANISHED. Restoring its footprint from terrain also
@@ -946,6 +954,8 @@ void StrategyWorldInit(void)
     // Resetting both here rather than at the top of init is deliberate: the
     // grid has to exist before the service can be pointed at it.
     SpServiceReset(&s_nav);
+    SpFlowReset(&s_nav);
+    SpFlowSetVersion(s_navVersion);
     StrategyMoveInit();
 
     // Starting stockpiles so building/training is possible right away. The
@@ -1956,14 +1966,45 @@ static void OrderInput(void)
     const int *sel = SelectedUnits(&selCount);
 
     bool any = false;
-    for (int k = 0; k < selCount; k++)
-    {
-        Unit *u = &world.units[sel[k]];
-        if (u->faction != 0) continue;
 
-        OrderUnitAt(u, hostile, enemyBld, node, ownGather, ownScaffold, ownRepair,
-                    shift, ground);
-        any = true;
+    // A PLAIN GROUND MOVE IS THE ONE ORDER THAT BECOMES A GROUP ORDER. Every
+    // other branch already targets a specific object - a unit, a node, a
+    // building - so there is nothing to spread the group over and each unit
+    // wants the identical destination anyway.
+    //
+    // For ground, the click is a POINT and the group needs an AREA: 500 units
+    // sent to one spot are being asked to stand where about six fit. Phase 2
+    // measured what that costs even with perfect settling - 300 units to one
+    // point come to rest 7,316 overlapping pairs deep. The same steering with
+    // formation slots gives zero.
+    bool plainMove = (hostile < 0 && enemyBld < 0 && node < 0 &&
+                      ownGather < 0 && ownScaffold < 0 && ownRepair < 0);
+
+    if (plainMove && !shift)
+    {
+        // Gather the player's own selected units and hand them over as a group.
+        // Shift is excluded: it means "queue this job", which is a per-unit
+        // notion the formation layer has nothing to say about.
+        static int s_groupBuf[STRAT_MAX_UNITS];
+        int n = 0;
+        for (int k = 0; k < selCount; k++)
+        {
+            if (world.units[sel[k]].faction != 0) continue;
+            s_groupBuf[n++] = sel[k];
+        }
+        if (n > 0) { StrategyOrderMoveGroup(s_groupBuf, n, ground); any = true; }
+    }
+    else
+    {
+        for (int k = 0; k < selCount; k++)
+        {
+            Unit *u = &world.units[sel[k]];
+            if (u->faction != 0) continue;
+
+            OrderUnitAt(u, hostile, enemyBld, node, ownGather, ownScaffold, ownRepair,
+                        shift, ground);
+            any = true;
+        }
     }
     if (!any) return;
 
@@ -3158,9 +3199,17 @@ static void NavDraw(void)
 
 // -- Path overlay -------------------------------------------------------------
 static bool s_pathShow;
+static bool s_flowShow;
+static bool s_slotShow;
 
 void StrategyDebugPathShow(bool on) { s_pathShow = on; }
 bool StrategyDebugPathShown(void)   { return s_pathShow; }
+
+void StrategyDebugFlowShow(bool on) { s_flowShow = on; }
+bool StrategyDebugFlowShown(void)   { return s_flowShow; }
+
+void StrategyDebugSlotShow(bool on) { s_slotShow = on; }
+bool StrategyDebugSlotShown(void)   { return s_slotShow; }
 
 void StrategyDebugPathBudgetSet(int nodesPerFrame) { SpServiceSetBudget(nodesPerFrame); }
 int  StrategyDebugPathBudget(void)                 { return SpServiceBudget(); }
@@ -3206,6 +3255,82 @@ static void PathDraw(void)
             DrawCube(cur, 0.16f, 0.16f, 0.16f, col);
             prev = cur;
         }
+    }
+}
+
+// -- Flow field overlay -------------------------------------------------------
+// Draws the direction field the FIRST selected unit is riding. One field, not
+// all sixteen: overlapping arrow mats answer nothing, and the question is
+// always "what is this group following". Nothing selected, or nothing selected
+// that is on a field, draws nothing - which is itself the answer when a group
+// that should be sharing a field is not.
+static void FlowDraw(void)
+{
+    const SpGrid *g = StrategyNavGrid();
+    if (g == NULL) return;
+
+    int selCount = 0;
+    const int *sel = SelectedUnits(&selCount);
+
+    SpFieldId id = SP_FIELD_NONE;
+    for (int k = 0; k < selCount && id == SP_FIELD_NONE; k++)
+        id = StrategyMoveFieldOf(sel[k]);
+    if (id == SP_FIELD_NONE || !SpFlowValid(id)) return;
+
+    const float y = 0.30f;      // under the path overlay, over the nav tint
+
+    // Every fourth cell. At 96x96 that is 576 arrows instead of 9,216, which is
+    // the difference between reading the field and looking at fur.
+    for (int tz = 0; tz < g->h; tz += 4)
+    {
+        for (int tx = 0; tx < g->w; tx += 4)
+        {
+            float dx, dz;
+            if (!SpFlowDir(id, tx, tz, &dx, &dz)) continue;
+            if (dx == 0.0f && dz == 0.0f) continue;         // the goal itself
+
+            Vector3 c = SpCellToWorld(g, (SpCell)(tz*g->w + tx));
+
+            // Cost tint: bright near the goal, dark far from it, so the shape
+            // of the field reads at a glance without following any one arrow.
+            uint16_t cost = SpFlowCost(id, tx, tz);
+            float t = (float)cost/2000.0f;
+            if (t > 1.0f) t = 1.0f;
+            Color col = { (unsigned char)(60 + 195*(1.0f - t)), 220,
+                          (unsigned char)(80 + 100*t), 200 };
+
+            Vector3 a = { c.x - dx*0.35f, y, c.z - dz*0.35f };
+            Vector3 b = { c.x + dx*0.35f, y, c.z + dz*0.35f };
+            DrawLine3D(a, b, col);
+            DrawCube(b, 0.12f, 0.02f, 0.12f, col);          // the head
+        }
+    }
+}
+
+// -- Formation slot overlay ---------------------------------------------------
+// A line from each selected unit to the destination it was ACTUALLY given. The
+// spread of the endpoints is the formation; whether the lines cross is whether
+// slot assignment is spatially coherent. Crossed lines mean units walk through
+// each other to reach their slots - a sort-key bug, invisible any other way.
+static void SlotDraw(void)
+{
+    const float y = 0.40f;
+
+    int selCount = 0;
+    const int *sel = SelectedUnits(&selCount);
+    for (int k = 0; k < selCount; k++)
+    {
+        int i = sel[k];
+        const Unit *u = &world.units[i];
+        if (!u->active) continue;
+
+        Vector3 goal;
+        if (!StrategyMoveGoalOf(i, &goal)) continue;
+
+        Vector3 from = { u->pos.x, y, u->pos.z };
+        Vector3 to   = { goal.x,   y, goal.z   };
+        DrawLine3D(from, to, (Color){ 255, 200, 60, 160 });
+        DrawCube(to, 0.22f, 0.02f, 0.22f, (Color){ 255, 200, 60, 220 });
     }
 }
 
@@ -3266,6 +3391,15 @@ void StrategyWorldUpdate(float dt)
     SpProfEnd(SP_PROF_SEPARATE);
 
     StrategyMoveStats();
+
+    // Flow refcounts, recomputed at 1 Hz. Cheap (O(live)) and immune to a
+    // missed decrement, which is the whole reason it is a sweep.
+    s_flowSweepTimer += dt;
+    if (s_flowSweepTimer >= 1.0f)
+    {
+        s_flowSweepTimer = 0.0f;
+        StrategyMoveFlowSweep((float)GetTime());
+    }
 
     // Arrival census, for the clustering acceptance test. The fix is judged by
     // eye - a pile either stops or it does not - but the eye cannot tell a
@@ -3663,6 +3797,12 @@ void StrategyWorldDraw3D(void)
     // Paths above the nav tint but before the props, so a route reads against
     // the terrain it crosses rather than through a tree.
     if (s_pathShow) PathDraw();
+
+    // Flow arrows go UNDER the paths: when both are on, the question is whether
+    // an individual route agrees with the field, and the route has to be the
+    // one on top for that comparison to be readable.
+    if (s_flowShow) FlowDraw();
+    if (s_slotShow) SlotDraw();
 
     for (int i = 0; i < STRAT_MAX_NODES; i++)
     {
