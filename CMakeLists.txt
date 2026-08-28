@@ -158,6 +158,23 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
         src/strategy_map/strategy_map_io.c
         src/strategy_map/strategy_map_catalog.c)
     target_link_libraries(map_tests raylib)
+
+    # path_tests - navigation and steering. src/strategy_path/ deliberately does
+    # not include strategy_types.h (which would drag in the whole anim system
+    # via strategy_asset.h), so it links here with no stubs at all. raylib is
+    # linked for Vector2/Vector3 and the maths inlines only.
+    # strategy_map.c rides along ONLY so the nav grid's tile<->world maths can
+    # be cross-checked against SgmTileToWorld directly. The two are duplicated
+    # (strategy_path/ must stay linkable without the map module), and a silent
+    # drift between them would put every unit half a tile off its path.
+    add_executable(path_tests
+        tests/path_tests.c
+        src/strategy_path/strategy_path_hash.c
+        src/strategy_path/strategy_path_grid.c
+        src/strategy_path/strategy_path_astar.c
+        src/strategy_path/strategy_path_service.c
+        src/strategy_map/strategy_map.c)
+    target_link_libraries(path_tests raylib)
 endif()
 
 # Checks if OSX and links appropriate frameworks (Only required on MacOS)
@@ -315,6 +332,70 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
     endif()
 endif()
 
+# ---------------------------------------------------------------------------
+#  Strategy runtime capacities. Same two-tier scheme again: Web keeps the small
+#  value in strategy_types.h, desktop gets the raised one. Unlike the map and
+#  asset caps this one is a PERFORMANCE guard rather than a memory guard - 10000
+#  units is only 2.4 MB of Unit structs, well inside the 128 MB Web heap, but a
+#  browser cannot draw that many procedural units at any framerate.
+#
+#  NOTE these are plain variables, NOT cache entries, for the same reason as
+#  every other cap block here: reconfiguring one build dir from desktop to Web
+#  would keep a cached 10000 and make the Web build unusable. An explicit -D
+#  still wins, since that defines the variable before this runs.
+# ---------------------------------------------------------------------------
+if (NOT "${PLATFORM}" STREQUAL "Web")
+    if (NOT DEFINED STRAT_MAX_UNITS)  # strategy_types.h Web default: 256
+        set(STRAT_MAX_UNITS 10000)
+    endif()
+endif()
+
+# Navigation / steering capacities (src/strategy_path/). Same two-tier scheme:
+# Web keeps the small header defaults, desktop is raised here.
+#
+# SP_HASH_ITEMS_MAX MUST BE >= STRAT_MAX_UNITS. The spatial hash holds one entry
+# per live unit; if it is short, the overflow is REFUSED rather than crashing -
+# which reads in-game as units at the back of a crowd walking through each other.
+# It is derived from STRAT_MAX_UNITS above rather than typed twice, so raising
+# the unit cap cannot leave the hash behind.
+#
+# A plain variable, NOT a cache entry: the platform default must be recomputed
+# on every configure, or a desktop->Web reconfigure keeps the big desktop value.
+if (NOT "${PLATFORM}" STREQUAL "Web")
+    if (NOT DEFINED SP_GRID_MAX)         # strategy_path.h Web default: 128
+        set(SP_GRID_MAX 256)
+    endif()
+    if (NOT DEFINED SP_HASH_CELLS_MAX)   # strategy_path.h Web default: 16384
+        set(SP_HASH_CELLS_MAX 65536)
+    endif()
+    if (NOT DEFINED SP_HASH_ITEMS_MAX)   # strategy_path.h Web default: 256
+        set(SP_HASH_ITEMS_MAX ${STRAT_MAX_UNITS})
+    endif()
+    if (NOT DEFINED SP_PATH_MAX)         # strategy_path.h Web default: 12
+        set(SP_PATH_MAX 24)
+    endif()
+    if (NOT DEFINED SP_REQUESTS_MAX)     # strategy_path.h Web default: 64
+        set(SP_REQUESTS_MAX 256)
+    endif()
+endif()
+
+function(sp_apply_caps target)
+    foreach(cap SP_GRID_MAX SP_HASH_CELLS_MAX SP_HASH_ITEMS_MAX
+                SP_PATH_MAX SP_REQUESTS_MAX)
+        if (DEFINED ${cap})
+            target_compile_definitions(${target} PUBLIC ${cap}=${${cap}})
+        endif()
+    endforeach()
+endfunction()
+
+function(strat_apply_caps target)
+    foreach(cap STRAT_MAX_UNITS)
+        if (DEFINED ${cap})
+            target_compile_definitions(${target} PUBLIC ${cap}=${${cap}})
+        endif()
+    endforeach()
+endfunction()
+
 function(sgm_apply_caps target)
     foreach(cap SGM_GRID_MAX SGM_PLACES_MAX SGM_MAPS_MAX)
         if (DEFINED ${cap})
@@ -351,6 +432,31 @@ endif()
 sgm_apply_caps(${PROJECT_NAME})
 if (TARGET map_tests)
     sgm_apply_caps(map_tests)
+endif()
+# path_tests links strategy_map.c for the tile<->world cross-check, so it needs
+# the same SGM caps - otherwise it would compare a 256-grid nav module against a
+# 128-grid map module and the mismatch would look like a maths bug.
+if (TARGET path_tests)
+    sgm_apply_caps(path_tests)
+endif()
+
+if ("${PLATFORM}" STREQUAL "Web")
+    message(STATUS " - - - strategy runtime capacities: WEB tier (header defaults)")
+else()
+    message(STATUS " - - - strategy runtime capacities: units=${STRAT_MAX_UNITS}")
+endif()
+
+strat_apply_caps(${PROJECT_NAME})
+
+if ("${PLATFORM}" STREQUAL "Web")
+    message(STATUS " - - - strategy path capacities: WEB tier (header defaults)")
+else()
+    message(STATUS " - - - strategy path capacities: grid=${SP_GRID_MAX} hashCells=${SP_HASH_CELLS_MAX} hashItems=${SP_HASH_ITEMS_MAX} path=${SP_PATH_MAX} requests=${SP_REQUESTS_MAX}")
+endif()
+
+sp_apply_caps(${PROJECT_NAME})
+if (TARGET path_tests)
+    sp_apply_caps(path_tests)
 endif()
 
 # Setting RESOURCES_PATH
