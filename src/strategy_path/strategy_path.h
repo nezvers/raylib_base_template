@@ -372,4 +372,91 @@ Vector3 SpCellToWorld(const SpGrid *g, SpCell c);
 const SpServiceStats *SpServiceGetStats(void);
 void SpServiceResetStats(void);
 
+// -- Flow fields --------------------------------------------------------------
+//  What A* cannot do: serve five hundred units heading to one place for the
+//  price of one. A flow field is a whole-grid answer to "which way from here?"
+//  built once per DESTINATION, so the cost of an order stops depending on how
+//  many units it was given to.
+//
+//  THE SWITCH IS ON DISTINCT DESTINATIONS, NOT GROUP SIZE. The expensive thing
+//  was never the crowd, it was the number of different places they are going.
+//  Two hundred units to one point should share a field at any group size; three
+//  units to three corners are three searches and cost more than the two hundred.
+//  So a field is looked up FIRST and only built when the group is big enough to
+//  earn one - see SpFlowFind / SpFlowAcquire.
+//
+//  BUCKETED DIJKSTRA, NOT A HEAP. Terrain costs are small bounded integers, so
+//  the priority queue can be a ring of buckets indexed by cost: O(cells) instead
+//  of O(cells log cells). On a 256-grid that is ~65k operations rather than ~1M,
+//  and a field build is the single most expensive operation in the system.
+//
+//  int8_t DIRECTION PAIRS, NOT Vector2. Two bytes per cell instead of eight
+//  saves 384 KB per field - the difference between affording four fields and
+//  sixteen. The direction is one of the eight neighbours, so a byte pair is not
+//  even lossy.
+#ifndef SP_FLOW_FIELDS_MAX
+#define SP_FLOW_FIELDS_MAX   4      // Web tier; desktop raised via CMake
+#endif
+
+#define SP_FLOW_UNREACHED    0xFFFFu
+
+typedef struct {
+    SpCell   goalCell;
+    uint32_t navVersion;        // grid version this was built against
+    float    lastUsed;          // seconds; LRU eviction
+    int32_t  refCount;          // units currently attached, recomputed by sweep
+    bool     live;
+
+    uint16_t integration[SP_CELLS_MAX];  // cost-to-goal, SP_FLOW_UNREACHED = none
+    int8_t   dirX[SP_CELLS_MAX];
+    int8_t   dirZ[SP_CELLS_MAX];
+} SpFlowField;
+
+typedef int32_t SpFieldId;
+#define SP_FIELD_NONE  ((SpFieldId)-1)
+
+// Drop every field. Call alongside SpServiceReset.
+void SpFlowReset(const SpGrid *g);
+
+// An existing, still-valid field for this goal, or SP_FIELD_NONE. Goals are
+// keyed COARSELY - to 2x2 tile blocks - so two clicks a tile apart share one
+// field. Two tiles of goal error disappears under formation offsets, and the
+// coarsening roughly quadruples the hit rate.
+SpFieldId SpFlowFind(int gx, int gz);
+
+// Get or build a field for this goal. Returns SP_FIELD_NONE only when every
+// slot is pinned by units still using it - in which case the caller falls back
+// to individual paths, which is slower but never wrong.
+SpFieldId SpFlowAcquire(int gx, int gz);
+
+// Which way to walk from a tile, as a unit-ish vector in world space. Writes
+// (0,0) and returns false when the tile cannot reach the goal - the caller then
+// steers directly, the same fallback every other failure takes.
+bool SpFlowDir(SpFieldId id, int tx, int tz, float *outX, float *outZ);
+
+// Cost-to-goal at a tile, for group cohesion: a unit whose integration value is
+// far below the group median is ahead of the pack and can slow down. Returns
+// SP_FLOW_UNREACHED when the tile cannot reach.
+uint16_t SpFlowCost(SpFieldId id, int tx, int tz);
+
+// Tell the cache the nav grid changed. Every field is a WHOLE-GRID answer, so
+// any local change can make part of one wrong - invalidation is deliberately
+// all-or-nothing rather than an attempt at partial repair, which is where the
+// subtle bugs live. One integer compare to detect, so the bluntness is free.
+void SpFlowSetVersion(uint32_t version);
+
+// Is this field still usable? False once the nav grid has changed under it.
+bool SpFlowValid(SpFieldId id);
+
+// Refcounts are RECOMPUTED BY SWEEP, not hand-maintained. Every exit path -
+// death, re-order, arrival, world reset - would otherwise need a decrement, and
+// missing one leaks a field until all slots pin and everything silently
+// degrades to individual A*. The caller reports who is using what, at whatever
+// cadence it likes; a sweep is O(live) and structurally cannot leak.
+void SpFlowSweepBegin(void);
+void SpFlowSweepMark(SpFieldId id);
+void SpFlowSweepEnd(float now);
+
+int  SpFlowLiveCount(void);
+
 #endif // STRATEGY_PATH_H

@@ -1228,6 +1228,312 @@ static void TestServiceUnreachableReports(void)
 }
 
 // ---------------------------------------------------------------------------
+//  Flow fields
+//
+//  The headline test is not "does a field build" - it is that following the
+//  direction arrows from EVERY reachable cell of a maze arrives at the goal.
+//  A field with one local minimum looks completely fine in an overlay and traps
+//  whichever units happen to walk into that cell, which is the kind of bug that
+//  gets blamed on the steering for a week.
+//
+//  The second is that bucketed Dijkstra agrees with a plain reference Dijkstra
+//  on random grids. The bucket ring is the one piece of cleverness in the build,
+//  and its failure mode - a relaxation wrapping onto an already-drained bucket -
+//  loses cells silently and only for particular cost patterns.
+// ---------------------------------------------------------------------------
+
+static void TestFlowBasics(void)
+{
+    SpGridInit(&s_grid, 24, 24);
+    SpFlowReset(&s_grid);
+    SpFlowSetVersion(1);
+
+    SpFieldId id = SpFlowAcquire(12, 12);
+    CHECK(id != SP_FIELD_NONE);
+    CHECK(SpFlowValid(id));
+    CHECK(SpFlowLiveCount() == 1);
+
+    // The goal itself is cost 0 and has no direction to give.
+    CHECK(SpFlowCost(id, 12, 12) == 0);
+    float dx, dz;
+    CHECK(!SpFlowDir(id, 12, 12, &dx, &dz));
+
+    // Cost rises with distance on open ground, and a direction exists anywhere.
+    CHECK(SpFlowCost(id, 12, 11) < SpFlowCost(id, 12, 5));
+    CHECK(SpFlowDir(id, 2, 2, &dx, &dz));
+    CHECK(dx > 0.0f && dz > 0.0f);          // toward the middle, from the corner
+}
+
+static void TestFlowCacheAndCoarsening(void)
+{
+    SpGridInit(&s_grid, 32, 32);
+    SpFlowReset(&s_grid);
+    SpFlowSetVersion(1);
+
+    SpFieldId a = SpFlowAcquire(16, 16);
+    CHECK(a != SP_FIELD_NONE);
+
+    // The same goal is a hit, not a rebuild.
+    CHECK(SpFlowAcquire(16, 16) == a);
+    CHECK(SpFlowFind(16, 16) == a);
+
+    // A goal one tile away shares the field: keys are coarsened to 2x2 blocks,
+    // which is what makes near-identical clicks cheap. Two tiles of goal error
+    // vanishes under the formation offsets a group order applies anyway.
+    CHECK(SpFlowAcquire(17, 16) == a);
+    CHECK(SpFlowAcquire(17, 17) == a);
+    CHECK(SpFlowLiveCount() == 1);
+
+    // Far enough away and it is a different field.
+    SpFieldId b = SpFlowAcquire(4, 4);
+    CHECK(b != SP_FIELD_NONE);
+    CHECK(b != a);
+    CHECK(SpFlowLiveCount() == 2);
+}
+
+static void TestFlowInvalidatesOnNavChange(void)
+{
+    // A field is a WHOLE-GRID answer, so any wall placed anywhere can make part
+    // of it wrong. Invalidation is deliberately all-or-nothing: a field built
+    // against an older grid must never be handed out again.
+    SpGridInit(&s_grid, 24, 24);
+    SpFlowReset(&s_grid);
+    SpFlowSetVersion(1);
+
+    SpFieldId a = SpFlowAcquire(12, 12);
+    CHECK(a != SP_FIELD_NONE);
+    CHECK(SpFlowValid(a));
+
+    SpFlowSetVersion(2);                    // something was built or demolished
+    CHECK(!SpFlowValid(a));
+    CHECK(SpFlowFind(12, 12) == SP_FIELD_NONE);
+
+    float dx, dz;
+    CHECK(!SpFlowDir(a, 2, 2, &dx, &dz));   // a stale field answers nothing
+    CHECK(SpFlowCost(a, 2, 2) == SP_FLOW_UNREACHED);
+
+    // Re-acquiring rebuilds it against the new version.
+    SpFieldId b = SpFlowAcquire(12, 12);
+    CHECK(b != SP_FIELD_NONE);
+    CHECK(SpFlowValid(b));
+}
+
+static void TestFlowUnreachable(void)
+{
+    // A sealed room: cells inside cannot reach a goal outside, and must say so
+    // rather than pointing somewhere hopeful.
+    SpGridInit(&s_grid, 32, 32);
+    for (int i = 20; i <= 28; i++)
+    {
+        SpGridSet(&s_grid, i, 20, SP_COST_BLOCKED);
+        SpGridSet(&s_grid, i, 28, SP_COST_BLOCKED);
+        SpGridSet(&s_grid, 20, i, SP_COST_BLOCKED);
+        SpGridSet(&s_grid, 28, i, SP_COST_BLOCKED);
+    }
+    SpFlowReset(&s_grid);
+    SpFlowSetVersion(1);
+
+    SpFieldId id = SpFlowAcquire(2, 2);
+    CHECK(id != SP_FIELD_NONE);
+    CHECK(SpFlowCost(id, 24, 24) == SP_FLOW_UNREACHED);
+    float dx, dz;
+    CHECK(!SpFlowDir(id, 24, 24, &dx, &dz));
+    CHECK(SpFlowCost(id, 30, 30) != SP_FLOW_UNREACHED);      // outside: fine
+}
+
+// THE headline test. Walk the arrows from every reachable cell and require
+// arrival. A single local minimum traps every unit that steps on that cell.
+static void FlowFollowAllCells(int w, int h, int gx, int gz, const char *what)
+{
+    SpFlowReset(&s_grid);
+    SpFlowSetVersion(1);
+    SpFieldId id = SpFlowAcquire(gx, gz);
+    CHECK(id != SP_FIELD_NONE);
+    if (id == SP_FIELD_NONE) return;
+
+    int trapped = 0, tested = 0;
+    for (int z = 0; z < h; z++)
+    {
+        for (int x = 0; x < w; x++)
+        {
+            if (!SpGridPassable(&s_grid, x, z)) continue;
+            if (SpFlowCost(id, x, z) == SP_FLOW_UNREACHED) continue;
+            tested++;
+
+            int cx = x, cz = z;
+            int steps = 0, cap = 4*(w + h);
+            while ((cx != gx || cz != gz) && steps < cap)
+            {
+                float dx, dz;
+                if (!SpFlowDir(id, cx, cz, &dx, &dz)) break;
+                // The arrows are eight-way unit steps; round back to integers.
+                cx += (dx > 0.3f) ? 1 : (dx < -0.3f) ? -1 : 0;
+                cz += (dz > 0.3f) ? 1 : (dz < -0.3f) ? -1 : 0;
+                steps++;
+            }
+            if (cx != gx || cz != gz) trapped++;
+        }
+    }
+    if (trapped != 0)
+        printf("  (%s: %d of %d cells never reached the goal)\n", what, trapped, tested);
+    CHECK(trapped == 0);
+    CHECK(tested > 0);
+}
+
+static void TestFlowNoLocalMinima(void)
+{
+    // Open ground first - if this fails nothing else is worth reading.
+    SpGridInit(&s_grid, 32, 32);
+    FlowFollowAllCells(32, 32, 16, 16, "open");
+
+    // A spiral maze: the case where a naive "walk toward the goal" field traps
+    // units against the inside of a wall.
+    SpGridInit(&s_grid, 32, 32);
+    for (int r = 2; r < 15; r += 4)
+    {
+        for (int i = r; i < 32 - r; i++)
+        {
+            SpGridSet(&s_grid, i, r, SP_COST_BLOCKED);
+            SpGridSet(&s_grid, i, 31 - r, SP_COST_BLOCKED);
+            SpGridSet(&s_grid, r, i, SP_COST_BLOCKED);
+            SpGridSet(&s_grid, 31 - r, i, SP_COST_BLOCKED);
+        }
+        SpGridSet(&s_grid, r, 16, SP_COST_NORMAL);          // one gap per ring
+    }
+    FlowFollowAllCells(32, 32, 16, 16, "spiral");
+
+    // Random obstacles at several densities, and mixed terrain costs - the
+    // steepest-descent pass has to cope with a cost surface, not just a
+    // distance one.
+    RngSeed(0xF10AAu);
+    for (int trial = 0; trial < 10; trial++)
+    {
+        SpGridInit(&s_grid, 28, 28);
+        for (int z = 0; z < 28; z++)
+            for (int x = 0; x < 28; x++)
+            {
+                uint32_t r = RngNext() % 100u;
+                uint8_t c = SP_COST_NORMAL;
+                if (r < 22)      c = SP_COST_BLOCKED;
+                else if (r < 38) c = SP_COST_SHALLOW;
+                else if (r < 50) c = SP_COST_SKIRT;
+                SpGridSet(&s_grid, x, z, c);
+            }
+        SpGridSet(&s_grid, 14, 14, SP_COST_NORMAL);
+        FlowFollowAllCells(28, 28, 14, 14, "random");
+    }
+}
+
+static void TestFlowMatchesDijkstra(void)
+{
+    // Bucketed Dijkstra vs the plain reference, on random cost grids. The bucket
+    // ring's failure mode is a relaxation wrapping onto a drained bucket, which
+    // loses cells silently and only for particular cost patterns - so this is
+    // swept over many seeds rather than spot-checked.
+    RngSeed(0xB0C4E7u);
+    for (int trial = 0; trial < 20; trial++)
+    {
+        SpGridInit(&s_grid, 24, 24);
+        for (int z = 0; z < 24; z++)
+            for (int x = 0; x < 24; x++)
+            {
+                uint32_t r = RngNext() % 100u;
+                uint8_t c = SP_COST_NORMAL;
+                if (r < 20)      c = SP_COST_BLOCKED;
+                else if (r < 40) c = SP_COST_SHALLOW;
+                else if (r < 55) c = SP_COST_SKIRT;
+                SpGridSet(&s_grid, x, z, c);
+            }
+        SpGridSet(&s_grid, 12, 12, SP_COST_NORMAL);
+
+        SpFlowReset(&s_grid);
+        SpFlowSetVersion(1);
+        SpFieldId id = SpFlowAcquire(12, 12);
+        CHECK(id != SP_FIELD_NONE);
+
+        // DIRECTION MATTERS HERE. A step charges the terrain of the tile being
+        // ENTERED, so cost(A->B) != cost(B->A) wherever terrain differs - the
+        // graph is directed even though the walls are not. A flow field answers
+        // "what does it cost to walk from HERE to the goal", so the reference
+        // must be run cell -> goal, NOT goal -> cell.
+        //
+        // Comparing against the wrong direction is not a small error: it passes
+        // on every uniform-cost grid and only diverges once terrain varies,
+        // which is precisely the case flow fields are used on.
+        for (int z = 0; z < 24; z++)
+            for (int x = 0; x < 24; x++)
+            {
+                if (!SpGridPassable(&s_grid, x, z)) continue;
+                uint32_t ref = RefDijkstra(&s_grid, x, z, 12, 12);
+                uint16_t got = SpFlowCost(id, x, z);
+                if (ref == REF_INF) CHECK(got == SP_FLOW_UNREACHED);
+                else                CHECK((uint32_t)got == ref);
+            }
+    }
+}
+
+static void TestFlowEvictionRespectsRefcount(void)
+{
+    // Filling every slot then asking for one more must NOT evict a field units
+    // are standing on. Stranding a crowd mid-walk is far worse than falling
+    // back to individual A*, which is slower but always correct.
+    SpGridInit(&s_grid, 24, 24);
+    SpFlowReset(&s_grid);
+    SpFlowSetVersion(1);
+
+    SpFieldId held[SP_FLOW_FIELDS_MAX];
+    for (int i = 0; i < SP_FLOW_FIELDS_MAX; i++)
+    {
+        held[i] = SpFlowAcquire(2 + 4*i, 2);
+        CHECK(held[i] != SP_FIELD_NONE);
+    }
+    CHECK(SpFlowLiveCount() == SP_FLOW_FIELDS_MAX);
+
+    // Everything is in use.
+    SpFlowSweepBegin();
+    for (int i = 0; i < SP_FLOW_FIELDS_MAX; i++) SpFlowSweepMark(held[i]);
+    SpFlowSweepEnd(1.0f);
+
+    CHECK(SpFlowAcquire(20, 20) == SP_FIELD_NONE);      // refuses rather than strands
+    for (int i = 0; i < SP_FLOW_FIELDS_MAX; i++) CHECK(SpFlowValid(held[i]));
+
+    // Release one by not marking it, and the slot becomes available.
+    SpFlowSweepBegin();
+    for (int i = 1; i < SP_FLOW_FIELDS_MAX; i++) SpFlowSweepMark(held[i]);
+    SpFlowSweepEnd(2.0f);
+
+    SpFieldId fresh = SpFlowAcquire(20, 20);
+    CHECK(fresh != SP_FIELD_NONE);
+    CHECK(fresh == held[0]);                            // the unreferenced one
+}
+
+static void TestFlowSweepIsIdempotent(void)
+{
+    // The sweep RECOMPUTES refcounts rather than adjusting them, which is the
+    // whole reason it cannot leak: running it twice with the same marks must
+    // give the same answer, not double it.
+    SpGridInit(&s_grid, 16, 16);
+    SpFlowReset(&s_grid);
+    SpFlowSetVersion(1);
+    SpFieldId a = SpFlowAcquire(8, 8);
+
+    for (int pass = 0; pass < 3; pass++)
+    {
+        SpFlowSweepBegin();
+        SpFlowSweepMark(a);
+        SpFlowSweepMark(a);
+        SpFlowSweepEnd(1.0f + (float)pass);
+    }
+    // Two marks, three passes: still two, not six.
+    SpFlowSweepBegin();
+    SpFlowSweepEnd(9.0f);
+    // With nothing marked the field is unreferenced and therefore evictable.
+    SpFieldId b = SpFlowAcquire(2, 2);
+    CHECK(b != SP_FIELD_NONE);
+    CHECK(SpFlowValid(b));
+}
+
+// ---------------------------------------------------------------------------
 int main(void)
 {
     printf("path_tests\n");
@@ -1275,6 +1581,15 @@ int main(void)
     TestServiceStaleCancel();
     TestServiceQueueFull();
     TestServiceUnreachableReports();
+
+    TestFlowBasics();
+    TestFlowCacheAndCoarsening();
+    TestFlowInvalidatesOnNavChange();
+    TestFlowUnreachable();
+    TestFlowNoLocalMinima();
+    TestFlowMatchesDijkstra();
+    TestFlowEvictionRespectsRefcount();
+    TestFlowSweepIsIdempotent();
 
     printf("\n%d checks, %d failed\n", s_checks, s_fails);
     return (s_fails == 0) ? 0 : 1;

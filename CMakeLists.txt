@@ -173,6 +173,7 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
         src/strategy_path/strategy_path_grid.c
         src/strategy_path/strategy_path_astar.c
         src/strategy_path/strategy_path_service.c
+        src/strategy_path/strategy_path_flow.c
         src/strategy_map/strategy_map.c)
     target_link_libraries(path_tests raylib)
 endif()
@@ -377,11 +378,14 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
     if (NOT DEFINED SP_REQUESTS_MAX)     # strategy_path.h Web default: 64
         set(SP_REQUESTS_MAX 256)
     endif()
+    if (NOT DEFINED SP_FLOW_FIELDS_MAX)  # strategy_path.h Web default: 4
+        set(SP_FLOW_FIELDS_MAX 16)
+    endif()
 endif()
 
 function(sp_apply_caps target)
     foreach(cap SP_GRID_MAX SP_HASH_CELLS_MAX SP_HASH_ITEMS_MAX
-                SP_PATH_MAX SP_REQUESTS_MAX)
+                SP_PATH_MAX SP_REQUESTS_MAX SP_FLOW_FIELDS_MAX)
         if (DEFINED ${cap})
             target_compile_definitions(${target} PUBLIC ${cap}=${${cap}})
         endif()
@@ -451,7 +455,7 @@ strat_apply_caps(${PROJECT_NAME})
 if ("${PLATFORM}" STREQUAL "Web")
     message(STATUS " - - - strategy path capacities: WEB tier (header defaults)")
 else()
-    message(STATUS " - - - strategy path capacities: grid=${SP_GRID_MAX} hashCells=${SP_HASH_CELLS_MAX} hashItems=${SP_HASH_ITEMS_MAX} path=${SP_PATH_MAX} requests=${SP_REQUESTS_MAX}")
+    message(STATUS " - - - strategy path capacities: grid=${SP_GRID_MAX} hashCells=${SP_HASH_CELLS_MAX} hashItems=${SP_HASH_ITEMS_MAX} path=${SP_PATH_MAX} requests=${SP_REQUESTS_MAX} fields=${SP_FLOW_FIELDS_MAX}")
 endif()
 
 sp_apply_caps(${PROJECT_NAME})
