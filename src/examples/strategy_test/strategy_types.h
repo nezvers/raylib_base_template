@@ -78,6 +78,10 @@
 // which looks exactly like the spiral this is meant to remove.
 #define STRAT_ARRIVE_RESUME  (2.0f*STRAT_ARRIVE_SLOW)   // shoved this far: re-seek
 #define STRAT_ARRIVE_STALL   1.25f   // seconds of no progress before settling
+// The stall rule only applies once a unit is CLOSE. Ungated it fires on the
+// rear of any large column - those units are blocked for seconds while the
+// front resolves, and settling them strands a 500-unit order at its start.
+#define STRAT_ARRIVE_GIVEUP  (8.0f*STRAT_UNIT_RADIUS)   // stall test applies inside this
 #define STRAT_AGGRO_STRIDE   15      // 1 unit in N runs its sight scan per frame
                                      //   (~0.25s worst-case reaction at 60 Hz)
 #define STRAT_SETTLE_CROWD   3       // settled neighbours that justify stopping
@@ -194,6 +198,51 @@ typedef enum {
     ARRIVE_SETTLED,     // parked: no drive, no push applied, still pushable
 } ArrivalPhase;
 
+// Formation shape for a group move. The player picks one; it applies to every
+// group order until changed. SHAPE AND BREAK-OFF BEHAVIOUR ARE SEPARATE AXES -
+// any shape can be marched with any of the three behaviours, because "what the
+// block looks like" and "who peels off when shot at" are unrelated decisions.
+//
+// Every shape lays out on the SAME two axes: `offR` across the formation's
+// right-hand perpendicular, `offF` along its forward. Only the offsets differ,
+// which is what keeps the whole set one switch in one function.
+typedef enum {
+    FORM_GRID = 0,      // square block; the historical default
+    FORM_LINE,          // wide and shallow - the anti-spearhead shape
+    FORM_COLUMN,        // narrow and deep, for marching through gaps
+    FORM_TWO_COLUMN,    // two parallel files with a lane between them
+    FORM_WEDGE,         // V, point toward the destination
+    FORM_COUNT,
+} FormationShape;
+
+// What a formation does when hostiles turn up mid-march. Orthogonal to shape.
+typedef enum {
+    FORM_BEHAVIOR_SKIRMISH = 0, // only units with an enemy in their own range peel
+                                //   off; the rest hold shape and keep marching
+    FORM_BEHAVIOR_ENGAGE,       // first contact breaks the whole formation
+    FORM_BEHAVIOR_HOLD,         // nobody peels; the march is the order
+    FORM_BEHAVIOR_COUNT,
+} FormationBehavior;
+
+// An attack order further than this from the group's centroid is a MARCH and
+// gets a formation; anything nearer is "hit that now" and stays a direct order,
+// because forming up first would be a visible delay in the one moment the
+// player least wants one.
+#define STRAT_FORM_MARCH_DIST 18.0f
+
+#define FORM_LINE_RANKS      2      // nominal depth of FORM_LINE
+#define FORM_COLUMN_FILES    2      // nominal width of FORM_COLUMN
+#define FORM_TWO_COLUMN_LANE 3.0f   // gap between the two files, world units
+
+// EXTENT CAPS. Without these a shape scales linearly with unit count and walks
+// straight off the map: two ranks of 100 units is 73 world units of frontage,
+// most of the long march, and the outer slots land outside the grid where
+// SpNearestOpen's ring cap cannot recover them - those units are stranded.
+// Past the cap a line gains ranks and a column gains files, which is what real
+// formations do when they run out of frontage or road.
+#define FORM_LINE_MAX_WIDTH  40.0f  // frontage before FORM_LINE adds ranks
+#define FORM_COLUMN_MAX_DEPTH 40.0f // depth before a column adds files
+
 // A queued worker job (Shift-RMB chain). One building index serves all kinds;
 // gather resolves its resource node at dispatch time. See WorkerStartNextJob.
 typedef enum {
@@ -241,6 +290,19 @@ typedef struct {
                                     //   pass; lets a unit boxed in by finished
                                     //   units settle where it stands instead of
                                     //   grinding at a chokepoint forever
+
+    // -- Formation march ------------------------------------------------------
+    // Set by StrategyOrderMoveGroup, cleared by any single-unit order. A unit
+    // with formGroup < 0 is not in a formation and every rule below is skipped.
+    int          formGroup;         // group id this unit marches with, -1 = none
+    Vector3      formSlot;          // its assigned slot, in world space
+    bool         formForming;       // still closing up: speed is being scaled down
+    bool         formEverFormed;    // THE ONCE-ONLY LATCH. Form-up slows the units
+                                    //   out in front until the block closes up, and
+                                    //   then must never do it again - otherwise every
+                                    //   straggler re-triggers it and the whole army
+                                    //   crawls for the rest of the march.
+    bool         formBrokeOff;      // peeled off to fight; rejoins on its next order
     float        hp, maxHp;
 
     // Stats resolved at spawn (def x difficulty x building buffs); see header.

@@ -138,7 +138,9 @@ static void Update()
     if (IsKeyPressed(KEY_T))     s_profView = (s_profView + 1) % 3;
     if (IsKeyPressed(KEY_G))     StrategyDebugNavShow(!StrategyDebugNavShown());
     if (IsKeyPressed(KEY_P))     StrategyDebugPathShow(!StrategyDebugPathShown());
-    if (IsKeyPressed(KEY_F))     StrategyDebugFlowShow(!StrategyDebugFlowShown());
+    // J, not F: F cycles the formation shape in StrategyWorldHandleInput, which
+    // the lab calls, so binding the flow overlay there too would fire both.
+    if (IsKeyPressed(KEY_J))     StrategyDebugFlowShow(!StrategyDebugFlowShown());
     if (IsKeyPressed(KEY_O))     StrategyDebugSlotShow(!StrategyDebugSlotShown());
 
     // Flow threshold, doubling and halving for the same reason the budget does:
@@ -351,8 +353,9 @@ static void Gui()
     const char *keys[] = {
         "N spawn    M two armies    C clear",
         "[ ] count    1-6 faction    L render LOD",
-        "G nav grid    P paths    F flow    O slots",
+        "G nav grid    P paths    J flow    O slots",
         "- + astar budget    , / flow threshold",
+        "F formation shape    V formation behaviour",
         "T profiler    SPACE pause    . step    ESC back",
     };
     int n = (int)(sizeof(keys)/sizeof(keys[0]));

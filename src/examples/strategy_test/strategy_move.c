@@ -173,6 +173,10 @@ void StrategyMoveDirect(Unit *u, Vector3 dest, float dt)
 // front of its group walks slower. 1.0 whenever it does not apply.
 static float CohesionScale(SpFieldId field, int tx, int tz);
 
+// Form-up, defined with the per-frame pass that feeds it - a unit ahead of its
+// formation slows exponentially until the block closes up, once per order.
+static float FormUpScale(const Unit *u);
+
 // ----------------------------------------------------------------------------
 //  Requesting
 // ----------------------------------------------------------------------------
@@ -235,6 +239,12 @@ void StrategyMoveTo(Unit *u, int index, Vector3 dest, float dt)
     UnitPath *p = &s_paths[index];
     const SpGrid *g = StrategyNavGrid();
     float dist = MoveDistXZ(u->pos, dest);
+
+    // Form-up scales dt for EVERY branch below - field, path, or straight line -
+    // because a unit out in front should hang back regardless of how it happens
+    // to be routed. Applied here once rather than at each steering call, which
+    // is also what stops it being forgotten when a branch is added.
+    dt *= FormUpScale(u);
 
     // -- Flow field, if this unit is riding one ------------------------------
     // Checked BEFORE anything asks for a path, because the whole point of a
@@ -476,6 +486,162 @@ bool StrategyMoveGoalOf(int index, Vector3 *out)
 #define FORMATION_SPACING     1.5f
 #define FORMATION_MAX         512
 
+// Player's current shape and break-off rule, set by the hotkeys. Globals rather
+// than per-group state because they are a PLAYER SETTING: the next order uses
+// whatever is selected now, and a group already marching keeps the rule it was
+// given. Storing them per-group would mean re-ordering a group to change its
+// shape, which is not what a hotkey implies.
+static FormationShape    s_formShape    = FORM_GRID;
+static FormationBehavior s_formBehavior = FORM_BEHAVIOR_SKIRMISH;
+
+// Monotonic group id. Every group order mints a fresh one so units from an
+// earlier order can never be mistaken for members of this one - the ids are
+// only ever compared for equality, never indexed, so wrapping is harmless.
+static int s_formNextGroup = 1;
+
+void StrategyFormationShapeSet(FormationShape s)
+{
+    if (s >= 0 && s < FORM_COUNT) s_formShape = s;
+}
+FormationShape StrategyFormationShape(void) { return s_formShape; }
+
+void StrategyFormationBehaviorSet(FormationBehavior b)
+{
+    if (b >= 0 && b < FORM_BEHAVIOR_COUNT) s_formBehavior = b;
+}
+FormationBehavior StrategyFormationBehavior(void) { return s_formBehavior; }
+
+const char *StrategyFormationShapeName(FormationShape s)
+{
+    switch (s)
+    {
+        case FORM_GRID:       return "GRID";
+        case FORM_LINE:       return "LINE";
+        case FORM_COLUMN:     return "COLUMN";
+        case FORM_TWO_COLUMN: return "TWO COLUMN";
+        case FORM_WEDGE:      return "WEDGE";
+        default:              return "?";
+    }
+}
+
+const char *StrategyFormationBehaviorName(FormationBehavior b)
+{
+    switch (b)
+    {
+        case FORM_BEHAVIOR_SKIRMISH: return "SKIRMISH";
+        case FORM_BEHAVIOR_ENGAGE:   return "ENGAGE";
+        case FORM_BEHAVIOR_HOLD:     return "HOLD";
+        default:                     return "?";
+    }
+}
+
+// Lay out slot `i` of `count` in FORMATION-LOCAL space: `outR` across the
+// formation's right-hand perpendicular, `outF` along its forward. The caller
+// rotates and translates, so every shape is expressed on the same two axes and
+// none of them needs to know the group's facing.
+//
+// Rows are laid out BACK TO FRONT (offF decreasing) so that slot 0 is the front
+// rank. The assignment sort relies on that ordering to put the units that start
+// nearest the destination at the front, rather than marching them through their
+// own formation.
+static void FormationSlotLocal(FormationShape shape, int i, int count,
+                               float *outR, float *outF)
+{
+    float r = 0.0f, f = 0.0f;
+
+    switch (shape)
+    {
+        case FORM_LINE:
+        {
+            // Wide and shallow: fill the width first, only adding depth once a
+            // rank is full. This is the shape that answers the spearhead - the
+            // whole point is that nobody stands behind anybody.
+            //
+            // WIDTH IS CAPPED, and it has to be. Two ranks of 100 units is 73
+            // world units across, which is most of the long march - the outer
+            // slots land off the map, SpNearestOpen's ring cap cannot pull them
+            // back, and those units are stranded. Past the cap the line simply
+            // gains ranks, which is what a real line does when it runs out of
+            // frontage.
+            int perRank = (int)(FORM_LINE_MAX_WIDTH/FORMATION_SPACING);
+            if (perRank < 1) perRank = 1;
+            int wanted = (count + FORM_LINE_RANKS - 1)/FORM_LINE_RANKS;
+            if (wanted < 1) wanted = 1;
+            if (wanted < perRank) perRank = wanted;
+
+            int rank = i/perRank, col = i % perRank;
+            int fullRanks = count/perRank;
+            int inThis = (rank == fullRanks) ? (count % perRank) : perRank;
+            if (inThis <= 0) inThis = perRank;
+            r = ((float)col - (float)(inThis - 1)*0.5f)*FORMATION_SPACING;
+            f = -(float)rank*FORMATION_SPACING;
+        } break;
+
+        case FORM_COLUMN:
+        {
+            // Narrow and deep. The shape you want for a gap or a bridge, and
+            // the one that arrives strung out - which is the honest trade.
+            // Widens past the depth cap rather than running off the map.
+            int maxRows = (int)(FORM_COLUMN_MAX_DEPTH/FORMATION_SPACING);
+            if (maxRows < 1) maxRows = 1;
+            int files = FORM_COLUMN_FILES;
+            while (files < count && (count + files - 1)/files > maxRows) files++;
+
+            int file = i % files, row = i/files;
+            r = ((float)file - (float)(files - 1)*0.5f)*FORMATION_SPACING;
+            f = -(float)row*FORMATION_SPACING;
+        } break;
+
+        case FORM_TWO_COLUMN:
+        {
+            // Two files with a lane between them. Alternating left/right keeps
+            // the two sides the same length as units are added.
+            //
+            // Past the depth cap each side thickens into several sub-files
+            // rather than stretching: the lane down the middle is the point of
+            // the shape, so it is preserved while the files themselves widen.
+            int maxRows = (int)(FORM_COLUMN_MAX_DEPTH/FORMATION_SPACING);
+            if (maxRows < 1) maxRows = 1;
+            int perSide = (count + 1)/2;
+            int sub = 1;
+            while (sub < perSide && (perSide + sub - 1)/sub > maxRows) sub++;
+
+            int side = i % 2, idx = i/2;
+            int subFile = idx % sub, row = idx/sub;
+            float lane = FORM_TWO_COLUMN_LANE*0.5f
+                       + (float)subFile*FORMATION_SPACING;
+            r = (side == 0) ? -lane : lane;
+            f = -(float)row*FORMATION_SPACING;
+        } break;
+
+        case FORM_WEDGE:
+        {
+            // A V with its point forward. Row n holds n+1 units, so the rows
+            // grow as they fall back; solving for the row containing slot i is
+            // the triangular-number inverse.
+            int row = (int)((sqrtf(8.0f*(float)i + 1.0f) - 1.0f)*0.5f);
+            int rowStart = row*(row + 1)/2;
+            int col = i - rowStart;
+            r = ((float)col - (float)row*0.5f)*FORMATION_SPACING;
+            f = -(float)row*FORMATION_SPACING;
+        } break;
+
+        case FORM_GRID:
+        default:
+        {
+            int cols = (int)ceilf(sqrtf((float)count));
+            if (cols < 1) cols = 1;
+            int rows = (count + cols - 1)/cols;
+            int row = i/cols, col = i % cols;
+            r = ((float)col - (float)(cols - 1)*0.5f)*FORMATION_SPACING;
+            f = ((float)row - (float)(rows - 1)*0.5f)*FORMATION_SPACING;
+        } break;
+    }
+
+    *outR = r;
+    *outF = f;
+}
+
 // Above this many units sharing one destination, build a flow field instead of
 // a path each. Runtime-tunable because the A/B - watch one field serve 2,000
 // units, then raise the threshold past the group size and watch the queue pin -
@@ -543,36 +709,31 @@ void StrategyOrderMoveGroup(const int *units, int count, Vector3 dest)
     float rx = -fz, rz = fx;                            // right-hand perpendicular
 
     // -- Slots ----------------------------------------------------------------
-    // A square-ish grid centred on the destination, rotated to the facing.
-    int cols = (int)ceilf(sqrtf((float)count));
-    if (cols < 1) cols = 1;
-    int rows = (count + cols - 1)/cols;
-
+    // Shape-driven, rotated to the facing. FormationSlotLocal emits formation-
+    // local offsets and the rotation is applied identically for every shape, so
+    // adding a shape never touches this loop.
     int slotCount = 0;
-    for (int r = 0; r < rows && slotCount < count; r++)
+    for (int i = 0; i < count; i++)
     {
-        for (int c = 0; c < cols && slotCount < count; c++)
-        {
-            float offR = ((float)c - (float)(cols - 1)*0.5f)*FORMATION_SPACING;
-            float offF = ((float)r - (float)(rows - 1)*0.5f)*FORMATION_SPACING;
+        float offR, offF;
+        FormationSlotLocal(s_formShape, i, count, &offR, &offF);
 
-            Vector3 p = {
-                dest.x + rx*offR + fx*offF,
-                0.0f,
-                dest.z + rz*offR + fz*offF
-            };
+        Vector3 p = {
+            dest.x + rx*offR + fx*offF,
+            0.0f,
+            dest.z + rz*offR + fz*offF
+        };
 
-            // EVERY slot through SpNearestOpen. A slot inside a lake or a
-            // building is an unreachable target, and the unit assigned to it
-            // walks at a wall forever - the exact orbit-forever failure this
-            // whole overhaul exists to remove, reintroduced quietly for one
-            // unit in twenty.
-            int tx, tz, ox, oz;
-            SpWorldToTile(g, p.x, p.z, &tx, &tz);
-            if (SpNearestOpen(g, tx, tz, 6, &ox, &oz)) p = SpCellToWorld(g, (SpCell)(oz*g->w + ox));
+        // EVERY slot through SpNearestOpen. A slot inside a lake or a
+        // building is an unreachable target, and the unit assigned to it
+        // walks at a wall forever - the exact orbit-forever failure this
+        // whole overhaul exists to remove, reintroduced quietly for one
+        // unit in twenty.
+        int tx, tz, ox, oz;
+        SpWorldToTile(g, p.x, p.z, &tx, &tz);
+        if (SpNearestOpen(g, tx, tz, 6, &ox, &oz)) p = SpCellToWorld(g, (SpCell)(oz*g->w + ox));
 
-            s_slotPos[slotCount++] = p;
-        }
+        s_slotPos[slotCount++] = p;
     }
     if (slotCount == 0) return;
 
@@ -600,6 +761,10 @@ void StrategyOrderMoveGroup(const int *units, int count, Vector3 dest)
     SortByKey(s_unitOrder, count);
     SortByKey(s_slotOrder, slotCount);
 
+    // One id for this whole order. Minted per order, never reused, so a unit
+    // left over from a previous group cannot be counted as a member of this one.
+    int groupId = s_formNextGroup++;
+
     for (int k = 0; k < count; k++)
     {
         int unitSlot = s_unitOrder[k].index;
@@ -610,6 +775,15 @@ void StrategyOrderMoveGroup(const int *units, int count, Vector3 dest)
         // order every other caller uses. UNIT_MOVE's handler never learns that
         // formations exist - which is what keeps this addition survivable.
         StrategyOrderMove(u, s_slotPos[slot]);
+
+        // Stamped AFTER the order: StrategyOrderMove clears formation state (a
+        // single-unit order means "leave your formation"), so setting it first
+        // would be wiped by the very call that starts the march.
+        u->formGroup      = groupId;
+        u->formSlot       = s_slotPos[slot];
+        u->formForming    = true;
+        u->formEverFormed = false;
+        u->formBrokeOff   = false;
     }
 
     // -- Flow field -----------------------------------------------------------
@@ -736,3 +910,138 @@ static float CohesionScale(SpFieldId field, int tx, int tz)
 }
 
 int StrategyMoveFlowLive(void) { return SpFlowLiveCount(); }
+
+// ----------------------------------------------------------------------------
+//  Form-up
+//
+//  A scattered group that sets off immediately arrives scattered, because the
+//  units that started nearest simply get there first. The fix is NOT to stop
+//  and assemble - that reads as unresponsive, and the player ordered a move,
+//  not a parade. Instead the units out in FRONT slow down until the block has
+//  closed up, and then it is over.
+//
+//  TWO PROPERTIES MATTER, AND BOTH ARE EASY TO GET WRONG:
+//
+//  1. THE SLOWDOWN IS EXPONENTIAL IN HOW FAR AHEAD A UNIT IS, not a flat
+//     multiplier. A flat scale either barely helps the badly-scattered case or
+//     visibly hobbles the nearly-formed one; scaling by the ratio makes a unit
+//     far out in front crawl while one slightly ahead barely notices.
+//
+//  2. IT LATCHES OFF, ONCE, PER ORDER. `formEverFormed` is the whole reason
+//     this is usable: without it every straggler that falls behind later - one
+//     unit walking round a rock - re-triggers form-up and the entire army
+//     crawls for the rest of the march. Form up once at the start; after that
+//     the group marches at full speed and stragglers stay stragglers.
+// ----------------------------------------------------------------------------
+#define FORMUP_TIGHT       (4.0f*STRAT_UNIT_RADIUS) // slot distance that counts as "in place"
+#define FORMUP_MIN_SCALE   0.15f   // never fully stop; a frozen unit reads as stuck
+#define FORMUP_EXP         2.0f    // how sharply being far ahead is punished
+
+// Per-group worst slot distance, recomputed every frame. Indexed by a small
+// dense map of group id -> slot, because group ids are monotonic and unbounded
+// while the number of LIVE groups is tiny.
+#define FORMUP_MAX_GROUPS  32
+static int   s_formGroupId[FORMUP_MAX_GROUPS];
+static float s_formGroupWorst[FORMUP_MAX_GROUPS];
+static int   s_formGroupCount;
+
+static int FormGroupSlot(int groupId)
+{
+    for (int i = 0; i < s_formGroupCount; i++)
+        if (s_formGroupId[i] == groupId) return i;
+    return -1;
+}
+
+// Recompute each live group's worst-case distance-to-slot. Runs once per frame
+// before the movement pass, so every unit in a group compares against the same
+// snapshot - computing it per unit would make the answer depend on update order.
+void StrategyMoveFormUpdate(void)
+{
+    StrategyWorld *world = StrategyWorldGet();
+    int liveCount = 0;
+    const int *live = StrategyActiveUnits(&liveCount);
+
+    s_formGroupCount = 0;
+
+    for (int k = 0; k < liveCount; k++)
+    {
+        Unit *u = &world->units[live[k]];
+        if (u->formGroup < 0 || u->formEverFormed || u->formBrokeOff) continue;
+
+        float dx = u->formSlot.x - u->pos.x;
+        float dz = u->formSlot.z - u->pos.z;
+        float d  = sqrtf(dx*dx + dz*dz);
+
+        int slot = FormGroupSlot(u->formGroup);
+        if (slot < 0)
+        {
+            if (s_formGroupCount >= FORMUP_MAX_GROUPS) continue;   // more groups than tracked: they simply skip form-up
+            slot = s_formGroupCount++;
+            s_formGroupId[slot]    = u->formGroup;
+            s_formGroupWorst[slot] = 0.0f;
+        }
+        if (d > s_formGroupWorst[slot]) s_formGroupWorst[slot] = d;
+    }
+
+    // Latch off every group that has closed up. Done as a second pass so the
+    // whole group flips together - a unit that latched mid-scan would stop
+    // contributing to its own group's worst distance.
+    for (int k = 0; k < liveCount; k++)
+    {
+        Unit *u = &world->units[live[k]];
+        if (u->formGroup < 0 || u->formEverFormed) continue;
+
+        int slot = FormGroupSlot(u->formGroup);
+        if (slot < 0) continue;
+
+        if (s_formGroupWorst[slot] <= FORMUP_TIGHT)
+        {
+            u->formEverFormed = true;    // THE LATCH. Never set back to false.
+            u->formForming    = false;
+        }
+    }
+}
+
+// Release every member of a group from its formation. Used by FORM_BEHAVIOR_
+// ENGAGE, where one unit making contact commits the whole block - feeding units
+// in one at a time is how a formation loses a fight it should win.
+void StrategyFormationBreak(int groupId)
+{
+    if (groupId < 0) return;
+
+    StrategyWorld *world = StrategyWorldGet();
+    int liveCount = 0;
+    const int *live = StrategyActiveUnits(&liveCount);
+
+    for (int k = 0; k < liveCount; k++)
+    {
+        Unit *u = &world->units[live[k]];
+        if (u->formGroup == groupId) u->formBrokeOff = true;
+    }
+}
+
+// Speed multiplier while forming up: 1.0 for the unit furthest from its slot,
+// falling off exponentially for the ones already close. Returns 1.0 the moment
+// the group has formed once, forever after.
+static float FormUpScale(const Unit *u)
+{
+    if (u->formGroup < 0 || u->formEverFormed || u->formBrokeOff) return 1.0f;
+
+    int slot = FormGroupSlot(u->formGroup);
+    if (slot < 0) return 1.0f;
+
+    float worst = s_formGroupWorst[slot];
+    if (worst <= FORMUP_TIGHT) return 1.0f;      // group is already together
+
+    float dx = u->formSlot.x - u->pos.x;
+    float dz = u->formSlot.z - u->pos.z;
+    float d  = sqrtf(dx*dx + dz*dz);
+
+    // Ratio of "how far I still have to go" to "how far the worst unit has to
+    // go". The unit setting the pace gets 1.0; everyone nearer is scaled down.
+    float ratio = d/worst;
+    if (ratio > 1.0f) ratio = 1.0f;
+
+    float scale = powf(ratio, FORMUP_EXP);
+    return (scale < FORMUP_MIN_SCALE) ? FORMUP_MIN_SCALE : scale;
+}

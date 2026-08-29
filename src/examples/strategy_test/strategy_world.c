@@ -650,6 +650,8 @@ static Unit *UnitSpawn(int faction, UnitKind kind, Vector3 pos)
         u->targetNode     = -1;
         u->targetBuilding = -1;
         u->dropoffCache   = -1;
+        u->formGroup      = -1;     // NOT 0: `(Unit){0}` above would otherwise
+                                    // enrol every fresh unit in group 0
 
         RosterAdd(i);
         return u;
@@ -1980,7 +1982,37 @@ static void OrderInput(void)
     bool plainMove = (hostile < 0 && enemyBld < 0 && node < 0 &&
                       ownGather < 0 && ownScaffold < 0 && ownRepair < 0);
 
-    if (plainMove && !shift)
+    // AN ATTACK ORDER AT DISTANCE IS A MARCH, AND MARCHES GET FORMATIONS.
+    // Sending every selected unit at one enemy is what produces the overlapping
+    // spearhead: they converge on a single point and stack, and a stack fights
+    // far better than it should because only its front rank can be hit.
+    //
+    // Only at DISTANCE, though. Once the enemy is already close the players
+    // means "hit that now", and forming up first would be a visible delay in
+    // exactly the moment it is least wanted - so a near target keeps the direct
+    // per-unit order, and the units break off into the fight the moment they
+    // arrive anyway.
+    bool attackMarch = false;
+    if (hostile >= 0 && !shift && selCount > 1)
+    {
+        Vector3 c = { 0 };
+        int n = 0;
+        for (int k = 0; k < selCount; k++)
+        {
+            if (world.units[sel[k]].faction != 0) continue;
+            c.x += world.units[sel[k]].pos.x;
+            c.z += world.units[sel[k]].pos.z;
+            n++;
+        }
+        if (n > 1)
+        {
+            c.x /= (float)n;
+            c.z /= (float)n;
+            attackMarch = (DistXZ(c, world.units[hostile].pos) > STRAT_FORM_MARCH_DIST);
+        }
+    }
+
+    if ((plainMove || attackMarch) && !shift)
     {
         // Gather the player's own selected units and hand them over as a group.
         // Shift is excluded: it means "queue this job", which is a per-unit
@@ -1992,7 +2024,13 @@ static void OrderInput(void)
             if (world.units[sel[k]].faction != 0) continue;
             s_groupBuf[n++] = sel[k];
         }
-        if (n > 0) { StrategyOrderMoveGroup(s_groupBuf, n, ground); any = true; }
+
+        // An attack march forms up on the TARGET's position rather than the
+        // clicked ground. The units break off and engage as they close - under
+        // whatever the current behaviour says - so this only has to get them
+        // there as a block rather than as a queue.
+        Vector3 dest = attackMarch ? world.units[hostile].pos : ground;
+        if (n > 0) { StrategyOrderMoveGroup(s_groupBuf, n, dest); any = true; }
     }
     else
     {
@@ -2045,10 +2083,25 @@ static void ControlGroupInput(void)
     }
 }
 
+// Formation hotkeys. Letters, per the house idiom - and two keys cycling two
+// independent settings rather than one key cycling their product, because shape
+// and break-off behaviour are orthogonal: fifteen combinations behind one key
+// would be unusable.
+static void FormationInput(void)
+{
+    if (IsKeyPressed(KEY_F))
+        StrategyFormationShapeSet((FormationShape)((StrategyFormationShape() + 1) % FORM_COUNT));
+
+    if (IsKeyPressed(KEY_V))
+        StrategyFormationBehaviorSet(
+            (FormationBehavior)((StrategyFormationBehavior() + 1) % FORM_BEHAVIOR_COUNT));
+}
+
 void StrategyWorldHandleInput(void)
 {
     CameraPanZoom();
     ControlGroupInput();
+    FormationInput();
 
     if (world.placing >= 0)
     {
@@ -2139,16 +2192,34 @@ static bool MoveArrive(Unit *u, int index, Vector3 dest, float dt)
     // Making no headway. Measured against distance-to-target rather than
     // distance travelled, because a unit circling its destination is moving
     // fast and getting nowhere - which is precisely the failure being fixed.
-    u->stallTimer += dt;
-    if (u->stallTimer >= 0.5f)
+    //
+    // ONLY WITHIN THE GIVE-UP BAND. Without that gate this rule fires on the
+    // rear of any large column: those units are legitimately blocked for well
+    // over half a second while the front sorts itself out, and settling them
+    // parks a 500-unit order back at its start. The stall rule exists to
+    // resolve units that cannot close the LAST few metres, not to abandon ones
+    // that have not begun.
+    if (dist <= STRAT_ARRIVE_GIVEUP)
     {
-        if (u->lastProgressDist - dist < STRAT_UNIT_RADIUS*0.5f)
+        u->stallTimer += dt;
+        if (u->stallTimer >= 0.5f)
         {
-            u->arrival = ARRIVE_SETTLED;
-            u->vel = (Vector3){ 0.0f, 0.0f, 0.0f };
-            return true;
+            if (u->lastProgressDist - dist < STRAT_UNIT_RADIUS*0.5f)
+            {
+                u->arrival = ARRIVE_SETTLED;
+                u->vel = (Vector3){ 0.0f, 0.0f, 0.0f };
+                return true;
+            }
+            u->stallTimer = 0.0f;
+            u->lastProgressDist = dist;
         }
-        u->stallTimer = 0.0f;
+    }
+    else
+    {
+        // Outside the band the timer must not accumulate, or a unit that
+        // spends ten seconds marching arrives with a primed stall timer and
+        // settles on its first blocked frame.
+        u->stallTimer       = 0.0f;
         u->lastProgressDist = dist;
     }
 
@@ -2190,6 +2261,16 @@ static void MoveArriveReset(Unit *u)
     u->arrival          = ARRIVE_SEEKING;
     u->stallTimer       = 0.0f;
     u->lastProgressDist = 1000000.0f;
+
+    // Any new destination leaves the old formation. StrategyOrderMoveGroup
+    // re-stamps this immediately AFTER calling the single-unit order, so a group
+    // order still forms up - but every other order (attack, gather, a lone
+    // right-click) drops the unit out of its block, which is what the player
+    // means by giving it a different job.
+    u->formGroup      = -1;
+    u->formForming    = false;
+    u->formEverFormed = false;
+    u->formBrokeOff   = false;
 }
 
 // Nearest own building that ACCEPTS what the unit is carrying - wood only
@@ -2448,10 +2529,51 @@ static void UnitAggroScan(Unit *u, int index, int frame)
                                      u->state == UNIT_GATHER ||
                                      u->state == UNIT_RETURN ||
                                      u->state == UNIT_FARM));
+
+    // A player unit marching in formation scans too, but under the formation's
+    // OWN break-off rule rather than the blanket one above - that is the whole
+    // point of the setting. Without this a formation walks past an enemy army
+    // without reacting, because plain UNIT_MOVE never scanned for faction 0.
+    bool inFormation = (u->formGroup >= 0 && u->state == UNIT_MOVE && !u->formBrokeOff);
+    if (inFormation)
+    {
+        switch (StrategyFormationBehavior())
+        {
+            case FORM_BEHAVIOR_HOLD:
+                return;                 // the march IS the order; ignore everything
+            case FORM_BEHAVIOR_SKIRMISH:
+            case FORM_BEHAVIOR_ENGAGE:
+                scan = true;
+                break;
+            default: break;
+        }
+    }
+
     if (!scan) return;
 
-    int hostile = NearestHostile(u, u->sightRange);
-    if (hostile >= 0) StrategyOrderAttack(u, hostile);
+    // SKIRMISH peels a unit off only when the enemy is inside its OWN attack
+    // range, not its much longer sight range. That difference is what keeps a
+    // brush with one scout from dissolving the formation: units see far, but
+    // only the ones actually able to strike stop marching.
+    float range = u->sightRange;
+    if (inFormation && StrategyFormationBehavior() == FORM_BEHAVIOR_SKIRMISH)
+        range = u->attackRange;
+
+    int hostile = NearestHostile(u, range);
+    if (hostile < 0) return;
+
+    if (inFormation)
+    {
+        // ENGAGE breaks the whole formation on first contact: one unit finding
+        // an enemy releases every member of its group, so they commit together
+        // instead of feeding in one at a time.
+        if (StrategyFormationBehavior() == FORM_BEHAVIOR_ENGAGE)
+            StrategyFormationBreak(u->formGroup);
+        else
+            u->formBrokeOff = true;     // SKIRMISH: just this one
+    }
+
+    StrategyOrderAttack(u, hostile);
 }
 
 // Templar target search. The blessing templar shadows own units that are
@@ -3009,6 +3131,23 @@ static void UnitHashRebuild(void)
     }
 }
 
+// A unit only pushes while it is actually walking somewhere. Everything else -
+// idle, gathering, building, attacking in place - is stationary by intent, and
+// a stationary unit that still applies push is a permanent engine with nothing
+// pulling it back.
+//
+// This is deliberately derived from `state` rather than tracked in a field.
+// `arrival` is only ever written by MoveArrive, which only the two UNIT_MOVE /
+// UNIT_FLEE branches call, so a freshly spawned unit sits at ARRIVE_SEEKING (=0
+// from `(Unit){0}`) forever and reads as a full-strength pusher. Deriving it
+// means a new unit state cannot silently opt itself back into shoving.
+static bool UnitPushes(const Unit *u)
+{
+    if (u->arrival == ARRIVE_SETTLED) return false;
+    return (u->state == UNIT_MOVE) || (u->state == UNIT_FLEE) ||
+           (u->state == UNIT_FOLLOW);
+}
+
 static void UnitSeparation(float dt)
 {
     int32_t neighbors[STRAT_SEP_MAX_NEIGHBORS];
@@ -3035,7 +3174,11 @@ static void UnitSeparation(float dt)
             float dz = a->pos.z - b->pos.z;
             float d  = sqrtf(dx*dx + dz*dz);
 
-            if (b->arrival == ARRIVE_SETTLED) settledNeighbors++;
+            // "Finished" for the chokepoint rule means anything not going to
+            // move out of the way, which includes units that never had an order
+            // at all - a squad grinding against idle bystanders is stuck just as
+            // hard as one grinding against arrivals.
+            if (!UnitPushes(b)) settledNeighbors++;
 
             if (d < 0.001f)
             {
@@ -3063,9 +3206,9 @@ static void UnitSeparation(float dt)
 
         a->crowd = settledNeighbors;
 
-        // A settled unit does not push. It is still pushed - it just stopped
+        // A parked unit does not push. It is still pushed - it just stopped
         // being an engine. This is the line that ends the oscillation.
-        if (a->arrival == ARRIVE_SETTLED) { fx = 0.0f; fz = 0.0f; }
+        if (!UnitPushes(a)) { fx = 0.0f; fz = 0.0f; }
 
         // Deadband: forces this small are the residue of a crowd that has
         // effectively resolved, and applying them is what makes a dense pile
@@ -3366,6 +3509,13 @@ void StrategyWorldUpdate(float dt)
     SpServiceUpdate();
     StrategyMoveCollect();
     SpProfEnd(SP_PROF_ASTAR);
+
+    // Form-up BEFORE the state machine, for the same reason as pathing: every
+    // unit in a group must scale its speed against the SAME snapshot of how
+    // scattered the group is. Computed inside UnitUpdate it would depend on
+    // update order, and units early in the roster would pace themselves against
+    // a group that had already half-moved.
+    StrategyMoveFormUpdate();
 
     SpProfBegin(SP_PROF_UNIT_UPDATE);
     // Snapshot the count, and re-check `active` inside the loop. UnitUpdate can
@@ -4085,6 +4235,22 @@ void StrategyWorldDraw2DOverlay(void)
         const char *hint = "LMB place - Shift+LMB place more - RMB/ESC cancel";
         DrawText(hint, (int)(gameSize.x*0.5f - (float)MeasureText(hint, size/2)*0.5f),
                  (int)(gameSize.y*0.9f), size/2, RAYWHITE);
+    }
+
+    // Formation readout. Shown only while units are selected - it is a property
+    // of the order you are about to give, so it is noise at every other moment.
+    {
+        int selCount = 0;
+        SelectedUnits(&selCount);
+        if (selCount > 0)
+        {
+            const char *txt = TextFormat("[F] %s   [V] %s",
+                                         StrategyFormationShapeName(StrategyFormationShape()),
+                                         StrategyFormationBehaviorName(StrategyFormationBehavior()));
+            int fs = size/2;
+            DrawText(txt, (int)(gameSize.x*0.5f - (float)MeasureText(txt, fs)*0.5f),
+                     (int)(gameSize.y*0.945f), fs, (Color){ 190, 195, 205, 255 });
+        }
     }
 
     // Victory/defeat banner: the sim keeps running underneath, R restarts.

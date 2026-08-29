@@ -182,6 +182,27 @@ bool      StrategyMoveGoalOf(int index, Vector3 *out);
 //  AREA, and that is what this does.
 void StrategyOrderMoveGroup(const int *units, int count, Vector3 dest);
 
+// -- Formations --------------------------------------------------------------
+// Shape and break-off behaviour are SEPARATE AXES, deliberately: "what the block
+// looks like" and "who peels off when shot at" are unrelated decisions, and any
+// shape can be marched with any behaviour. Both are player settings applied to
+// the NEXT group order; a group already marching keeps what it was given.
+void              StrategyFormationShapeSet(FormationShape s);
+FormationShape    StrategyFormationShape(void);
+void              StrategyFormationBehaviorSet(FormationBehavior b);
+FormationBehavior StrategyFormationBehavior(void);
+const char       *StrategyFormationShapeName(FormationShape s);
+const char       *StrategyFormationBehaviorName(FormationBehavior b);
+
+// Release every member of a group from its formation. FORM_BEHAVIOR_ENGAGE uses
+// it so first contact commits the whole block at once.
+void StrategyFormationBreak(int groupId);
+
+// Per-frame form-up pass: recomputes each live group's worst distance-to-slot
+// and latches groups that have closed up. MUST run before the movement pass, so
+// every unit in a group compares against the same snapshot.
+void StrategyMoveFormUpdate(void);
+
 // Units sharing a destination, above which a flow field is built instead of a
 // path each. A field is looked up FIRST regardless of size, so a lone unit sent
 // where a crowd is already headed rides theirs for free; the threshold only
