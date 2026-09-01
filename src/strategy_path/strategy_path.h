@@ -459,4 +459,122 @@ void SpFlowSweepEnd(float now);
 
 int  SpFlowLiveCount(void);
 
+
+// ============================================================================
+//  Formation geometry  (strategy_path_form.c)
+//
+//  Pure layout math: where slot i of n sits, how big the block is, and how wide
+//  the open ground is across the line of travel. No Unit, no world, no faction -
+//  which is what makes it testable, and why the shape below is a plain int
+//  rather than the game's FormationShape enum.
+//
+//  THE ENUMS MUST AGREE. strategy_move.c carries a _Static_assert pinning each
+//  SP_FORM_* to its FormationShape twin; reorder either list and the build
+//  fails rather than the formations quietly turning into each other.
+// ============================================================================
+enum {
+    SP_FORM_GRID = 0,
+    SP_FORM_LINE,
+    SP_FORM_COLUMN,
+    SP_FORM_TWO_COLUMN,
+    SP_FORM_WEDGE,
+    SP_FORM_FREEFORM,
+    SP_FORM_SHAPE_COUNT,
+};
+
+// How loosely FORM_FREEFORM scatters, as a multiple of the slot pitch. Above
+// 1.0 because a sunflower disc at exactly the pitch packs tighter than a grid
+// does - the point of the shape is that it is loose.
+#define SP_FORM_FREEFORM_PITCH  1.15f
+
+// The extent caps, passed in rather than defined here: they are a game-balance
+// question ("how much frontage may a line take"), not a geometry one, so they
+// live with the rest of the tuning in strategy_types.h.
+typedef struct {
+    float lineMaxWidth;     // frontage before a LINE adds ranks
+    int   lineRanks;        // nominal depth of a LINE
+    float columnMaxDepth;   // depth before a COLUMN adds files
+    int   columnFiles;      // nominal width of a COLUMN
+    float twoColumnLane;    // gap between the two files of a TWO_COLUMN
+} SpFormCaps;
+
+// Slot `i` of `count` in FORMATION-LOCAL space: `outR` across the formation's
+// right-hand perpendicular, `outF` along its forward. The caller rotates and
+// translates, so every shape is expressed on the same two axes and none of them
+// needs to know the group's facing.
+//
+// Rows run BACK TO FRONT (offF decreasing) so slot 0 is the front rank. The
+// caller's assignment sort relies on that to put the units which start nearest
+// the destination at the front, rather than marching them through their own
+// formation.
+void SpFormSlotLocal(int shape, int i, int count, float spacing,
+                     const SpFormCaps *caps, float *outR, float *outF);
+
+// Distance from the formation centre to its furthest slot. This is the number a
+// flow-field release radius has to scale with: release at a constant while the
+// block's own footprint grows with the unit count, and at a thousand units the
+// field governs the whole march and funnels it onto one tile.
+float SpFormHalfExtent(int shape, int count, float spacing,
+                       const SpFormCaps *caps);
+
+// Mean forward-offset of a shape's slots. GRID centres on the point it is built
+// around; LINE, COLUMN and WEDGE grow backward from it, so their mass lands
+// behind the player's click - a 100-unit column by eighteen world units.
+// Subtract this from each slot's forward offset to re-anchor any shape on its
+// own centroid. See the definition for why a short move otherwise walks the rear
+// ranks backwards.
+float SpFormForwardBias(int shape, int count, float spacing,
+                        const SpFormCaps *caps);
+
+// Passable tiles across the direction of travel at (tx,tz), counting outward
+// from the tile itself and stopping at the first obstacle each way. Capped at
+// `maxTiles` per side, because past a couple of dozen tiles the ground is open
+// by any standard a formation cares about. Returns 0 when the tile itself is
+// blocked.
+int SpFormCorridorWidth(const SpGrid *g, int tx, int tz,
+                        float dirX, float dirZ, int maxTiles);
+
+// A point on the ground. Deliberately not Vector3: assignment is a 2-D problem
+// and carrying the unused y would double the scratch this walks over.
+typedef struct { float x, z; } SpFormPoint;
+
+typedef struct { float key; int index; } SpFormSortEntry;
+
+void SpFormSortByKey(SpFormSortEntry *a, int n);
+
+// Pair each unit with a slot, writing unit i's slot index to outSlotOf[i].
+// `units` and `slots` must both hold `n` entries; the two scratch arrays must
+// hold `n` each and are owned by the caller (this module allocates nothing).
+//
+// WHY NOT THE 1-D ZIP THIS REPLACES. Projecting both sets onto one axis and
+// zipping is coherent along that axis and arbitrary across it, so a group
+// re-ordered onto ground it already occupies walks 30-47% further than needed
+// and individual units cross the block to reach a slot beside where they stood.
+// An angular seed plus a bounded 2-opt repair cuts the worst single-unit walk at
+// 512 units from 29.4 to 19.3 world units for about 0.7 ms, on a click.
+//
+// Deterministic: the same inputs give the same assignment every time, which the
+// slot overlay relies on.
+void SpFormAssign(const SpFormPoint *units, const SpFormPoint *slots, int n,
+                  int *outSlotOf, SpFormSortEntry *scratchA, SpFormSortEntry *scratchB);
+
+// Assign with MEMORY, which is what a group that is merely being re-ordered
+// needs. `prevSlot[i]` is unit i's slot index from its previous order, or -1 for
+// a unit with none. Units that still have a valid, unclaimed slot keep it - so a
+// block that has not changed shape or size translates and turns rigidly instead
+// of re-pairing itself - and only the remainder are placed, into the nearest
+// free slot, which is by construction the gap they are standing next to.
+//
+// `slotTaken` is caller-owned scratch of at least n bytes. Returns how many
+// units had to be placed fresh.
+//
+// WHY THIS IS NOT SpFormAssign WITH AN EXTRA ARGUMENT. That one minimises total
+// distance for a pairing built from nothing, which is the right answer for a NEW
+// formation and the wrong one for an existing formation: re-deriving an optimal
+// pairing every order is precisely what made a 15-degree facing change reshuffle
+// 33 units out of 36.
+int SpFormAssignStable(const SpFormPoint *units, const SpFormPoint *slots, int n,
+                       const int *prevSlot, int *outSlotOf,
+                       unsigned char *slotTaken);
+
 #endif // STRATEGY_PATH_H

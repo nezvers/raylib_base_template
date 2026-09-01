@@ -1534,6 +1534,653 @@ static void TestFlowSweepIsIdempotent(void)
 }
 
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+//  Formation geometry
+//
+//  THE BUG THIS EXISTS TO CATCH. The first formation system shipped a form-up
+//  tolerance of 1.4 world units against a slot pitch of 1.5 - so a group was
+//  asked to pack tighter than its own slots were spaced, the latch could never
+//  fire, and a thousand-unit army crawled at 0.15x speed for the whole march.
+//  Nothing caught it because the layout math lived in a file that cannot link
+//  into a test. It can now, so the invariants it has to satisfy are asserted
+//  here rather than discovered in a playtest.
+// ---------------------------------------------------------------------------
+static const SpFormCaps s_caps = { 40.0f, 2, 40.0f, 2, 3.0f };
+#define FORM_TEST_PITCH 1.5f
+
+static const int s_formCounts[] = { 2, 10, 100, 512 };
+#define FORM_TEST_COUNTS ((int)(sizeof(s_formCounts)/sizeof(s_formCounts[0])))
+
+// No two units may be sent to the same place. A duplicate slot is two units
+// ordered to stand inside each other, which separation then fights forever.
+static void TestFormSlotsUnique(void)
+{
+    static float rr[512], ff[512];
+
+    for (int shape = 0; shape < SP_FORM_SHAPE_COUNT; shape++)
+    {
+        for (int c = 0; c < FORM_TEST_COUNTS; c++)
+        {
+            int n = s_formCounts[c];
+            for (int i = 0; i < n; i++)
+                SpFormSlotLocal(shape, i, n, FORM_TEST_PITCH, &s_caps, &rr[i], &ff[i]);
+
+            int dupes = 0;
+            for (int i = 0; i < n; i++)
+                for (int j = i + 1; j < n; j++)
+                {
+                    float dx = rr[i] - rr[j], dz = ff[i] - ff[j];
+                    if (dx*dx + dz*dz < 0.0001f) dupes++;
+                }
+            CHECK(dupes == 0);
+        }
+    }
+}
+
+// THE D3 INVARIANT. The closest any two slots sit is what every form-up
+// tolerance has to clear: ask units to be nearer their slots than their slots
+// are to each other and the latch is unsatisfiable by construction.
+static void TestFormSlotSpacing(void)
+{
+    static float rr[512], ff[512];
+
+    for (int shape = 0; shape < SP_FORM_SHAPE_COUNT; shape++)
+    {
+        for (int c = 0; c < FORM_TEST_COUNTS; c++)
+        {
+            int n = s_formCounts[c];
+            for (int i = 0; i < n; i++)
+                SpFormSlotLocal(shape, i, n, FORM_TEST_PITCH, &s_caps, &rr[i], &ff[i]);
+
+            float closest = 1e9f;
+            for (int i = 0; i < n; i++)
+                for (int j = i + 1; j < n; j++)
+                {
+                    float dx = rr[i] - rr[j], dz = ff[i] - ff[j];
+                    float d = sqrtf(dx*dx + dz*dz);
+                    if (d < closest) closest = d;
+                }
+
+            // FREEFORM is a scatter, not a lattice, so its minimum pair is not
+            // the pitch - but it still may not put two units on one spot.
+            if (shape == SP_FORM_FREEFORM) CHECK(closest > FORM_TEST_PITCH*0.4f);
+            else                           CHECK(closest > FORM_TEST_PITCH*0.9f);
+        }
+    }
+}
+
+// EXTENT CAPS ARE LOAD-BEARING. Past them a shape scales linearly with the unit
+// count and walks off the map: the outer slots land outside the grid, where
+// SpNearestOpen's ring cannot recover them, and those units are stranded.
+static void TestFormExtentCaps(void)
+{
+    for (int c = 0; c < FORM_TEST_COUNTS; c++)
+    {
+        int n = s_formCounts[c];
+
+        float wide = 0.0f, deep = 0.0f;
+        for (int i = 0; i < n; i++)
+        {
+            float r, f;
+            SpFormSlotLocal(SP_FORM_LINE, i, n, FORM_TEST_PITCH, &s_caps, &r, &f);
+            if (fabsf(r) > wide) wide = fabsf(r);
+        }
+        CHECK(wide*2.0f <= s_caps.lineMaxWidth + FORM_TEST_PITCH);
+
+        for (int i = 0; i < n; i++)
+        {
+            float r, f;
+            SpFormSlotLocal(SP_FORM_COLUMN, i, n, FORM_TEST_PITCH, &s_caps, &r, &f);
+            if (fabsf(f) > deep) deep = fabsf(f);
+        }
+        CHECK(deep <= s_caps.columnMaxDepth + FORM_TEST_PITCH);
+    }
+}
+
+// Slot 0 is the FRONT rank for every ordered shape. The assignment sort relies
+// on it to put the units that start nearest the destination at the front -
+// break the ordering and a group marches through its own formation.
+static void TestFormFrontRank(void)
+{
+    const int ordered[] = { SP_FORM_LINE, SP_FORM_COLUMN, SP_FORM_TWO_COLUMN, SP_FORM_WEDGE };
+
+    for (int k = 0; k < 4; k++)
+    {
+        for (int c = 0; c < FORM_TEST_COUNTS; c++)
+        {
+            int n = s_formCounts[c];
+            float r0, f0;
+            SpFormSlotLocal(ordered[k], 0, n, FORM_TEST_PITCH, &s_caps, &r0, &f0);
+
+            int ahead = 0;
+            for (int i = 1; i < n; i++)
+            {
+                float r, f;
+                SpFormSlotLocal(ordered[k], i, n, FORM_TEST_PITCH, &s_caps, &r, &f);
+                if (f > f0 + 0.001f) ahead++;
+            }
+            CHECK(ahead == 0);
+        }
+    }
+}
+
+// FREEFORM's radius must grow as sqrt(i), or density collapses: grow it
+// linearly and a thousand units become a thin ring with nothing in the middle.
+// Measured as area per unit, which is what "constant density" actually means.
+static void TestFormFreeformDensity(void)
+{
+    float prev = 0.0f;
+    for (int c = 0; c < FORM_TEST_COUNTS; c++)
+    {
+        int n = s_formCounts[c];
+        float worst = SpFormHalfExtent(SP_FORM_FREEFORM, n, FORM_TEST_PITCH, &s_caps);
+        float perUnit = (worst*worst)/(float)n;     // area/unit, up to pi
+
+        if (prev > 0.0f)
+        {
+            CHECK(perUnit < prev*1.5f);
+            CHECK(perUnit > prev*0.5f);
+        }
+        prev = perUnit;
+    }
+
+    // Deterministic: the same order twice must give the same layout, or the
+    // slot overlay flickers and nothing about it can be read.
+    float a, b, c2, d;
+    SpFormSlotLocal(SP_FORM_FREEFORM, 37, 100, FORM_TEST_PITCH, &s_caps, &a, &b);
+    SpFormSlotLocal(SP_FORM_FREEFORM, 37, 100, FORM_TEST_PITCH, &s_caps, &c2, &d);
+    CHECK(a == c2 && b == d);
+}
+
+// The extent is what the flow release radius scales with, so it has to grow
+// with the count - a constant here is the D2 funnel bug in a different place.
+static void TestFormHalfExtentGrows(void)
+{
+    for (int shape = 0; shape < SP_FORM_SHAPE_COUNT; shape++)
+    {
+        float small = SpFormHalfExtent(shape, 10,  FORM_TEST_PITCH, &s_caps);
+        float big   = SpFormHalfExtent(shape, 500, FORM_TEST_PITCH, &s_caps);
+        CHECK(big > small);
+        CHECK(small > 0.0f);
+    }
+}
+
+// The corridor probe against hand-built ground. This is the number the whole
+// chokepoint rule turns on, and it is deliberately NOT the flow field's
+// gradient - that answers "how far to the goal", so a long detour and a narrow
+// gap read identically.
+static void TestFormCorridorWidth(void)
+{
+    SpGridInit(&s_grid, 32, 32);
+
+    // Open ground: capped, not infinite.
+    int w = SpFormCorridorWidth(&s_grid, 16, 16, 0.0f, 1.0f, 12);
+    CHECK(w == 25);                                 // 12 each way + the tile itself
+
+    // A one-tile gap in a wall running across x, travelling along z.
+    for (int x = 0; x < 32; x++) SpGridSet(&s_grid, x, 16, SP_COST_BLOCKED);
+    SpGridSet(&s_grid, 16, 16, SP_COST_NORMAL);
+    CHECK(SpFormCorridorWidth(&s_grid, 16, 16, 0.0f, 1.0f, 12) == 1);
+
+    // Widen it to three.
+    SpGridSet(&s_grid, 15, 16, SP_COST_NORMAL);
+    SpGridSet(&s_grid, 17, 16, SP_COST_NORMAL);
+    CHECK(SpFormCorridorWidth(&s_grid, 16, 16, 0.0f, 1.0f, 12) == 3);
+
+    // Probed PERPENDICULAR to travel: walking along the wall instead of through
+    // it is not a chokepoint, and reporting one would funnel a block that has
+    // open ground on both sides.
+    CHECK(SpFormCorridorWidth(&s_grid, 16, 16, 1.0f, 0.0f, 12) > 3);
+
+    // A blocked tile has no width at all rather than a misleading 1.
+    SpGridInit(&s_grid, 32, 32);
+    SpGridSet(&s_grid, 8, 8, SP_COST_BLOCKED);
+    CHECK(SpFormCorridorWidth(&s_grid, 8, 8, 0.0f, 1.0f, 12) == 0);
+}
+
+
+// A valid assignment is first of all a PERMUTATION: every slot used exactly
+// once. Get this wrong and two units are sent to the same place while another
+// slot stands empty - which reads as a formation with a hole in it.
+static void TestFormAssignIsPermutation(void)
+{
+    static SpFormPoint units[512], slots[512];
+    static int         got[512];
+    static SpFormSortEntry sa[512], sb[512];
+    static int seen[512];
+
+    RngSeed(99);
+    const int counts[] = { 1, 2, 7, 64, 512 };
+
+    for (int c = 0; c < 5; c++)
+    {
+        int n = counts[c];
+        for (int i = 0; i < n; i++)
+        {
+            units[i].x = RngRange(-30.0f, 30.0f);
+            units[i].z = RngRange(-30.0f, 30.0f);
+            slots[i].x = RngRange(-30.0f, 30.0f);
+            slots[i].z = RngRange(-30.0f, 30.0f);
+        }
+
+        SpFormAssign(units, slots, n, got, sa, sb);
+
+        memset(seen, 0, sizeof(int)*(size_t)n);
+        int bad = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (got[i] < 0 || got[i] >= n) { bad++; continue; }
+            seen[got[i]]++;
+        }
+        CHECK(bad == 0);
+        for (int i = 0; i < n; i++) CHECK(seen[i] == 1);
+    }
+}
+
+// THE POINT OF THE CHANGE. Against the 1-D axis zip it replaces, on the case
+// that actually looked wrong - a group standing on its own destination,
+// re-ordered - the assignment must not walk the group further. Total distance
+// AND the worst single unit both matter: the complaint was units crossing the
+// block to reach a slot beside the one they were on, which is a worst-case
+// symptom that a total-distance win can hide.
+static void TestFormAssignBeatsAxisZip(void)
+{
+    static SpFormPoint units[512], slots[512];
+    static int         got[512];
+    static SpFormSortEntry sa[512], sb[512];
+
+    RngSeed(4242);
+    const int counts[] = { 24, 100, 512 };
+
+    for (int c = 0; c < 3; c++)
+    {
+        int n = counts[c];
+
+        // A grid of slots, and units scattered over the same ground - the
+        // re-order-in-place case.
+        int cols = (int)ceilf(sqrtf((float)n));
+        for (int i = 0; i < n; i++)
+        {
+            slots[i].x = ((float)(i % cols) - (float)(cols - 1)*0.5f)*1.5f;
+            slots[i].z = ((float)(i/cols)   - (float)(cols - 1)*0.5f)*1.5f;
+            units[i].x = RngRange(-1.0f, 1.0f)*(float)cols*0.75f;
+            units[i].z = RngRange(-1.0f, 1.0f)*(float)cols*0.75f;
+        }
+
+        // The axis zip, reproduced exactly as it shipped: project both onto one
+        // axis (forward = +z here, so right = +x) and pair the sorted orders.
+        for (int i = 0; i < n; i++)
+        {
+            sa[i].key = units[i].x + units[i].z*0.5f;  sa[i].index = i;
+            sb[i].key = slots[i].x + slots[i].z*0.5f;  sb[i].index = i;
+        }
+        SpFormSortByKey(sa, n);
+        SpFormSortByKey(sb, n);
+
+        float zipTotal = 0.0f, zipWorst = 0.0f;
+        for (int k = 0; k < n; k++)
+        {
+            float dx = units[sa[k].index].x - slots[sb[k].index].x;
+            float dz = units[sa[k].index].z - slots[sb[k].index].z;
+            float d = sqrtf(dx*dx + dz*dz);
+            zipTotal += d;
+            if (d > zipWorst) zipWorst = d;
+        }
+
+        SpFormAssign(units, slots, n, got, sa, sb);
+
+        float total = 0.0f, worst = 0.0f;
+        for (int i = 0; i < n; i++)
+        {
+            float dx = units[i].x - slots[got[i]].x;
+            float dz = units[i].z - slots[got[i]].z;
+            float d = sqrtf(dx*dx + dz*dz);
+            total += d;
+            if (d > worst) worst = d;
+        }
+
+        CHECK(total <= zipTotal);
+        CHECK(worst <= zipWorst);
+    }
+}
+
+// Deterministic, because the slot overlay draws a line per unit and a pairing
+// that differed between two identical orders would make it unreadable.
+static void TestFormAssignDeterministic(void)
+{
+    static SpFormPoint units[256], slots[256];
+    static int         a[256], b[256];
+    static SpFormSortEntry sa[256], sb[256];
+
+    RngSeed(5150);
+    for (int i = 0; i < 256; i++)
+    {
+        units[i].x = RngRange(-20.0f, 20.0f);
+        units[i].z = RngRange(-20.0f, 20.0f);
+        slots[i].x = RngRange(-20.0f, 20.0f);
+        slots[i].z = RngRange(-20.0f, 20.0f);
+    }
+
+    SpFormAssign(units, slots, 256, a, sa, sb);
+    SpFormAssign(units, slots, 256, b, sa, sb);
+    for (int i = 0; i < 256; i++) CHECK(a[i] == b[i]);
+}
+
+// THE ROTATED RE-ORDER, which is the case the player actually complained about:
+// a LINE standing in formation, ordered again with the facing turned 90 degrees.
+// The 1-D zip sorts by an axis that the rotation has just redefined, so it walks
+// units the length of the block to reach a slot near where they already stood -
+// worst unit 29.8 world units on this exact layout.
+//
+// Note what is NOT asserted: that a group standing on its slots does not move.
+// The zip scores a perfect zero on that too - the projection is injective on a
+// regular grid - so a test built on it would pass for both algorithms and prove
+// nothing. This one separates them.
+static void TestFormAssignRotatedReorder(void)
+{
+    static SpFormPoint units[100], slots[100];
+    static int         got[100];
+    static SpFormSortEntry sa[100], sb[100];
+
+    // The same LINE, laid out twice: once facing +z, once facing +x.
+    for (int i = 0; i < 100; i++)
+    {
+        float r = ((float)(i % 25) - 12.0f)*1.5f;
+        float f = -(float)(i/25)*1.5f;
+
+        units[i].x = r*(-1.0f) + f*0.0f;    // facing (0,1): right = (-1,0)
+        units[i].z = r*( 0.0f) + f*1.0f;
+        slots[i].x = r*( 0.0f) + f*1.0f;    // facing (1,0): right = (0,1)
+        slots[i].z = r*( 1.0f) + f*0.0f;
+    }
+
+    // The axis zip as it shipped, measured against the NEW facing.
+    for (int i = 0; i < 100; i++)
+    {
+        sa[i].key = units[i].z + units[i].x*0.5f;  sa[i].index = i;
+        sb[i].key = slots[i].z + slots[i].x*0.5f;  sb[i].index = i;
+    }
+    SpFormSortByKey(sa, 100);
+    SpFormSortByKey(sb, 100);
+
+    float zipWorst = 0.0f, zipTotal = 0.0f;
+    for (int k = 0; k < 100; k++)
+    {
+        float dx = units[sa[k].index].x - slots[sb[k].index].x;
+        float dz = units[sa[k].index].z - slots[sb[k].index].z;
+        float d = sqrtf(dx*dx + dz*dz);
+        zipTotal += d;
+        if (d > zipWorst) zipWorst = d;
+    }
+
+    SpFormAssign(units, slots, 100, got, sa, sb);
+
+    float worst = 0.0f, total = 0.0f;
+    for (int i = 0; i < 100; i++)
+    {
+        float dx = units[i].x - slots[got[i]].x;
+        float dz = units[i].z - slots[got[i]].z;
+        float d = sqrtf(dx*dx + dz*dz);
+        total += d;
+        if (d > worst) worst = d;
+    }
+
+    // The zip really is bad here - if it were not, this test would be proving
+    // nothing, so assert that too.
+    CHECK(zipWorst > 20.0f);
+    CHECK(worst < zipWorst);
+    CHECK(total < zipTotal);
+}
+
+
+// A slot that cannot be resolved must never be handed out as-is. The shipped
+// code called SpNearestOpen with a ring cap of 6 and, on failure, kept the
+// ORIGINAL blocked position - so a LINE whose corner reached into a wide
+// obstacle sent those units at a tile they could never stand on. They wedge
+// against it and never arrive, which is the orbit-forever failure the whole
+// slot-resolution rule exists to prevent.
+//
+// This asserts the property the caller needs: for a slot anywhere in a large
+// blocked region, SOME passable tile is found, given a ring cap big enough to
+// clear a realistic obstacle.
+static void TestNearestOpenEscapesLargeObstacle(void)
+{
+    SpGridInit(&s_grid, 64, 64);
+
+    // A 20x20 lake - far wider than a ring cap of 6 can escape from its centre.
+    for (int z = 20; z < 40; z++)
+        for (int x = 20; x < 40; x++)
+            SpGridSet(&s_grid, x, z, SP_COST_BLOCKED);
+
+    int ox, oz;
+
+    // The old cap cannot escape the middle: this is the bug, asserted so the
+    // number below is not mistaken for arbitrary.
+    CHECK(!SpNearestOpen(&s_grid, 30, 30, 6, &ox, &oz));
+
+    // A cap that spans the obstacle does, and lands somewhere passable.
+    CHECK(SpNearestOpen(&s_grid, 30, 30, 16, &ox, &oz));
+    CHECK(SpGridPassable(&s_grid, ox, oz));
+
+    // Every tile inside the lake must resolve to open ground at that cap.
+    int failed = 0, notPassable = 0;
+    for (int z = 20; z < 40; z++)
+        for (int x = 20; x < 40; x++)
+        {
+            if (!SpNearestOpen(&s_grid, x, z, 16, &ox, &oz)) { failed++; continue; }
+            if (!SpGridPassable(&s_grid, ox, oz)) notPassable++;
+        }
+    CHECK(failed == 0);
+    CHECK(notPassable == 0);
+}
+
+
+// Every shape must land CENTRED on the point it is built around, not trailing
+// behind it. GRID always did; LINE, COLUMN and WEDGE grew backward from the
+// click, so a 100-unit column's mass sat eighteen world units behind where the
+// player pointed - and on a short move its rear ranks were sent to ground behind
+// where they already stood, so they walked backwards into position.
+static void TestFormForwardBiasCentres(void)
+{
+    const int counts[] = { 2, 10, 100, 512 };
+
+    for (int shape = 0; shape < SP_FORM_SHAPE_COUNT; shape++)
+    {
+        for (int c = 0; c < 4; c++)
+        {
+            int n = counts[c];
+            float bias = SpFormForwardBias(shape, n, FORM_TEST_PITCH, &s_caps);
+
+            // Re-anchored mean forward offset must be zero.
+            float sum = 0.0f;
+            for (int i = 0; i < n; i++)
+            {
+                float r, f;
+                SpFormSlotLocal(shape, i, n, FORM_TEST_PITCH, &s_caps, &r, &f);
+                sum += (f - bias);
+            }
+            CHECK(fabsf(sum/(float)n) < 0.001f);
+        }
+    }
+}
+
+// The bias must be REAL for the trailing shapes - if it were near zero this
+// would be a no-op dressed up as a fix, so the size of the correction is
+// asserted rather than assumed.
+static void TestFormForwardBiasIsSubstantial(void)
+{
+    // GRID already centres: its bias is nil.
+    CHECK(fabsf(SpFormForwardBias(SP_FORM_GRID, 100, FORM_TEST_PITCH, &s_caps)) < 0.6f);
+
+    // The trailing shapes do not, and by a lot at scale.
+    CHECK(SpFormForwardBias(SP_FORM_COLUMN, 100, FORM_TEST_PITCH, &s_caps) < -10.0f);
+    CHECK(SpFormForwardBias(SP_FORM_WEDGE,  100, FORM_TEST_PITCH, &s_caps) < -5.0f);
+    CHECK(SpFormForwardBias(SP_FORM_LINE,   100, FORM_TEST_PITCH, &s_caps) < -1.0f);
+}
+
+// THE SHORT-MOVE CASE, which is what was actually reported. A column ordered a
+// few units forward must not send anybody backwards past where the group
+// already stands. Before re-anchoring the deepest slot sat 10.5 units behind
+// the centroid for a 3-unit step.
+static void TestFormShortMoveDoesNotWalkBackwards(void)
+{
+    const int n = 20;
+    const float step = 3.0f;        // the click, 3 units ahead of the centroid
+
+    for (int shape = 0; shape < SP_FORM_SHAPE_COUNT; shape++)
+    {
+        float bias = SpFormForwardBias(shape, n, FORM_TEST_PITCH, &s_caps);
+
+        float meanF = 0.0f;
+        for (int i = 0; i < n; i++)
+        {
+            float r, f;
+            SpFormSlotLocal(shape, i, n, FORM_TEST_PITCH, &s_caps, &r, &f);
+            meanF += (f - bias) + step;     // slot position along forward
+        }
+        meanF /= (float)n;
+
+        // The block's mass must end up where the player clicked, so the group
+        // as a whole moves FORWARD by the step rather than staying put or
+        // sliding back.
+        CHECK(fabsf(meanF - step) < 0.001f);
+    }
+}
+
+
+// THE HEADLINE PROPERTY. A block whose shape and size are unchanged keeps every
+// unit in the slot it already holds, however far the formation has moved or
+// turned. Re-deriving the pairing instead - which is what the plain assignment
+// does - reshuffled 33 units in 36 for a 15-degree facing swing, and facing is
+// re-derived from centroid-to-destination on every single order.
+static void TestFormAssignStableKeepsSlots(void)
+{
+    static SpFormPoint units[64], slots[64];
+    static int prev[64], got[64];
+    static unsigned char taken[64];
+
+    const int n = 36;
+
+    // Units standing in a GRID; slots the same grid moved and rotated hard.
+    for (int i = 0; i < n; i++)
+    {
+        float r = ((float)(i % 6) - 2.5f)*1.5f;
+        float f = ((float)(i/6)   - 2.5f)*1.5f;
+        units[i].x = r;   units[i].z = f;
+        // 45 degrees and 20 units away
+        slots[i].x =  r*0.7071f + f*0.7071f + 20.0f;
+        slots[i].z = -r*0.7071f + f*0.7071f + 20.0f;
+        prev[i] = i;
+    }
+
+    int placed = SpFormAssignStable(units, slots, n, prev, got, taken);
+
+    CHECK(placed == 0);                         // nobody needed re-placing
+    for (int i = 0; i < n; i++) CHECK(got[i] == i);
+}
+
+// A unit with no remembered slot takes a free one NEAR IT, not across the block.
+// The free slots are the gaps left by units that departed, so "nearest free" is
+// a local answer by construction - which is the property that stops a
+// reinforcement walking through the formation to reach the far corner.
+static void TestFormAssignStablePlacesLocally(void)
+{
+    static SpFormPoint units[64], slots[64];
+    static int prev[64], got[64];
+    static unsigned char taken[64];
+
+    const int n = 36;
+    for (int i = 0; i < n; i++)
+    {
+        float r = ((float)(i % 6) - 2.5f)*1.5f;
+        float f = ((float)(i/6)   - 2.5f)*1.5f;
+        units[i].x = r;  units[i].z = f;
+        slots[i].x = r;  slots[i].z = f;        // formation stays put
+        prev[i] = i;
+    }
+
+    // Three units in one corner forget their slots - a squad that broke off to
+    // fight and rejoined. They must reclaim slots beside them, not across.
+    const int forgot[3] = { 0, 1, 6 };
+    for (int k = 0; k < 3; k++) prev[forgot[k]] = -1;
+
+    int placed = SpFormAssignStable(units, slots, n, prev, got, taken);
+    CHECK(placed == 3);
+
+    for (int k = 0; k < 3; k++)
+    {
+        int i = forgot[k];
+        float dx = units[i].x - slots[got[i]].x;
+        float dz = units[i].z - slots[got[i]].z;
+        float d  = sqrtf(dx*dx + dz*dz);
+
+        // Their own three slots are the only free ones and all sit in that
+        // corner, so the walk is a couple of slot pitches at most - never the
+        // ~12 units it would take to cross this block.
+        CHECK(d < 4.0f);
+    }
+}
+
+// The result must still be a permutation, even when remembered slots collide
+// (two units claiming one) or point outside the current layout.
+static void TestFormAssignStableHandlesBadMemory(void)
+{
+    static SpFormPoint units[32], slots[32];
+    static int prev[32], got[32], seen[32];
+    static unsigned char taken[32];
+
+    const int n = 16;
+    RngSeed(31337);
+    for (int i = 0; i < n; i++)
+    {
+        units[i].x = RngRange(-10.0f, 10.0f);
+        units[i].z = RngRange(-10.0f, 10.0f);
+        slots[i].x = RngRange(-10.0f, 10.0f);
+        slots[i].z = RngRange(-10.0f, 10.0f);
+    }
+
+    // Deliberately hostile memory: duplicates, out-of-range and negatives.
+    for (int i = 0; i < n; i++) prev[i] = 3;        // everyone claims slot 3
+    prev[0]  = -1;
+    prev[1]  = n + 99;
+    prev[2]  = -42;
+
+    SpFormAssignStable(units, slots, n, prev, got, taken);
+
+    memset(seen, 0, sizeof(int)*(size_t)n);
+    for (int i = 0; i < n; i++)
+    {
+        CHECK(got[i] >= 0 && got[i] < n);
+        seen[got[i]]++;
+    }
+    for (int i = 0; i < n; i++) CHECK(seen[i] == 1);
+}
+
+// No memory at all (a brand-new formation) must still produce a valid
+// permutation - the caller uses the from-scratch path there, but passing NULL
+// must not be a trap.
+static void TestFormAssignStableNullMemory(void)
+{
+    static SpFormPoint units[16], slots[16];
+    static int got[16], seen[16];
+    static unsigned char taken[16];
+
+    RngSeed(777);
+    for (int i = 0; i < 16; i++)
+    {
+        units[i].x = RngRange(-5.0f, 5.0f);  units[i].z = RngRange(-5.0f, 5.0f);
+        slots[i].x = RngRange(-5.0f, 5.0f);  slots[i].z = RngRange(-5.0f, 5.0f);
+    }
+
+    int placed = SpFormAssignStable(units, slots, 16, NULL, got, taken);
+    CHECK(placed == 16);
+
+    memset(seen, 0, sizeof(seen));
+    for (int i = 0; i < 16; i++) { CHECK(got[i] >= 0 && got[i] < 16); seen[got[i]]++; }
+    for (int i = 0; i < 16; i++) CHECK(seen[i] == 1);
+}
+
 int main(void)
 {
     printf("path_tests\n");
@@ -1590,6 +2237,26 @@ int main(void)
     TestFlowMatchesDijkstra();
     TestFlowEvictionRespectsRefcount();
     TestFlowSweepIsIdempotent();
+
+    TestFormSlotsUnique();
+    TestFormSlotSpacing();
+    TestFormExtentCaps();
+    TestFormFrontRank();
+    TestFormFreeformDensity();
+    TestFormHalfExtentGrows();
+    TestFormCorridorWidth();
+    TestFormAssignIsPermutation();
+    TestFormAssignBeatsAxisZip();
+    TestFormAssignDeterministic();
+    TestFormAssignRotatedReorder();
+    TestNearestOpenEscapesLargeObstacle();
+    TestFormForwardBiasCentres();
+    TestFormForwardBiasIsSubstantial();
+    TestFormShortMoveDoesNotWalkBackwards();
+    TestFormAssignStableKeepsSlots();
+    TestFormAssignStablePlacesLocally();
+    TestFormAssignStableHandlesBadMemory();
+    TestFormAssignStableNullMemory();
 
     printf("\n%d checks, %d failed\n", s_checks, s_fails);
     return (s_fails == 0) ? 0 : 1;

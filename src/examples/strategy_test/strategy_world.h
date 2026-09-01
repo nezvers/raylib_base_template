@@ -182,6 +182,11 @@ bool      StrategyMoveGoalOf(int index, Vector3 *out);
 //  AREA, and that is what this does.
 void StrategyOrderMoveGroup(const int *units, int count, Vector3 dest);
 
+// Same, with the formation's heading pinned by the player instead of inferred
+// from the direction of travel. Used by the drag-to-orient order.
+void StrategyOrderMoveGroupFacing(const int *units, int count, Vector3 dest,
+                                  float faceX, float faceZ);
+
 // -- Formations --------------------------------------------------------------
 // Shape and break-off behaviour are SEPARATE AXES, deliberately: "what the block
 // looks like" and "who peels off when shot at" are unrelated decisions, and any
@@ -201,7 +206,36 @@ void StrategyFormationBreak(int groupId);
 // Per-frame form-up pass: recomputes each live group's worst distance-to-slot
 // and latches groups that have closed up. MUST run before the movement pass, so
 // every unit in a group compares against the same snapshot.
-void StrategyMoveFormUpdate(void);
+void StrategyMoveFormUpdate(float dt);
+
+// Drop the flow field a unit is riding, keeping its A* path. Called from the
+// single funnel every new individual destination passes through: a field is a
+// GROUP answer, so the moment a unit is sent somewhere of its own it is being
+// steered at somebody else's destination.
+void StrategyMoveDropField(int index);
+
+// Order preview: a fading ring the size of the block plus one marker per slot,
+// showing where a move order will put the group. Ticked once a frame; the query
+// returns false when nothing is live.
+void StrategyMovePreviewUpdate(float dt);
+bool StrategyMovePreview(Vector3 *outCentre, float *outRadius, float *outFade,
+                         const Vector3 **outSlots, int *outCount, Vector3 *outFace);
+
+// Live preview for an order still being aimed: lays the slots out at `faceX/Z`
+// and holds them on screen until StrategyMovePreviewRelease. Same layout code
+// the real order uses, so what is aimed is what is given.
+void StrategyMovePreviewAim(const int *units, int count, Vector3 dest,
+                            float faceX, float faceZ);
+void StrategyMovePreviewRelease(void);
+
+// True when this group has arrived and its members should hold their slots, and
+// when the group is a loose FREEFORM scatter that opts out of holding entirely.
+bool StrategyFormationGroupHolding(int groupId);
+bool StrategyFormationGroupLoose(int groupId);
+
+// Restoring displacement toward a held slot, or zero. Added to `pos` directly
+// rather than to `vel` - see the definition for why that is load-bearing.
+Vector3 StrategyFormationHoldPull(int index, const Unit *u, float dt);
 
 // Units sharing a destination, above which a flow field is built instead of a
 // path each. A field is looked up FIRST regardless of size, so a lone unit sent

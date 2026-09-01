@@ -652,6 +652,9 @@ static Unit *UnitSpawn(int faction, UnitKind kind, Vector3 pos)
         u->dropoffCache   = -1;
         u->formGroup      = -1;     // NOT 0: `(Unit){0}` above would otherwise
                                     // enrol every fresh unit in group 0
+        u->formSlotIndex  = -1;     // ...and, for the same reason, would have it
+        u->formSlotShape  = -1;     // claim slot 0 of whatever shape it joins,
+        u->formSlotOf     = -1;     // evicting the unit that actually holds it
 
         RosterAdd(i);
         return u;
@@ -883,6 +886,14 @@ static void SpawnFromMap(const SgmMap *m)
     }
 }
 
+// Drag-to-orient state. File statics rather than fields of `world`, because they
+// are INPUT state and not world state - but that means StrategyWorldInit's
+// struct wipe does not reach them, so it clears them by hand.
+static bool    s_orderDragging;
+static Vector3 s_orderDragFrom;     // the ground point the press landed on
+static int     s_orderDragBuf[STRAT_MAX_UNITS];
+static int     s_orderDragCount;
+
 void StrategyWorldInit(void)
 {
     world = (StrategyWorld){ 0 };
@@ -897,6 +908,13 @@ void StrategyWorldInit(void)
     world.selectedBuilding = -1;
     world.gameOver         = -1;
     EffectsReset();
+
+    // A drag in flight refers to unit indices that no longer mean anything after
+    // the wipe above. It is a file static rather than part of `world`, so the
+    // struct clear does not reach it and it has to be dropped by hand.
+    s_orderDragging  = false;
+    s_orderDragCount = 0;
+    StrategyMovePreviewRelease();
 
     // Authored assets, if any. The catalog is shared with the showcase and the
     // forge, so this is a no-op when one of them already loaded it; it is here
@@ -1911,11 +1929,144 @@ static void OrderUnitAt(Unit *u, int hostile, int enemyBld, int node,
     else                                  StrategyOrderMove(u, ground);
 }
 
+// -- Drag to orient -----------------------------------------------------------
+// Press on open ground, drag to aim, release to commit. The markers appear on
+// press and turn with the cursor, so the player sets the formation's final
+// heading rather than accepting the direction of travel.
+//
+// ONLY A PLAIN GROUND MOVE DRAGS. An attack, a gather or a build click is a
+// verb aimed at a specific object - there is no formation heading to choose and
+// making the player release before anything happened would put a delay on the
+// one order that most needs to be instant. Those still fire on press.
+//
+// A CLICK IS A DRAG OF ZERO LENGTH, which is what keeps this from being a new
+// mode the player has to know about. Below the deadzone the order is given with
+// no explicit facing at all, so an ordinary right-click behaves exactly as it
+// did - travel direction, as before.
+#define ORDER_DRAG_DEADZONE  1.6f   // world units of drag before a heading is
+                                    //   taken; under this it is just a click
+
+// Units the drag will move, gathered once on press. Re-gathering per frame would
+// let a selection change mid-drag rewrite the order being aimed.
+static int OrderDragGather(void)
+{
+    int selCount = 0;
+    const int *sel = SelectedUnits(&selCount);
+
+    int n = 0;
+    for (int k = 0; k < selCount; k++)
+    {
+        const Unit *u = &world.units[sel[k]];
+        if (u->active && u->faction == 0) s_orderDragBuf[n++] = sel[k];
+    }
+    return n;
+}
+
+// Drop anyone who died while the button was held. A drag lasts as long as the
+// player wants it to, and StrategyOrderMoveGroup does NOT check `active` - it
+// would happily stamp formation state into a dead unit's slot, which then gets
+// handed to the next unit spawned there. Compacting in place keeps the buffer
+// and the count in agreement.
+static int OrderDragPrune(void)
+{
+    int n = 0;
+    for (int k = 0; k < s_orderDragCount; k++)
+        if (world.units[s_orderDragBuf[k]].active) s_orderDragBuf[n++] = s_orderDragBuf[k];
+    s_orderDragCount = n;
+    return n;
+}
+
+// The heading the cursor is currently asking for, or false while inside the
+// deadzone. Split out so the live preview and the commit cannot disagree about
+// where the threshold is.
+static bool OrderDragFacing(float *outX, float *outZ)
+{
+    Vector3 now;
+    if (!MouseGroundPoint(&now)) return false;
+
+    float dx = now.x - s_orderDragFrom.x, dz = now.z - s_orderDragFrom.z;
+    float d  = sqrtf(dx*dx + dz*dz);
+    if (d < ORDER_DRAG_DEADZONE) return false;
+
+    *outX = dx/d;
+    *outZ = dz/d;
+    return true;
+}
+
+// Runs every frame while the button is held, and once on release. Returns true
+// when it consumed the frame, so OrderInput does not also act on it.
+static bool OrderDragUpdate(void)
+{
+    if (!s_orderDragging) return false;
+
+    float fx, fz;
+    bool aimed = OrderDragFacing(&fx, &fz);
+
+    // The whole selection can die mid-drag; with nobody left there is no order to
+    // give and no centroid to divide by.
+    if (OrderDragPrune() == 0)
+    {
+        if (!IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+        {
+            s_orderDragging = false;
+            StrategyMovePreviewRelease();
+        }
+        return true;
+    }
+
+    if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+    {
+        // Hold the markers on screen under the cursor's current heading. Inside
+        // the deadzone show the travel direction, which is what a release there
+        // would actually give - the preview must never promise a layout the
+        // order will not produce.
+        if (!aimed)
+        {
+            Vector3 c = { 0 };
+            for (int k = 0; k < s_orderDragCount; k++)
+            {
+                c.x += world.units[s_orderDragBuf[k]].pos.x;
+                c.z += world.units[s_orderDragBuf[k]].pos.z;
+            }
+            c.x /= (float)s_orderDragCount;
+            c.z /= (float)s_orderDragCount;
+
+            fx = s_orderDragFrom.x - c.x;
+            fz = s_orderDragFrom.z - c.z;
+            float l = sqrtf(fx*fx + fz*fz);
+            if (l < 0.001f) { fx = 0.0f; fz = 1.0f; } else { fx /= l; fz /= l; }
+        }
+
+        StrategyMovePreviewAim(s_orderDragBuf, s_orderDragCount,
+                               s_orderDragFrom, fx, fz);
+        return true;
+    }
+
+    // Released: give the order.
+    s_orderDragging = false;
+    StrategyMovePreviewRelease();
+
+    if (s_orderDragCount > 0)
+    {
+        if (aimed)
+            StrategyOrderMoveGroupFacing(s_orderDragBuf, s_orderDragCount,
+                                         s_orderDragFrom, fx, fz);
+        else
+            StrategyOrderMoveGroup(s_orderDragBuf, s_orderDragCount,
+                                   s_orderDragFrom);
+
+        EffectSpawn(FX_RING, s_orderDragFrom, LIME);
+    }
+    return true;
+}
+
 // Right click: hostile unit/animal > enemy building > resource node >
 // own building job > plain move - checked in that priority so a click near a
 // tree still prefers the deer standing beside it.
 static void OrderInput(void)
 {
+    if (OrderDragUpdate()) return;      // a drag owns the button until release
+
     if (!IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) || MouseOnGui()) return;
 
     bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
@@ -2023,6 +2174,18 @@ static void OrderInput(void)
         {
             if (world.units[sel[k]].faction != 0) continue;
             s_groupBuf[n++] = sel[k];
+        }
+
+        // A PLAIN GROUND MOVE BEGINS A DRAG instead of ordering now: the player
+        // may be about to aim a heading, and that cannot be known until the
+        // button comes up. An attack march does not - its heading is the target,
+        // and delaying an attack until release would be felt.
+        if (plainMove && n > 0)
+        {
+            s_orderDragging  = true;
+            s_orderDragFrom  = ground;
+            s_orderDragCount = OrderDragGather();
+            return;         // the order is given on release, by OrderDragUpdate
         }
 
         // An attack march forms up on the TARGET's position rather than the
@@ -2202,7 +2365,7 @@ static bool MoveArrive(Unit *u, int index, Vector3 dest, float dt)
     if (dist <= STRAT_ARRIVE_GIVEUP)
     {
         u->stallTimer += dt;
-        if (u->stallTimer >= 0.5f)
+        if (u->stallTimer >= STRAT_ARRIVE_STALL)
         {
             if (u->lastProgressDist - dist < STRAT_UNIT_RADIUS*0.5f)
             {
@@ -2262,6 +2425,18 @@ static void MoveArriveReset(Unit *u)
     u->stallTimer       = 0.0f;
     u->lastProgressDist = 1000000.0f;
 
+    // Drop any shared flow field along with the formation. A field points every
+    // unit on it at ONE goal cell, so a unit given its own destination while
+    // still riding one is steered at the old group's target - and since the
+    // field is only released on the approach, it does so for the whole march.
+    //
+    // The index is derived by pointer arithmetic rather than passed in:
+    // StrategyOrderMove takes a `Unit *` and is called from strategy_ai.c and
+    // several other sites, and this is the single funnel every new destination
+    // already passes through. The unit's A* path is deliberately kept - NeedsPath
+    // decides when a route has gone stale, which is not this function's business.
+    StrategyMoveDropField((int)(u - world.units));
+
     // Any new destination leaves the old formation. StrategyOrderMoveGroup
     // re-stamps this immediately AFTER calling the single-unit order, so a group
     // order still forms up - but every other order (attack, gather, a lone
@@ -2271,6 +2446,14 @@ static void MoveArriveReset(Unit *u)
     u->formForming    = false;
     u->formEverFormed = false;
     u->formBrokeOff   = false;
+
+    // The remembered slot goes too. It is only meaningful as a position within a
+    // formation this unit is still part of - kept across a job change, it would
+    // let the unit re-claim a slot in a block it has left, and evict whoever is
+    // standing there now.
+    u->formSlotIndex  = -1;
+    u->formSlotShape  = -1;
+    u->formSlotOf     = -1;
 }
 
 // Nearest own building that ACCEPTS what the unit is carrying - wood only
@@ -2648,7 +2831,20 @@ static void UnitUpdate(int index, float dt)
     switch (u->state)
     {
         case UNIT_IDLE:
-            break;
+        {
+            // A unit that arrived in a formation holds its slot, so the block
+            // stays visible instead of dissolving the moment everyone stops.
+            // An idle unit with no formation is free, which is the other half of
+            // what the player means - the formation is the order, not a leash.
+            //
+            // Applied to `pos`, not `vel`: that bypasses the separation velocity
+            // integrator so its damping term cannot amplify the correction into
+            // a bounce. See StrategyFormationHoldPull for the other two rules
+            // that keep this from reintroducing the clustering spiral.
+            Vector3 pull = StrategyFormationHoldPull(index, u, dt);
+            u->pos.x += pull.x;
+            u->pos.z += pull.z;
+        } break;
 
         case UNIT_MOVE:
         {
@@ -3477,6 +3673,61 @@ static void SlotDraw(void)
     }
 }
 
+// -- Order preview ------------------------------------------------------------
+// Where a move order is about to put the group: a ring the size of the block and
+// a marker on every slot. Drawn for everyone, not just the selection, because it
+// answers a question the player asks at the moment of clicking - "is that going
+// to fit where I think it will" - and the selection may well change immediately.
+static void PreviewDraw(void)
+{
+    Vector3 centre, face; float radius, fade; const Vector3 *slots; int count;
+    if (!StrategyMovePreview(&centre, &radius, &fade, &slots, &count, &face)) return;
+
+    // Alpha eases out rather than falling linearly, so the preview reads as
+    // settling onto the ground instead of being switched off.
+    float a = fade*fade;
+    Color ringCol = { 140, 230, 160, (unsigned char)(200.0f*a) };
+    Color slotCol = { 190, 245, 205, (unsigned char)(230.0f*a) };
+
+    // The ring contracts slightly onto its final size, which is what makes it
+    // read as an order landing rather than an explosion going off.
+    float r = radius*(1.0f + 0.18f*fade);
+    DrawCircle3D((Vector3){ centre.x, 0.04f, centre.z }, r,
+                 (Vector3){ 1.0f, 0.0f, 0.0f }, 90.0f, ringCol);
+
+    // One flat marker per slot. Cubes rather than circles: DrawCircle3D is a
+    // line loop per call, and at 512 slots the difference is visible in the
+    // draw profile.
+    for (int i = 0; i < count; i++)
+        DrawCube((Vector3){ slots[i].x, 0.04f, slots[i].z },
+                 0.34f, 0.02f, 0.34f, slotCol);
+
+    // -- Heading arrow --------------------------------------------------------
+    // Which way the block will FACE, drawn from the centre out past the ring so
+    // it reads against the markers rather than through them. This is the whole
+    // point of the drag, so it is the one part of the preview that stays fully
+    // opaque as the rest fades.
+    if (face.x*face.x + face.z*face.z > 0.0001f)
+    {
+        float len = radius + 2.2f;
+        Vector3 tail = { centre.x, 0.05f, centre.z };
+        Vector3 head = { centre.x + face.x*len, 0.05f, centre.z + face.z*len };
+
+        Color arrow = { 255, 232, 150, (unsigned char)(235.0f*a) };
+        DrawLine3D(tail, head, arrow);
+
+        // Two barbs swept back from the tip, drawn from the perpendicular so the
+        // head reads at any camera angle without needing a billboard.
+        float px = -face.z, pz = face.x;
+        Vector3 barbL = { head.x - face.x*1.1f + px*0.6f, 0.05f,
+                          head.z - face.z*1.1f + pz*0.6f };
+        Vector3 barbR = { head.x - face.x*1.1f - px*0.6f, 0.05f,
+                          head.z - face.z*1.1f - pz*0.6f };
+        DrawLine3D(head, barbL, arrow);
+        DrawLine3D(head, barbR, arrow);
+    }
+}
+
 void StrategyWorldUpdate(float dt)
 {
     SpProfResetFrameCounters();
@@ -3515,7 +3766,8 @@ void StrategyWorldUpdate(float dt)
     // scattered the group is. Computed inside UnitUpdate it would depend on
     // update order, and units early in the roster would pace themselves against
     // a group that had already half-moved.
-    StrategyMoveFormUpdate();
+    StrategyMoveFormUpdate(dt);
+    StrategyMovePreviewUpdate(dt);
 
     SpProfBegin(SP_PROF_UNIT_UPDATE);
     // Snapshot the count, and re-check `active` inside the loop. UnitUpdate can
@@ -4163,6 +4415,7 @@ void StrategyWorldDraw3D(void)
         }
     }
 
+    PreviewDraw();
     EffectsDraw3D();
     EndMode3D();
     SpProfEnd(SP_PROF_DRAW_WORLD);

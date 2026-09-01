@@ -75,14 +75,21 @@
 #define MOVE_REPATH_PER_FRAME 32
 #define MOVE_REPATH_PERIOD    8     // frames between a given unit's attempts
 
-// Distance from its own destination at which a unit stops riding the shared
-// flow field and steers at its own slot instead.
+// FLOOR on the distance from its own destination at which a unit stops riding
+// the shared flow field and steers at its own slot instead. The real radius
+// scales with the formation's own half-extent (see FormReleaseRadius); this is
+// what a unit on a field with no formation gets, and the minimum for one with.
 //
 // A field points every unit at ONE goal cell. A formation deliberately spreads
 // them over many, so riding the field all the way in would funnel the whole
 // group onto a single tile - rebuilding, at the last moment, exactly the pile
 // the formation exists to prevent. Releasing on the approach costs nothing:
 // the last few units of travel are open ground the group has already reached.
+//
+// AS A CONSTANT IT WAS THE FUNNEL BUG. A block's width grows with its unit
+// count while this does not, so at a thousand units 98% of the slots sat
+// outside it and the field governed the entire march - which is what "they all
+// funnel through a single path line" actually was.
 #define MOVE_FLOW_RELEASE     4.0f
 
 typedef struct {
@@ -101,6 +108,25 @@ typedef struct {
     // units share the destination, and a lone unit is better served by the
     // exact route A* gives it than by a whole-grid approximation.
     SpFieldId   field;
+
+    // -- Formation side state -------------------------------------------------
+    // Here rather than in Unit for the same reason the waypoints are: Unit is
+    // walked three times a frame by loops - separation, drawing, HP bars - that
+    // have no interest in any of it, and the struct is already 248 bytes.
+    int16_t     formGroupSlot;  // resolved index into the group table, or -1.
+                                //   CACHED because StrategyMoveTo runs per unit
+                                //   per frame and the table lookup is a linear
+                                //   scan of 64 entries - 640k integer compares a
+                                //   frame at ten thousand units, for an answer
+                                //   that changes only when an order does.
+    bool        formReleased;   // has left the shared field for its own slot
+    bool        formSlotClear;  // line of sight to the slot, tested ONCE at
+                                //   release: the common case is open ground the
+                                //   group just crossed, and a unit that really is
+                                //   blocked still gets a path via blockedTime
+    bool        formChoked;     // in terrain too narrow for the block: rides the
+                                //   field through and re-forms on the far side
+    float       formChokeTime;  // dwell accumulator for the verdict above
 } UnitPath;
 
 static UnitPath s_paths[STRAT_MAX_UNITS];
@@ -126,6 +152,11 @@ static void PathClear(int index)
     p->request     = SP_REQUEST_NONE;
     p->blockedTime = 0.0f;
     p->field       = SP_FIELD_NONE;
+    p->formGroupSlot = -1;
+    p->formReleased  = false;
+    p->formSlotClear = false;
+    p->formChoked    = false;
+    p->formChokeTime = 0.0f;
 }
 
 void StrategyMoveInit(void)
@@ -138,6 +169,11 @@ void StrategyMoveInit(void)
         s_paths[i].request = SP_REQUEST_NONE;
         s_paths[i].blockedTime = 0.0f;
         s_paths[i].field   = SP_FIELD_NONE;
+        s_paths[i].formGroupSlot = -1;
+        s_paths[i].formReleased  = false;
+        s_paths[i].formSlotClear = false;
+        s_paths[i].formChoked    = false;
+        s_paths[i].formChokeTime = 0.0f;
     }
     s_moveFrame = 0;
 }
@@ -175,7 +211,13 @@ static float CohesionScale(SpFieldId field, int tx, int tz);
 
 // Form-up, defined with the per-frame pass that feeds it - a unit ahead of its
 // formation slows exponentially until the block closes up, once per order.
-static float FormUpScale(const Unit *u);
+static float FormUpScale(int index, const Unit *u);
+
+// Formation release and chokepoint tests, defined with the group table they
+// read. Both answer questions about the BLOCK, which is why neither can be a
+// property of the unit in front of you.
+static float FormReleaseRadius(int index);
+static bool  FormChokedHere(int index, const Unit *u, Vector3 dest, float dt);
 
 // ----------------------------------------------------------------------------
 //  Requesting
@@ -244,7 +286,7 @@ void StrategyMoveTo(Unit *u, int index, Vector3 dest, float dt)
     // because a unit out in front should hang back regardless of how it happens
     // to be routed. Applied here once rather than at each steering call, which
     // is also what stops it being forgotten when a branch is added.
-    dt *= FormUpScale(u);
+    dt *= FormUpScale(index, u);
 
     // -- Flow field, if this unit is riding one ------------------------------
     // Checked BEFORE anything asks for a path, because the whole point of a
@@ -259,8 +301,29 @@ void StrategyMoveTo(Unit *u, int index, Vector3 dest, float dt)
     // unit's own slot.
     if (p->field != SP_FIELD_NONE)
     {
+        // THE RELEASE RADIUS SCALES WITH THE BLOCK, and this is the fix that
+        // matters most at scale. It used to be a flat 4.0, which is fine for a
+        // formation a few units wide and catastrophic past that: at a thousand
+        // units the block is 46 across, so 98% of the slots sit OUTSIDE the
+        // release and the field - which points every unit at ONE goal cell -
+        // governs the whole march. That is the "funnels through a single path
+        // line" report, and it is not a steering bug at all.
+        float release = FormReleaseRadius(index);
+
+        // Terrain narrower than the block gets to break it. A funnelling unit
+        // keeps riding the field THROUGH the gap regardless of how close it is,
+        // and picks its slot up again on the far side - so a formation is
+        // something the ground can take away and give back, rather than a thing
+        // that wedges a thousand units against a two-tile bridge.
+        bool choked = FormChokedHere(index, u, dest, dt);
+
+        // Choked units go back on the field even after release: `formReleased`
+        // is cleared by the chokepoint exit test, so a block re-forms past a gap
+        // rather than threading it one unit at a time forever.
+        if (choked) p->formReleased = false;
+
         if (!SpFlowValid(p->field)) p->field = SP_FIELD_NONE;    // grid moved
-        else if (dist > MOVE_FLOW_RELEASE)
+        else if (choked || (!p->formReleased && dist > release))
         {
             int tx, tz;
             SpWorldToTile(g, u->pos.x, u->pos.z, &tx, &tz);
@@ -280,6 +343,44 @@ void StrategyMoveTo(Unit *u, int index, Vector3 dest, float dt)
             // cannot be reached from. Fall through to A*, which will say so
             // properly rather than leaving it standing.
         }
+        else if (!p->formReleased)
+        {
+            // FIRST FRAME OFF THE FIELD. Test line of sight to the slot ONCE and
+            // cache it, because this is the moment the whole change can go
+            // wrong: after release a unit is up to ~35 world units from its slot
+            // at n=1000, which is well past MOVE_PATH_MIN_DIST, so NeedsPath
+            // fires - and first paths deliberately bypass the repath limiter.
+            // Releasing a thousand-unit block would then dump a thousand
+            // unbudgeted A* requests into one frame, which is a worse bug than
+            // the funnel it replaces.
+            //
+            // The common case needs no search at all: the field has already
+            // carried the group to the destination area and the last leg is open
+            // ground the group just walked across. A unit that genuinely IS
+            // blocked still gets a path, via blockedTime.
+            int sx, sz, ux, uz;
+            SpWorldToTile(g, u->pos.x, u->pos.z, &ux, &uz);
+            SpWorldToTile(g, dest.x, dest.z, &sx, &sz);
+            p->formSlotClear = SpLosClear(g, ux, uz, sx, sz);
+            p->formReleased  = true;
+
+            // THE FIELD IS KEPT, NOT DROPPED, and that is deliberate. Release is
+            // not a one-way door: a block that has reached its slots can still
+            // meet ground too narrow to hold them - a re-order, a break-off and
+            // a rejoin, or simply a destination on the far side of a bridge.
+            // Dropping the field here would leave nothing to funnel on, so the
+            // chokepoint rule below could never fire again for this unit. The
+            // handoff is gated by `formReleased` alone; the sweep reclaims the
+            // field when the last member stops referencing it.
+        }
+    }
+
+    // Released with a clear line to its slot: walk at it. No path, by design -
+    // see the release branch above.
+    if (p->formReleased && p->formSlotClear && p->count == 0 && !p->pending)
+    {
+        StrategyMoveDirect(u, dest, dt);
+        return;
     }
 
     if (NeedsPath(index, u, dest, dist))
@@ -483,7 +584,11 @@ bool StrategyMoveGoalOf(int index, Vector3 *out)
 //      Assign naively and 200 units trade places on the spot.
 // ============================================================================
 
-#define FORMATION_SPACING     1.5f
+// FORMATION_SPACING lives in strategy_types.h, derived from STRAT_UNIT_RADIUS.
+// It was defined here as a bare 1.5 and that is half of how D3 happened: the
+// form-up tolerance sat in this file too, the two were never compared, and one
+// ended up smaller than the other. A static assert now pins the relationship,
+// but only because both numbers are finally in one place to be compared.
 #define FORMATION_MAX         512
 
 // Player's current shape and break-off rule, set by the hotkeys. Globals rather
@@ -520,6 +625,7 @@ const char *StrategyFormationShapeName(FormationShape s)
         case FORM_COLUMN:     return "COLUMN";
         case FORM_TWO_COLUMN: return "TWO COLUMN";
         case FORM_WEDGE:      return "WEDGE";
+        case FORM_FREEFORM:   return "FREEFORM";
         default:              return "?";
     }
 }
@@ -535,112 +641,51 @@ const char *StrategyFormationBehaviorName(FormationBehavior b)
     }
 }
 
-// Lay out slot `i` of `count` in FORMATION-LOCAL space: `outR` across the
-// formation's right-hand perpendicular, `outF` along its forward. The caller
-// rotates and translates, so every shape is expressed on the same two axes and
-// none of them needs to know the group's facing.
+// The layout math itself lives in src/strategy_path/strategy_path_form.c, as
+// pure geometry with no idea what a Unit is - which is what makes it testable.
+// path_tests asserts spacing, extent, uniqueness and the width caps for every
+// shape at every size that matters; before the extraction none of that could be
+// checked at all, and the bug that cost the most (a form-up tolerance tighter
+// than the slot pitch, so the brake could never release) is exactly the kind a
+// test like that catches on the first run.
 //
-// Rows are laid out BACK TO FRONT (offF decreasing) so that slot 0 is the front
-// rank. The assignment sort relies on that ordering to put the units that start
-// nearest the destination at the front, rather than marching them through their
-// own formation.
-static void FormationSlotLocal(FormationShape shape, int i, int count,
-                               float *outR, float *outF)
-{
-    float r = 0.0f, f = 0.0f;
+// THE TWO ENUMERATIONS MUST AGREE, and nothing but this makes them. The module
+// takes the shape as a plain int because it must not include strategy_types.h;
+// reorder either list and the build stops here rather than the formations
+// quietly turning into each other at runtime.
+_Static_assert((int)FORM_GRID       == SP_FORM_GRID,       "formation shape enums drifted");
+_Static_assert((int)FORM_LINE       == SP_FORM_LINE,       "formation shape enums drifted");
+_Static_assert((int)FORM_COLUMN     == SP_FORM_COLUMN,     "formation shape enums drifted");
+_Static_assert((int)FORM_TWO_COLUMN == SP_FORM_TWO_COLUMN, "formation shape enums drifted");
+_Static_assert((int)FORM_WEDGE      == SP_FORM_WEDGE,      "formation shape enums drifted");
+_Static_assert((int)FORM_FREEFORM   == SP_FORM_FREEFORM,   "formation shape enums drifted");
+_Static_assert((int)FORM_COUNT      == SP_FORM_SHAPE_COUNT,"formation shape enums drifted");
 
-    switch (shape)
-    {
-        case FORM_LINE:
-        {
-            // Wide and shallow: fill the width first, only adding depth once a
-            // rank is full. This is the shape that answers the spearhead - the
-            // whole point is that nobody stands behind anybody.
-            //
-            // WIDTH IS CAPPED, and it has to be. Two ranks of 100 units is 73
-            // world units across, which is most of the long march - the outer
-            // slots land off the map, SpNearestOpen's ring cap cannot pull them
-            // back, and those units are stranded. Past the cap the line simply
-            // gains ranks, which is what a real line does when it runs out of
-            // frontage.
-            int perRank = (int)(FORM_LINE_MAX_WIDTH/FORMATION_SPACING);
-            if (perRank < 1) perRank = 1;
-            int wanted = (count + FORM_LINE_RANKS - 1)/FORM_LINE_RANKS;
-            if (wanted < 1) wanted = 1;
-            if (wanted < perRank) perRank = wanted;
+// THE TWO INVARIANTS D3 VIOLATED, pinned so they cannot drift apart again.
+// Both were true statements about the old code, and both were false: the shipped
+// form-up tolerance was 1.4 against a 1.5 slot pitch, so a group was asked to
+// pack tighter than its own slots allowed and the brake could never release.
+// A comment saying so would have been just as wrong; a static assert stops the
+// build instead.
+_Static_assert(FORMUP_TIGHT > FORMATION_SPACING,
+               "form-up tolerance is tighter than the slot pitch: the latch can never fire");
+_Static_assert(FORM_HOLD_DEADBAND > STRAT_SEP_RADIUS,
+               "hold deadband is inside the separation radius: the two forces will oscillate");
 
-            int rank = i/perRank, col = i % perRank;
-            int fullRanks = count/perRank;
-            int inThis = (rank == fullRanks) ? (count % perRank) : perRank;
-            if (inThis <= 0) inThis = perRank;
-            r = ((float)col - (float)(inThis - 1)*0.5f)*FORMATION_SPACING;
-            f = -(float)rank*FORMATION_SPACING;
-        } break;
+// The extent caps are a balance question, not a geometry one, so they stay in
+// strategy_types.h and are handed to the module per call.
+static const SpFormCaps s_formCaps = {
+    FORM_LINE_MAX_WIDTH,
+    FORM_LINE_RANKS,
+    FORM_COLUMN_MAX_DEPTH,
+    FORM_COLUMN_FILES,
+    FORM_TWO_COLUMN_LANE,
+};
 
-        case FORM_COLUMN:
-        {
-            // Narrow and deep. The shape you want for a gap or a bridge, and
-            // the one that arrives strung out - which is the honest trade.
-            // Widens past the depth cap rather than running off the map.
-            int maxRows = (int)(FORM_COLUMN_MAX_DEPTH/FORMATION_SPACING);
-            if (maxRows < 1) maxRows = 1;
-            int files = FORM_COLUMN_FILES;
-            while (files < count && (count + files - 1)/files > maxRows) files++;
-
-            int file = i % files, row = i/files;
-            r = ((float)file - (float)(files - 1)*0.5f)*FORMATION_SPACING;
-            f = -(float)row*FORMATION_SPACING;
-        } break;
-
-        case FORM_TWO_COLUMN:
-        {
-            // Two files with a lane between them. Alternating left/right keeps
-            // the two sides the same length as units are added.
-            //
-            // Past the depth cap each side thickens into several sub-files
-            // rather than stretching: the lane down the middle is the point of
-            // the shape, so it is preserved while the files themselves widen.
-            int maxRows = (int)(FORM_COLUMN_MAX_DEPTH/FORMATION_SPACING);
-            if (maxRows < 1) maxRows = 1;
-            int perSide = (count + 1)/2;
-            int sub = 1;
-            while (sub < perSide && (perSide + sub - 1)/sub > maxRows) sub++;
-
-            int side = i % 2, idx = i/2;
-            int subFile = idx % sub, row = idx/sub;
-            float lane = FORM_TWO_COLUMN_LANE*0.5f
-                       + (float)subFile*FORMATION_SPACING;
-            r = (side == 0) ? -lane : lane;
-            f = -(float)row*FORMATION_SPACING;
-        } break;
-
-        case FORM_WEDGE:
-        {
-            // A V with its point forward. Row n holds n+1 units, so the rows
-            // grow as they fall back; solving for the row containing slot i is
-            // the triangular-number inverse.
-            int row = (int)((sqrtf(8.0f*(float)i + 1.0f) - 1.0f)*0.5f);
-            int rowStart = row*(row + 1)/2;
-            int col = i - rowStart;
-            r = ((float)col - (float)row*0.5f)*FORMATION_SPACING;
-            f = -(float)row*FORMATION_SPACING;
-        } break;
-
-        case FORM_GRID:
-        default:
-        {
-            int cols = (int)ceilf(sqrtf((float)count));
-            if (cols < 1) cols = 1;
-            int rows = (count + cols - 1)/cols;
-            int row = i/cols, col = i % cols;
-            r = ((float)col - (float)(cols - 1)*0.5f)*FORMATION_SPACING;
-            f = ((float)row - (float)(rows - 1)*0.5f)*FORMATION_SPACING;
-        } break;
-    }
-
-    *outR = r;
-    *outF = f;
-}
+// FREEFORM is an AREA order, not a block: the player asking for a loose scatter
+// is asking for the opposite of what the form-up brake and the slot pull do. One
+// predicate, so the two opt-outs can never disagree.
+static bool FormShapeIsLoose(FormationShape s) { return (s == FORM_FREEFORM); }
 
 // Above this many units sharing one destination, build a flow field instead of
 // a path each. Runtime-tunable because the A/B - watch one field serve 2,000
@@ -651,29 +696,525 @@ static int s_flowThreshold = 12;
 void StrategyMoveFlowThresholdSet(int n) { s_flowThreshold = (n < 1) ? 1 : n; }
 int  StrategyMoveFlowThreshold(void)     { return s_flowThreshold; }
 
-// Sort key scratch. Static, not stack: 512 entries twice over is not something
-// to put on a frame's stack in a function reached from input handling.
-typedef struct { float key; int index; } SortEntry;
-static SortEntry s_unitOrder[FORMATION_MAX];
-static SortEntry s_slotOrder[FORMATION_MAX];
-static Vector3   s_slotPos[FORMATION_MAX];
+// Assignment scratch. Static, not stack: several 512-entry arrays is not
+// something to put on a frame's stack in a function reached from input handling.
+// The sort entry type and the sort itself come from the geometry module, so the
+// assignment and its caller cannot disagree about either.
+typedef SpFormSortEntry SortEntry;
+static SortEntry   s_unitOrder[FORMATION_MAX];
+static SortEntry   s_slotOrder[FORMATION_MAX];
+static Vector3     s_slotPos[FORMATION_MAX];
+static SpFormPoint s_assignUnits[FORMATION_MAX];
+static SpFormPoint s_assignSlots[FORMATION_MAX];
+static int         s_assignSlot[FORMATION_MAX];
+static int         s_assignPrev[FORMATION_MAX];
+static unsigned char s_assignTaken[FORMATION_MAX];
 
-// Insertion sort. n is capped at 512 and this runs on a click, not per frame -
-// qsort's function-pointer indirection would cost more than it saves here, and
-// insertion sort on nearly-sorted input (which a selected group usually is) is
-// close to linear.
-static void SortByKey(SortEntry *a, int n)
+
+// ============================================================================
+//  The live formation group table
+//
+//  WHY THIS EXISTS AT ALL. The first cut of formations had no runtime identity
+//  for a group - just three parallel arrays holding a worst-case distance. That
+//  single gap is what made four separate bugs unfixable in place: the flow
+//  release could not scale with a block's extent because nothing knew the
+//  extent; the form-up tolerance could not scale with the spacing because
+//  nothing owned the shape; the table overflowed silently at 32 groups; and the
+//  chokepoint rule had nothing to ask how wide the block needed to be.
+//
+//  One record per live group answers all four. 64 entries at ~56 bytes is 3.5 KB
+//  of static memory - small enough that the alternative was never worth the
+//  argument.
+//
+//  SIXTY-FOUR, NOT THIRTY-TWO. A ten-thousand-unit army now chunks into twenty
+//  echelons from a SINGLE click, so 32 is one large order plus one small one
+//  away from overflow - and overflow used to mean a group that never latched
+//  and therefore crawled forever.
+// ============================================================================
+#define FORM_GROUPS_MAX  64
+
+typedef struct {
+    int     id;             // group id, or 0 for a free slot
+    int     members;        // live units still carrying this id
+    int     inPlace;        // ...of which this many are within FORMUP_TIGHT
+    float   worst;          // furthest any member is from its slot
+    float   halfExtent;     // centre to furthest slot; what release scales with
+    float   needWidth;      // frontage the block wants, capped; chokepoint test
+    float   formTime;       // seconds spent forming up, for the hard cap
+    bool    everFormed;     // THE LATCH. Authoritative here, mirrored on Unit.
+    bool    holding;        // arrived: members hold their slots
+    bool    loose;          // FREEFORM: no brake, no hold, still shares a field
+    Vector3 dest;
+} FormGroup;
+
+static FormGroup s_formGroups[FORM_GROUPS_MAX];
+static int       s_formGroupCount;
+
+static int FormGroupSlot(int groupId)
 {
-    for (int i = 1; i < n; i++)
+    if (groupId < 0) return -1;
+    for (int i = 0; i < s_formGroupCount; i++)
+        if (s_formGroups[i].id == groupId) return i;
+    return -1;
+}
+
+// Claim a table slot for a new group. On overflow, evict the group with the
+// FEWEST live members rather than refusing.
+//
+// FAIL OPEN, and this is the whole point of the change. The old code did
+// `continue` on a full table, which left the group with no record - and a group
+// with no record could never latch its form-up, so it crawled at the minimum
+// scale for the rest of the march. A group marching at full speed in a slightly
+// ragged shape is a cosmetic loss; one that crawls forever is the bug that was
+// actually reported. The smallest group is evicted because form-up matters
+// least to a skeleton crew.
+static int FormGroupClaim(int groupId)
+{
+    int slot = FormGroupSlot(groupId);
+    if (slot >= 0) return slot;
+
+    if (s_formGroupCount < FORM_GROUPS_MAX) slot = s_formGroupCount++;
+    else
     {
-        SortEntry v = a[i];
-        int j = i - 1;
-        while (j >= 0 && a[j].key > v.key) { a[j+1] = a[j]; j--; }
-        a[j+1] = v;
+        slot = 0;
+        for (int i = 1; i < s_formGroupCount; i++)
+            if (s_formGroups[i].members < s_formGroups[slot].members) slot = i;
+    }
+
+    s_formGroups[slot] = (FormGroup){ 0 };
+    s_formGroups[slot].id = groupId;
+    return slot;
+}
+
+// Read-only accessors for the world layer: the hold force and the HUD both need
+// to know what a group is doing without reaching into the table.
+bool StrategyFormationGroupHolding(int groupId)
+{
+    int slot = FormGroupSlot(groupId);
+    return (slot >= 0) && s_formGroups[slot].holding;
+}
+
+bool StrategyFormationGroupLoose(int groupId)
+{
+    int slot = FormGroupSlot(groupId);
+    return (slot >= 0) && s_formGroups[slot].loose;
+}
+
+// Distance from its own slot at which a unit stops riding the shared field.
+//
+// DERIVED FROM THE BLOCK'S OWN FOOTPRINT, not a constant. The field delivers the
+// group to the destination area - which is the whole performance win and is
+// kept - and hands off exactly when the block reaches the ground it is going to
+// stand on. The 1.25 multiplier releases slightly OUTSIDE that: release exactly
+// at the block edge and the rear ranks are still funnelling while the front is
+// already forming, which reads as the block being extruded through a hole.
+static float FormReleaseRadius(int index)
+{
+    int slot = s_paths[index].formGroupSlot;
+    if (slot < 0) return MOVE_FLOW_RELEASE;         // no formation: the old rule
+
+    float r = (s_formGroups[slot].halfExtent + FORM_RELEASE_MARGIN)*FORM_RELEASE_SCALE;
+    return (r < MOVE_FLOW_RELEASE) ? MOVE_FLOW_RELEASE : r;
+}
+
+// Is this unit in ground too narrow for its block to hold shape through?
+//
+// A SUSPEND, NOT A BREAK-OFF. The unit rejoins its slot past the constriction
+// and the group's form-up latch is left alone, so a block does not re-enter the
+// form-up crawl every time it threads a gap. Break-off stays the combat concept.
+//
+// HYSTERESIS IS MANDATORY. Two widths and a dwell time, matching what
+// STRAT_ARRIVE_RESUME does against exactly this failure: with a single threshold
+// a unit at the mouth of a gap flips verdict every frame, and the block visibly
+// shivers between formed and funnelling.
+//
+// AMORTISED ON A STRIDE, like the aggro scan. Two dozen grid reads per unit per
+// frame is not affordable at ten thousand units, and corridor width changes on
+// the scale of a unit walking a few tiles - not per frame.
+static bool FormChokedHere(int index, const Unit *u, Vector3 dest, float dt)
+{
+    UnitPath *p = &s_paths[index];
+    int slot = p->formGroupSlot;
+    if (slot < 0) return false;
+
+    const FormGroup *fg = &s_formGroups[slot];
+    if (fg->loose) return false;            // a scatter has no shape to protect
+
+    p->formChokeTime += dt;
+    if (((s_moveFrame + (uint32_t)index) % FORM_CHOKE_STRIDE) != 0)
+        return p->formChoked;               // between probes: last verdict stands
+    if (p->formChokeTime < FORM_CHOKE_DWELL)
+        return p->formChoked;               // and it must hold for the dwell
+
+    const SpGrid *g = StrategyNavGrid();
+    int tx, tz;
+    SpWorldToTile(g, u->pos.x, u->pos.z, &tx, &tz);
+
+    float dx = dest.x - u->pos.x, dz = dest.z - u->pos.z;
+    int width = SpFormCorridorWidth(g, tx, tz, dx, dz, FORM_CHOKE_PROBE_MAX);
+
+    // Tiles are one world unit, so the needed frontage compares directly. The
+    // enter/exit pair is what stops the flicker; the needWidth cap set at order
+    // time is what stops every large block reading as permanently choked.
+    float need = fg->needWidth;
+    int enterAt = (int)((need < FORM_CHOKE_ENTER) ? need : FORM_CHOKE_ENTER);
+    int exitAt  = (int)((need < FORM_CHOKE_EXIT)  ? need : FORM_CHOKE_EXIT);
+
+    bool was = p->formChoked;
+    if (!was && width <= enterAt)     { p->formChoked = true;  p->formChokeTime = 0.0f; }
+    else if (was && width >= exitAt)  { p->formChoked = false; p->formChokeTime = 0.0f;
+                                        p->formReleased = false; }   // re-form past the gap
+    return p->formChoked;
+}
+
+// ============================================================================
+//  Order preview
+//
+//  A fading ring the size of the block, plus one marker per slot, showing where
+//  a move order will actually put the group before it gets there.
+//
+//  NOT THROUGH THE EFFECT POOL, deliberately. That pool holds 96 entries shared
+//  with combat - a 512-slot order would evict every hit spark and muzzle flash
+//  on screen, and then still drop most of its own markers. The preview is one
+//  array owned here, where the slots already exist, and it costs one float of
+//  bookkeeping per frame.
+//
+//  SLOTS ARE COPIED, NOT RECOMPUTED FOR DRAWING. They have already been through
+//  SpNearestOpen by the time they land here, so the preview shows the ground the
+//  units are really going to stand on - including a slot nudged out of a lake.
+//  Recomputing the layout at draw time would quietly show the pre-resolution
+//  positions and disagree with where the units actually end up.
+// ============================================================================
+#define PREVIEW_LIFE  3.30f     // seconds. Far longer than FX_RING's 0.6 because
+                                //   this is READ, not just noticed - the player
+                                //   is checking whether the block fits, and that
+                                //   is a look-and-compare, not a glance.
+
+static Vector3 s_previewSlot[FORMATION_MAX];
+static int     s_previewCount;
+static Vector3 s_previewCentre;
+static float   s_previewRadius;
+static float   s_previewLife;
+static Vector3 s_previewFace;   // formation heading, for the direction arrow
+static bool    s_previewHeld;   // frozen while the player is dragging a facing
+
+// Called once per ORDER, after the slots are resolved. A multi-echelon order
+// calls it per chunk; the last chunk wins, which is the one the player is most
+// likely to be looking at and keeps this to a single fixed array.
+static void PreviewCapture(const Vector3 *slots, int count, Vector3 dest,
+                           float radius, float faceX, float faceZ)
+{
+    if (count > FORMATION_MAX) count = FORMATION_MAX;
+    for (int i = 0; i < count; i++) s_previewSlot[i] = slots[i];
+    s_previewCount  = count;
+    s_previewCentre = dest;
+    s_previewRadius = radius;
+    s_previewFace   = (Vector3){ faceX, 0.0f, faceZ };
+    s_previewLife   = PREVIEW_LIFE;
+    s_previewHeld   = false;
+}
+
+// Build the preview for an order that has NOT been given yet - the live picture
+// under a drag. Same layout code the real order uses, so what the player aims is
+// exactly what they get; the only thing missing is SpNearestOpen resolution per
+// slot, which is skipped because this runs every frame of the drag and the
+// player is aiming a direction, not inspecting individual tiles.
+//
+// `held` keeps the preview alive while the button is down: the normal decay is a
+// fade after the fact, and a drag needs the markers to simply stay put.
+void StrategyMovePreviewAim(const int *units, int count, Vector3 dest,
+                            float faceX, float faceZ)
+{
+    if (count <= 0) return;
+    if (count > FORMATION_MAX) count = FORMATION_MAX;
+
+    float fx = faceX, fz = faceZ;
+    float l = sqrtf(fx*fx + fz*fz);
+    if (l < 0.001f) { fx = 0.0f; fz = 1.0f; }
+    else            { fx /= l; fz /= l; }
+    float rx = -fz, rz = fx;
+
+    float bias = SpFormForwardBias((int)s_formShape, count, FORMATION_SPACING,
+                                   &s_formCaps);
+
+    for (int i = 0; i < count; i++)
+    {
+        float offR, offF;
+        SpFormSlotLocal((int)s_formShape, i, count, FORMATION_SPACING,
+                        &s_formCaps, &offR, &offF);
+        offF -= bias;
+        s_previewSlot[i] = (Vector3){ dest.x + rx*offR + fx*offF, 0.0f,
+                                      dest.z + rz*offR + fz*offF };
+    }
+
+    s_previewCount  = count;
+    s_previewCentre = dest;
+    s_previewRadius = SpFormHalfExtent((int)s_formShape, count, FORMATION_SPACING,
+                                       &s_formCaps);
+    s_previewFace   = (Vector3){ fx, 0.0f, fz };
+    s_previewLife   = PREVIEW_LIFE;
+    s_previewHeld   = true;
+
+    (void)units;
+}
+
+// Let the held preview start fading. Called on release, so the markers persist
+// for the whole drag and then decay normally once the order is given.
+void StrategyMovePreviewRelease(void) { s_previewHeld = false; }
+
+void StrategyMovePreviewUpdate(float dt)
+{
+    if (s_previewHeld) return;      // a drag is in progress: hold the picture
+    if (s_previewLife > 0.0f)
+    {
+        s_previewLife -= dt;
+        if (s_previewLife < 0.0f) s_previewLife = 0.0f;
     }
 }
 
-void StrategyOrderMoveGroup(const int *units, int count, Vector3 dest)
+// Fraction of life remaining, 1 -> 0, and the geometry to draw it with. Returns
+// false when nothing is live, so the caller draws nothing rather than a ring at
+// zero alpha.
+bool StrategyMovePreview(Vector3 *outCentre, float *outRadius, float *outFade,
+                         const Vector3 **outSlots, int *outCount, Vector3 *outFace)
+{
+    if (s_previewLife <= 0.0f) return false;
+    *outCentre = s_previewCentre;
+    *outRadius = s_previewRadius;
+    *outFade   = s_previewLife/PREVIEW_LIFE;
+    *outSlots  = s_previewSlot;
+    *outCount  = s_previewCount;
+    *outFace   = s_previewFace;
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+//  Ordering one echelon
+//
+//  Extracted from StrategyOrderMoveGroup so a large order can call it once per
+//  chunk. Everything here is what the single-block version always did: lay out
+//  slots, resolve each through SpNearestOpen, sort both ends of the assignment
+//  on the same axis, and zip.
+//
+//  `backOff` slides this echelon's whole slot block backward along -forward, so
+//  chunks stack behind one another instead of landing on top of each other.
+// ----------------------------------------------------------------------------
+static void FormationChunkOrder(const int *units, int count, Vector3 dest,
+                                float fx, float fz, float rx, float rz,
+                                float backOff, int totalCount, SpFieldId field)
+{
+    StrategyWorld *world = StrategyWorldGet();
+    const SpGrid *g = StrategyNavGrid();
+
+    if (count <= 0) return;
+
+    // -- Slots ----------------------------------------------------------------
+    // Shape-driven, rotated to the facing. SpFormSlotLocal emits formation-local
+    // offsets and the rotation is applied identically for every shape, so adding
+    // a shape never touches this loop.
+    // Re-anchor the shape on its own centroid. Without this only GRID lands on
+    // the point the player clicked - LINE, COLUMN and WEDGE all grow backward
+    // from it, so their mass sits behind the click and, on a SHORT move, the
+    // rear ranks are sent to ground behind where they already stand and walk
+    // backwards to get there. Computed once per chunk, not per slot.
+    float bias = SpFormForwardBias((int)s_formShape, count, FORMATION_SPACING,
+                                   &s_formCaps);
+
+    int slotCount = 0;
+    for (int i = 0; i < count; i++)
+    {
+        float offR, offF;
+        SpFormSlotLocal((int)s_formShape, i, count, FORMATION_SPACING,
+                        &s_formCaps, &offR, &offF);
+        offF -= bias;
+        offF -= backOff;
+
+        Vector3 p = {
+            dest.x + rx*offR + fx*offF,
+            0.0f,
+            dest.z + rz*offR + fz*offF
+        };
+
+        // EVERY slot through SpNearestOpen. A slot inside a lake or a
+        // building is an unreachable target, and the unit assigned to it
+        // walks at a wall forever - the exact orbit-forever failure this
+        // whole overhaul exists to remove, reintroduced quietly for one
+        // unit in twenty.
+        //
+        // THE RING CAP MUST SPAN A REAL OBSTACLE. It was 6, which cannot escape
+        // anything wider than twelve tiles - so a LINE reaching its corner into
+        // a lake got slots left INSIDE it, and those units wedged against the
+        // shore and did the orbit-forever dance. A wide shape is exactly the
+        // case that puts a slot deep inside terrain, because it is the shape
+        // that reaches furthest from the point the player clicked.
+        int tx, tz, ox, oz;
+        SpWorldToTile(g, p.x, p.z, &tx, &tz);
+        if (SpNearestOpen(g, tx, tz, FORM_SLOT_RESOLVE_RING, &ox, &oz))
+        {
+            p = SpCellToWorld(g, (SpCell)(oz*g->w + ox));
+        }
+        else
+        {
+            // AND WHEN IT STILL FAILS, FALL BACK TO THE DESTINATION - never keep
+            // the blocked position. The old code did exactly that on failure,
+            // which is how an unreachable slot survived the very check written to
+            // remove it. The clicked point has itself been resolved by the
+            // caller, so it is somewhere a unit can stand; several units sharing
+            // it is a pile, which separation handles, and a pile at the right
+            // place beats a unit grinding on a cliff face forever.
+            p = dest;
+        }
+
+        s_slotPos[slotCount++] = p;
+    }
+    if (slotCount == 0) return;
+
+    // -- Assignment -----------------------------------------------------------
+    // NEAREST-SLOT, not a 1-D zip. The zip this replaced sorted units and slots
+    // onto one axis and paired them off, which is coherent along that axis and
+    // arbitrary across it. The cost lands exactly where the player looks: a
+    // group already standing on its destination, re-ordered, walked 30-47%
+    // further than it needed to and individual units crossed the whole block to
+    // reach a slot beside the one they were standing on. Line and column suffer
+    // worst, because their slots are spread along the axis the zip sorts by.
+    //
+    // The units array is indexed 0..count-1 here and the slot each one gets is
+    // written to s_assignSlot; both scratch arrays belong to this file.
+    for (int k = 0; k < count; k++)
+    {
+        const Unit *u = &world->units[units[k]];
+        s_assignUnits[k].x = u->pos.x;
+        s_assignUnits[k].z = u->pos.z;
+    }
+    for (int k = 0; k < slotCount; k++)
+    {
+        s_assignSlots[k].x = s_slotPos[k].x;
+        s_assignSlots[k].z = s_slotPos[k].z;
+    }
+
+    // Fewer slots than units cannot happen - one slot is laid out per unit - but
+    // if it ever did, the extra units would read past the slot array. Pair only
+    // what exists and let the tail fall back to the last slot, as before.
+    int pairs = (count < slotCount) ? count : slotCount;
+
+    // -- Does this group already have an identity to keep? --------------------
+    // Only if EVERY unit in it was last assigned under the same shape and the
+    // same member count. Either changing means the slot indices describe a
+    // different layout, and keeping them would scatter the block into the shape
+    // of its predecessor.
+    //
+    // Note this deliberately does not require the same group id: a re-order
+    // mints a fresh one every time, so keying on it would mean the memory never
+    // applies, which is the bug rather than the fix.
+    bool keepIdentity = true;
+    for (int k = 0; k < pairs; k++)
+    {
+        const Unit *u = &world->units[units[k]];
+        if (u->formSlotIndex < 0 ||
+            u->formSlotShape != (int)s_formShape ||
+            u->formSlotOf    != pairs)
+        {
+            keepIdentity = false;
+            break;
+        }
+    }
+
+    if (keepIdentity)
+    {
+        for (int k = 0; k < pairs; k++)
+            s_assignPrev[k] = world->units[units[k]].formSlotIndex;
+
+        // Read BEFORE StrategyOrderMove runs below - that call funnels through
+        // MoveArriveReset, which clears the remembered slot precisely so a unit
+        // given a different job cannot re-claim one. The stamp is redone
+        // immediately after the order, the same dance the rest of the formation
+        // state already does.
+
+        // The block is the same shape and size as last time: everyone keeps the
+        // slot they hold and it simply translates and turns. This is what stops
+        // an ordinary click - which swings the facing a few degrees - from
+        // reshuffling the formation around its own centre.
+        SpFormAssignStable(s_assignUnits, s_assignSlots, pairs, s_assignPrev,
+                           s_assignSlot, s_assignTaken);
+    }
+    else
+    {
+        // A new formation, or one whose shape or size changed. There is nothing
+        // to preserve, so pair from scratch for the shortest walk.
+        SpFormAssign(s_assignUnits, s_assignSlots, pairs, s_assignSlot,
+                     s_unitOrder, s_slotOrder);
+    }
+
+    // One id per ECHELON, not per order. Form-up measures a worst-case distance
+    // across a group, so two echelons sharing an id would make each wait for the
+    // other's stragglers - the rear chunk holding the front one at a crawl is
+    // exactly the "1000 units got stuck" report.
+    int groupId = s_formNextGroup++;
+    bool loose  = FormShapeIsLoose(s_formShape);
+
+    int slot = FormGroupClaim(groupId);
+    s_formGroups[slot].dest       = dest;
+    s_formGroups[slot].loose      = loose;
+    s_formGroups[slot].everFormed = loose;   // a loose scatter never forms up
+    s_formGroups[slot].halfExtent =
+        SpFormHalfExtent((int)s_formShape, count, FORMATION_SPACING, &s_formCaps);
+
+    // Frontage the block asks the terrain for, CAPPED. Uncapped, a 512-unit
+    // block wants ~34 tiles and almost no corridor is that wide, so every large
+    // group would read as permanently choked and the funnel would become the
+    // default again - reinstating the very bug the chokepoint rule bounds.
+    float need = s_formGroups[slot].halfExtent*2.0f;
+    s_formGroups[slot].needWidth = (need > FORM_CHOKE_NEED_MAX) ? FORM_CHOKE_NEED_MAX : need;
+
+    for (int k = 0; k < count; k++)
+    {
+        int slotIdx = (k < pairs) ? s_assignSlot[k] : (slotCount - 1);
+        int index   = units[k];
+        Unit *u = &world->units[index];
+
+        // Still one target per unit, and still through the SAME single-unit
+        // order every other caller uses. UNIT_MOVE's handler never learns that
+        // formations exist - which is what keeps this addition survivable.
+        StrategyOrderMove(u, s_slotPos[slotIdx]);
+
+        // Stamped AFTER the order: StrategyOrderMove clears formation state (a
+        // single-unit order means "leave your formation"), so setting it first
+        // would be wiped by the very call that starts the march. The field is
+        // assigned after this too, for the same reason - MoveArriveReset drops
+        // it, which is what step 7 relies on for individual re-orders.
+        u->formGroup      = groupId;
+        u->formSlot       = s_slotPos[slotIdx];
+
+        // Remember WHICH slot, under which shape and size, so the next order can
+        // keep it rather than re-deriving the whole pairing.
+        u->formSlotIndex  = slotIdx;
+        u->formSlotShape  = (int)s_formShape;
+        u->formSlotOf     = pairs;
+        u->formForming    = !loose;
+        u->formEverFormed = loose;
+        u->formBrokeOff   = false;
+
+        UnitPath *p = &s_paths[index];
+        p->field         = field;
+        p->formGroupSlot = (int16_t)slot;
+        p->formReleased  = false;
+        p->formSlotClear = false;
+        p->formChoked    = false;
+        p->formChokeTime = 0.0f;
+    }
+
+    // The ring is sized to the block, not to a constant: the whole point is to
+    // show how much ground this order takes. The half-extent already accounts
+    // for the shape, so a LINE previews wide and a COLUMN previews deep.
+    PreviewCapture(s_slotPos, slotCount, dest, s_formGroups[slot].halfExtent, fx, fz);
+
+    (void)totalCount;
+}
+
+// The real entry point. `hasFacing` lets the caller pin the formation's heading -
+// the drag-to-orient order does, an ordinary click and every AI order do not.
+static void OrderMoveGroupFaced(const int *units, int count, Vector3 dest,
+                                bool hasFacing, float faceX, float faceZ)
 {
     StrategyWorld *world = StrategyWorldGet();
     const SpGrid *g = StrategyNavGrid();
@@ -688,7 +1229,7 @@ void StrategyOrderMoveGroup(const int *units, int count, Vector3 dest)
         return;
     }
 
-    if (count > FORMATION_MAX) count = FORMATION_MAX;
+    if (count > STRAT_MAX_UNITS) count = STRAT_MAX_UNITS;
 
     // -- Facing ---------------------------------------------------------------
     // The formation faces the way the group is travelling, so a block of units
@@ -702,114 +1243,149 @@ void StrategyOrderMoveGroup(const int *units, int count, Vector3 dest)
     centroid.x /= (float)count;
     centroid.z /= (float)count;
 
-    float fx = dest.x - centroid.x, fz = dest.z - centroid.z;
-    float flen = sqrtf(fx*fx + fz*fz);
-    if (flen < 0.001f) { fx = 0.0f; fz = 1.0f; }       // already there: any facing
-    else               { fx /= flen; fz /= flen; }
+    // An EXPLICIT facing wins when the player dragged one out; otherwise the
+    // formation faces the way the group is travelling, which is the right guess
+    // for a plain click and the only one available for an AI order.
+    float fx, fz;
+    if (hasFacing)
+    {
+        fx = faceX; fz = faceZ;
+        float l = sqrtf(fx*fx + fz*fz);
+        if (l < 0.001f) { fx = 0.0f; fz = 1.0f; }
+        else            { fx /= l; fz /= l; }
+    }
+    else
+    {
+        fx = dest.x - centroid.x; fz = dest.z - centroid.z;
+        float flen = sqrtf(fx*fx + fz*fz);
+        if (flen < 0.001f) { fx = 0.0f; fz = 1.0f; }   // already there: any facing
+        else               { fx /= flen; fz /= flen; }
+    }
     float rx = -fz, rz = fx;                            // right-hand perpendicular
 
-    // -- Slots ----------------------------------------------------------------
-    // Shape-driven, rotated to the facing. FormationSlotLocal emits formation-
-    // local offsets and the rotation is applied identically for every shape, so
-    // adding a shape never touches this loop.
-    int slotCount = 0;
-    for (int i = 0; i < count; i++)
-    {
-        float offR, offF;
-        FormationSlotLocal(s_formShape, i, count, &offR, &offF);
-
-        Vector3 p = {
-            dest.x + rx*offR + fx*offF,
-            0.0f,
-            dest.z + rz*offR + fz*offF
-        };
-
-        // EVERY slot through SpNearestOpen. A slot inside a lake or a
-        // building is an unreachable target, and the unit assigned to it
-        // walks at a wall forever - the exact orbit-forever failure this
-        // whole overhaul exists to remove, reintroduced quietly for one
-        // unit in twenty.
-        int tx, tz, ox, oz;
-        SpWorldToTile(g, p.x, p.z, &tx, &tz);
-        if (SpNearestOpen(g, tx, tz, 6, &ox, &oz)) p = SpCellToWorld(g, (SpCell)(oz*g->w + ox));
-
-        s_slotPos[slotCount++] = p;
-    }
-    if (slotCount == 0) return;
-
-    // -- Assignment -----------------------------------------------------------
-    // Project both units and slots onto the SAME axis and zip the sorted
-    // orders. Units that start in front end up in front, so nobody walks
-    // through the formation to reach their slot. Assign naively instead and a
-    // 200-unit group visibly trades places on the spot before setting off.
-    //
-    // The axis is the formation's right-hand perpendicular with the forward
-    // component folded in, so the ordering is stable for a group approaching
-    // from any direction rather than only from the side.
-    for (int k = 0; k < count; k++)
-    {
-        const Unit *u = &world->units[units[k]];
-        s_unitOrder[k].key   = u->pos.x*rx + u->pos.z*rz + (u->pos.x*fx + u->pos.z*fz)*0.5f;
-        s_unitOrder[k].index = k;
-    }
-    for (int k = 0; k < slotCount; k++)
-    {
-        s_slotOrder[k].key   = s_slotPos[k].x*rx + s_slotPos[k].z*rz
-                             + (s_slotPos[k].x*fx + s_slotPos[k].z*fz)*0.5f;
-        s_slotOrder[k].index = k;
-    }
-    SortByKey(s_unitOrder, count);
-    SortByKey(s_slotOrder, slotCount);
-
-    // One id for this whole order. Minted per order, never reused, so a unit
-    // left over from a previous group cannot be counted as a member of this one.
-    int groupId = s_formNextGroup++;
-
-    for (int k = 0; k < count; k++)
-    {
-        int unitSlot = s_unitOrder[k].index;
-        int slot     = s_slotOrder[(k < slotCount) ? k : slotCount - 1].index;
-        Unit *u = &world->units[units[unitSlot]];
-
-        // Still one target per unit, and still through the SAME single-unit
-        // order every other caller uses. UNIT_MOVE's handler never learns that
-        // formations exist - which is what keeps this addition survivable.
-        StrategyOrderMove(u, s_slotPos[slot]);
-
-        // Stamped AFTER the order: StrategyOrderMove clears formation state (a
-        // single-unit order means "leave your formation"), so setting it first
-        // would be wiped by the very call that starts the march.
-        u->formGroup      = groupId;
-        u->formSlot       = s_slotPos[slot];
-        u->formForming    = true;
-        u->formEverFormed = false;
-        u->formBrokeOff   = false;
-    }
-
     // -- Flow field -----------------------------------------------------------
-    // Looked up FIRST and only built when the group earns one. A lone worker
-    // sent where two hundred units are already headed costs nothing; three
-    // units to three corners are three searches and rightly stay individual.
-    int gx, gz;
+    // Resolved ONCE for the whole order, before any chunk is laid out, and
+    // handed to each. All echelons walk to the same place, so they share one
+    // field - and the threshold is tested against the TOTAL count, not a
+    // chunk's, or a 600-unit order would fail it on its 88-unit tail and leave
+    // that echelon to find its own way with individual searches.
+    SpFieldId field = SP_FIELD_NONE;
+    int gx, gz, gox, goz;
     SpWorldToTile(g, dest.x, dest.z, &gx, &gz);
-    int ox, oz;
-    if (!SpNearestOpen(g, gx, gz, 8, &ox, &oz)) return;
+    if (SpNearestOpen(g, gx, gz, 8, &gox, &goz))
+    {
+        field = SpFlowFind(gox, goz);
 
-    SpFieldId field = SpFlowFind(ox, oz);
+        // Counted here and nowhere else: this is the only place the cache is
+        // consulted, so hit/miss on the overlay means exactly "orders that
+        // reused a field" against "orders that had to build one". A miss rate
+        // that stays high under repeated orders to the same area means the 2x2
+        // goal coarsening is not doing its job.
+        SpProfAdd(SP_COUNT_FLOW_HIT,  (field != SP_FIELD_NONE) ? 1 : 0);
+        SpProfAdd(SP_COUNT_FLOW_MISS, (field == SP_FIELD_NONE) ? 1 : 0);
 
-    // Counted here and nowhere else: this is the only place the cache is
-    // consulted, so hit/miss on the overlay means exactly "orders that reused a
-    // field" against "orders that had to build one". A miss rate that stays
-    // high under repeated orders to the same area means the 2x2 goal
-    // coarsening is not doing its job.
-    SpProfAdd(SP_COUNT_FLOW_HIT,  (field != SP_FIELD_NONE) ? 1 : 0);
-    SpProfAdd(SP_COUNT_FLOW_MISS, (field == SP_FIELD_NONE) ? 1 : 0);
+        if (field == SP_FIELD_NONE && count >= s_flowThreshold)
+            field = SpFlowAcquire(gox, goz);
+    }
 
-    if (field == SP_FIELD_NONE && count >= s_flowThreshold)
-        field = SpFlowAcquire(ox, oz);
+    // -- Chunking -------------------------------------------------------------
+    // Anything past one block's worth becomes several echelons, each with its
+    // own id and its own slot block, stacked progressively backward.
+    //
+    // NOT just an array-bounds fix. The old code silently truncated at 512, so
+    // in a 1000-unit order the last 488 units kept whatever they were doing -
+    // which is the "some settle in a distant corner" report, exactly.
+    //
+    // AND CHUNKING IS CHEAPER THAN ONE BIG BLOCK. The assignment sorts with an
+    // insertion sort, so it is O(n^2): 50 million comparisons at ten thousand
+    // units, a multi-second hitch on a single right-click. Twenty sorted blocks
+    // of 512 is 2.6 million - nineteen times less - and one 150-unit-wide
+    // formation would not fit on most maps anyway.
+    if (count > FORMATION_MAX)
+    {
+        // CHUNK MEMBERSHIP MUST BE SPATIAL, and this is the subtle part. The
+        // caller fills its buffer in SELECTION order, which is roster order and
+        // therefore arbitrary. Chunk that naively and every echelon holds units
+        // from both ends of the map, so the rear block marches straight through
+        // the front one.
+        //
+        // Bucketing on the same forward-axis key the assignment sort already
+        // uses costs one O(n) pass and fixes it. Approximate is fine: exact
+        // ordering inside a chunk is still done by the insertion sort.
+        static SortEntry s_chunkOrder[STRAT_MAX_UNITS];
+        static int       s_chunkBuf[STRAT_MAX_UNITS];
 
-    for (int k = 0; k < count; k++) s_paths[units[k]].field = field;
+        for (int k = 0; k < count; k++)
+        {
+            const Unit *u = &world->units[units[k]];
+            s_chunkOrder[k].key   = -(u->pos.x*fx + u->pos.z*fz);   // nearest the
+            s_chunkOrder[k].index = units[k];                        //   destination first
+        }
+
+        // Counting sort into coarse buckets, then read out in bucket order. A
+        // full sort of ten thousand entries is the cost this whole branch
+        // exists to avoid, so the bucketing must stay linear.
+        #define FORM_CHUNK_BUCKETS 64
+        float lo = s_chunkOrder[0].key, hi = lo;
+        for (int k = 1; k < count; k++)
+        {
+            if (s_chunkOrder[k].key < lo) lo = s_chunkOrder[k].key;
+            if (s_chunkOrder[k].key > hi) hi = s_chunkOrder[k].key;
+        }
+        float span = hi - lo;
+        if (span < 0.001f) span = 0.001f;
+
+        int histo[FORM_CHUNK_BUCKETS + 1] = { 0 };
+        for (int k = 0; k < count; k++)
+        {
+            int b = (int)((s_chunkOrder[k].key - lo)/span*(FORM_CHUNK_BUCKETS - 1));
+            if (b < 0) b = 0;
+            if (b >= FORM_CHUNK_BUCKETS) b = FORM_CHUNK_BUCKETS - 1;
+            histo[b + 1]++;
+        }
+        for (int b = 0; b < FORM_CHUNK_BUCKETS; b++) histo[b + 1] += histo[b];
+        for (int k = 0; k < count; k++)
+        {
+            int b = (int)((s_chunkOrder[k].key - lo)/span*(FORM_CHUNK_BUCKETS - 1));
+            if (b < 0) b = 0;
+            if (b >= FORM_CHUNK_BUCKETS) b = FORM_CHUNK_BUCKETS - 1;
+            s_chunkBuf[histo[b]++] = s_chunkOrder[k].index;
+        }
+        #undef FORM_CHUNK_BUCKETS
+
+        int chunks = (count + FORMATION_MAX - 1)/FORMATION_MAX;
+        float backOff = 0.0f;
+        for (int c = 0; c < chunks; c++)
+        {
+            int base = c*FORMATION_MAX;
+            int n    = count - base;
+            if (n > FORMATION_MAX) n = FORMATION_MAX;
+
+            FormationChunkOrder(&s_chunkBuf[base], n, dest, fx, fz, rx, rz,
+                                backOff, count, field);
+
+            // Stack the next echelon behind this one, plus a rank of clearance
+            // so the two blocks do not interleave at their seam.
+            backOff += SpFormHalfExtent((int)s_formShape, n, FORMATION_SPACING,
+                                        &s_formCaps)*2.0f + FORMATION_SPACING*2.0f;
+        }
+    }
+    else FormationChunkOrder(units, count, dest, fx, fz, rx, rz, 0.0f, count, field);
+
     SpProfSet(SP_COUNT_FLOW_LIVE, SpFlowLiveCount());
+}
+
+void StrategyOrderMoveGroup(const int *units, int count, Vector3 dest)
+{
+    OrderMoveGroupFaced(units, count, dest, false, 0.0f, 0.0f);
+}
+
+// Same order, with the formation's heading chosen by the player rather than
+// inferred from the direction of travel.
+void StrategyOrderMoveGroupFacing(const int *units, int count, Vector3 dest,
+                                  float faceX, float faceZ)
+{
+    OrderMoveGroupFaced(units, count, dest, true, faceX, faceZ);
 }
 
 // ----------------------------------------------------------------------------
@@ -933,71 +1509,147 @@ int StrategyMoveFlowLive(void) { return SpFlowLiveCount(); }
 //     crawls for the rest of the march. Form up once at the start; after that
 //     the group marches at full speed and stragglers stay stragglers.
 // ----------------------------------------------------------------------------
-#define FORMUP_TIGHT       (4.0f*STRAT_UNIT_RADIUS) // slot distance that counts as "in place"
-#define FORMUP_MIN_SCALE   0.15f   // never fully stop; a frozen unit reads as stuck
-#define FORMUP_EXP         2.0f    // how sharply being far ahead is punished
+// The tuning lives in strategy_types.h, derived from FORMATION_SPACING and
+// STRAT_UNIT_RADIUS rather than typed as bare numbers. That is not tidiness: the
+// bug this whole section exists to fix was a tolerance (1.4) SMALLER than the
+// slot pitch (1.5), so a group was asked to pack tighter than its own slots
+// allowed, the latch could never fire, and the brake stayed down for the rest of
+// the march. Tie the two numbers together and that cannot be written again.
 
-// Per-group worst slot distance, recomputed every frame. Indexed by a small
-// dense map of group id -> slot, because group ids are monotonic and unbounded
-// while the number of LIVE groups is tiny.
-#define FORMUP_MAX_GROUPS  32
-static int   s_formGroupId[FORMUP_MAX_GROUPS];
-static float s_formGroupWorst[FORMUP_MAX_GROUPS];
-static int   s_formGroupCount;
-
-static int FormGroupSlot(int groupId)
-{
-    for (int i = 0; i < s_formGroupCount; i++)
-        if (s_formGroupId[i] == groupId) return i;
-    return -1;
-}
-
-// Recompute each live group's worst-case distance-to-slot. Runs once per frame
-// before the movement pass, so every unit in a group compares against the same
-// snapshot - computing it per unit would make the answer depend on update order.
-void StrategyMoveFormUpdate(void)
+// Recompute each live group's state from the roster. Runs once per frame before
+// the movement pass, so every unit in a group compares against the SAME
+// snapshot - computed inside the unit update it would depend on iteration order,
+// and units early in the roster would pace themselves against a group that had
+// already half-moved.
+//
+// RECOUNTED, never incrementally maintained, for the same reason the flow
+// refcounts are: every exit a unit can take - dying, re-ordering, arriving,
+// breaking off - would otherwise need its own decrement, and missing exactly one
+// leaves a phantom member holding a group short of its latch forever.
+void StrategyMoveFormUpdate(float dt)
 {
     StrategyWorld *world = StrategyWorldGet();
     int liveCount = 0;
     const int *live = StrategyActiveUnits(&liveCount);
 
-    s_formGroupCount = 0;
+    // Zero the per-frame tallies but KEEP the records. The latch, the timer and
+    // the extents are what the table is for; clearing the whole table each frame
+    // is what the parallel arrays used to do, and it is why nothing could
+    // remember anything for longer than a frame.
+    for (int i = 0; i < s_formGroupCount; i++)
+    {
+        s_formGroups[i].members = 0;
+        s_formGroups[i].inPlace = 0;
+        s_formGroups[i].worst   = 0.0f;
+    }
 
     for (int k = 0; k < liveCount; k++)
     {
-        Unit *u = &world->units[live[k]];
-        if (u->formGroup < 0 || u->formEverFormed || u->formBrokeOff) continue;
+        int index = live[k];
+        Unit *u = &world->units[index];
+        if (u->formGroup < 0) { s_paths[index].formGroupSlot = -1; continue; }
+
+        int slot = FormGroupSlot(u->formGroup);
+
+        // Cached on the path side array so StrategyMoveTo does not repeat the
+        // linear scan per unit per frame - 640k integer compares a frame at ten
+        // thousand units, for an answer that only changes when an order does.
+        // This pass already walks every unit and already does the lookup.
+        s_paths[index].formGroupSlot = (int16_t)slot;
+        if (slot < 0) continue;
+
+        FormGroup *fg = &s_formGroups[slot];
+        fg->members++;
 
         float dx = u->formSlot.x - u->pos.x;
         float dz = u->formSlot.z - u->pos.z;
         float d  = sqrtf(dx*dx + dz*dz);
 
-        int slot = FormGroupSlot(u->formGroup);
-        if (slot < 0)
-        {
-            if (s_formGroupCount >= FORMUP_MAX_GROUPS) continue;   // more groups than tracked: they simply skip form-up
-            slot = s_formGroupCount++;
-            s_formGroupId[slot]    = u->formGroup;
-            s_formGroupWorst[slot] = 0.0f;
-        }
-        if (d > s_formGroupWorst[slot]) s_formGroupWorst[slot] = d;
+        if (d > fg->worst) fg->worst = d;
+        if (d <= FORMUP_TIGHT) fg->inPlace++;
     }
 
-    // Latch off every group that has closed up. Done as a second pass so the
-    // whole group flips together - a unit that latched mid-scan would stop
-    // contributing to its own group's worst distance.
+    // Second pass over the GROUPS, not the units: the latch is a group decision
+    // and a unit that flipped it mid-scan would stop contributing to its own
+    // group's worst distance.
+    for (int i = 0; i < s_formGroupCount; i++)
+    {
+        FormGroup *fg = &s_formGroups[i];
+        if (fg->members == 0) continue;
+
+        if (!fg->everFormed)
+        {
+            fg->formTime += dt;
+
+            // A FRACTION of the members, not the worst one. The worst-unit rule
+            // makes the latch hostage to the single unluckiest member, and at a
+            // thousand units there is always exactly one stuck behind a rock -
+            // which is precisely how the reported 1000-unit group ended up
+            // crawling until an unrelated enemy spawn released the brake.
+            bool packed = ((float)fg->inPlace >= (float)fg->members*FORMUP_FRACTION);
+
+            // THE BACKSTOP, and the reason this class of bug does not recur. Any
+            // latch predicated on crowd geometry can be defeated by geometry; a
+            // brake that can be held down indefinitely is exactly the failure
+            // being removed. With the cap, "crawls forever" stops being a state
+            // the system can reach at all.
+            bool timedOut = (fg->formTime >= FORMUP_MAX_TIME);
+
+            if (packed || timedOut) fg->everFormed = true;
+        }
+
+        // Arrived: the block holds its slots so the formation stays visible.
+        // Measured on the same in-place fraction the latch uses, so a group that
+        // formed up is a group that can hold.
+        fg->holding = !fg->loose && fg->everFormed &&
+                      ((float)fg->inPlace >= (float)fg->members*FORMUP_FRACTION);
+    }
+
+    // Mirror the latch onto the units. `formEverFormed` must stay on Unit even
+    // though the group record is authoritative: MoveArriveReset reads it to drop
+    // a unit out of its formation on any individual re-order, and deleting the
+    // field would silently break every single-unit order in the game.
     for (int k = 0; k < liveCount; k++)
     {
         Unit *u = &world->units[live[k]];
-        if (u->formGroup < 0 || u->formEverFormed) continue;
-
-        int slot = FormGroupSlot(u->formGroup);
+        if (u->formGroup < 0) continue;
+        int slot = s_paths[live[k]].formGroupSlot;
         if (slot < 0) continue;
 
-        if (s_formGroupWorst[slot] <= FORMUP_TIGHT)
+        if (s_formGroups[slot].everFormed)
         {
-            u->formEverFormed = true;    // THE LATCH. Never set back to false.
+            u->formEverFormed = true;
             u->formForming    = false;
+        }
+    }
+
+    // Retire records nobody carries any more, so a long session cannot fill the
+    // table with dead groups and start evicting live ones.
+    //
+    // COMPACTION MUST REPAIR THE CACHES IT MOVES. Swapping the last record down
+    // leaves every unit that cached the old index pointing at whatever landed
+    // there - an index still IN RANGE, so the `slot < 0` guard every reader has
+    // does not catch it, and the unit silently paces itself against a different
+    // group's extent and latch. Waiting for the next frame's refresh is not good
+    // enough either: a group order arriving between now and then stamps fresh
+    // caches alongside the stale ones. So the moved record's members are
+    // re-pointed here, while the id needed to find them is still known.
+    for (int i = 0; i < s_formGroupCount; )
+    {
+        if (s_formGroups[i].members != 0) { i++; continue; }
+
+        int moved = --s_formGroupCount;
+        s_formGroups[i] = s_formGroups[moved];
+
+        if (moved != i)
+        {
+            int movedId = s_formGroups[i].id;
+            for (int k = 0; k < liveCount; k++)
+            {
+                int index = live[k];
+                if (world->units[index].formGroup == movedId)
+                    s_paths[index].formGroupSlot = (int16_t)i;
+            }
         }
     }
 }
@@ -1018,20 +1670,26 @@ void StrategyFormationBreak(int groupId)
         Unit *u = &world->units[live[k]];
         if (u->formGroup == groupId) u->formBrokeOff = true;
     }
+
+    int slot = FormGroupSlot(groupId);
+    if (slot >= 0) s_formGroups[slot].holding = false;
 }
 
 // Speed multiplier while forming up: 1.0 for the unit furthest from its slot,
 // falling off exponentially for the ones already close. Returns 1.0 the moment
 // the group has formed once, forever after.
-static float FormUpScale(const Unit *u)
+static float FormUpScale(int index, const Unit *u)
 {
     if (u->formGroup < 0 || u->formEverFormed || u->formBrokeOff) return 1.0f;
 
-    int slot = FormGroupSlot(u->formGroup);
+    int slot = s_paths[index].formGroupSlot;
     if (slot < 0) return 1.0f;
 
-    float worst = s_formGroupWorst[slot];
-    if (worst <= FORMUP_TIGHT) return 1.0f;      // group is already together
+    const FormGroup *fg = &s_formGroups[slot];
+    if (fg->loose) return 1.0f;                 // a scatter has nothing to close up
+
+    float worst = fg->worst;
+    if (worst <= FORMUP_TIGHT) return 1.0f;     // group is already together
 
     float dx = u->formSlot.x - u->pos.x;
     float dz = u->formSlot.z - u->pos.z;
@@ -1044,4 +1702,65 @@ static float FormUpScale(const Unit *u)
 
     float scale = powf(ratio, FORMUP_EXP);
     return (scale < FORMUP_MIN_SCALE) ? FORMUP_MIN_SCALE : scale;
+}
+
+// Drop the flow field a unit is riding, WITHOUT touching its path.
+//
+// A field is a GROUP answer: the moment a unit is given its own destination the
+// field is steering it at somebody else's, and since the field is only released
+// on the approach it does so for the entire march. Its A* route, by contrast, is
+// still worth keeping - NeedsPath decides when that has gone stale.
+void StrategyMoveDropField(int index)
+{
+    if (index < 0 || index >= STRAT_MAX_UNITS) return;
+    s_paths[index].field         = SP_FIELD_NONE;
+    s_paths[index].formGroupSlot = -1;
+    s_paths[index].formReleased  = false;
+    s_paths[index].formChoked    = false;
+    s_paths[index].formChokeTime = 0.0f;
+}
+
+// The restoring pull that makes a formation strict, applied to an ARRIVED unit
+// that is still a member of a holding group. Returns the displacement to add to
+// the unit's position this frame; zero whenever holding does not apply.
+//
+// THREE RULES, ALL LOAD-BEARING. Get any one wrong and this reintroduces the
+// clustering spiral that Phase 2 removed:
+//
+//   1. The deadband is WIDER than the separation radius. Separation pushes out
+//      to STRAT_SEP_RADIUS; a pull engaging inside that would oppose it head-on
+//      and the pair would oscillate forever.
+//   2. The pull is slow and capped. A shoved unit rocketing back to its slot
+//      reads worse than one drifting off it.
+//   3. It moves `pos`, not `vel`. That bypasses the separation integrator
+//      entirely, so its damping term cannot amplify the correction into a
+//      bounce.
+//
+// And the thing that is NOT here: UNIT_IDLE is deliberately still absent from
+// UnitPushes. A holding unit receives push without applying it, so two
+// neighbours both drifting home never shove each other - the existing
+// apply/receive asymmetry does the work that a fourth rule would otherwise need.
+Vector3 StrategyFormationHoldPull(int index, const Unit *u, float dt)
+{
+    Vector3 zero = { 0 };
+    if (index < 0 || index >= STRAT_MAX_UNITS) return zero;
+    if (u->formGroup < 0 || u->formBrokeOff)   return zero;
+
+    int slot = s_paths[index].formGroupSlot;
+    if (slot < 0) return zero;
+
+    const FormGroup *fg = &s_formGroups[slot];
+    if (!fg->holding || fg->loose) return zero;
+
+    float dx = u->formSlot.x - u->pos.x;
+    float dz = u->formSlot.z - u->pos.z;
+    float d  = sqrtf(dx*dx + dz*dz);
+    if (d <= FORM_HOLD_DEADBAND || d < 0.001f) return zero;
+
+    float step = u->moveSpeed*FORM_HOLD_SPEED*dt;
+    float room = d - FORM_HOLD_DEADBAND;        // never pull past the deadband,
+    if (step > room) step = room;               //   or the unit oscillates on it
+
+    Vector3 out = { dx/d*step, 0.0f, dz/d*step };
+    return out;
 }

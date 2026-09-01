@@ -77,7 +77,11 @@
 // on the edge of a crowd flips between settled and seeking every few frames,
 // which looks exactly like the spiral this is meant to remove.
 #define STRAT_ARRIVE_RESUME  (2.0f*STRAT_ARRIVE_SLOW)   // shoved this far: re-seek
-#define STRAT_ARRIVE_STALL   1.25f   // seconds of no progress before settling
+// Seconds of no progress before a unit gives up and settles. 0.5, not the 1.25
+// this once claimed: the constant was declared and then never used - MoveArrive
+// carried a literal - so the two had been disagreeing silently. The literal is
+// the value that was actually shipped and tested, so it is the one kept.
+#define STRAT_ARRIVE_STALL   0.5f
 // The stall rule only applies once a unit is CLOSE. Ungated it fires on the
 // rear of any large column - those units are blocked for seconds while the
 // front resolves, and settling them strands a 500-unit order at its start.
@@ -212,6 +216,7 @@ typedef enum {
     FORM_COLUMN,        // narrow and deep, for marching through gaps
     FORM_TWO_COLUMN,    // two parallel files with a lane between them
     FORM_WEDGE,         // V, point toward the destination
+    FORM_FREEFORM,      // loose scatter over a disc; an AREA order, not a block
     FORM_COUNT,
 } FormationShape;
 
@@ -242,6 +247,80 @@ typedef enum {
 // formations do when they run out of frontage or road.
 #define FORM_LINE_MAX_WIDTH  40.0f  // frontage before FORM_LINE adds ranks
 #define FORM_COLUMN_MAX_DEPTH 40.0f // depth before a column adds files
+
+// -- Formation geometry and pacing -------------------------------------------
+// DERIVED FROM STRAT_UNIT_RADIUS, for the same reason every arrival distance is:
+// the one formation bug that cost the most was a tolerance smaller than the slot
+// pitch, so units were asked to pack tighter than their own slots allowed and
+// the form-up brake could never release. Tie the numbers together and that
+// class of mistake stops being expressible.
+#define FORMATION_SPACING    (4.286f*STRAT_UNIT_RADIUS)  // slot pitch (= 1.5 at r=0.35)
+
+// Slot distance that counts as "in place" for the form-up latch. MUST exceed
+// FORMATION_SPACING: a unit standing exactly on its own slot still has
+// neighbours one pitch away, and separation legitimately displaces it.
+#define FORMUP_TIGHT         (1.5f*FORMATION_SPACING)
+
+// Fraction of a group that must be in place before form-up releases. Not the
+// worst unit: at a thousand units there is always exactly one stuck behind a
+// rock, and letting it hold the brake down is how the whole army crawls.
+#define FORMUP_FRACTION      0.85f
+
+// Hard ceiling on form-up, in seconds. THE BACKSTOP. Any latch predicated on
+// crowd geometry can be defeated by geometry; this is what makes "crawls
+// forever" structurally impossible rather than merely unlikely.
+#define FORMUP_MAX_TIME      6.0f
+
+// Slowest a forming unit walks. 0.35 rather than 0.15 because a 6.7x slowdown
+// reads as broken even when it is working - and it matches the arrival ramp's
+// own floor, which is the other place in this game a unit is deliberately slow.
+#define FORMUP_MIN_SCALE     0.35f
+#define FORMUP_EXP           2.0f   // how sharply being far ahead is punished
+
+// Extra margin past the block's own half-extent at which a unit stops riding
+// the shared flow field. The multiplier releases the rear ranks slightly BEFORE
+// the front reaches its slots - release exactly at the block edge and the rear
+// is still funnelling while the front is forming, which reads as the block
+// being extruded through a hole.
+#define FORM_RELEASE_MARGIN  2.0f
+#define FORM_RELEASE_SCALE   1.25f
+
+// -- Chokepoints --------------------------------------------------------------
+// Terrain narrower than the block gets to break it: the units funnel through and
+// re-form on the far side. Two widths, not one, and a dwell time - a single
+// threshold flickers every frame at the mouth of a gap, the same failure
+// STRAT_ARRIVE_RESUME exists to prevent.
+#define FORM_CHOKE_ENTER     6      // tiles of open width: narrower than this funnels
+#define FORM_CHOKE_EXIT      10     // ...and it takes this much to re-form
+#define FORM_CHOKE_DWELL     0.6f   // seconds a verdict must hold before it flips
+#define FORM_CHOKE_PROBE_MAX 12     // tiles counted per side; 24 wide is open ground
+#define FORM_CHOKE_STRIDE    11     // 1 unit in N probes per frame (prime: spreads load)
+
+// THE WIDTH A BLOCK ASKS FOR IS CAPPED. A 512-unit block wants ~34 tiles of
+// frontage and almost no corridor is that wide, so without this every large
+// group reads as permanently choked and the funnel becomes the default again -
+// reinstating the bug the chokepoint rule exists to bound. The question is "is
+// this a GAP", not "can the whole block stand abreast".
+#define FORM_CHOKE_NEED_MAX  16.0f
+
+// Rings searched outward when a formation slot lands on impassable ground.
+// SIZED TO CLEAR A REAL OBSTACLE, not to be cheap: at 6 it could not escape
+// anything wider than twelve tiles, so a LINE reaching a corner into a lake kept
+// slots INSIDE it and those units wedged on the shore. This runs once per slot
+// per order, on a click - a wider ring costs nothing that matters.
+#define FORM_SLOT_RESOLVE_RING  16
+
+// -- Slot holding -------------------------------------------------------------
+// A unit in a formation is pulled back toward its slot, so the block holds shape
+// while moving and stays visible once arrived.
+//
+// THE DEADBAND MUST EXCEED THE SEPARATION RADIUS. Separation pushes out to
+// STRAT_SEP_RADIUS; a pull that engaged inside that would oppose it directly and
+// the pair would oscillate forever. 2x is the distance saying how far a
+// neighbour may legitimately displace you.
+#define FORM_HOLD_DEADBAND   (2.0f*STRAT_SEP_RADIUS)
+#define FORM_HOLD_SPEED      0.35f  // fraction of moveSpeed; a unit rocketing
+                                    //   home reads worse than one drifting
 
 // A queued worker job (Shift-RMB chain). One building index serves all kinds;
 // gather resolves its resource node at dispatch time. See WorkerStartNextJob.
@@ -296,6 +375,22 @@ typedef struct {
     // with formGroup < 0 is not in a formation and every rule below is skipped.
     int          formGroup;         // group id this unit marches with, -1 = none
     Vector3      formSlot;          // its assigned slot, in world space
+
+    // WHICH slot of the shape this unit holds, and the shape and member count it
+    // was assigned under. Together these are the formation's IDENTITY: while all
+    // three still match, a re-order keeps every unit in the position it already
+    // occupies and the block simply translates and turns as one.
+    //
+    // Without them a re-order re-derives the pairing from scratch, and because
+    // facing is recomputed from centroid-to-destination every time, a 15-degree
+    // swing - which an ordinary click produces easily - reshuffled 33 units in
+    // 36. That is the "bunch that shuffle completely around" report.
+    //
+    // -1 means no remembered slot, which is what a fresh order or a changed
+    // shape/count leaves behind.
+    int          formSlotIndex;
+    int          formSlotShape;     // FormationShape it was assigned under
+    int          formSlotOf;        // member count it was assigned under
     bool         formForming;       // still closing up: speed is being scaled down
     bool         formEverFormed;    // THE ONCE-ONLY LATCH. Form-up slows the units
                                     //   out in front until the block closes up, and

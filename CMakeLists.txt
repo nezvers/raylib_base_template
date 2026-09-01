@@ -174,6 +174,7 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
         src/strategy_path/strategy_path_astar.c
         src/strategy_path/strategy_path_service.c
         src/strategy_path/strategy_path_flow.c
+        src/strategy_path/strategy_path_form.c
         src/strategy_map/strategy_map.c)
     target_link_libraries(path_tests raylib)
 endif()
