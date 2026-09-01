@@ -46,6 +46,26 @@ typedef struct {
     int      tendAmount;           // resource units in each planted node
     float    trainCostMul;          // cost reduction hook, 1.0 default
     float    buffHpMul, buffDmgMul; // applied to units trained here
+
+    // Footprint in TILES (one tile = one world unit), odd so the building sits
+    // centred on its snap tile. This is the size the building actually
+    // OCCUPIES, and it is the single source of truth for three things that used
+    // to disagree: how much of the nav grid it blocks, how far apart two
+    // buildings may be placed, and how close a worker must get to interact.
+    //
+    // Before this existed, placement used hand-typed clearance distances -
+    // 2.4 for buildings, 1.6 for nodes - which are not footprints at all. That
+    // let a 3-tile town hall and a 1-tile house be placed 2.4 apart and
+    // visually intersect. Derive, do not re-type.
+    //
+    // SIZED FROM WHAT DrawBuilding ACTUALLY DRAWS, rounded to whole tiles. Only
+    // the town hall (a 2.4-unit body) earns 3x3; everything else draws between
+    // 1.2 and 2.2 units and is 1x1. Two of these were briefly authored bigger
+    // than their art, and the barracks at 3 wide made the game's own built-in
+    // layout illegal under this very rule - its town hall and barracks sit 3
+    // units apart. If a building's art grows, this grows with it; guessing
+    // upward "for safety" walls players into their own bases.
+    int      footprintX, footprintZ;
 } BuildingDef;
 
 const UnitDef     *StrategyUnitDef(UnitKind kind);

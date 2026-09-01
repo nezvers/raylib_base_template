@@ -279,10 +279,13 @@ static void GuiCommandPanel(StrategyWorld *world)
     int soldiers = 0;   // fighters: melee + ranged
     int templars = 0;
     int lastSel = -1;   // index of the single selected unit (for detailed info)
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    int liveCount = 0;
+    const int *live = StrategyActiveUnits(&liveCount);
+    for (int k = 0; k < liveCount; k++)
     {
+        int i = live[k];
         Unit *u = &world->units[i];
-        if (!u->active || u->faction != 0 || !u->selected) continue;
+        if (u->faction != 0 || !u->selected) continue;
         if (u->kind == KIND_WORKER) workers++;
         else if (u->kind == KIND_TEMPLAR ||
                  u->kind == KIND_TEMPLAR_HEALER) templars++;
@@ -332,10 +335,10 @@ static void GuiCommandPanel(StrategyWorld *world)
         else if (bd->tendNode >= 0)
         {
             int hands = 0;
-            for (int i = 0; i < STRAT_MAX_UNITS; i++)
+            for (int k = 0; k < liveCount; k++)
             {
-                Unit *u = &world->units[i];
-                if (u->active && u->state == UNIT_FARM &&
+                Unit *u = &world->units[live[k]];
+                if (u->state == UNIT_FARM &&
                     u->targetBuilding == world->selectedBuilding) hands++;
             }
             const char *what = (bd->tendNode == NODE_TREE) ? "planting wood" : "planting wheat";
@@ -486,10 +489,10 @@ static void GuiCommandPanel(StrategyWorld *world)
         if (GuiButton((Rectangle){ x, y, 80.0f*(float)s, h }, "STOP"))
         {
             AudioPlayButton();
-            for (int i = 0; i < STRAT_MAX_UNITS; i++)
+            for (int k = 0; k < liveCount; k++)
             {
-                Unit *u = &world->units[i];
-                if (!u->active || u->faction != 0 || !u->selected) continue;
+                Unit *u = &world->units[live[k]];
+                if (u->faction != 0 || !u->selected) continue;
                 u->state          = UNIT_IDLE;
                 u->targetUnit     = -1;
                 u->targetNode     = -1;
@@ -502,10 +505,10 @@ static void GuiCommandPanel(StrategyWorld *world)
             GuiButton((Rectangle){ x, y, 160.0f*(float)s, h }, "GATHER NEAREST"))
         {
             AudioPlayButton();
-            for (int i = 0; i < STRAT_MAX_UNITS; i++)
+            for (int k = 0; k < liveCount; k++)
             {
-                Unit *u = &world->units[i];
-                if (!u->active || u->faction != 0 || !u->selected) continue;
+                Unit *u = &world->units[live[k]];
+                if (u->faction != 0 || !u->selected) continue;
                 if (u->kind != KIND_WORKER) continue;
 
                 int node = StrategyNearestNodeOfKind(u->pos, -1, STRAT_RETARGET_RADIUS);

@@ -24,6 +24,10 @@ void AppStateTransition(AppState* value){
     }
 }
 
+bool AppStateIsCurrent(const AppState* value) {
+    return current_app_state == value;
+}
+
 void AppStateEnter() {
     if (current_app_state->enter != NULL){
         current_app_state->enter();

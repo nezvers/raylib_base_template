@@ -59,6 +59,7 @@ static const BuildingDef buildingDefs[BLD_COUNT] = {
         .maxHp = 100.0f, .buildTime = 4.0f, .popCap = 4,
         .tendNode = -1,
         .trainCostMul = 1.0f, .buffHpMul = 1.0f, .buffDmgMul = 1.0f,
+        .footprintX = 1, .footprintZ = 1,
     },
     [BLD_LOGGING] = {
         .name = "LOGGING", .cost = { 3, 0, 0, 0 }, .refundRate = 0.5f,
@@ -66,6 +67,7 @@ static const BuildingDef buildingDefs[BLD_COUNT] = {
         .accepts = { [RES_WOOD] = true },
         .tendNode = -1,
         .trainCostMul = 1.0f, .buffHpMul = 1.0f, .buffDmgMul = 1.0f,
+        .footprintX = 1, .footprintZ = 1,
     },
     [BLD_QUARRY] = {
         .name = "QUARRY", .cost = { 2, 2, 0, 0 }, .refundRate = 0.5f,
@@ -73,6 +75,7 @@ static const BuildingDef buildingDefs[BLD_COUNT] = {
         .accepts = { [RES_STONE] = true },
         .tendNode = -1,
         .trainCostMul = 1.0f, .buffHpMul = 1.0f, .buffDmgMul = 1.0f,
+        .footprintX = 1, .footprintZ = 1,
     },
     [BLD_BARRACKS] = {
         .name = "BARRACKS", .cost = { 6, 4, 0, 0 }, .refundRate = 0.5f,
@@ -81,6 +84,7 @@ static const BuildingDef buildingDefs[BLD_COUNT] = {
         .trainCooldown = 2.0f,
         .tendNode = -1,
         .trainCostMul = 1.0f, .buffHpMul = 1.0f, .buffDmgMul = 1.0f,
+        .footprintX = 1, .footprintZ = 1,
     },
     [BLD_FARM] = {
         .name = "FARM", .cost = { 4, 1, 0, 0 }, .refundRate = 0.5f,
@@ -88,6 +92,7 @@ static const BuildingDef buildingDefs[BLD_COUNT] = {
         .accepts = { [RES_FOOD] = true },
         .tendNode = NODE_WHEAT, .tendAmount = 8,
         .trainCostMul = 1.0f, .buffHpMul = 1.0f, .buffDmgMul = 1.0f,
+        .footprintX = 1, .footprintZ = 1,
     },
     [BLD_TOWN_HALL] = {
         .name = "TOWN HALL", .cost = { 8, 6, 0, 0 }, .refundRate = 0.5f,
@@ -97,6 +102,7 @@ static const BuildingDef buildingDefs[BLD_COUNT] = {
         .accepts = { [RES_WOOD] = true, [RES_STONE] = true, [RES_FOOD] = true },
         .tendNode = -1,
         .trainCostMul = 1.0f, .buffHpMul = 1.0f, .buffDmgMul = 1.0f,
+        .footprintX = 3, .footprintZ = 3,
     },
     [BLD_CHANTRY] = {
         .name = "CHANTRY", .cost = { 6, 3, 0, 0 }, .refundRate = 0.5f,
@@ -105,12 +111,14 @@ static const BuildingDef buildingDefs[BLD_COUNT] = {
         .trainCooldown = 2.0f,
         .tendNode = -1,
         .trainCostMul = 1.0f, .buffHpMul = 1.0f, .buffDmgMul = 1.0f,
+        .footprintX = 1, .footprintZ = 1,
     },
     [BLD_FORESTRY] = {
         .name = "FORESTRY", .cost = { 4, 2, 0, 0 }, .refundRate = 0.5f,
         .maxHp = 80.0f, .buildTime = 5.0f,
         .tendNode = NODE_TREE, .tendAmount = 12,
         .trainCostMul = 1.0f, .buffHpMul = 1.0f, .buffDmgMul = 1.0f,
+        .footprintX = 1, .footprintZ = 1,
     },
 };
 

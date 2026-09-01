@@ -131,6 +131,63 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
         src/anim_editor_zen/zen_groups.c
         ${ANIM_TEST_SRC})
     target_link_libraries(zen_tests raylib)
+
+    # Authored strategy assets. The data model and its binary IO are kept free
+    # of UI calls precisely so they link headless here, the same way zen_groups.c
+    # does. simple_save.h is header-only and its IMPLEMENTATION lives in an
+    # example the tests do not link, so the suite compiles it itself.
+    # strategy_asset_ease.c is the one file that bridges to src/anim/, so the
+    # suite links the anim sources too - that bridge (baking a curve so the
+    # asset stops depending on _easings.cfg) is exactly what needs testing.
+    add_executable(sga_tests
+        tests/sga_tests.c
+        src/strategy_asset/strategy_asset.c
+        src/strategy_asset/strategy_asset_io.c
+        src/strategy_asset/strategy_asset_ease.c
+        src/strategy_asset/strategy_bindings.c
+        src/strategy_asset/strategy_catalog.c
+        ${ANIM_TEST_SRC})
+    target_link_libraries(sga_tests raylib)
+
+    # map_tests - authored battlefields. src/strategy_map/ never calls raylib
+    # UI (that is the whole reason it is split from the map forge), so the
+    # suite links the module directly and needs no stubs.
+    add_executable(map_tests
+        tests/map_tests.c
+        src/strategy_map/strategy_map.c
+        src/strategy_map/strategy_map_io.c
+        src/strategy_map/strategy_map_catalog.c)
+    target_link_libraries(map_tests raylib)
+
+    # path_tests - navigation and steering. src/strategy_path/ deliberately does
+    # not include strategy_types.h (which would drag in the whole anim system
+    # via strategy_asset.h), so it links here with no stubs at all. raylib is
+    # linked for Vector2/Vector3 and the maths inlines only.
+    # strategy_map.c rides along ONLY so the nav grid's tile<->world maths can
+    # be cross-checked against SgmTileToWorld directly. The two are duplicated
+    # (strategy_path/ must stay linkable without the map module), and a silent
+    # drift between them would put every unit half a tile off its path.
+    add_executable(path_tests
+        tests/path_tests.c
+        src/strategy_path/strategy_path_hash.c
+        src/strategy_path/strategy_path_grid.c
+        src/strategy_path/strategy_path_astar.c
+        src/strategy_path/strategy_path_service.c
+        src/strategy_path/strategy_path_flow.c
+        src/strategy_path/strategy_path_form.c
+        src/strategy_map/strategy_map.c)
+    target_link_libraries(path_tests raylib)
+
+    # ai_tests - faction behaviour. src/strategy_ai/ is the strictest of the
+    # headless modules: it does not include strategy_types.h AND does not
+    # include raylib, because a decision function needs neither a Vector3 nor a
+    # window. So this target links nothing but the module itself - which is the
+    # point, since "does a rusher attack before a turtle" used to be a question
+    # you could only answer by playing the game for five minutes.
+    add_executable(ai_tests
+        tests/ai_tests.c
+        src/strategy_ai/strategy_ai_profile.c
+        src/strategy_ai/strategy_ai_brain.c)
 endif()
 
 # Checks if OSX and links appropriate frameworks (Only required on MacOS)
@@ -237,6 +294,194 @@ if (TARGET anim_tests)
 endif()
 if (TARGET zen_tests)
     anim_apply_caps(zen_tests)
+endif()
+
+# ---------------------------------------------------------------------------
+#  Authored strategy asset capacities (src/strategy_asset/strategy_asset.h)
+#
+#  Same shape, and the same reason, as the anim caps above: an SgaAsset is a
+#  fixed-capacity, heap-free value the forge holds by value in an undo ring, so
+#  every one of these is an ARRAY DIMENSION and they NEST (asset > parts >
+#  keys-per-state). Web keeps the smaller values written in the header, because
+#  it links a FIXED 128 MB emscripten heap with no ALLOW_MEMORY_GROWTH, where
+#  overshooting is an abort at load rather than a slowdown.
+#
+#  A desktop-authored .sga can therefore be too big for the Web build. That is
+#  expected and REPORTED, not silent - see SgaLoadTrunc in strategy_asset_io.h.
+#
+#  Plain variables, NOT cache entries - same reason as the caps above.
+# ---------------------------------------------------------------------------
+if (NOT "${PLATFORM}" STREQUAL "Web")
+    if (NOT DEFINED SGA_PARTS_MAX)    # strategy_asset.h Web default: 24
+        set(SGA_PARTS_MAX 64)
+    endif()
+    if (NOT DEFINED SGA_KEYS_MAX)     # strategy_asset.h Web default: 12
+        set(SGA_KEYS_MAX 32)
+    endif()
+    if (NOT DEFINED SGA_EASES_MAX)    # strategy_asset.h Web default: 16
+        set(SGA_EASES_MAX 32)
+    endif()
+    if (NOT DEFINED SGA_ASSETS_MAX)   # strategy_asset.h Web default: 64
+        set(SGA_ASSETS_MAX 128)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+#  Map capacities. Same two-tier scheme, same reasoning: Web keeps the small
+#  values written in strategy_map.h, desktop gets the raised ones. The .sgm
+#  format itself is pinned to the DESKTOP tier (SGM_FILE_GRID in
+#  strategy_map_io.c), so a desktop-authored map always fits on disk and a Web
+#  build reports what it had to crop instead of misreading it.
+# ---------------------------------------------------------------------------
+if (NOT "${PLATFORM}" STREQUAL "Web")
+    if (NOT DEFINED SGM_GRID_MAX)     # strategy_map.h Web default: 128
+        set(SGM_GRID_MAX 256)
+    endif()
+    if (NOT DEFINED SGM_PLACES_MAX)   # strategy_map.h Web default: 128
+        set(SGM_PLACES_MAX 512)
+    endif()
+    if (NOT DEFINED SGM_MAPS_MAX)     # strategy_map.h Web default: 32
+        set(SGM_MAPS_MAX 64)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+#  Strategy runtime capacities. Same two-tier scheme again: Web keeps the small
+#  value in strategy_types.h, desktop gets the raised one. Unlike the map and
+#  asset caps this one is a PERFORMANCE guard rather than a memory guard - 10000
+#  units is only 2.4 MB of Unit structs, well inside the 128 MB Web heap, but a
+#  browser cannot draw that many procedural units at any framerate.
+#
+#  NOTE these are plain variables, NOT cache entries, for the same reason as
+#  every other cap block here: reconfiguring one build dir from desktop to Web
+#  would keep a cached 10000 and make the Web build unusable. An explicit -D
+#  still wins, since that defines the variable before this runs.
+# ---------------------------------------------------------------------------
+if (NOT "${PLATFORM}" STREQUAL "Web")
+    if (NOT DEFINED STRAT_MAX_UNITS)  # strategy_types.h Web default: 256
+        set(STRAT_MAX_UNITS 10000)
+    endif()
+    # Nine factions with a real base each do not fit the two-faction budget.
+    # These also size SgmBudget in the map forge, so an authored map's building
+    # and node allowance follows the tier it was authored on.
+    if (NOT DEFINED STRAT_MAX_BUILDINGS)  # strategy_types.h Web default: 64
+        set(STRAT_MAX_BUILDINGS 256)
+    endif()
+    if (NOT DEFINED STRAT_MAX_NODES)      # strategy_types.h Web default: 96
+        set(STRAT_MAX_NODES 384)
+    endif()
+endif()
+
+# Navigation / steering capacities (src/strategy_path/). Same two-tier scheme:
+# Web keeps the small header defaults, desktop is raised here.
+#
+# SP_HASH_ITEMS_MAX MUST BE >= STRAT_MAX_UNITS. The spatial hash holds one entry
+# per live unit; if it is short, the overflow is REFUSED rather than crashing -
+# which reads in-game as units at the back of a crowd walking through each other.
+# It is derived from STRAT_MAX_UNITS above rather than typed twice, so raising
+# the unit cap cannot leave the hash behind.
+#
+# A plain variable, NOT a cache entry: the platform default must be recomputed
+# on every configure, or a desktop->Web reconfigure keeps the big desktop value.
+if (NOT "${PLATFORM}" STREQUAL "Web")
+    if (NOT DEFINED SP_GRID_MAX)         # strategy_path.h Web default: 128
+        set(SP_GRID_MAX 256)
+    endif()
+    if (NOT DEFINED SP_HASH_CELLS_MAX)   # strategy_path.h Web default: 16384
+        set(SP_HASH_CELLS_MAX 65536)
+    endif()
+    if (NOT DEFINED SP_HASH_ITEMS_MAX)   # strategy_path.h Web default: 256
+        set(SP_HASH_ITEMS_MAX ${STRAT_MAX_UNITS})
+    endif()
+    if (NOT DEFINED SP_PATH_MAX)         # strategy_path.h Web default: 12
+        set(SP_PATH_MAX 24)
+    endif()
+    if (NOT DEFINED SP_REQUESTS_MAX)     # strategy_path.h Web default: 64
+        set(SP_REQUESTS_MAX 256)
+    endif()
+    if (NOT DEFINED SP_FLOW_FIELDS_MAX)  # strategy_path.h Web default: 4
+        set(SP_FLOW_FIELDS_MAX 16)
+    endif()
+endif()
+
+function(sp_apply_caps target)
+    foreach(cap SP_GRID_MAX SP_HASH_CELLS_MAX SP_HASH_ITEMS_MAX
+                SP_PATH_MAX SP_REQUESTS_MAX SP_FLOW_FIELDS_MAX)
+        if (DEFINED ${cap})
+            target_compile_definitions(${target} PUBLIC ${cap}=${${cap}})
+        endif()
+    endforeach()
+endfunction()
+
+function(strat_apply_caps target)
+    foreach(cap STRAT_MAX_UNITS STRAT_MAX_BUILDINGS STRAT_MAX_NODES)
+        if (DEFINED ${cap})
+            target_compile_definitions(${target} PUBLIC ${cap}=${${cap}})
+        endif()
+    endforeach()
+endfunction()
+
+function(sgm_apply_caps target)
+    foreach(cap SGM_GRID_MAX SGM_PLACES_MAX SGM_MAPS_MAX)
+        if (DEFINED ${cap})
+            target_compile_definitions(${target} PUBLIC ${cap}=${${cap}})
+        endif()
+    endforeach()
+endfunction()
+
+function(sga_apply_caps target)
+    foreach(cap SGA_PARTS_MAX SGA_KEYS_MAX SGA_EASES_MAX SGA_ASSETS_MAX)
+        if (DEFINED ${cap})
+            target_compile_definitions(${target} PUBLIC ${cap}=${${cap}})
+        endif()
+    endforeach()
+endfunction()
+
+if ("${PLATFORM}" STREQUAL "Web")
+    message(STATUS " - - - strategy asset capacities: WEB tier (header defaults)")
+else()
+    message(STATUS " - - - strategy asset capacities: parts=${SGA_PARTS_MAX} keys=${SGA_KEYS_MAX} eases=${SGA_EASES_MAX} assets=${SGA_ASSETS_MAX}")
+endif()
+
+sga_apply_caps(${PROJECT_NAME})
+if (TARGET sga_tests)
+    sga_apply_caps(sga_tests)
+endif()
+
+if ("${PLATFORM}" STREQUAL "Web")
+    message(STATUS " - - - strategy map capacities: WEB tier (header defaults)")
+else()
+    message(STATUS " - - - strategy map capacities: grid=${SGM_GRID_MAX} places=${SGM_PLACES_MAX} maps=${SGM_MAPS_MAX}")
+endif()
+
+sgm_apply_caps(${PROJECT_NAME})
+if (TARGET map_tests)
+    sgm_apply_caps(map_tests)
+endif()
+# path_tests links strategy_map.c for the tile<->world cross-check, so it needs
+# the same SGM caps - otherwise it would compare a 256-grid nav module against a
+# 128-grid map module and the mismatch would look like a maths bug.
+if (TARGET path_tests)
+    sgm_apply_caps(path_tests)
+endif()
+
+if ("${PLATFORM}" STREQUAL "Web")
+    message(STATUS " - - - strategy runtime capacities: WEB tier (header defaults)")
+else()
+    message(STATUS " - - - strategy runtime capacities: units=${STRAT_MAX_UNITS} buildings=${STRAT_MAX_BUILDINGS} nodes=${STRAT_MAX_NODES}")
+endif()
+
+strat_apply_caps(${PROJECT_NAME})
+
+if ("${PLATFORM}" STREQUAL "Web")
+    message(STATUS " - - - strategy path capacities: WEB tier (header defaults)")
+else()
+    message(STATUS " - - - strategy path capacities: grid=${SP_GRID_MAX} hashCells=${SP_HASH_CELLS_MAX} hashItems=${SP_HASH_ITEMS_MAX} path=${SP_PATH_MAX} requests=${SP_REQUESTS_MAX} fields=${SP_FLOW_FIELDS_MAX}")
+endif()
+
+sp_apply_caps(${PROJECT_NAME})
+if (TARGET path_tests)
+    sp_apply_caps(path_tests)
 endif()
 
 # Setting RESOURCES_PATH

@@ -12,23 +12,277 @@
 //    if clicking ever feels "off", look there first.
 // ============================================================================
 
+#define SP_PROF_IMPLEMENTATION   // this TU owns the profiler storage
+#include "../../strategy_path/strategy_path_prof.h"
+#include "../../strategy_path/strategy_path.h"
 #include "strategy_world.h"
+#include "strategy_entity_anim.h"
+#include "strategy_models.h"
+#include "../../strategy_asset/strategy_catalog.h"
+#include "../../strategy_ai/strategy_ai.h"
+#include "../../strategy_map/strategy_map.h"
+#include "../../strategy_map/strategy_map_catalog.h"
 #include "../../screen_state/screen_state.h"
 #include "../../settings_state/settings_state.h"
 #include "raymath.h"
 #include <math.h>
 #include <stddef.h>
 
+// THE faction palette, and the only copy of it. It used to hold two colours
+// while the same nine lived duplicated in map_forge.c and strategy_showcase.c,
+// each commented "until the runtime grows to match" - this is the runtime
+// growing to match, so both duplicates now read this array instead. The order
+// is the authored order a map's colorIndex refers to; do not permute it.
 const Color strategyFactionColor[STRAT_FACTIONS] = {
-    {  80, 140, 255, 255 },     // faction 0: player, blue
-    { 230,  70,  70, 255 },     // faction 1: enemy, red
+    {  80, 140, 255, 255 },     // 0 blue   - the human player
+    { 230,  70,  70, 255 },     // 1 red
+    {  90, 200, 110, 255 },     // 2 green
+    { 235, 190,  70, 255 },     // 3 gold
+    { 190, 110, 230, 255 },     // 4 violet
+    { 240, 150,  60, 255 },     // 5 orange
+    {  80, 210, 210, 255 },     // 6 teal
+    { 240, 120, 180, 255 },     // 7 pink
+    { 190, 195, 205, 255 },     // 8 silver
 };
 
 static StrategyWorld world;
 
+// The battlefield the next Init builds. A NAME, not a pointer: the map catalog
+// is rebuilt whenever the forge saves, which moves maps between slots and
+// invalidates every pointer it has handed out. Empty = the built-in layout.
+static char s_selectedMap[SGM_NAME_MAX];
+
 StrategyWorld *StrategyWorldGet(void)
 {
     return &world;
+}
+
+// ----------------------------------------------------------------------------
+//  Unit roster  -  active list, free list, selection list
+//
+//  WHY. The unit pool is sized for the worst case (10,000 on desktop) but a
+//  normal game holds fewer than a hundred. Every "for i < STRAT_MAX_UNITS"
+//  therefore paid for 10,000 slots to visit 96, and the Unit struct is 248
+//  bytes, so the scan is not merely 100x too long - it is 100x too long while
+//  touching a different cache line every step. The lists make every pass cost
+//  what is LIVE rather than what is POSSIBLE.
+//
+//  THE INVARIANT, and it is the only thing that can go wrong here:
+//  s_active holds exactly the indices where units[i].active is true, once
+//  each, and s_activeCount is its length. Two mutation points maintain it -
+//  UnitSpawn and UnitKill - plus a full rebuild on world reset and bulk clear.
+//  Nothing else may write units[i].active. RosterAssert() checks this in debug
+//  builds; if a unit ever vanishes or double-updates, call it first.
+//
+//  ORDER IS NOT STABLE. UnitKill swaps the last entry into the dead slot's
+//  place, so the active list is a set, not a sequence. Anything that needs
+//  deterministic iteration order must sort - see the formation slot assignment
+//  in the movement plan. Iterating it while spawning or killing is likewise
+//  unsafe; the update loop below explains how it avoids that.
+// ----------------------------------------------------------------------------
+static int s_active[STRAT_MAX_UNITS];       // indices of live units, unordered
+static int s_activeAt[STRAT_MAX_UNITS];     // unit index -> its slot in s_active, -1 if dead
+static int s_activeCount;
+
+static int s_free[STRAT_MAX_UNITS];         // stack of unused unit indices
+static int s_freeCount;
+
+static int s_selected[STRAT_MAX_UNITS];     // indices of selected units
+static int s_selectedCount;
+static bool s_selectionDirty = true;        // rebuild s_selected before next use
+
+// -- Spatial hashes -----------------------------------------------------------
+//  Rebuilt once per frame from the active roster (UnitHashRebuild), replacing
+//  the two O(n^2) scans that dominated the frame at scale: unit separation and
+//  the sight/aggro searches.
+//
+//  TWO HASHES, NOT ONE. Separation queries a 0.7-unit radius; sight queries 6
+//  to 8. One hash cannot serve both - sized for separation a sight query sweeps
+//  a 10x10 block of cells and walks a hundred chains, and sized for sight every
+//  separation query drags in dozens of units that were never close enough to
+//  matter. A second rebuild of the same positions is one extra linear pass,
+//  which is far cheaper than either mis-sized query.
+#define STRAT_SIGHT_CELL  8.0f  // ~ the largest sightRange in strategy_defs.c
+
+// Frame counter, used only to stagger per-unit work across frames. Wrapping is
+// harmless: every consumer takes it modulo a small stride.
+static int s_frame;
+
+// Which movement system is driving. Declared here rather than beside its
+// accessors at the bottom of the file because the UNIT_MOVE state, the
+// separation pass and the group-order path all read it, and the earliest of
+// those is ~1700 lines above the accessors. Defaults to CURRENT: the game never
+// touches this, so the default IS the shipped behaviour.
+static StrategyControlScheme s_scheme = STRAT_CTRL_CURRENT;
+
+static SpHash s_unitHash;       // separation: fine cells, tiny radius
+static SpHash s_sightHash;      // aggro / targeting: coarse cells, wide radius
+
+// Neighbour scratch for the sight queries. File-static rather than a local:
+// SP_HASH_ITEMS_MAX is the unit cap, so at desktop settings this is 40 KB and
+// has no business on the stack. The queries using it never nest.
+static int32_t s_sightScratch[SP_HASH_ITEMS_MAX];
+
+// ----------------------------------------------------------------------------
+//  Navigation grid
+//
+//  TWO GRIDS. s_navStatic is terrain alone - whatever the authored map says,
+//  and nothing else. s_nav is that plus every building and blocking node. A
+//  demolition restores its footprint from s_navStatic rather than trying to
+//  recompute what the tile "used to be", which is unanswerable once two
+//  obstacles have overlapped a tile.
+//
+//  128 KB of BSS at desktop caps. That is the cost of never having to reason
+//  about obstacle removal, and it is a bargain.
+//
+//  s_navVersion is bumped on every change. Nothing reads it yet; flow fields in
+//  Phase 5 store the version they were built against and evict themselves when
+//  it moves. It is here now because adding it later means auditing every
+//  mutation site a second time.
+// ----------------------------------------------------------------------------
+static SpGrid   s_navStatic;    // terrain only
+static SpGrid   s_nav;          // terrain + buildings + blocking nodes
+static uint32_t s_navVersion;
+
+// False while the world is being populated. Spawning happens in bulk during
+// init - dozens of buildings and nodes - and each one would otherwise trigger a
+// full skirt rebuild for a grid that is about to be rebuilt from scratch
+// anyway. Init stamps nothing and calls NavRebuild once at the end.
+static bool s_navReady;
+
+// Paces the flow-field refcount sweep. See StrategyMoveFlowSweep.
+static float s_flowSweepTimer;
+
+// The grid must be able to hold any map the forge can author. Checked here
+// because this is the one file that sees both headers.
+_Static_assert(SP_GRID_MAX >= SGM_GRID_MAX, "nav grid smaller than map grid");
+
+// Read-only access for strategy_move.c. Deliberately const: this file is the
+// only writer, which is what keeps "who may change the grid" a question with
+// one answer. The version lets a path notice the ground moved under it.
+const SpGrid *StrategyNavGrid(void)    { return &s_nav; }
+uint32_t      StrategyNavVersion(void) { return s_navVersion; }
+
+// Full reset: every slot free, nothing active. The free stack is filled in
+// DESCENDING order so the first pops are 0, 1, 2... - spawn order then matches
+// the old linear scan exactly, which keeps save files, replays and the AI's
+// index-based targeting behaving as they did.
+static void RosterReset(void)
+{
+    s_activeCount = 0;
+    s_freeCount   = 0;
+    for (int i = STRAT_MAX_UNITS - 1; i >= 0; i--) s_free[s_freeCount++] = i;
+    for (int i = 0; i < STRAT_MAX_UNITS; i++) s_activeAt[i] = -1;
+    s_selectedCount  = 0;
+    s_selectionDirty = true;
+}
+
+static void RosterAdd(int index)
+{
+    s_activeAt[index] = s_activeCount;
+    s_active[s_activeCount++] = index;
+}
+
+// Swap-with-last removal: O(1), but it REORDERS the list. See the note above.
+static void RosterRemove(int index)
+{
+    int slot = s_activeAt[index];
+    if (slot < 0) return;                   // already dead: idempotent by design
+
+    int last = s_active[--s_activeCount];
+    s_active[slot]   = last;
+    s_activeAt[last] = slot;
+    s_activeAt[index] = -1;
+
+    s_free[s_freeCount++] = index;
+    s_selectionDirty = true;
+
+    // The slot is about to be reused by the next spawn. A path left behind
+    // would be inherited by whoever lands here, and a search still in flight
+    // would deliver its result to them - a new unit walking a dead one's route.
+    StrategyMoveForget(index);
+}
+
+// The selection list is rebuilt lazily rather than maintained on every
+// `selected` write, because selection is touched from a dozen places (drag
+// rect, shift-click, control groups, deselect-all, death) and a missed update
+// in any one of them is a phantom or a ghost. A rebuild is O(live) and happens
+// at most once per frame, against input that happens at human speed.
+static const int *SelectedUnits(int *count)
+{
+    if (s_selectionDirty)
+    {
+        s_selectedCount = 0;
+        for (int k = 0; k < s_activeCount; k++)
+        {
+            int i = s_active[k];
+            if (world.units[i].selected) s_selected[s_selectedCount++] = i;
+        }
+        s_selectionDirty = false;
+    }
+    *count = s_selectedCount;
+    return s_selected;
+}
+
+// Call after ANY write to units[].selected. Cheap enough to call redundantly.
+static void SelectionTouch(void) { s_selectionDirty = true; }
+
+// Invariant check, for when a unit vanishes or updates twice. Verifies that
+// s_active and units[].active agree in BOTH directions, that s_activeAt is a
+// correct inverse, and that active + free accounts for every slot exactly once.
+//
+// Off by default because it is O(pool) - running it every frame would reinstate
+// exactly the full-array scan this phase removed. Turn it on from the path lab
+// (or a debugger) when something is wrong; it traces the first failure and
+// stops. Debug builds only.
+#ifndef NDEBUG
+bool strategyRosterAudit = false;
+
+static bool RosterCheck(void)
+{
+    if (s_activeCount + s_freeCount != STRAT_MAX_UNITS)
+    {
+        TraceLog(LOG_ERROR, "ROSTER: %d active + %d free != %d",
+                 s_activeCount, s_freeCount, STRAT_MAX_UNITS);
+        return false;
+    }
+    for (int k = 0; k < s_activeCount; k++)
+    {
+        int i = s_active[k];
+        if (i < 0 || i >= STRAT_MAX_UNITS)
+        { TraceLog(LOG_ERROR, "ROSTER: bad index %d at %d", i, k); return false; }
+        if (!world.units[i].active)
+        { TraceLog(LOG_ERROR, "ROSTER: unit %d listed but dead", i); return false; }
+        if (s_activeAt[i] != k)
+        { TraceLog(LOG_ERROR, "ROSTER: unit %d at %d, activeAt says %d",
+                   i, k, s_activeAt[i]); return false; }
+    }
+    // The other direction: nothing live may be missing from the list.
+    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    {
+        if (world.units[i].active && s_activeAt[i] < 0)
+        { TraceLog(LOG_ERROR, "ROSTER: unit %d live but unlisted", i); return false; }
+    }
+    return true;
+}
+#endif
+
+// Public view of the active list, for strategy_ai.c and strategy_test.c.
+const int *StrategyActiveUnits(int *count)
+{
+    *count = s_activeCount;
+    return s_active;
+}
+
+void StrategyMapSelect(const char *name)
+{
+    if (name == NULL) { s_selectedMap[0] = '\0'; return; }
+    TextCopy(s_selectedMap, name);
+}
+
+const char *StrategyMapSelected(void)
+{
+    return s_selectedMap;
 }
 
 // ----------------------------------------------------------------------------
@@ -50,6 +304,272 @@ static void CameraRefresh(void)
 
     world.camera.target   = target;
     world.camera.position = Vector3Add(target, Vector3Scale(offset, world.camZoom));
+}
+
+// ----------------------------------------------------------------------------
+//  Authored map: terrain queries and terrain drawing
+//
+//  The world holds a BORROWED pointer to the map it was built from, or NULL for
+//  the built-in layout. Every one of these helpers answers the built-in case
+//  first and permissively - no map means no authored obstacles, which is
+//  exactly how the game behaved before maps existed.
+// ----------------------------------------------------------------------------
+
+// Can a building stand here? Snapped to the tile, matching PlacementGhost's
+// roundf, so the ghost the player sees and the rule that rejects agree.
+static bool MapBuildableAt(Vector3 pos)
+{
+    if (world.map == NULL) return true;
+    int tx, tz;
+    SgmWorldToTile(world.map, roundf(pos.x), roundf(pos.z), &tx, &tz);
+    return SgmTileBuildable(world.map, tx, tz);
+}
+
+// The colour a terrain kind draws as. Ground/grass/dirt return false: they are
+// the base plane and are not drawn as tiles at all, which keeps the common case
+// free of thousands of overlapping quads.
+static bool MapTerrainColor(int terrain, Color *out)
+{
+    switch (terrain)
+    {
+        case SGM_TERRAIN_SHALLOW: *out = (Color){  90, 150, 180, 255 }; return true;
+        case SGM_TERRAIN_WATER:   *out = (Color){  40,  80, 140, 255 }; return true;
+        case SGM_TERRAIN_ROCK:    *out = (Color){ 110, 105, 100, 255 }; return true;
+        case SGM_TERRAIN_CLIFF:   *out = (Color){  85,  75,  70, 255 }; return true;
+        default: return false;      // ground/grass/dirt: the base plane shows
+    }
+}
+
+// Draw the authored terrain: one box per non-plain tile, at its elevation.
+// VOID draws nothing at all - it is a hole, and the base plane is what would
+// show through, so a void tile is punched by simply skipping it.
+static void MapDrawTerrain(void)
+{
+    if (world.map == NULL) return;
+    const SgmMap *m = world.map;
+
+    for (int z = 0; z < m->gridH; z++)
+    {
+        for (int x = 0; x < m->gridW; x++)
+        {
+            const SgmTile *t = SgmTileAtConst(m, x, z);
+            if (t == NULL || t->terrain == SGM_TERRAIN_VOID) continue;
+
+            Color c;
+            bool paint = MapTerrainColor(t->terrain, &c);
+            if (!paint && t->height == 0) continue;     // plain ground: the plane
+
+            if (!paint) c = (Color){ 100, 120, 88, 255 };   // raised plain ground
+
+            // Elevation steps are half a world unit, so a 15-step cliff reads as
+            // tall without dwarfing the units standing beside it.
+            float h  = 0.5f*(float)t->height;
+            Vector3 p = SgmTileToWorld(m, x, z);
+
+            // Every tile is drawn from the plane UP, so a raised tile is a solid
+            // column rather than a floating lid.
+            float boxH = h + 0.12f;
+            DrawCube((Vector3){ p.x, boxH*0.5f - 0.06f, p.z }, 1.0f, boxH, 1.0f, c);
+        }
+    }
+}
+
+// The gridlines. Replaces raylib's DrawGrid(), which is a fixed LIGHTGRAY at
+// full alpha centred on the origin - it cannot express a non-square extent, and
+// its opacity is the thing being complained about. Phase 5 makes the strength
+// authored + player-tunable; for now it is a markedly lighter fixed value.
+static void DrawGroundGrid(void)
+{
+    Color line = (Color){ 255, 255, 255, 40 };
+    float hx = world.groundHalfX, hz = world.groundHalfZ;
+
+    for (float x = -hx; x <= hx + 0.001f; x += 1.0f)
+        DrawLine3D((Vector3){ x, 0.0f, -hz }, (Vector3){ x, 0.0f, hz }, line);
+    for (float z = -hz; z <= hz + 0.001f; z += 1.0f)
+        DrawLine3D((Vector3){ -hx, 0.0f, z }, (Vector3){ hx, 0.0f, z }, line);
+}
+
+// ----------------------------------------------------------------------------
+//  Navigation grid: build, stamp, patch
+//
+//  Nothing STEERS by this yet - units still lerp straight at their targets.
+//  The grid lands on its own so it can be proven correct against an overlay
+//  that is already trusted (the forge's P view) before A* is written on top of
+//  it. A pathfinding bug and a grid bug are indistinguishable from the outside,
+//  so they get separated in time.
+// ----------------------------------------------------------------------------
+
+// Does a resource node block movement? Trees and rocks are solid objects a unit
+// must walk around; wheat is knee-high and corpses are on the floor, so both
+// stay walkable. Getting this wrong is very visible: blocking corpses would
+// mean a battlefield slowly filling with invisible walls.
+static bool NodeBlocks(NodeKind kind)
+{
+    return (kind == NODE_TREE) || (kind == NODE_ROCK);
+}
+
+// Half-extents in tiles for a building, from its footprint. Footprints are odd
+// so the building sits centred on one tile; halving rounds down, which is
+// exactly right: 3 -> 1 (the centre tile plus one either side), 1 -> 0.
+static void BuildingHalfTiles(BuildingKind kind, int *hx, int *hz)
+{
+    const BuildingDef *bd = StrategyBuildingDef(kind);
+    *hx = bd->footprintX/2;
+    *hz = bd->footprintZ/2;
+}
+
+// Half the footprint in WORLD units, for interaction ranges. A 3x3 town hall
+// reaches 1.5 units from its centre, so a worker asked to stand within 1.6 of
+// the centre is being asked to stand inside the wall - it walks to the edge,
+// never satisfies the check, and shuffles there forever. This is the number
+// that fixes that.
+static float BuildingHalfWorld(BuildingKind kind)
+{
+    const BuildingDef *bd = StrategyBuildingDef(kind);
+    int f = (bd->footprintX > bd->footprintZ) ? bd->footprintX : bd->footprintZ;
+    return 0.5f*(float)f;
+}
+
+// How close a unit must be to a building's CENTRE to interact with it: dropoff,
+// build, repair, tend-equip. Half the footprint plus a unit's own diameter and
+// a little slack, so a worker standing flush against the wall counts as
+// arrived - which the old flat 1.6f/1.8f could not express, because a 3x3 town
+// hall's wall is already 1.5 units out.
+//
+// Floored at STRAT_BUILD_RANGE so nothing gets HARDER to reach than it is
+// today: a 1x1 house would otherwise want 1.3, and tightening an interaction
+// radius is a gameplay change, not a bug fix.
+#define STRAT_BLD_REACH_PAD  0.8f
+static float BuildingReach(BuildingKind kind)
+{
+    float r = BuildingHalfWorld(kind) + STRAT_BLD_REACH_PAD;
+    return (r > STRAT_BUILD_RANGE) ? r : STRAT_BUILD_RANGE;
+}
+
+// Stamp one building into the live grid. `blocked` false restores the tiles
+// from terrain instead - that is the demolition path.
+static void NavStampBuilding(const Building *b, bool blocked)
+{
+    int hx, hz;
+    BuildingHalfTiles(b->kind, &hx, &hz);
+
+    if (blocked) SpGridStampRect(&s_nav, b->pos.x, b->pos.z, hx, hz, SP_COST_BLOCKED);
+    else         SpGridRestoreRect(&s_nav, &s_navStatic, b->pos.x, b->pos.z, hx, hz, 1);
+}
+
+static void NavStampNode(const ResourceNode *n, bool blocked)
+{
+    if (!NodeBlocks(n->kind)) return;   // wheat and corpses never stamped
+
+    if (blocked) SpGridStampRect(&s_nav, n->pos.x, n->pos.z, 0, 0, SP_COST_BLOCKED);
+    else         SpGridRestoreRect(&s_nav, &s_navStatic, n->pos.x, n->pos.z, 0, 0, 1);
+}
+
+// Rebuild both grids from scratch: terrain into s_navStatic, then a copy plus
+// every live obstacle into s_nav. Called on world init and after any change
+// too broad to patch.
+static void NavRebuild(void)
+{
+    // world.map == NULL is the built-in layout, and it is answered HERE, once.
+    // Every function downstream then works on a real grid and never NULL-checks
+    // - which is the whole point, because a NULL check that has to be repeated
+    // at thirty call sites is a bug waiting for the thirty-first.
+    if (world.map != NULL)
+    {
+        const SgmMap *m = world.map;
+        SpGridInit(&s_navStatic, m->gridW, m->gridH);
+
+        for (int z = 0; z < m->gridH; z++)
+        {
+            for (int x = 0; x < m->gridW; x++)
+            {
+                const SgmTile *t = SgmTileAtConst(m, x, z);
+                uint8_t cost = SP_COST_NORMAL;
+
+                if (t == NULL || !SgmTilePassable(m, x, z))    cost = SP_COST_BLOCKED;
+                else if (t->terrain == SGM_TERRAIN_SHALLOW)    cost = SP_COST_SHALLOW;
+
+                SpGridSet(&s_navStatic, x, z, cost);
+            }
+        }
+    }
+    else
+    {
+        // The built-in battlefield is a bare STRAT_GROUND_HALF square with no
+        // authored terrain at all, so the grid is simply open ground the same
+        // size. Buildings and nodes still stamp into it.
+        int side = (int)(2.0f*STRAT_GROUND_HALF);
+        SpGridInit(&s_navStatic, side, side);
+    }
+
+    s_nav = s_navStatic;
+
+    for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
+    {
+        if (world.buildings[i].active) NavStampBuilding(&world.buildings[i], true);
+    }
+    for (int i = 0; i < STRAT_MAX_NODES; i++)
+    {
+        if (world.nodes[i].active) NavStampNode(&world.nodes[i], true);
+    }
+
+    SpGridBuildSkirt(&s_nav);
+    s_navVersion++;
+    SpFlowSetVersion(s_navVersion);
+}
+
+// Patch after an obstacle APPEARED. Only the skirt needs redoing; the stamp
+// itself was already written.
+//
+// The skirt is recomputed WHOLE rather than locally, because a tile can be
+// skirting two obstacles at once - so "lower the neighbours of what I just
+// removed" is wrong in exactly the case that matters. The full pass is one
+// byte-compare per cell and only runs on placement and demolition, never per
+// frame.
+static void NavPatch(void)
+{
+    SpGridBuildSkirt(&s_nav);
+    s_navVersion++;
+    // Every flow field is a whole-grid answer, so one new wall retires all of
+    // them. Told here rather than at each caller: this and NavRebuild are the
+    // only two places s_navVersion moves.
+    SpFlowSetVersion(s_navVersion);
+}
+
+// Patch after an obstacle VANISHED. Restoring its footprint from terrain also
+// wipes anything else that overlapped those tiles - a node under the edge of a
+// demolished town hall, say - so every surviving obstacle whose own footprint
+// touches the restored rect has to be stamped back.
+//
+// The re-stamp is gated on an AABB test rather than being a blanket rescan.
+// STRAT_MAX_BUILDINGS is 24 and STRAT_MAX_NODES is 48 today, but both are
+// flagged as far too small for a 10k-unit map; when they grow to hundreds this
+// stays proportional to what is actually nearby.
+static void NavClearArea(float wx, float wz, float halfWorldX, float halfWorldZ)
+{
+    // +2 world units of margin: the vanished obstacle's skirt reached one tile
+    // past its footprint, and rounding to tiles can cost another.
+    float rx = halfWorldX + 2.0f, rz = halfWorldZ + 2.0f;
+
+    for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
+    {
+        const Building *b = &world.buildings[i];
+        if (!b->active) continue;
+        float bh = BuildingHalfWorld(b->kind);
+        if (fabsf(b->pos.x - wx) > rx + bh) continue;
+        if (fabsf(b->pos.z - wz) > rz + bh) continue;
+        NavStampBuilding(b, true);
+    }
+    for (int i = 0; i < STRAT_MAX_NODES; i++)
+    {
+        const ResourceNode *n = &world.nodes[i];
+        if (!n->active || !NodeBlocks(n->kind)) continue;
+        if (fabsf(n->pos.x - wx) > rx + 0.5f) continue;
+        if (fabsf(n->pos.z - wz) > rz + 0.5f) continue;
+        NavStampNode(n, true);
+    }
+
+    NavPatch();
 }
 
 // Mouse position in GAME-CANVAS pixels (the 3D scene's framebuffer space).
@@ -114,12 +634,15 @@ static Color UnitColor(const Unit *u)
 // ----------------------------------------------------------------------------
 //  Spawning
 // ----------------------------------------------------------------------------
+// Pops a free slot instead of scanning for one. The old linear scan was O(n)
+// per spawn and therefore O(n^2) for a bulk spawn - at 10,000 units that was a
+// visible hitch measured in seconds, not frames.
 static Unit *UnitSpawn(int faction, UnitKind kind, Vector3 pos)
 {
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    if (s_freeCount > 0)
     {
+        int i = s_free[--s_freeCount];
         Unit *u = &world.units[i];
-        if (u->active) continue;
 
         // Resolve stats ONCE: base def x this faction's difficulty mods.
         // (Training-building buffs multiply on top in BuildingsUpdate.)
@@ -146,9 +669,17 @@ static Unit *UnitSpawn(int faction, UnitKind kind, Vector3 pos)
         u->targetUnit     = -1;
         u->targetNode     = -1;
         u->targetBuilding = -1;
+        u->dropoffCache   = -1;
+        u->formGroup      = -1;     // NOT 0: `(Unit){0}` above would otherwise
+                                    // enrol every fresh unit in group 0
+        u->formSlotIndex  = -1;     // ...and, for the same reason, would have it
+        u->formSlotShape  = -1;     // claim slot 0 of whatever shape it joins,
+        u->formSlotOf     = -1;     // evicting the unit that actually holds it
+
+        RosterAdd(i);
         return u;
     }
-    return NULL;
+    return NULL;       // pool full
 }
 
 // scaffold=true spawns an under-construction site: near-zero HP, non-functional
@@ -171,6 +702,8 @@ static Building *BuildingSpawn(BuildingKind kind, int faction, Vector3 pos, bool
         b->buildProgress     = 0.0f;
         b->trainKind         = -1;
         b->trainProgress     = 0.0f;
+
+        if (s_navReady) { NavStampBuilding(b, true); NavPatch(); }
         return b;
     }
     return NULL;
@@ -188,7 +721,47 @@ static void NodeSpawn(NodeKind kind, Vector3 pos, int amount)
         n->kind      = kind;
         n->pos       = pos;
         n->remaining = amount;
+
+        if (s_navReady) { NavStampNode(n, true); NavPatch(); }
         return;
+    }
+}
+
+// The ONE way a node leaves the world. A raw `n->active = false` anywhere else
+// leaves its stamp in the nav grid forever - a phantom obstacle standing where
+// a tree used to be, invisible and permanent. Funnelling it through here is the
+// only defence, since the compiler cannot catch the raw assignment.
+static void NodeDespawn(int index)
+{
+    ResourceNode *n = &world.nodes[index];
+    if (!n->active) return;
+
+    bool blocked = NodeBlocks(n->kind);
+    Vector3 pos  = n->pos;
+    n->active = false;
+
+    if (s_navReady && blocked)
+    {
+        // Restore the one tile from terrain, then let NavClearArea put back
+        // whatever else was standing under it.
+        SpGridRestoreRect(&s_nav, &s_navStatic, pos.x, pos.z, 0, 0, 1);
+        NavClearArea(pos.x, pos.z, 0.5f, 0.5f);
+    }
+}
+
+// How much a node yields. The built-in layout passes these amounts as literals
+// (see SpawnBuiltinLayout); an authored placement carries a per-node override,
+// and 0 - which is what the forge writes, since it does not author amounts -
+// means "use the default for this kind". There is no NodeDef table to hang
+// these on, so they live here beside the only other place they appear.
+static int NodeAmount(int kind, int authored)
+{
+    if (authored > 0) return authored;
+    switch (kind)
+    {
+        case NODE_ROCK:  return 100;
+        case NODE_WHEAT: return 8;
+        default:         return 12;    // NODE_TREE
     }
 }
 
@@ -203,42 +776,15 @@ static void NodeCluster(NodeKind kind, Vector3 center, int count, float spread, 
     }
 }
 
-void StrategyWorldInit(void)
+// The battlefield the game shipped with, spawned when no authored map is
+// selected. Kept verbatim so that "no map" plays exactly as it always did.
+// Runs AFTER the difficulty mods are installed, like every other spawn path.
+static void SpawnBuiltinLayout(void)
 {
-    world = (StrategyWorld){ 0 };
-    world.placing          = -1;
-    world.selectedBuilding = -1;
-    world.gameOver         = -1;
-    EffectsReset();
-
-    // Difficulty mods BEFORE any spawn (UnitSpawn reads them). The player and
-    // neutral rows stay identity; only the AI faction is scaled. Hard is the
-    // baseline; Normal/Easy weaken the AI and give the player a sell bonus.
-    FactionMods identity = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f };
-    world.mods[0] = world.mods[1] = world.mods[FACTION_NEUTRAL] = identity;
-    switch (SettingsGet()->difficulty)
-    {
-        case 0:     // Easy
-            world.mods[1] = (FactionMods){ 0.8f, 0.8f, 1.10f, 0.9f, 1.6f, 0.0f };
-            world.mods[0].refundBonus = 0.2f;
-            break;
-        case 1:     // Normal
-            world.mods[1] = (FactionMods){ 0.9f, 1.0f, 1.05f, 1.0f, 1.25f, 0.0f };
-            world.mods[0].refundBonus = 0.1f;
-            break;
-        default:    // Hard: identity
-            break;
-    }
-    world.aiPeriod = STRAT_AI_PERIOD*world.mods[1].aiPeriodMul;
-    world.aiTimer  = world.aiPeriod;
-
-    // Camera: perspective, fixed pitch; focus starts over the player base.
-    world.camera.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
-    world.camera.fovy       = 45.0f;
-    world.camera.projection = CAMERA_PERSPECTIVE;
-    world.camFocus = (Vector2){ -14.0f, -12.0f };
-    world.camZoom  = 1.0f;
-    CameraRefresh();
+    world.groundHalfX = STRAT_GROUND_HALF;
+    world.groundHalfZ = STRAT_GROUND_HALF;
+    world.camFocus    = (Vector2){ -14.0f, -12.0f };
+    world.factionCount = 2;     // the shipped layout is player vs one enemy
 
     // Two rival bases in opposite corners: town hall FIRST (critical, trains
     // workers, and the AI's EnemyHome anchors to the first building), two
@@ -287,13 +833,221 @@ void StrategyWorldInit(void)
         };
         UnitSpawn(FACTION_NEUTRAL, KIND_ANIMAL_STRONG, pos);
     }
+}
+
+// Spawn an authored battlefield.
+//
+// Two ordering constraints are load-bearing and are why this is a single
+// straight-line pass rather than three loops by family:
+//
+//  1. DIFFICULTY MODS FIRST. UnitSpawn reads world.mods to resolve stats, so
+//     every spawn here must run after StrategyWorldInit has installed them.
+//     (Guaranteed by the call site, which is the last thing Init does.)
+//
+//  2. TOWN HALL FIRST, PER FACTION. strategy_ai.c anchors EnemyHome to the
+//     first building it finds for its faction, so a faction's town hall must
+//     occupy a lower buildings[] slot than its other buildings. SgmValidate
+//     enforces town-hall-first in the authored list and the map forge refuses
+//     to save a map that breaks it, so walking the list in order preserves it.
+//     Walking by family would NOT: it would spawn every faction's buildings
+//     interleaved and could seat a house ahead of a town hall.
+//
+// Every authored faction the map declares now spawns (up to STRAT_FACTIONS).
+// Placements owned by a faction beyond the map's own factionCount are skipped,
+// which only happens if a map lists an owner it never declared. Neutral
+// placements (resource nodes, wild animals) always spawn.
+static void SpawnFromMap(const SgmMap *m)
+{
+    world.map         = m;
+    world.groundHalfX = 0.5f*(float)m->gridW;
+    world.groundHalfZ = 0.5f*(float)m->gridH;
+
+    // How many factions this match runs. Clamped to the array ceiling rather
+    // than trusted outright: the on-disk value is validated 1..9 on load, but
+    // this is the one place a bad map would index past every faction array.
+    world.factionCount = m->factionCount;
+    if (world.factionCount < 1)              world.factionCount = 1;
+    if (world.factionCount > STRAT_FACTIONS) world.factionCount = STRAT_FACTIONS;
+
+    // Focus on faction 0's start, so the player opens looking at their own base
+    // wherever the author put it.
+    if (m->factionCount > 0)
+    {
+        Vector3 home = SgmTileToWorld(m, m->starts[0].tileX, m->starts[0].tileZ);
+        world.camFocus = (Vector2){ home.x, home.z };
+    }
+
+    for (int i = 0; i < m->placeCount; i++)
+    {
+        const SgmPlacement *pl = &m->places[i];
+        Vector3 pos = SgmTileToWorld(m, pl->tileX, pl->tileZ);
+
+        // A neutral placement belongs to nobody; an owned one belongs to a
+        // faction the runtime may not be playing yet.
+        bool neutral = (pl->faction == SGM_FACTION_NEUTRAL);
+        // Owned by a faction this match does not run. Was `>= STRAT_FACTIONS`,
+        // which silently threw away every authored faction past the second -
+        // "four lakes" lost half its bases and "the crucible" two thirds.
+        if (!neutral && pl->faction >= world.factionCount) continue;
+        int faction = neutral ? FACTION_NEUTRAL : (int)pl->faction;
+
+        switch (pl->family)
+        {
+            case SGM_PLACE_BUILDING:
+                // Buildings are always owned; a neutral one is meaningless and
+                // would index the stockpile at FACTION_NEUTRAL, which has no row.
+                if (neutral) break;
+                if (pl->kind < BLD_COUNT)
+                    BuildingSpawn((BuildingKind)pl->kind, faction, pos, false);
+                break;
+
+            case SGM_PLACE_UNIT:
+                if (pl->kind < UNIT_KIND_COUNT)
+                    UnitSpawn(faction, (UnitKind)pl->kind, pos);
+                break;
+
+            case SGM_PLACE_NODE:
+                // amount 0 means "the game's default for this kind", which is
+                // what the forge writes unless the author overrode it.
+                if (pl->kind < NODE_KIND_COUNT)
+                    NodeSpawn((NodeKind)pl->kind, pos, NodeAmount(pl->kind, pl->amount));
+                break;
+
+            default: break;
+        }
+    }
+}
+
+// Drag-to-orient state. File statics rather than fields of `world`, because they
+// are INPUT state and not world state - but that means StrategyWorldInit's
+// struct wipe does not reach them, so it clears them by hand.
+static bool    s_orderDragging;
+static Vector3 s_orderDragFrom;     // the ground point the press landed on
+static int     s_orderDragBuf[STRAT_MAX_UNITS];
+static int     s_orderDragCount;
+
+void StrategyWorldInit(void)
+{
+    world = (StrategyWorld){ 0 };
+    RosterReset();      // must follow the world wipe: it mirrors units[].active
+
+    // Nav stamping stays OFF through the whole of init. The layouts below spawn
+    // dozens of buildings and nodes, and each one would otherwise trigger a
+    // full skirt rebuild for a grid that NavRebuild replaces wholesale at the
+    // end of this function anyway.
+    s_navReady = false;
+    world.placing          = -1;
+    world.selectedBuilding = -1;
+    world.gameOver         = -1;
+    EffectsReset();
+
+    // A drag in flight refers to unit indices that no longer mean anything after
+    // the wipe above. It is a file static rather than part of `world`, so the
+    // struct clear does not reach it and it has to be dropped by hand.
+    s_orderDragging  = false;
+    s_orderDragCount = 0;
+    StrategyMovePreviewRelease();
+
+    // Authored assets, if any. The catalog is shared with the showcase and the
+    // forge, so this is a no-op when one of them already loaded it; it is here
+    // so the game can be entered first and still draw bound roles.
+    StrategyAssetSetFactionTint(StrategyFactionTint);
+    StrategyBindingsSetRoleCounts(UNIT_KIND_COUNT, BLD_COUNT, NODE_KIND_COUNT);
+    StrategyCatalogLoad();
+
+    // Difficulty mods BEFORE any spawn (UnitSpawn reads them). The player and
+    // neutral rows stay identity; EVERY AI faction gets the difficulty row.
+    // Hard is the baseline; Normal/Easy weaken the AI and give the player a
+    // sell bonus.
+    //
+    // Applied to all STRAT_FACTIONS AI slots rather than just the live ones
+    // because factionCount is not known yet - the battlefield below is what
+    // sets it, and UnitSpawn runs inside that. Rows for factions that never
+    // spawn are simply never read.
+    //
+    // Difficulty says how STRONG an AI is; the archetype (strategy_ai) says how
+    // it PLAYS, and multiplies its own mods on top of this row.
+    FactionMods identity = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f };
+    FactionMods aiRow    = identity;
+    switch (SettingsGet()->difficulty)
+    {
+        case 0:     // Easy
+            aiRow = (FactionMods){ 0.8f, 0.8f, 1.10f, 0.9f, 1.6f, 0.0f };
+            break;
+        case 1:     // Normal
+            aiRow = (FactionMods){ 0.9f, 1.0f, 1.05f, 1.0f, 1.25f, 0.0f };
+            break;
+        default:    // Hard: identity
+            break;
+    }
+    world.mods[0]               = identity;
+    world.mods[FACTION_NEUTRAL] = identity;
+    // Difficulty row x archetype row. Two orthogonal axes: difficulty decides
+    // how strong an AI faction is, the archetype decides how it plays, and an
+    // Easy AGGRESSOR still rushes - it is just weaker while doing it. The
+    // archetype's own mods are deliberately mild (ai_tests asserts 0.85..1.15),
+    // so this multiply can never turn a behaviour row into a stat advantage.
+    for (int f = 1; f < STRAT_FACTIONS; f++)
+    {
+        const AiProfile *p = AiProfileFor(f);
+        world.mods[f] = aiRow;
+        world.mods[f].hpMul     *= p->hpMul;
+        world.mods[f].dmgMul    *= p->dmgMul;
+        world.mods[f].gatherMul *= p->gatherMul;
+        world.mods[f].sightMul  *= p->sightMul;
+    }
+
+    world.mods[0].refundBonus = (SettingsGet()->difficulty == 0) ? 0.2f
+                              : (SettingsGet()->difficulty == 1) ? 0.1f : 0.0f;
+
+    world.aiPeriod = STRAT_AI_PERIOD*aiRow.aiPeriodMul;
+    world.aiTimer  = world.aiPeriod;
+
+    // Camera: perspective, fixed pitch. The FOCUS is not set here - it belongs
+    // to the battlefield (the built-in looks at its corner base, an authored map
+    // at faction 0's start), so each layout sets it and CameraRefresh runs once
+    // afterwards. Likewise the extent: groundHalf* is still zero at this point.
+    world.camera.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
+    world.camera.fovy       = 45.0f;
+    world.camera.projection = CAMERA_PERSPECTIVE;
+    world.camZoom  = 1.0f;
+
+    // The battlefield itself. An authored map is looked up by NAME here rather
+    // than held as a pointer, because the map catalog is rebuilt whenever the
+    // forge saves; a name that no longer resolves falls back to the built-in
+    // layout rather than failing to start.
+    SgmCatalogLoad();
+    const SgmMap *sel = (s_selectedMap[0] != '\0') ? SgmCatalogFind(s_selectedMap)
+                                                   : NULL;
+    if (sel != NULL) SpawnFromMap(sel);
+    else             SpawnBuiltinLayout();
+    CameraRefresh();    // the layout set camFocus; rebuild the camera from it
+
+    // Faction brains, AFTER the battlefield: the layout is what sets
+    // factionCount, and a brain built before it would be sized against a world
+    // that does not exist yet.
+    StrategyAiReset();
+
+    // The battlefield is populated: derive the nav grid from it once, then let
+    // later placements and demolitions patch incrementally.
+    NavRebuild();
+    s_navReady = true;
+
+    // The path service holds a grid pointer and cell indices, both of which a
+    // rebuild invalidates - and s_paths[] holds routes over the PREVIOUS map.
+    // Resetting both here rather than at the top of init is deliberate: the
+    // grid has to exist before the service can be pointed at it.
+    SpServiceReset(&s_nav);
+    SpFlowReset(&s_nav);
+    SpFlowSetVersion(s_navVersion);
+    StrategyMoveInit();
 
     // Starting stockpiles so building/training is possible right away. The
     // human player (faction 0) gets an easier-difficulty head start: Easy x3,
     // Normal x2, Hard x1. The enemy always starts on the base amounts.
     int playerMul = (SettingsGet()->difficulty == 0) ? 3
                   : (SettingsGet()->difficulty == 1) ? 2 : 1;
-    for (int f = 0; f < STRAT_FACTIONS; f++)
+    for (int f = 0; f < world.factionCount; f++)
     {
         int mul = (f == 0) ? playerMul : 1;
         world.stockpile[f][RES_WOOD]  = 10*mul;
@@ -306,6 +1060,11 @@ void StrategyWorldInit(void)
 //  Orders: the ONLY way anything (mouse, GUI or AI) makes a unit act.
 //  Exported so strategy_ai.c issues the exact same orders the mouse does.
 // ----------------------------------------------------------------------------
+
+// Defined with the movement code far below; declared here because the orders
+// sit above it and every new destination must clear the arrival progression.
+static void MoveArriveReset(Unit *u);
+
 void StrategyOrderMove(Unit *u, Vector3 dest)
 {
     u->state          = UNIT_MOVE;
@@ -313,6 +1072,8 @@ void StrategyOrderMove(Unit *u, Vector3 dest)
     u->targetUnit     = -1;
     u->targetNode     = -1;
     u->targetBuilding = -1;
+    MoveArriveReset(u);     // or a unit that settled on its last order arrives
+                            // at this one instantly, without moving
 }
 
 void StrategyOrderGather(Unit *u, int nodeIndex)
@@ -379,10 +1140,10 @@ static int PickUnit(Vector3 ground, int faction, float radius)
 {
     int best = -1;
     float bestDist = radius;
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < s_activeCount; k++)
     {
+        int i = s_active[k];
         Unit *u = &world.units[i];
-        if (!u->active) continue;
         if (faction >= 0 && u->faction != faction) continue;
 
         float d = DistXZ(u->pos, ground);
@@ -593,9 +1354,9 @@ int StrategyPopCap(int faction)
 int StrategyPopUsed(int faction)
 {
     int used = 0;
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < s_activeCount; k++)
     {
-        if (world.units[i].active && world.units[i].faction == faction) used++;
+        if (world.units[s_active[k]].faction == faction) used++;
     }
     return used;
 }
@@ -604,10 +1365,10 @@ int StrategyPopUsed(int faction)
 int StrategyCountUnits(int faction, int kind)
 {
     int n = 0;
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < s_activeCount; k++)
     {
-        Unit *u = &world.units[i];
-        if (!u->active || u->faction != faction) continue;
+        Unit *u = &world.units[s_active[k]];
+        if (u->faction != faction) continue;
         if (kind >= 0 && (int)u->kind != kind) continue;
         n++;
     }
@@ -617,10 +1378,10 @@ int StrategyCountUnits(int faction, int kind)
 int StrategyCountIdleWorkers(int faction)
 {
     int n = 0;
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < s_activeCount; k++)
     {
-        Unit *u = &world.units[i];
-        if (u->active && u->faction == faction &&
+        Unit *u = &world.units[s_active[k]];
+        if (u->faction == faction &&
             u->kind == KIND_WORKER && u->state == UNIT_IDLE) n++;
     }
     return n;
@@ -633,10 +1394,11 @@ void StrategySelectNearestIdleWorker(void)
     Vector3 focus = (Vector3){ world.camFocus.x, 0.0f, world.camFocus.y };
     int best = -1;
     float bestDist = 1000000.0f;
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < s_activeCount; k++)
     {
+        int i = s_active[k];
         Unit *u = &world.units[i];
-        if (!u->active || u->faction != 0) continue;
+        if (u->faction != 0) continue;
         if (u->kind != KIND_WORKER || u->state != UNIT_IDLE) continue;
 
         float d = DistXZ(u->pos, focus);
@@ -644,12 +1406,13 @@ void StrategySelectNearestIdleWorker(void)
     }
     if (best < 0) return;
 
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < s_activeCount; k++)
     {
-        if (world.units[i].active && world.units[i].faction == 0)
-            world.units[i].selected = false;
+        Unit *u = &world.units[s_active[k]];
+        if (u->faction == 0) u->selected = false;
     }
     world.units[best].selected = true;
+    SelectionTouch();
     world.selectedBuilding = -1;
 
     world.camFocus = (Vector2){ world.units[best].pos.x, world.units[best].pos.z };
@@ -748,12 +1511,31 @@ bool StrategyTrainStart(int bldIndex, UnitKind kind)
 // A faction is defeated when it has NO critical building AND no workers left
 // (houses alone can't rebuild an economy). Called after every building
 // destroy/sell and every unit kill.
+//
+// THE WIN RULE IS "LAST ONE STANDING", not "the other one". This used to end
+// with `world.gameOver = 1 - f`, which reads as "whoever isn't the loser wins"
+// and is only arithmetic that works for exactly two factions - with nine it
+// would hand victory to faction -6. Now defeat is latched per faction and the
+// match ends when one survivor remains.
+//
+// The player is special-cased on purpose: losing your own base ends YOUR game
+// immediately, even with four AIs still fighting each other. Watching a match
+// you are no longer in play itself out is not a defeat screen.
 static void CheckGameOver(void)
 {
-    if (world.gameOver >= 0) return;
+    if (world.gameOver != -1) return;   // != -1, not >= 0: see the banner note
 
-    for (int f = 0; f < STRAT_FACTIONS; f++)
+    // Nothing has spawned yet. This runs from BuildingDestroy and UnitKill,
+    // both of which are reachable DURING init (a placement that fails, a
+    // starting layout being rebuilt), and with factionCount still 0 the
+    // survivor count below is 0 - which would declare the match over on frame
+    // one, before a single unit exists.
+    if (world.factionCount <= 0) return;
+
+    for (int f = 0; f < world.factionCount; f++)
     {
+        if (world.defeated[f]) continue;     // latched: cannot come back
+
         bool critical = false;
         bool workers  = false;
         for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
@@ -766,21 +1548,31 @@ static void CheckGameOver(void)
                 break;
             }
         }
-        for (int i = 0; i < STRAT_MAX_UNITS; i++)
+        for (int k = 0; k < s_activeCount; k++)
         {
-            Unit *u = &world.units[i];
-            if (u->active && u->faction == f && u->kind == KIND_WORKER)
+            Unit *u = &world.units[s_active[k]];
+            if (u->faction == f && u->kind == KIND_WORKER)
             {
                 workers = true;
                 break;
             }
         }
-        if (!critical && !workers)
-        {
-            world.gameOver = 1 - f;     // the OTHER faction wins
-            return;
-        }
+        if (!critical && !workers) world.defeated[f] = true;
     }
+
+    // The player is out: over now, whoever else is still standing.
+    if (world.defeated[0])
+    {
+        world.gameOver = STRAT_GAMEOVER_PLAYER_LOST;
+        return;
+    }
+
+    int alive = 0, last = -1;
+    for (int f = 0; f < world.factionCount; f++)
+    {
+        if (!world.defeated[f]) { alive++; last = f; }
+    }
+    if (alive <= 1) world.gameOver = last;   // last one standing takes it
 }
 
 static void BuildingDestroy(int index)
@@ -788,6 +1580,15 @@ static void BuildingDestroy(int index)
     Building *b = &world.buildings[index];
     b->active = false;
     if (world.selectedBuilding == index) world.selectedBuilding = -1;
+
+    // Unblock the nav grid before the effects fire - a destroyed building that
+    // keeps blocking is a wall you can see through.
+    if (s_navReady)
+    {
+        NavStampBuilding(b, false);
+        float bh = BuildingHalfWorld(b->kind);
+        NavClearArea(b->pos.x, b->pos.z, bh, bh);
+    }
 
     EffectSpawn(FX_RING, b->pos, strategyFactionColor[b->faction]);
     EffectSpawn(FX_FLASH, (Vector3){ b->pos.x, 0.8f, b->pos.z }, RAYWHITE);
@@ -814,6 +1615,13 @@ bool StrategySellBuilding(int index)
     b->active = false;
     if (world.selectedBuilding == index) world.selectedBuilding = -1;
 
+    if (s_navReady)
+    {
+        NavStampBuilding(b, false);
+        float bh = BuildingHalfWorld(b->kind);
+        NavClearArea(b->pos.x, b->pos.z, bh, bh);
+    }
+
     EffectSpawn(FX_RING, b->pos, GOLD);
     for (int i = 0; i < 3; i++)
     {
@@ -839,8 +1647,9 @@ static int NodesNear(NodeKind kind, Vector3 pos, float radius)
 // and off the map edge. Used to scatter tended nodes without overlap.
 static bool PlantSpotClear(Vector3 pos)
 {
-    float margin = STRAT_GROUND_HALF - 1.0f;
-    if (fabsf(pos.x) > margin || fabsf(pos.z) > margin) return false;
+    if (fabsf(pos.x) > world.groundHalfX - 1.0f ||
+        fabsf(pos.z) > world.groundHalfZ - 1.0f) return false;
+    if (!MapBuildableAt(pos)) return false;     // no farms in the lake
     for (int i = 0; i < STRAT_MAX_NODES; i++)
         if (world.nodes[i].active &&
             DistXZ(world.nodes[i].pos, pos) < STRAT_TEND_SPACING) return false;
@@ -936,8 +1745,8 @@ static void CameraPanZoom(void)
     if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN))  world.camFocus.y += pan;
     if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT))  world.camFocus.x -= pan;
     if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) world.camFocus.x += pan;
-    world.camFocus.x = Clamp(world.camFocus.x, -STRAT_GROUND_HALF, STRAT_GROUND_HALF);
-    world.camFocus.y = Clamp(world.camFocus.y, -STRAT_GROUND_HALF, STRAT_GROUND_HALF);
+    world.camFocus.x = Clamp(world.camFocus.x, -world.groundHalfX, world.groundHalfX);
+    world.camFocus.y = Clamp(world.camFocus.y, -world.groundHalfZ, world.groundHalfZ);
 
     float wheel = GetMouseWheelMove();
     if (wheel != 0.0f)
@@ -957,23 +1766,65 @@ static bool Affordable(int faction, BuildingKind kind)
     return true;
 }
 
+// Placement, rewritten against real footprints.
+//
+// The old version compared CENTRE DISTANCES against three hand-typed numbers -
+// 2.4 between buildings, 1.6 to a node, 1.2 to a unit - which are clearance
+// values, not sizes. Nothing tied them to how big anything actually is, so a
+// 3x3 town hall and a 1x1 house could be placed 2.4 apart and visually
+// intersect. Now every rule is derived from footprintX/Z, and the rule the
+// player is judged by is the same one the nav grid is stamped with.
 static bool PlacementValid(int faction, BuildingKind kind, Vector3 pos)
 {
     if (!Affordable(faction, kind)) return false;
-    float margin = STRAT_GROUND_HALF - 1.5f;
-    if (fabsf(pos.x) > margin || fabsf(pos.z) > margin) return false;
 
+    float half = BuildingHalfWorld(kind);
+    if (fabsf(pos.x) > world.groundHalfX - half ||
+        fabsf(pos.z) > world.groundHalfZ - half) return false;
+
+    // Authored terrain: a map may forbid building on water, cliffs and voids.
+    // Checked over the WHOLE footprint, not just the centre tile - a 3x3 hall
+    // whose centre is on grass but whose corner hangs over a lake was legal
+    // before, and then permanently blocked three tiles of water.
+    int hx, hz, cx, cz;
+    BuildingHalfTiles(kind, &hx, &hz);
+    SpWorldToTile(&s_nav, roundf(pos.x), roundf(pos.z), &cx, &cz);
+
+    for (int z = cz - hz; z <= cz + hz; z++)
+    {
+        for (int x = cx - hx; x <= cx + hx; x++)
+        {
+            // Buildability, not passability: shallow water is walkable but not
+            // buildable, and the authored flags already carry that distinction.
+            if (world.map != NULL)
+            {
+                if (!SgmTileBuildable(world.map, x, z)) return false;
+            }
+            else if (!SpGridInBounds(&s_nav, x, z)) return false;
+        }
+    }
+
+    // Building-vs-building: the two footprints must not touch, plus one tile of
+    // walkable gap so a worker can get between them rather than being sealed in
+    // by a wall of houses.
     for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
     {
-        if (world.buildings[i].active && DistXZ(world.buildings[i].pos, pos) < 2.4f) return false;
+        const Building *b = &world.buildings[i];
+        if (!b->active) continue;
+        float gap = half + BuildingHalfWorld(b->kind) + 1.0f;
+        if (fabsf(b->pos.x - pos.x) < gap && fabsf(b->pos.z - pos.z) < gap) return false;
     }
+
+    // Nodes and units are round and roughly one unit across, so a centre
+    // distance is the right test for them - just measured from the building's
+    // EDGE now instead of its centre.
     for (int i = 0; i < STRAT_MAX_NODES; i++)
     {
-        if (world.nodes[i].active && DistXZ(world.nodes[i].pos, pos) < 1.6f) return false;
+        if (world.nodes[i].active && DistXZ(world.nodes[i].pos, pos) < half + 0.6f) return false;
     }
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < s_activeCount; k++)
     {
-        if (world.units[i].active && DistXZ(world.units[i].pos, pos) < 1.2f) return false;
+        if (DistXZ(world.units[s_active[k]].pos, pos) < half + STRAT_UNIT_RADIUS) return false;
     }
     return true;
 }
@@ -988,9 +1839,11 @@ bool StrategyTryBuild(int faction, BuildingKind kind, Vector3 pos)
     {
         world.stockpile[faction][r] -= StrategyBuildingDef(kind)->cost[r];
     }
-    // Player buildings go up as scaffolds a worker must finish; the AI has no
-    // build behavior, so its buildings spawn complete.
-    BuildingSpawn(kind, faction, pos, faction == 0);
+    // Everyone builds scaffolds. The AI used to skip straight to a finished
+    // building because it had no build behaviour - a free head start that was
+    // tolerable against one enemy and is not against eight. The AI adapter
+    // issues StrategyOrderBuild for its own scaffolds instead.
+    BuildingSpawn(kind, faction, pos, true);
     EffectSpawn(FX_RING, pos, RAYWHITE);
     for (int i = 0; i < 3; i++) EffectSpawn(FX_PUFF, (Vector3){ pos.x, 0.8f, pos.z }, LIGHTGRAY);
     return true;
@@ -1034,10 +1887,10 @@ static void SelectOnScreenOfKind(UnitKind kind, bool shift)
 {
     Vector2 gameSize = ScreenStateTargetSize();
     Rectangle screen = { 0.0f, 0.0f, gameSize.x, gameSize.y };
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < s_activeCount; k++)
     {
-        Unit *u = &world.units[i];
-        if (!u->active || u->faction != 0) continue;
+        Unit *u = &world.units[s_active[k]];
+        if (u->faction != 0) continue;
         if (u->kind != kind)
         {
             if (!shift) u->selected = false;
@@ -1046,6 +1899,7 @@ static void SelectOnScreenOfKind(UnitKind kind, bool shift)
         if (CheckCollisionPointRec(WorldToGame(u->pos), screen)) u->selected = true;
         else if (!shift) u->selected = false;
     }
+    SelectionTouch();
 }
 
 static void SelectionInput(void)
@@ -1084,17 +1938,16 @@ static void SelectionInput(void)
             fminf(world.dragStart.x, mouse.x), fminf(world.dragStart.y, mouse.y),
             fabsf(mouse.x - world.dragStart.x), fabsf(mouse.y - world.dragStart.y),
         };
-        for (int i = 0; i < STRAT_MAX_UNITS; i++)
+        for (int k = 0; k < s_activeCount; k++)
         {
-            Unit *u = &world.units[i];
-            if (!u->active || u->faction != 0)
-            {
-                continue;
-            }
+            Unit *u = &world.units[s_active[k]];
+            if (u->faction != 0) continue;
+
             bool inside = CheckCollisionPointRec(WorldToGame(u->pos), rect);
             if (inside)      u->selected = true;
             else if (!shift) u->selected = false;
         }
+        SelectionTouch();
         world.dragging = false;
         return;
     }
@@ -1111,7 +1964,8 @@ static void SelectionInput(void)
         world.selectedBuilding = PickBuilding(ground, 0, 1.4f);
         if (world.selectedBuilding >= 0)
         {
-            for (int i = 0; i < STRAT_MAX_UNITS; i++) world.units[i].selected = false;
+            for (int k = 0; k < s_activeCount; k++) world.units[s_active[k]].selected = false;
+            SelectionTouch();
             EffectSpawn(FX_RING, world.buildings[world.selectedBuilding].pos, GREEN);
             return;
         }
@@ -1138,13 +1992,15 @@ static void SelectionInput(void)
     }
     else lastClickKind = -1;
 
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < s_activeCount; k++)
     {
+        int i = s_active[k];
         Unit *u = &world.units[i];
-        if (!u->active || u->faction != 0) continue;
+        if (u->faction != 0) continue;
         if (i == hit)    u->selected = true;
         else if (!shift) u->selected = false;
     }
+    SelectionTouch();
     if (hit >= 0) EffectSpawn(FX_RING, world.units[hit].pos, GREEN);
 }
 
@@ -1168,11 +2024,144 @@ static void OrderUnitAt(Unit *u, int hostile, int enemyBld, int node,
     else                                  StrategyOrderMove(u, ground);
 }
 
+// -- Drag to orient -----------------------------------------------------------
+// Press on open ground, drag to aim, release to commit. The markers appear on
+// press and turn with the cursor, so the player sets the formation's final
+// heading rather than accepting the direction of travel.
+//
+// ONLY A PLAIN GROUND MOVE DRAGS. An attack, a gather or a build click is a
+// verb aimed at a specific object - there is no formation heading to choose and
+// making the player release before anything happened would put a delay on the
+// one order that most needs to be instant. Those still fire on press.
+//
+// A CLICK IS A DRAG OF ZERO LENGTH, which is what keeps this from being a new
+// mode the player has to know about. Below the deadzone the order is given with
+// no explicit facing at all, so an ordinary right-click behaves exactly as it
+// did - travel direction, as before.
+#define ORDER_DRAG_DEADZONE  1.6f   // world units of drag before a heading is
+                                    //   taken; under this it is just a click
+
+// Units the drag will move, gathered once on press. Re-gathering per frame would
+// let a selection change mid-drag rewrite the order being aimed.
+static int OrderDragGather(void)
+{
+    int selCount = 0;
+    const int *sel = SelectedUnits(&selCount);
+
+    int n = 0;
+    for (int k = 0; k < selCount; k++)
+    {
+        const Unit *u = &world.units[sel[k]];
+        if (u->active && u->faction == 0) s_orderDragBuf[n++] = sel[k];
+    }
+    return n;
+}
+
+// Drop anyone who died while the button was held. A drag lasts as long as the
+// player wants it to, and StrategyOrderMoveGroup does NOT check `active` - it
+// would happily stamp formation state into a dead unit's slot, which then gets
+// handed to the next unit spawned there. Compacting in place keeps the buffer
+// and the count in agreement.
+static int OrderDragPrune(void)
+{
+    int n = 0;
+    for (int k = 0; k < s_orderDragCount; k++)
+        if (world.units[s_orderDragBuf[k]].active) s_orderDragBuf[n++] = s_orderDragBuf[k];
+    s_orderDragCount = n;
+    return n;
+}
+
+// The heading the cursor is currently asking for, or false while inside the
+// deadzone. Split out so the live preview and the commit cannot disagree about
+// where the threshold is.
+static bool OrderDragFacing(float *outX, float *outZ)
+{
+    Vector3 now;
+    if (!MouseGroundPoint(&now)) return false;
+
+    float dx = now.x - s_orderDragFrom.x, dz = now.z - s_orderDragFrom.z;
+    float d  = sqrtf(dx*dx + dz*dz);
+    if (d < ORDER_DRAG_DEADZONE) return false;
+
+    *outX = dx/d;
+    *outZ = dz/d;
+    return true;
+}
+
+// Runs every frame while the button is held, and once on release. Returns true
+// when it consumed the frame, so OrderInput does not also act on it.
+static bool OrderDragUpdate(void)
+{
+    if (!s_orderDragging) return false;
+
+    float fx, fz;
+    bool aimed = OrderDragFacing(&fx, &fz);
+
+    // The whole selection can die mid-drag; with nobody left there is no order to
+    // give and no centroid to divide by.
+    if (OrderDragPrune() == 0)
+    {
+        if (!IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+        {
+            s_orderDragging = false;
+            StrategyMovePreviewRelease();
+        }
+        return true;
+    }
+
+    if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+    {
+        // Hold the markers on screen under the cursor's current heading. Inside
+        // the deadzone show the travel direction, which is what a release there
+        // would actually give - the preview must never promise a layout the
+        // order will not produce.
+        if (!aimed)
+        {
+            Vector3 c = { 0 };
+            for (int k = 0; k < s_orderDragCount; k++)
+            {
+                c.x += world.units[s_orderDragBuf[k]].pos.x;
+                c.z += world.units[s_orderDragBuf[k]].pos.z;
+            }
+            c.x /= (float)s_orderDragCount;
+            c.z /= (float)s_orderDragCount;
+
+            fx = s_orderDragFrom.x - c.x;
+            fz = s_orderDragFrom.z - c.z;
+            float l = sqrtf(fx*fx + fz*fz);
+            if (l < 0.001f) { fx = 0.0f; fz = 1.0f; } else { fx /= l; fz /= l; }
+        }
+
+        StrategyMovePreviewAim(s_orderDragBuf, s_orderDragCount,
+                               s_orderDragFrom, fx, fz);
+        return true;
+    }
+
+    // Released: give the order.
+    s_orderDragging = false;
+    StrategyMovePreviewRelease();
+
+    if (s_orderDragCount > 0)
+    {
+        if (aimed)
+            StrategyOrderMoveGroupFacing(s_orderDragBuf, s_orderDragCount,
+                                         s_orderDragFrom, fx, fz);
+        else
+            StrategyOrderMoveGroup(s_orderDragBuf, s_orderDragCount,
+                                   s_orderDragFrom);
+
+        EffectSpawn(FX_RING, s_orderDragFrom, LIME);
+    }
+    return true;
+}
+
 // Right click: hostile unit/animal > enemy building > resource node >
 // own building job > plain move - checked in that priority so a click near a
 // tree still prefers the deer standing beside it.
 static void OrderInput(void)
 {
+    if (OrderDragUpdate()) return;      // a drag owns the button until release
+
     if (!IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) || MouseOnGui()) return;
 
     bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
@@ -1221,15 +2210,97 @@ static void OrderInput(void)
         }
     }
 
-    bool any = false;
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
-    {
-        Unit *u = &world.units[i];
-        if (!u->active || u->faction != 0 || !u->selected) continue;
+    int selCount = 0;
+    const int *sel = SelectedUnits(&selCount);
 
-        OrderUnitAt(u, hostile, enemyBld, node, ownGather, ownScaffold, ownRepair,
-                    shift, ground);
-        any = true;
+    bool any = false;
+
+    // A PLAIN GROUND MOVE IS THE ONE ORDER THAT BECOMES A GROUP ORDER. Every
+    // other branch already targets a specific object - a unit, a node, a
+    // building - so there is nothing to spread the group over and each unit
+    // wants the identical destination anyway.
+    //
+    // For ground, the click is a POINT and the group needs an AREA: 500 units
+    // sent to one spot are being asked to stand where about six fit. Phase 2
+    // measured what that costs even with perfect settling - 300 units to one
+    // point come to rest 7,316 overlapping pairs deep. The same steering with
+    // formation slots gives zero.
+    bool plainMove = (hostile < 0 && enemyBld < 0 && node < 0 &&
+                      ownGather < 0 && ownScaffold < 0 && ownRepair < 0);
+
+    // AN ATTACK ORDER AT DISTANCE IS A MARCH, AND MARCHES GET FORMATIONS.
+    // Sending every selected unit at one enemy is what produces the overlapping
+    // spearhead: they converge on a single point and stack, and a stack fights
+    // far better than it should because only its front rank can be hit.
+    //
+    // Only at DISTANCE, though. Once the enemy is already close the players
+    // means "hit that now", and forming up first would be a visible delay in
+    // exactly the moment it is least wanted - so a near target keeps the direct
+    // per-unit order, and the units break off into the fight the moment they
+    // arrive anyway.
+    bool attackMarch = false;
+    if (hostile >= 0 && !shift && selCount > 1)
+    {
+        Vector3 c = { 0 };
+        int n = 0;
+        for (int k = 0; k < selCount; k++)
+        {
+            if (world.units[sel[k]].faction != 0) continue;
+            c.x += world.units[sel[k]].pos.x;
+            c.z += world.units[sel[k]].pos.z;
+            n++;
+        }
+        if (n > 1)
+        {
+            c.x /= (float)n;
+            c.z /= (float)n;
+            attackMarch = (DistXZ(c, world.units[hostile].pos) > STRAT_FORM_MARCH_DIST);
+        }
+    }
+
+    if ((plainMove || attackMarch) && !shift)
+    {
+        // Gather the player's own selected units and hand them over as a group.
+        // Shift is excluded: it means "queue this job", which is a per-unit
+        // notion the formation layer has nothing to say about.
+        static int s_groupBuf[STRAT_MAX_UNITS];
+        int n = 0;
+        for (int k = 0; k < selCount; k++)
+        {
+            if (world.units[sel[k]].faction != 0) continue;
+            s_groupBuf[n++] = sel[k];
+        }
+
+        // A PLAIN GROUND MOVE BEGINS A DRAG instead of ordering now: the player
+        // may be about to aim a heading, and that cannot be known until the
+        // button comes up. An attack march does not - its heading is the target,
+        // and delaying an attack until release would be felt.
+        if (plainMove && n > 0)
+        {
+            s_orderDragging  = true;
+            s_orderDragFrom  = ground;
+            s_orderDragCount = OrderDragGather();
+            return;         // the order is given on release, by OrderDragUpdate
+        }
+
+        // An attack march forms up on the TARGET's position rather than the
+        // clicked ground. The units break off and engage as they close - under
+        // whatever the current behaviour says - so this only has to get them
+        // there as a block rather than as a queue.
+        Vector3 dest = attackMarch ? world.units[hostile].pos : ground;
+        if (n > 0) { StrategyOrderMoveGroup(s_groupBuf, n, dest); any = true; }
+    }
+    else
+    {
+        for (int k = 0; k < selCount; k++)
+        {
+            Unit *u = &world.units[sel[k]];
+            if (u->faction != 0) continue;
+
+            OrderUnitAt(u, hostile, enemyBld, node, ownGather, ownScaffold, ownRepair,
+                        shift, ground);
+            any = true;
+        }
     }
     if (!any) return;
 
@@ -1254,10 +2325,10 @@ static void ControlGroupInput(void)
     {
         if (!IsKeyPressed(KEY_ZERO + g)) continue;
 
-        for (int i = 0; i < STRAT_MAX_UNITS; i++)
+        for (int k = 0; k < s_activeCount; k++)
         {
-            Unit *u = &world.units[i];
-            if (!u->active || u->faction != 0) continue;
+            Unit *u = &world.units[s_active[k]];
+            if (u->faction != 0) continue;
 
             if (ctrl)
             {
@@ -1266,14 +2337,29 @@ static void ControlGroupInput(void)
             }
             else u->selected = (u->controlGroup == g);
         }
-        if (!ctrl) world.selectedBuilding = -1;
+        if (!ctrl) { SelectionTouch(); world.selectedBuilding = -1; }
     }
+}
+
+// Formation hotkeys. Letters, per the house idiom - and two keys cycling two
+// independent settings rather than one key cycling their product, because shape
+// and break-off behaviour are orthogonal: fifteen combinations behind one key
+// would be unusable.
+static void FormationInput(void)
+{
+    if (IsKeyPressed(KEY_F))
+        StrategyFormationShapeSet((FormationShape)((StrategyFormationShape() + 1) % FORM_COUNT));
+
+    if (IsKeyPressed(KEY_V))
+        StrategyFormationBehaviorSet(
+            (FormationBehavior)((StrategyFormationBehavior() + 1) % FORM_BEHAVIOR_COUNT));
 }
 
 void StrategyWorldHandleInput(void)
 {
     CameraPanZoom();
     ControlGroupInput();
+    FormationInput();
 
     if (world.placing >= 0)
     {
@@ -1287,20 +2373,350 @@ void StrategyWorldHandleInput(void)
 // ----------------------------------------------------------------------------
 //  Unit behavior (faction-agnostic)
 // ----------------------------------------------------------------------------
+// Straight-line steering, unchanged in behaviour and now one line: the body
+// moved to strategy_move.c so that pathed and unpathed movement share a single
+// implementation of "step toward a point and face it". The name stays because
+// five call sites here legitimately want exactly this and not a path - see the
+// classification in strategy_move.c's header comment.
 static void MoveToward(Unit *u, Vector3 dest, float dt)
+{
+    StrategyMoveDirect(u, dest, dt);
+}
+
+// ----------------------------------------------------------------------------
+//  Legacy / simple movement  (STRAT_CTRL_LEGACY, STRAT_CTRL_SIMPLE)
+// ----------------------------------------------------------------------------
+//  The other side of the A/B. Deliberately NOT built on MoveArrive or
+//  StrategyMoveTo: the point of these arms is to measure what the world costs
+//  and looks like WITHOUT the arrival progression and without the path service,
+//  so borrowing either would defeat the experiment.
+// ----------------------------------------------------------------------------
+
+// SIMPLE's obstacle avoidance, and the whole of it. Given the direction the unit
+// wants to travel, return the direction it should actually travel.
+//
+// WHY LINE OF SIGHT AND NOT A SEARCH. A* answers "what route reaches the goal";
+// this answers only "is there a wall immediately in front of me", which is a
+// single supercover walk of four tiles and no allocation. That is the entire
+// bet of this arm - that most of the value of pathing on an open map comes from
+// not walking into the one obstacle you can already see.
+//
+// SUPERCOVER MATTERS HERE. SpLosClear visits both cells a diagonal line grazes;
+// a standard Bresenham would report a zero-width gap between two corner-touching
+// obstacles as clear, and the unit would wedge itself on the corner and sit
+// there. path_tests names that case.
+//
+// WHAT THIS CANNOT DO: escape a concave obstacle. A unit in a U-shaped bay
+// probes clear along the bay's axis, walks in, and then oscillates at the back
+// of it. There is no local rule that fixes that - it is what a search is for -
+// and finding out how much it costs in practice is a result this lab exists to
+// produce.
+static bool SimpleDodge(Unit *u, float dirX, float dirZ, float *outX, float *outZ)
+{
+    const SpGrid *g = StrategyNavGrid();
+
+    int sx, sz;
+    SpWorldToTile(g, u->pos.x, u->pos.z, &sx, &sz);
+
+    // Probe along a candidate direction: is the tile LOOK ahead reachable in a
+    // straight line? Out-of-bounds counts as blocked, so units turn back from
+    // the map edge instead of grinding along it.
+    #define PROBE_CLEAR(dx, dz, okOut)                                        \
+        do {                                                                  \
+            int px, pz;                                                       \
+            SpWorldToTile(g, u->pos.x + (dx)*(float)STRAT_SIMPLE_DODGE_LOOK,  \
+                             u->pos.z + (dz)*(float)STRAT_SIMPLE_DODGE_LOOK,  \
+                          &px, &pz);                                          \
+            (okOut) = SpGridInBounds(g, px, pz) &&                            \
+                      SpLosClear(g, sx, sz, px, pz);                          \
+        } while (0)
+
+    bool clear = false;
+    PROBE_CLEAR(dirX, dirZ, clear);
+    if (clear)
+    {
+        // Straight ahead is fine. Forget the remembered side: holding it across
+        // an open stretch would bias the NEXT obstacle toward whichever way this
+        // unit happened to turn minutes ago.
+        u->dodgeSide = 0;
+        *outX = dirX;
+        *outZ = dirZ;
+        return true;
+    }
+
+    // Blocked. Try both shoulders, preferring the side already committed to.
+    // COMMITTING MATTERS: a unit square-on to a wall probes identically to left
+    // and right, so a fresh decision every frame flips sides at frame rate and
+    // the unit vibrates in place. Once it has turned, it keeps turning that way
+    // until it gets a clear run.
+    float c = cosf(STRAT_SIMPLE_DODGE_ANGLE);
+    float s = sinf(STRAT_SIMPLE_DODGE_ANGLE);
+
+    int first = (u->dodgeSide != 0) ? u->dodgeSide : 1;
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        int side = (attempt == 0) ? first : -first;
+
+        // Rotate by +/- the dodge angle in XZ.
+        float rx = dirX*c - dirZ*(s*(float)side);
+        float rz = dirX*(s*(float)side) + dirZ*c;
+
+        PROBE_CLEAR(rx, rz, clear);
+        if (clear)
+        {
+            u->dodgeSide = (signed char)side;
+            *outX = rx;
+            *outZ = rz;
+            return true;
+        }
+    }
+
+    #undef PROBE_CLEAR
+
+    // Boxed in on all three probes. Steer straight and let separation and the
+    // stall test sort it out - refusing to move would strand the unit silently,
+    // and a unit pressed against a wall is at least visibly stuck.
+    *outX = dirX;
+    *outZ = dirZ;
+    return false;
+}
+
+// Walk toward a fixed destination the way the pre-overhaul game did, and decide
+// arrival the way it did: a bare distance test.
+//
+// THE 0.15 IS NOT A TYPO AND MUST NOT BE "FIXED". It is smaller than
+// STRAT_UNIT_RADIUS, so in any crowd it is physically unsatisfiable and the
+// state never resolves - units orbit their destination forever. That defect is
+// the entire reason MoveArrive exists, and reproducing it faithfully is what
+// makes the LEGACY arm worth measuring. The lab's `moving` counter is what
+// shows it: it stays pinned near the group size instead of falling to zero.
+//
+// Returns true once the unit should leave UNIT_MOVE.
+static bool MoveLegacy(Unit *u, int index, float dt)
+{
+    (void)index;    // no path, no slot, no per-unit service state to look up
+
+    Vector3 dest = u->target;
+
+    if (s_scheme == STRAT_CTRL_SIMPLE)
+    {
+        // Steer at a dodged heading rather than at the destination, but keep
+        // measuring arrival against the DESTINATION. Steering and arrival have
+        // to stay separate here for the same reason they do in MoveArrive: a
+        // unit that tested arrival against its dodge target would stop the
+        // moment it cleared the obstacle.
+        Vector3 delta = Vector3Subtract(dest, u->pos);
+        delta.y = 0.0f;
+        float dist = Vector3Length(delta);
+        if (dist > 0.001f)
+        {
+            float ox, oz;
+            SimpleDodge(u, delta.x/dist, delta.z/dist, &ox, &oz);
+
+            // Aim one look-ahead along the chosen heading, never past the
+            // destination - overshooting it would make the unit circle.
+            float reach = (float)STRAT_SIMPLE_DODGE_LOOK;
+            if (reach > dist) reach = dist;
+            Vector3 step = { u->pos.x + ox*reach, u->pos.y, u->pos.z + oz*reach };
+            StrategyMoveDirect(u, step, dt);
+        }
+    }
+    else
+    {
+        StrategyMoveDirect(u, dest, dt);
+    }
+
+    return DistXZ(u->pos, dest) < 0.15f;
+}
+
+// ----------------------------------------------------------------------------
+//  Arrival
+// ----------------------------------------------------------------------------
+//  Walk toward a final DESTINATION and decide when the walk is over. Returns
+//  true once the unit has settled and the caller should leave the move state.
+//
+//  This is deliberately NOT what every MoveToward call site wants. A worker
+//  closing on a tree, a soldier kiting to its preferred range and a templar
+//  shadowing a target are all pursuing something that moves or that has its own
+//  proximity test - they want plain steering. Only a walk to a fixed point on
+//  the ground needs to decide it has finished, so only those callers get this.
+//  Routing all sixteen sites through arrival logic would make workers settle
+//  next to a tree they were supposed to chop.
+//
+//  WHY A PROGRESSION AND NOT A DISTANCE TEST. The old test was one line -
+//  within 0.15 units, become idle - and it could not fire in a crowd, because
+//  separation holds units at least 0.7 apart. So a pile of units all drove
+//  inward forever. Three ways out are needed, because a crowd defeats any
+//  single one:
+//    - close enough (the ordinary case),
+//    - hemmed in by units that have themselves finished (the chokepoint case),
+//    - no longer making progress (the everything-else case).
+static bool MoveArrive(Unit *u, int index, Vector3 dest, float dt)
 {
     Vector3 delta = Vector3Subtract(dest, u->pos);
     delta.y = 0.0f;
     float dist = Vector3Length(delta);
-    if (dist < 0.001f) return;
 
-    float step = u->moveSpeed*dt;
-    if (step > dist) step = dist;
-    u->pos = Vector3Add(u->pos, Vector3Scale(delta, step/dist));
+    if (u->arrival == ARRIVE_SETTLED)
+    {
+        // Settled units stay settled unless shoved WELL clear of the target -
+        // past the slowing band, not merely past the stop radius. A tighter
+        // threshold makes units on the edge of a crowd flip state every few
+        // frames, which looks exactly like the spiral this replaces.
+        if (dist > STRAT_ARRIVE_RESUME)
+        {
+            u->arrival    = ARRIVE_SEEKING;
+            u->stallTimer = 0.0f;
+            u->lastProgressDist = dist;
+            return false;
+        }
+        return true;
+    }
+
+    // -- Settle tests ---------------------------------------------------------
+    if (dist <= STRAT_ARRIVE_STOP)
+    {
+        u->arrival = ARRIVE_SETTLED;
+        u->vel = (Vector3){ 0.0f, 0.0f, 0.0f };
+        return true;
+    }
+
+    // Hemmed in by units that have already finished. Without this a large group
+    // ordered through a gap grinds against the back of the ones that made it -
+    // they cannot reach the target, cannot settle, and push forever. The crowd
+    // count only includes SETTLED neighbours, so this cannot cascade off units
+    // that are merely slow.
+    if (dist <= STRAT_ARRIVE_SLOW && u->crowd >= STRAT_SETTLE_CROWD)
+    {
+        u->arrival = ARRIVE_SETTLED;
+        u->vel = (Vector3){ 0.0f, 0.0f, 0.0f };
+        return true;
+    }
+
+    // Making no headway. Measured against distance-to-target rather than
+    // distance travelled, because a unit circling its destination is moving
+    // fast and getting nowhere - which is precisely the failure being fixed.
+    //
+    // ONLY WITHIN THE GIVE-UP BAND. Without that gate this rule fires on the
+    // rear of any large column: those units are legitimately blocked for well
+    // over half a second while the front sorts itself out, and settling them
+    // parks a 500-unit order back at its start. The stall rule exists to
+    // resolve units that cannot close the LAST few metres, not to abandon ones
+    // that have not begun.
+    if (dist <= STRAT_ARRIVE_GIVEUP)
+    {
+        u->stallTimer += dt;
+        if (u->stallTimer >= STRAT_ARRIVE_STALL)
+        {
+            if (u->lastProgressDist - dist < STRAT_UNIT_RADIUS*0.5f)
+            {
+                u->arrival = ARRIVE_SETTLED;
+                u->vel = (Vector3){ 0.0f, 0.0f, 0.0f };
+                return true;
+            }
+            u->stallTimer = 0.0f;
+            u->lastProgressDist = dist;
+        }
+    }
+    else
+    {
+        // Outside the band the timer must not accumulate, or a unit that
+        // spends ten seconds marching arrives with a primed stall timer and
+        // settles on its first blocked frame.
+        u->stallTimer       = 0.0f;
+        u->lastProgressDist = dist;
+    }
+
+    if (dist < 0.001f) return true;
+
+    // -- Drive ----------------------------------------------------------------
+    // Speed ramps down across the approach band instead of stopping dead, so a
+    // unit does not overshoot and bounce. The floor keeps it from creeping so
+    // slowly that the stall test fires on an ordinary approach.
+    float speed = u->moveSpeed;
+    if (dist < STRAT_ARRIVE_SLOW)
+    {
+        u->arrival = ARRIVE_SLOWING;
+        float t = dist/STRAT_ARRIVE_SLOW;
+        speed *= (t < 0.35f) ? 0.35f : t;
+    }
+    else u->arrival = ARRIVE_SEEKING;
+
+    // THE ARRIVAL TESTS ABOVE MEASURE AGAINST THE DESTINATION; THE DRIVE BELOW
+    // STEERS AT THE NEXT WAYPOINT. Keeping those two apart is what lets a path
+    // and the settling logic coexist. Deciding "am I there yet" against a
+    // waypoint would settle a unit at the first corner of its route; steering
+    // at the final goal would walk it into the wall the route exists to avoid.
+    //
+    // The speed ramp is applied by scaling dt rather than by reimplementing the
+    // step, so the slowdown behaves identically whether or not a path is in
+    // play - the ramp is an arrival behaviour, not a pathing one.
+    float scaledDt = dt*(speed/u->moveSpeed);
+    if (index >= 0) StrategyMoveTo(u, index, dest, scaledDt);
+    else            StrategyMoveDirect(u, dest, scaledDt);
+    return false;
+}
+
+// Begin a fresh walk. Every place that sets a new move destination must reset
+// the arrival progression, or a unit that settled on its last order arrives
+// instantly at its next one.
+static void MoveArriveReset(Unit *u)
+{
+    u->arrival          = ARRIVE_SEEKING;
+    u->stallTimer       = 0.0f;
+    u->lastProgressDist = 1000000.0f;
+
+    // Drop any shared flow field along with the formation. A field points every
+    // unit on it at ONE goal cell, so a unit given its own destination while
+    // still riding one is steered at the old group's target - and since the
+    // field is only released on the approach, it does so for the whole march.
+    //
+    // The index is derived by pointer arithmetic rather than passed in:
+    // StrategyOrderMove takes a `Unit *` and is called from strategy_ai.c and
+    // several other sites, and this is the single funnel every new destination
+    // already passes through. The unit's A* path is deliberately kept - NeedsPath
+    // decides when a route has gone stale, which is not this function's business.
+    StrategyMoveDropField((int)(u - world.units));
+
+    // Any new destination leaves the old formation. StrategyOrderMoveGroup
+    // re-stamps this immediately AFTER calling the single-unit order, so a group
+    // order still forms up - but every other order (attack, gather, a lone
+    // right-click) drops the unit out of its block, which is what the player
+    // means by giving it a different job.
+    u->formGroup      = -1;
+    u->formForming    = false;
+    u->formEverFormed = false;
+    u->formBrokeOff   = false;
+
+    // The remembered slot goes too. It is only meaningful as a position within a
+    // formation this unit is still part of - kept across a job change, it would
+    // let the unit re-claim a slot in a block it has left, and evict whoever is
+    // standing there now.
+    u->formSlotIndex  = -1;
+    u->formSlotShape  = -1;
+    u->formSlotOf     = -1;
+
+    // The dodge commitment goes too. It records which way this unit turned
+    // around an obstacle on the way to its LAST destination; carried into a new
+    // order it would bias the first obstacle of the new route toward a side
+    // chosen for a wall somewhere else entirely.
+    u->dodgeSide      = 0;
 }
 
 // Nearest own building that ACCEPTS what the unit is carrying - wood only
 // lands at logging camps / town halls, and so on.
+// True when `index` is still a building this unit may deposit into. Used to
+// decide whether a cached dropoff choice can be reused: buildings are sold,
+// destroyed and completed mid-run, so the cache cannot simply be trusted.
+static bool DropoffValid(const Unit *u, int index)
+{
+    if (index < 0 || index >= STRAT_MAX_BUILDINGS) return false;
+
+    const Building *b = &world.buildings[index];
+    return b->active && !b->underConstruction && b->faction == u->faction &&
+           StrategyBuildingDef(b->kind)->accepts[u->carryKind];
+}
+
 static int NearestDropoff(const Unit *u)
 {
     int best = -1;
@@ -1321,14 +2737,45 @@ static int NearestDropoff(const Unit *u)
     return best;
 }
 
+// Cached NearestDropoff. The full search walks every building and runs from
+// UNIT_RETURN, which every carrying worker is in for seconds at a time - so at
+// scale it was a per-frame scan multiplied by the number of workers. The answer
+// only changes when the chosen building stops accepting, so keep it.
+//
+// NOT NECESSARILY THE NEAREST any more, and that is the deliberate trade: a
+// worker keeps walking to the depot it set out for even if a closer one is
+// finished mid-trip. That reads as a worker following through rather than as a
+// bug, and re-searching every frame to avoid it is what made this expensive.
+static int NearestDropoffCached(Unit *u)
+{
+    if (DropoffValid(u, u->dropoffCache)) return u->dropoffCache;
+
+    u->dropoffCache = NearestDropoff(u);
+    return u->dropoffCache;
+}
+
 static int NearestHostile(const Unit *u, float range)
 {
     int best = -1;
     float bestDist = range;
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+
+    // The sight hash, not the active roster. This scan used to walk every unit
+    // in the world and it runs from UnitAggroScan, which is the first line of
+    // every unit's update - so it was an O(n^2) pass hiding behind a name that
+    // sounds like a lookup. At 10,000 units it cost more than separation did.
+    int n = SpHashQuery(&s_sightHash, u->pos.x, u->pos.z, range,
+                        s_sightScratch, SP_HASH_ITEMS_MAX);
+
+    for (int q = 0; q < n; q++)
     {
+        int i = s_sightScratch[q];
         Unit *other = &world.units[i];
-        if (!other->active || other->faction == u->faction) continue;
+
+        // The hash is rebuilt at the top of the frame, so a unit killed earlier
+        // in this same update is still listed. Targeting a corpse would leave
+        // the attacker swinging at nothing until its next scan.
+        if (!other->active) continue;
+        if (other->faction == u->faction) continue;
         if (other->faction == FACTION_NEUTRAL) continue;   // animals aren't hostile
 
         float d = DistXZ(other->pos, u->pos);
@@ -1343,11 +2790,56 @@ static int NearestHostile(const Unit *u, float range)
 
 // Kill a unit. A hunted animal leaves a food corpse node behind, and a worker
 // that did the killing immediately starts harvesting it (hunting loop).
+// A corpse borrows the unit's look for as long as its DIE animation runs. When
+// the pool is full the OLDEST is recycled: a death that cannot be shown is
+// better than dropping the newest one, which is the one the player is watching.
+static void CorpseSpawn(const Unit *u)
+{
+    int slot = -1;
+    float oldest = -1.0f;
+
+    for (int i = 0; i < STRAT_MAX_CORPSES; i++)
+    {
+        if (!world.corpses[i].active) { slot = i; break; }
+        if (world.corpses[i].t > oldest) { oldest = world.corpses[i].t; slot = i; }
+    }
+    if (slot < 0) return;
+
+    world.corpses[slot] = (UnitCorpse){
+        .active = true, .kind = u->kind, .faction = u->faction,
+        .pos = u->pos, .yaw = u->anim.yaw, .t = 0.0f
+    };
+}
+
+static void CorpsesUpdate(float dt)
+{
+    for (int i = 0; i < STRAT_MAX_CORPSES; i++)
+    {
+        UnitCorpse *c = &world.corpses[i];
+        if (!c->active) continue;
+
+        c->t += dt;
+
+        // Retired against the ASSET's own DIE length, so an author lengthening
+        // the animation lengthens the corpse without touching this code. No
+        // asset, or nothing authored, means there is nothing to wait for.
+        const SgaAsset *a = StrategyCatalogForRole(SGB_ROLE_UNIT, c->kind);
+        float dur = (a != NULL) ? a->duration[SGA_STATE_DIE] : 0.0f;
+        if ((dur <= 0.0f) || (c->t >= dur)) c->active = false;
+    }
+}
+
 static void UnitKill(int index, Unit *killer)
 {
     Unit *u = &world.units[index];
+
+    // Copy the look out BEFORE the slot is freed. The slot itself is released
+    // on the very next line, exactly as it always was.
+    CorpseSpawn(u);
+
     u->active   = false;
     u->selected = false;
+    RosterRemove(index);
 
     EffectSpawn(FX_RING, u->pos, UnitColor(u));
     for (int i = 0; i < 4; i++)
@@ -1374,10 +2866,13 @@ static void AnimalPanic(int victimIndex, Vector3 threat)
 {
     Vector3 origin = world.units[victimIndex].pos;
 
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    int n = SpHashQuery(&s_sightHash, origin.x, origin.z, STRAT_FLEE_PACK_RADIUS,
+                        s_sightScratch, SP_HASH_ITEMS_MAX);
+    for (int q = 0; q < n; q++)
     {
-        Unit *u = &world.units[i];
-        if (!u->active || u->kind != KIND_ANIMAL_WEAK) continue;
+        Unit *u = &world.units[s_sightScratch[q]];
+        if (!u->active) continue;       // hash may hold a unit killed this frame
+        if (u->kind != KIND_ANIMAL_WEAK) continue;
         if (DistXZ(u->pos, origin) > STRAT_FLEE_PACK_RADIUS) continue;
 
         Vector3 away = Vector3Subtract(u->pos, threat);
@@ -1386,14 +2881,15 @@ static void AnimalPanic(int victimIndex, Vector3 threat)
 
         Vector3 dest = Vector3Add(u->pos,
                                   Vector3Scale(Vector3Normalize(away), STRAT_FLEE_DIST));
-        dest.x = Clamp(dest.x, -STRAT_GROUND_HALF + 1.0f, STRAT_GROUND_HALF - 1.0f);
-        dest.z = Clamp(dest.z, -STRAT_GROUND_HALF + 1.0f, STRAT_GROUND_HALF - 1.0f);
+        dest.x = Clamp(dest.x, -world.groundHalfX + 1.0f, world.groundHalfX - 1.0f);
+        dest.z = Clamp(dest.z, -world.groundHalfZ + 1.0f, world.groundHalfZ - 1.0f);
 
         u->state          = UNIT_FLEE;
         u->target         = dest;
         u->targetUnit     = -1;
         u->targetNode     = -1;
         u->targetBuilding = -1;
+        MoveArriveReset(u);
     }
 }
 
@@ -1405,10 +2901,14 @@ static void AnimalRetaliate(int victimIndex, Unit *attacker)
     if (attackerIndex < 0 || attackerIndex >= STRAT_MAX_UNITS) return;
 
     Vector3 origin = world.units[victimIndex].pos;
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+
+    int n = SpHashQuery(&s_sightHash, origin.x, origin.z, STRAT_FLEE_PACK_RADIUS,
+                        s_sightScratch, SP_HASH_ITEMS_MAX);
+    for (int q = 0; q < n; q++)
     {
-        Unit *u = &world.units[i];
-        if (!u->active || u->kind != KIND_ANIMAL_STRONG) continue;
+        Unit *u = &world.units[s_sightScratch[q]];
+        if (!u->active) continue;       // hash may hold a unit killed this frame
+        if (u->kind != KIND_ANIMAL_STRONG) continue;
         if (DistXZ(u->pos, origin) > STRAT_FLEE_PACK_RADIUS) continue;
 
         StrategyOrderAttack(u, attackerIndex);
@@ -1421,6 +2921,10 @@ static bool UnitDamage(int victimIndex, Unit *attacker, float damage)
 {
     Unit *v = &world.units[victimIndex];
     v->hp -= damage;
+
+    // Before the death test on purpose: a killing blow should read as a death,
+    // not as a flinch that is immediately replaced by one.
+    if (v->hp > 0.0f) StrategyEntityAnimEvent(v, SGA_STATE_DAMAGED);
 
     if (v->kind == KIND_ANIMAL_WEAK)        AnimalPanic(victimIndex, attacker->pos);
     else if (v->kind == KIND_ANIMAL_STRONG) AnimalRetaliate(victimIndex, attacker);
@@ -1436,20 +2940,86 @@ static bool UnitDamage(int victimIndex, Unit *attacker, float damage)
 // Auto-aggro: idle units of BOTH factions engage hostiles on sight; enemy
 // units also break off moving/working (the player keeps manual control).
 // Animals only react when hit; templars never fight.
-static void UnitAggroScan(Unit *u)
+//
+// STAGGERED. Only one unit in STRAT_AGGRO_STRIDE scans on any given frame,
+// chosen by index so the load is spread evenly rather than spiking when a wave
+// spawns together. A unit therefore notices an enemy up to a quarter second
+// late, which is well inside how long it already takes to walk into range - but
+// it makes the whole pass 15x cheaper, and this pass runs for every unit every
+// frame whether or not there is an enemy anywhere near.
+static void UnitAggroScan(Unit *u, int index, int frame)
 {
+    if (((index + frame) % STRAT_AGGRO_STRIDE) != 0) return;
+
     if (u->kind == KIND_ANIMAL_WEAK || u->kind == KIND_ANIMAL_STRONG) return;
     if (u->kind == KIND_TEMPLAR || u->kind == KIND_TEMPLAR_HEALER) return;
 
+    // Idle units of any faction scan. An AI FIGHTER also breaks off mid-march,
+    // because nobody is watching it and a soldier that walks past an enemy
+    // reads as broken. The player's units do not: that would be the game taking
+    // manual control away.
+    //
+    // WORKERS ARE EXCLUDED, and that exclusion is load-bearing. This test was
+    // `u->faction == 1` back when faction 1 was the only AI; generalising it to
+    // `!= 0` without also excluding workers made every AI worker abandon its
+    // job to charge any enemy it could see. On a map where two bases are close
+    // - "four lakes" - the two economies walked into each other and killed each
+    // other off with 4-damage punches inside thirty seconds, leaving both
+    // factions with buildings, no workers and no way to ever rebuild. A worker
+    // that is already working stays working; an idle one still defends itself
+    // through the UNIT_IDLE arm above.
+    bool fighter = (u->kind == KIND_SOLDIER) || (u->kind == KIND_RANGED);
     bool scan = (u->state == UNIT_IDLE) ||
-                (u->faction == 1 && (u->state == UNIT_MOVE ||
+                (u->faction != 0 && fighter &&
+                                    (u->state == UNIT_MOVE ||
                                      u->state == UNIT_GATHER ||
                                      u->state == UNIT_RETURN ||
                                      u->state == UNIT_FARM));
+
+    // A player unit marching in formation scans too, but under the formation's
+    // OWN break-off rule rather than the blanket one above - that is the whole
+    // point of the setting. Without this a formation walks past an enemy army
+    // without reacting, because plain UNIT_MOVE never scanned for faction 0.
+    bool inFormation = (u->formGroup >= 0 && u->state == UNIT_MOVE && !u->formBrokeOff);
+    if (inFormation)
+    {
+        switch (StrategyFormationBehavior())
+        {
+            case FORM_BEHAVIOR_HOLD:
+                return;                 // the march IS the order; ignore everything
+            case FORM_BEHAVIOR_SKIRMISH:
+            case FORM_BEHAVIOR_ENGAGE:
+                scan = true;
+                break;
+            default: break;
+        }
+    }
+
     if (!scan) return;
 
-    int hostile = NearestHostile(u, u->sightRange);
-    if (hostile >= 0) StrategyOrderAttack(u, hostile);
+    // SKIRMISH peels a unit off only when the enemy is inside its OWN attack
+    // range, not its much longer sight range. That difference is what keeps a
+    // brush with one scout from dissolving the formation: units see far, but
+    // only the ones actually able to strike stop marching.
+    float range = u->sightRange;
+    if (inFormation && StrategyFormationBehavior() == FORM_BEHAVIOR_SKIRMISH)
+        range = u->attackRange;
+
+    int hostile = NearestHostile(u, range);
+    if (hostile < 0) return;
+
+    if (inFormation)
+    {
+        // ENGAGE breaks the whole formation on first contact: one unit finding
+        // an enemy releases every member of its group, so they commit together
+        // instead of feeding in one at a time.
+        if (StrategyFormationBehavior() == FORM_BEHAVIOR_ENGAGE)
+            StrategyFormationBreak(u->formGroup);
+        else
+            u->formBrokeOff = true;     // SKIRMISH: just this one
+    }
+
+    StrategyOrderAttack(u, hostile);
 }
 
 // Templar target search. The blessing templar shadows own units that are
@@ -1461,10 +3031,21 @@ static int TemplarFindTarget(const Unit *u)
     int best = -1;
     float bestDist = healer ? 15.0f : 1000000.0f;
 
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    // NOT hashed, and deliberately so. The blessing templar's search is
+    // UNBOUNDED - it takes the nearest working unit anywhere on the map, and
+    // the fallback below is unbounded too - so a radius query cannot express
+    // it. Bounding it to make it hashable would change behaviour: a templar
+    // with no worker nearby would stand still instead of walking across the map
+    // to the far base, which is a gameplay change disguised as an optimization.
+    //
+    // It stays a full scan because templars are RARE - one or two per side, not
+    // a per-unit cost like the aggro scan. If a build ever fields hundreds of
+    // them this becomes the next thing to fix.
+    for (int k = 0; k < s_activeCount; k++)
     {
+        int i = s_active[k];
         Unit *other = &world.units[i];
-        if (!other->active || other->faction != u->faction || other == u) continue;
+        if (other->faction != u->faction || other == u) continue;
         if (other->kind == KIND_TEMPLAR || other->kind == KIND_TEMPLAR_HEALER) continue;
 
         if (healer)
@@ -1487,10 +3068,11 @@ static int TemplarFindTarget(const Unit *u)
 
     // Fallback: any own non-templar unit, unlimited range.
     bestDist = 1000000.0f;
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < s_activeCount; k++)
     {
+        int i = s_active[k];
         Unit *other = &world.units[i];
-        if (!other->active || other->faction != u->faction || other == u) continue;
+        if (other->faction != u->faction || other == u) continue;
         if (other->kind == KIND_TEMPLAR || other->kind == KIND_TEMPLAR_HEALER) continue;
 
         float d = DistXZ(other->pos, u->pos);
@@ -1507,17 +3089,42 @@ static void UnitUpdate(int index, float dt)
 {
     Unit *u = &world.units[index];
 
-    UnitAggroScan(u);
+    UnitAggroScan(u, index, s_frame);
 
     switch (u->state)
     {
         case UNIT_IDLE:
-            break;
+        {
+            // A unit that arrived in a formation holds its slot, so the block
+            // stays visible instead of dissolving the moment everyone stops.
+            // An idle unit with no formation is free, which is the other half of
+            // what the player means - the formation is the order, not a leash.
+            //
+            // Applied to `pos`, not `vel`: that bypasses the separation velocity
+            // integrator so its damping term cannot amplify the correction into
+            // a bounce. See StrategyFormationHoldPull for the other two rules
+            // that keep this from reintroducing the clustering spiral.
+            Vector3 pull = StrategyFormationHoldPull(index, u, dt);
+            u->pos.x += pull.x;
+            u->pos.z += pull.z;
+        } break;
 
         case UNIT_MOVE:
         {
-            MoveToward(u, u->target, dt);
-            if (DistXZ(u->pos, u->target) < 0.15f) u->state = UNIT_IDLE;
+            // MoveArrive, not MoveToward: this is a walk to a fixed point on
+            // the ground, so it is the one case that has to decide it is over.
+            // The old test here was `< 0.15f` against a 0.35 unit radius - in
+            // any crowd that is unreachable, so the state never resolved.
+            //
+            // THE ONE STATE THE CONTROL SCHEME FORKS. Every other case in this
+            // switch is chasing, gathering or fighting something, and those all
+            // steer directly under every scheme - see the note on the movers in
+            // strategy_world.h. A walk to a clicked point is the only thing the
+            // three systems actually disagree about.
+            bool done = (s_scheme == STRAT_CTRL_CURRENT)
+                      ? MoveArrive(u, index, u->target, dt)
+                      : MoveLegacy(u, index, dt);
+            if (done) u->state = UNIT_IDLE;
         } break;
 
         case UNIT_GATHER:
@@ -1537,7 +3144,7 @@ static void UnitUpdate(int index, float dt)
             }
             if (DistXZ(u->pos, n->pos) > 1.0f)
             {
-                MoveToward(u, n->pos, dt);
+                StrategyMoveTo(u, index, n->pos, dt);
                 break;
             }
             // In working range: one resource unit per gatherTime tick.
@@ -1554,9 +3161,10 @@ static void UnitUpdate(int index, float dt)
 
                 if (n->remaining <= 0)
                 {
-                    n->active = false;     // depleted: vanish with a burst
-                    EffectSpawn(FX_PUFF, (Vector3){ n->pos.x, 0.6f, n->pos.z }, puff);
-                    EffectSpawn(FX_RING, n->pos, puff);
+                    Vector3 np = n->pos;                // read before despawn
+                    NodeDespawn(u->targetNode);         // depleted: vanish with a burst
+                    EffectSpawn(FX_PUFF, (Vector3){ np.x, 0.6f, np.z }, puff);
+                    EffectSpawn(FX_RING, np, puff);
                 }
             }
             if (u->carryAmount >= STRAT_CARRY_MAX || !n->active)
@@ -1567,7 +3175,7 @@ static void UnitUpdate(int index, float dt)
 
         case UNIT_RETURN:
         {
-            int home = NearestDropoff(u);
+            int home = NearestDropoffCached(u);
             if (home < 0)
             {
                 u->carryAmount = 0;     // nothing accepts this - dump it
@@ -1575,9 +3183,9 @@ static void UnitUpdate(int index, float dt)
                 break;
             }
             Building *b = &world.buildings[home];
-            if (DistXZ(u->pos, b->pos) > 1.6f)
+            if (DistXZ(u->pos, b->pos) > BuildingReach(b->kind))
             {
-                MoveToward(u, b->pos, dt);
+                StrategyMoveTo(u, index, b->pos, dt);
                 break;
             }
             world.stockpile[u->faction][u->carryKind] += u->carryAmount;
@@ -1620,12 +3228,12 @@ static void UnitUpdate(int index, float dt)
             // 1) Carrying a full load: walk it to the nearest accepting building.
             if (u->carryAmount >= STRAT_CARRY_MAX)
             {
-                int home = NearestDropoff(u);
+                int home = NearestDropoffCached(u);
                 if (home < 0) { u->carryAmount = 0; }   // nothing accepts it: dump
                 else
                 {
                     Building *h = &world.buildings[home];
-                    if (DistXZ(u->pos, h->pos) > 1.6f) { MoveToward(u, h->pos, dt); break; }
+                    if (DistXZ(u->pos, h->pos) > BuildingReach(h->kind)) { StrategyMoveTo(u, index, h->pos, dt); break; }
                     world.stockpile[u->faction][u->carryKind] += u->carryAmount;
                     u->carryAmount = 0;
                     EffectSpawn(FX_FLASH, (Vector3){ h->pos.x, 1.2f, h->pos.z },
@@ -1639,7 +3247,7 @@ static void UnitUpdate(int index, float dt)
             {
                 ResourceNode *n = &world.nodes[u->targetNode];
                 if (!n->active) { u->targetNode = -1; break; }
-                if (DistXZ(u->pos, n->pos) > 1.0f) { MoveToward(u, n->pos, dt); break; }
+                if (DistXZ(u->pos, n->pos) > 1.0f) { StrategyMoveTo(u, index, n->pos, dt); break; }
                 u->gatherTimer += dt;
                 if (u->gatherTimer >= u->gatherTime)
                 {
@@ -1651,9 +3259,10 @@ static void UnitUpdate(int index, float dt)
                                 (nk == NODE_TREE) ? BROWN : (Color){ 220, 190, 90, 255 });
                     if (n->remaining <= 0)
                     {
-                        n->active = false;
+                        Vector3 np = n->pos;
+                        NodeDespawn(u->targetNode);
                         u->targetNode = -1;
-                        EffectSpawn(FX_RING, n->pos, GRAY);
+                        EffectSpawn(FX_RING, np, GRAY);
                     }
                 }
                 break;
@@ -1685,9 +3294,9 @@ static void UnitUpdate(int index, float dt)
             if (!u->tendEquipped)
             {
                 // Equip leg: return to the building and dwell to gear up.
-                if (DistXZ(u->pos, tb->pos) > STRAT_BUILD_RANGE)
+                if (DistXZ(u->pos, tb->pos) > BuildingReach(tb->kind))
                 {
-                    MoveToward(u, tb->pos, dt);
+                    StrategyMoveTo(u, index, tb->pos, dt);
                     break;
                 }
                 u->gatherTimer += dt;
@@ -1728,9 +3337,9 @@ static void UnitUpdate(int index, float dt)
                 u->targetBuilding = -1;
                 break;
             }
-            if (DistXZ(u->pos, b->pos) > STRAT_BUILD_RANGE)
+            if (DistXZ(u->pos, b->pos) > BuildingReach(b->kind))
             {
-                MoveToward(u, b->pos, dt);
+                StrategyMoveTo(u, index, b->pos, dt);
                 break;
             }
             float buildTime = StrategyBuildingDef(b->kind)->buildTime;
@@ -1772,9 +3381,9 @@ static void UnitUpdate(int index, float dt)
                     WorkerAutoGatherForBuilding(u, repaired);
                 break;
             }
-            if (DistXZ(u->pos, b->pos) > STRAT_BUILD_RANGE)
+            if (DistXZ(u->pos, b->pos) > BuildingReach(b->kind))
             {
-                MoveToward(u, b->pos, dt);
+                StrategyMoveTo(u, index, b->pos, dt);
                 break;
             }
             b->hp = fminf(b->maxHp, b->hp + STRAT_REPAIR_RATE*dt);
@@ -1873,8 +3482,13 @@ static void UnitUpdate(int index, float dt)
 
         case UNIT_FLEE:
         {
-            MoveToward(u, u->target, dt);
-            if (DistXZ(u->pos, u->target) < 0.2f) u->state = UNIT_IDLE;
+            // -1 means "no path, steer straight", and that is right here for
+            // two reasons. A flee target is STRAT_FLEE_DIST directly away from
+            // the threat - short, and by construction not around anything. And
+            // panic is a PACK response: every weak animal within the pack
+            // radius flees on the same frame, so pathing this would fire a
+            // burst of searches for a run that lasts a second or two.
+            if (MoveArrive(u, -1, u->target, dt)) u->state = UNIT_IDLE;
         } break;
 
         case UNIT_FOLLOW:
@@ -1905,6 +3519,7 @@ static void UnitUpdate(int index, float dt)
                         break;      // broke: keep following, try again later
                     world.stockpile[u->faction][RES_PROVIDENCE] -= STRAT_HEAL_COST;
                     t->hp = fminf(t->maxHp, t->hp + STRAT_HEAL_AMOUNT);
+                    StrategyEntityAnimEvent(t, SGA_STATE_HEALED);
                 }
                 else world.stockpile[u->faction][RES_PROVIDENCE] += 1;
 
@@ -1934,62 +3549,584 @@ static void UnitUpdate(int index, float dt)
     }
 
     // Never leave the ground plane.
-    u->pos.x = Clamp(u->pos.x, -STRAT_GROUND_HALF, STRAT_GROUND_HALF);
-    u->pos.z = Clamp(u->pos.z, -STRAT_GROUND_HALF, STRAT_GROUND_HALF);
+    u->pos.x = Clamp(u->pos.x, -world.groundHalfX, world.groundHalfX);
+    u->pos.z = Clamp(u->pos.z, -world.groundHalfZ, world.groundHalfZ);
 }
 
-// Push overlapping units apart so groups spread instead of stacking.
-// O(n^2) over 64 units is nothing; no spatial structure needed.
-static void UnitSeparation(void)
+// ----------------------------------------------------------------------------
+//  Separation
+// ----------------------------------------------------------------------------
+//  Push overlapping units apart so groups spread instead of stacking. Three
+//  things changed from the original pairwise version, and all three are needed
+//  before a large crowd will come to rest:
+//
+//  1. HASHED, NOT O(n^2). The old loop compared every unit against every other
+//     - 4,560 tests at 96 units, 50 million at 10,000. The hash asks only who
+//     shares your patch of ground.
+//
+//  2. FORCE, NOT TELEPORT. The old loop wrote a->pos and b->pos INSIDE the pair
+//     loop, so a unit's final position depended on how many neighbours were
+//     visited after it. That order-dependence is systematic, not random, which
+//     is what turned jitter into the whole mass slowly rotating. Now each unit
+//     sums a force, and every position is integrated once, after all forces are
+//     known - so the result cannot depend on visit order.
+//
+//  3. APPLY/RECEIVE ASYMMETRY. A settled unit stops APPLYING push but still
+//     RECEIVES it. Without this, two neighbours that have both arrived keep
+//     shoving each other forever and the pile never stops breathing.
+//
+//  The pass is one-directional: each unit queries its own neighbourhood and
+//  accumulates only its OWN force. That does redundant work - every pair is
+//  examined twice, once from each end - but it keeps the loop trivially
+//  parallel-shaped and, more importantly, lets rule 3 apply per-unit. Halving
+//  the work by writing both units from one visit is exactly the mutation that
+//  made the old version order-dependent.
+static void UnitHashRebuild(void)
 {
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    // Cell size is twice the query radius, so a query touches a 2x2 block of
+    // cells instead of 3x3 - four chains to walk rather than nine.
+    SpHashBegin(&s_unitHash, 2.0f*STRAT_SEP_RADIUS,
+                world.groundHalfX + 2.0f, world.groundHalfZ + 2.0f);
+    SpHashBegin(&s_sightHash, STRAT_SIGHT_CELL,
+                world.groundHalfX + 2.0f, world.groundHalfZ + 2.0f);
+
+    for (int k = 0; k < s_activeCount; k++)
     {
+        int i = s_active[k];
+        float x = world.units[i].pos.x, z = world.units[i].pos.z;
+        SpHashInsert(&s_unitHash,  i, x, z);
+        SpHashInsert(&s_sightHash, i, x, z);
+    }
+}
+
+// A unit only pushes while it is actually walking somewhere. Everything else -
+// idle, gathering, building, attacking in place - is stationary by intent, and
+// a stationary unit that still applies push is a permanent engine with nothing
+// pulling it back.
+//
+// This is deliberately derived from `state` rather than tracked in a field.
+// `arrival` is only ever written by MoveArrive, which only the two UNIT_MOVE /
+// UNIT_FLEE branches call, so a freshly spawned unit sits at ARRIVE_SEEKING (=0
+// from `(Unit){0}`) forever and reads as a full-strength pusher. Deriving it
+// means a new unit state cannot silently opt itself back into shoving.
+static bool UnitPushes(const Unit *u)
+{
+    if (u->arrival == ARRIVE_SETTLED) return false;
+    return (u->state == UNIT_MOVE) || (u->state == UNIT_FLEE) ||
+           (u->state == UNIT_FOLLOW);
+}
+
+static void UnitSeparation(float dt)
+{
+    int32_t neighbors[STRAT_SEP_MAX_NEIGHBORS];
+
+    for (int ka = 0; ka < s_activeCount; ka++)
+    {
+        int i = s_active[ka];
         Unit *a = &world.units[i];
-        if (!a->active) continue;
 
-        for (int j = i + 1; j < STRAT_MAX_UNITS; j++)
+        int n = SpHashQuery(&s_unitHash, a->pos.x, a->pos.z, STRAT_SEP_RADIUS,
+                            neighbors, STRAT_SEP_MAX_NEIGHBORS);
+
+        float fx = 0.0f, fz = 0.0f;
+        int   settledNeighbors = 0;
+
+        for (int q = 0; q < n; q++)
         {
+            int j = neighbors[q];
+            if (j == i) continue;               // the query returns self
+
             Unit *b = &world.units[j];
-            if (!b->active) continue;
+            if (!b->active) continue;           // killed after the rebuild
+            float dx = a->pos.x - b->pos.x;
+            float dz = a->pos.z - b->pos.z;
+            float d  = sqrtf(dx*dx + dz*dz);
 
-            float minDist = 2.0f*STRAT_UNIT_RADIUS;
-            float d = DistXZ(a->pos, b->pos);
-            if (d >= minDist) continue;
+            // "Finished" for the chokepoint rule means anything not going to
+            // move out of the way, which includes units that never had an order
+            // at all - a squad grinding against idle bystanders is stuck just as
+            // hard as one grinding against arrivals.
+            if (!UnitPushes(b)) settledNeighbors++;
 
-            Vector3 push;
             if (d < 0.001f)
             {
-                // Exactly stacked: separate along a per-pair fixed direction.
-                push = (Vector3){ (i%2 == 0) ? 1.0f : -1.0f, 0.0f, 1.0f };
-                push = Vector3Normalize(push);
+                // Exactly coincident: no direction to derive, so take a stable
+                // one from the pair itself. Deriving it from iteration order
+                // (the old `i % 2`) means the pair parts differently depending
+                // on which end the hash happened to return first, and that
+                // flips every frame.
+                SpSeparationJitter(i, j, &dx, &dz);
+                d = 0.001f;
             }
             else
             {
-                push = Vector3Scale(Vector3Subtract(a->pos, b->pos), 1.0f/d);
+                dx /= d;
+                dz /= d;
             }
-            float half = (minDist - d)*0.5f;
-            a->pos = Vector3Add(a->pos, Vector3Scale(push, half));
-            b->pos = Vector3Subtract(b->pos, Vector3Scale(push, half));
+
+            // Normalized falloff: full strength at total overlap, zero at the
+            // separation radius. Dividing by d instead would send the force to
+            // infinity as units converge, which ejects them across the map.
+            float strength = (STRAT_SEP_RADIUS - d)/STRAT_SEP_RADIUS;
+            fx += dx*strength;
+            fz += dz*strength;
         }
+
+        a->crowd = settledNeighbors;
+
+        // A parked unit does not push. It is still pushed - it just stopped
+        // being an engine. This is the line that ends the oscillation.
+        if (!UnitPushes(a)) { fx = 0.0f; fz = 0.0f; }
+
+        // Deadband: forces this small are the residue of a crowd that has
+        // effectively resolved, and applying them is what makes a dense pile
+        // shimmer in place instead of looking still.
+        if (fx*fx + fz*fz < STRAT_SEP_DEADBAND*STRAT_SEP_DEADBAND)
+        {
+            fx = 0.0f;
+            fz = 0.0f;
+        }
+
+        a->vel.x += fx*STRAT_SEP_STRENGTH*dt;
+        a->vel.z += fz*STRAT_SEP_STRENGTH*dt;
+
+        // Exponential damping. Without it the accumulated velocity has no way
+        // to decay and a resolved crowd keeps coasting apart.
+        float damp = 1.0f - STRAT_SEP_DAMP*dt;
+        if (damp < 0.0f) damp = 0.0f;       // guard a big dt (alt-tab, breakpoint)
+        a->vel.x *= damp;
+        a->vel.z *= damp;
+    }
+
+    // Integrate every unit ONCE, after every force is known. Splitting this out
+    // of the loop above is the whole point: while forces are being summed, no
+    // position moves, so nothing a unit reads can depend on who came first.
+    for (int k = 0; k < s_activeCount; k++)
+    {
+        Unit *u = &world.units[s_active[k]];
+
+        // Clamp to the unit's own speed so a shove out of a dense pile can
+        // never outrun a walk - a unit rocketing out of a crowd reads as a bug
+        // even when the maths is sound.
+        float speed = sqrtf(u->vel.x*u->vel.x + u->vel.z*u->vel.z);
+        if (speed > u->moveSpeed && speed > 0.0001f)
+        {
+            float s = u->moveSpeed/speed;
+            u->vel.x *= s;
+            u->vel.z *= s;
+        }
+
+        u->pos.x += u->vel.x*dt;
+        u->pos.z += u->vel.z*dt;
+
+        // Units cannot be shoved off the world. Buildings and terrain do not
+        // block yet - that is the nav grid in the next phase.
+        u->pos.x = Clamp(u->pos.x, -world.groundHalfX + 0.3f, world.groundHalfX - 0.3f);
+        u->pos.z = Clamp(u->pos.z, -world.groundHalfZ + 0.3f, world.groundHalfZ - 0.3f);
+    }
+}
+
+// ----------------------------------------------------------------------------
+//  Stress-test spawning (path lab only)
+//
+//  Goes through the ordinary UnitSpawn so stress units are indistinguishable
+//  from real ones - same stat resolution, same slots, same everything. A test
+//  population that took a shortcut would measure the shortcut.
+// ----------------------------------------------------------------------------
+int StrategyDebugSpawnUnits(int faction, UnitKind kind, Vector3 center,
+                            float radius, int count)
+{
+    int spawned = 0;
+    for (int i = 0; i < count; i++)
+    {
+        // Sunflower spiral rather than random: it fills the disc evenly at any
+        // count, so density does not depend on how many you asked for, and it
+        // is deterministic - the same N always lays out the same way, which is
+        // what makes two stress runs comparable.
+        float t = (count > 1) ? (float)i/(float)(count - 1) : 0.0f;
+        float r = radius*sqrtf(t);
+        float a = (float)i*2.39996323f;     // golden angle
+        Vector3 pos = (Vector3){ center.x + r*cosf(a), 0.0f, center.z + r*sinf(a) };
+
+        pos.x = Clamp(pos.x, -world.groundHalfX + 0.5f, world.groundHalfX - 0.5f);
+        pos.z = Clamp(pos.z, -world.groundHalfZ + 0.5f, world.groundHalfZ - 0.5f);
+
+        if (UnitSpawn(faction, kind, pos) == NULL) break;   // pool full
+        spawned++;
+    }
+    return spawned;
+}
+
+void StrategyDebugClearUnits(void)
+{
+    for (int k = 0; k < s_activeCount; k++) world.units[s_active[k]].active = false;
+    RosterReset();
+    world.selectedBuilding = -1;
+}
+
+void StrategyDebugNavStats(int *outBlocked, int *outSkirt)
+{
+    int blocked = 0, skirt = 0;
+    int cells = s_nav.w*s_nav.h;
+    for (int i = 0; i < cells; i++)
+    {
+        uint8_t c = s_nav.cost[i];
+        if (c == SP_COST_BLOCKED)     blocked++;
+        else if (c >= SP_COST_SKIRT)  skirt++;
+    }
+    if (outBlocked != NULL) *outBlocked = blocked;
+    if (outSkirt != NULL)   *outSkirt   = skirt;
+}
+
+static bool s_navShow;
+
+void StrategyDebugNavShow(bool on) { s_navShow = on; }
+bool StrategyDebugNavShown(void)   { return s_navShow; }
+
+// Called from inside StrategyWorldDraw3D's 3D pass, not by the lab directly.
+static void NavDraw(void)
+{
+    // Flat quads a hair above the ground plane so they win the depth test
+    // against it without z-fighting, and below anything standing on it.
+    const float y = 0.03f;
+
+    for (int z = 0; z < s_nav.h; z++)
+    {
+        for (int x = 0; x < s_nav.w; x++)
+        {
+            uint8_t c = s_nav.cost[z*s_nav.w + x];
+            if (c == SP_COST_NORMAL) continue;      // plain ground: draw nothing
+
+            Color col;
+            if (c == SP_COST_BLOCKED)      col = (Color){ 200,  40,  40, 150 };
+            else if (c == SP_COST_SHALLOW) col = (Color){  70, 140, 200, 100 };
+            else                           col = (Color){ 220, 170,  40,  90 };
+
+            Vector3 w = SpTileToWorld(&s_nav, x, z);
+            DrawCube((Vector3){ w.x, y, w.z }, 0.94f, 0.01f, 0.94f, col);
+        }
+    }
+}
+
+// -- Path overlay -------------------------------------------------------------
+static bool s_pathShow;
+static bool s_flowShow;
+static bool s_slotShow;
+
+void StrategyDebugPathShow(bool on) { s_pathShow = on; }
+bool StrategyDebugPathShown(void)   { return s_pathShow; }
+
+void StrategyDebugFlowShow(bool on) { s_flowShow = on; }
+bool StrategyDebugFlowShown(void)   { return s_flowShow; }
+
+void StrategyDebugSlotShow(bool on) { s_slotShow = on; }
+bool StrategyDebugSlotShown(void)   { return s_slotShow; }
+
+void StrategyDebugPathBudgetSet(int nodesPerFrame) { SpServiceSetBudget(nodesPerFrame); }
+int  StrategyDebugPathBudget(void)                 { return SpServiceBudget(); }
+
+void StrategyDebugPathStats(int *outQueued, int *outActive,
+                            int *outPending, int *outNodes)
+{
+    if (outQueued  != NULL) *outQueued  = SpProfGet(SP_COUNT_PATH_REQUESTS);
+    if (outActive  != NULL) *outActive  = SpProfGet(SP_COUNT_PATH_ACTIVE);
+    if (outPending != NULL) *outPending = SpProfGet(SP_COUNT_PATH_PENDING);
+    if (outNodes   != NULL) *outNodes   = SpProfGet(SP_COUNT_ASTAR_NODES);
+}
+
+// Draws the route each SELECTED unit has left to walk. Selected only, and on
+// purpose: at a thousand units every path drawn at once is a solid mat of lines
+// that answers nothing. Selecting a handful and watching where they intend to
+// go is what actually diagnoses a bad route.
+static void PathDraw(void)
+{
+    const float y = 0.35f;      // above the nav tint, below unit bodies
+    Vector3 wp[SP_PATH_MAX];
+
+    int selCount = 0;
+    const int *sel = SelectedUnits(&selCount);
+    for (int k = 0; k < selCount; k++)
+    {
+        int i = sel[k];
+        const Unit *u = &world.units[i];
+        if (!u->active) continue;
+
+        int n = StrategyMovePathOf(i, wp, SP_PATH_MAX);
+        if (n <= 0) continue;
+
+        Color col = strategyFactionColor[u->faction];
+        Vector3 prev = (Vector3){ u->pos.x, y, u->pos.z };
+        for (int j = 0; j < n; j++)
+        {
+            Vector3 cur = (Vector3){ wp[j].x, y, wp[j].z };
+            DrawLine3D(prev, cur, col);
+            // A marker at each corner: the count of these IS the smoothing
+            // result, so a route that should be four hops and shows twenty
+            // means string-pulling silently did nothing.
+            DrawCube(cur, 0.16f, 0.16f, 0.16f, col);
+            prev = cur;
+        }
+    }
+}
+
+// -- Flow field overlay -------------------------------------------------------
+// Draws the direction field the FIRST selected unit is riding. One field, not
+// all sixteen: overlapping arrow mats answer nothing, and the question is
+// always "what is this group following". Nothing selected, or nothing selected
+// that is on a field, draws nothing - which is itself the answer when a group
+// that should be sharing a field is not.
+static void FlowDraw(void)
+{
+    const SpGrid *g = StrategyNavGrid();
+    if (g == NULL) return;
+
+    int selCount = 0;
+    const int *sel = SelectedUnits(&selCount);
+
+    SpFieldId id = SP_FIELD_NONE;
+    for (int k = 0; k < selCount && id == SP_FIELD_NONE; k++)
+        id = StrategyMoveFieldOf(sel[k]);
+    if (id == SP_FIELD_NONE || !SpFlowValid(id)) return;
+
+    const float y = 0.30f;      // under the path overlay, over the nav tint
+
+    // Every fourth cell. At 96x96 that is 576 arrows instead of 9,216, which is
+    // the difference between reading the field and looking at fur.
+    for (int tz = 0; tz < g->h; tz += 4)
+    {
+        for (int tx = 0; tx < g->w; tx += 4)
+        {
+            float dx, dz;
+            if (!SpFlowDir(id, tx, tz, &dx, &dz)) continue;
+            if (dx == 0.0f && dz == 0.0f) continue;         // the goal itself
+
+            Vector3 c = SpCellToWorld(g, (SpCell)(tz*g->w + tx));
+
+            // Cost tint: bright near the goal, dark far from it, so the shape
+            // of the field reads at a glance without following any one arrow.
+            uint16_t cost = SpFlowCost(id, tx, tz);
+            float t = (float)cost/2000.0f;
+            if (t > 1.0f) t = 1.0f;
+            Color col = { (unsigned char)(60 + 195*(1.0f - t)), 220,
+                          (unsigned char)(80 + 100*t), 200 };
+
+            Vector3 a = { c.x - dx*0.35f, y, c.z - dz*0.35f };
+            Vector3 b = { c.x + dx*0.35f, y, c.z + dz*0.35f };
+            DrawLine3D(a, b, col);
+            DrawCube(b, 0.12f, 0.02f, 0.12f, col);          // the head
+        }
+    }
+}
+
+// -- Formation slot overlay ---------------------------------------------------
+// A line from each selected unit to the destination it was ACTUALLY given. The
+// spread of the endpoints is the formation; whether the lines cross is whether
+// slot assignment is spatially coherent. Crossed lines mean units walk through
+// each other to reach their slots - a sort-key bug, invisible any other way.
+static void SlotDraw(void)
+{
+    const float y = 0.40f;
+
+    int selCount = 0;
+    const int *sel = SelectedUnits(&selCount);
+    for (int k = 0; k < selCount; k++)
+    {
+        int i = sel[k];
+        const Unit *u = &world.units[i];
+        if (!u->active) continue;
+
+        Vector3 goal;
+        if (!StrategyMoveGoalOf(i, &goal)) continue;
+
+        Vector3 from = { u->pos.x, y, u->pos.z };
+        Vector3 to   = { goal.x,   y, goal.z   };
+        DrawLine3D(from, to, (Color){ 255, 200, 60, 160 });
+        DrawCube(to, 0.22f, 0.02f, 0.22f, (Color){ 255, 200, 60, 220 });
+    }
+}
+
+// -- Order preview ------------------------------------------------------------
+// Where a move order is about to put the group: a ring the size of the block and
+// a marker on every slot. Drawn for everyone, not just the selection, because it
+// answers a question the player asks at the moment of clicking - "is that going
+// to fit where I think it will" - and the selection may well change immediately.
+static void PreviewDraw(void)
+{
+    Vector3 centre, face; float radius, fade; const Vector3 *slots; int count;
+    if (!StrategyMovePreview(&centre, &radius, &fade, &slots, &count, &face)) return;
+
+    // Alpha eases out rather than falling linearly, so the preview reads as
+    // settling onto the ground instead of being switched off.
+    float a = fade*fade;
+    Color ringCol = { 140, 230, 160, (unsigned char)(200.0f*a) };
+    Color slotCol = { 190, 245, 205, (unsigned char)(230.0f*a) };
+
+    // The ring contracts slightly onto its final size, which is what makes it
+    // read as an order landing rather than an explosion going off.
+    float r = radius*(1.0f + 0.18f*fade);
+    DrawCircle3D((Vector3){ centre.x, 0.04f, centre.z }, r,
+                 (Vector3){ 1.0f, 0.0f, 0.0f }, 90.0f, ringCol);
+
+    // One flat marker per slot. Cubes rather than circles: DrawCircle3D is a
+    // line loop per call, and at 512 slots the difference is visible in the
+    // draw profile.
+    for (int i = 0; i < count; i++)
+        DrawCube((Vector3){ slots[i].x, 0.04f, slots[i].z },
+                 0.34f, 0.02f, 0.34f, slotCol);
+
+    // -- Heading arrow --------------------------------------------------------
+    // Which way the block will FACE, drawn from the centre out past the ring so
+    // it reads against the markers rather than through them. This is the whole
+    // point of the drag, so it is the one part of the preview that stays fully
+    // opaque as the rest fades.
+    if (face.x*face.x + face.z*face.z > 0.0001f)
+    {
+        float len = radius + 2.2f;
+        Vector3 tail = { centre.x, 0.05f, centre.z };
+        Vector3 head = { centre.x + face.x*len, 0.05f, centre.z + face.z*len };
+
+        Color arrow = { 255, 232, 150, (unsigned char)(235.0f*a) };
+        DrawLine3D(tail, head, arrow);
+
+        // Two barbs swept back from the tip, drawn from the perpendicular so the
+        // head reads at any camera angle without needing a billboard.
+        float px = -face.z, pz = face.x;
+        Vector3 barbL = { head.x - face.x*1.1f + px*0.6f, 0.05f,
+                          head.z - face.z*1.1f + pz*0.6f };
+        Vector3 barbR = { head.x - face.x*1.1f - px*0.6f, 0.05f,
+                          head.z - face.z*1.1f - pz*0.6f };
+        DrawLine3D(head, barbL, arrow);
+        DrawLine3D(head, barbR, arrow);
     }
 }
 
 void StrategyWorldUpdate(float dt)
 {
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    SpProfResetFrameCounters();
+    s_frame++;
+
+#ifndef NDEBUG
+    if (strategyRosterAudit && !RosterCheck()) strategyRosterAudit = false;  // trace once
+#endif
+
+    // BEFORE the state machine, so the sight/aggro queries inside UnitUpdate
+    // see this frame's positions. Separation therefore reads positions that are
+    // one step stale, which is harmless - it is a continuous force and a unit
+    // moves at most speed*dt (about 0.07 units) between the rebuild and the
+    // push. Aggro cannot tolerate the same staleness because it feeds targeting
+    // decisions, not a nudge.
+    //
+    // The cost is that a unit killed during the update stays in the hash until
+    // the next rebuild, so every consumer re-checks `active` on what it gets
+    // back. That is one load on an index the query already touched.
+    SpProfBegin(SP_PROF_NAV_HASH);
+    UnitHashRebuild();
+    SpProfEnd(SP_PROF_NAV_HASH);
+    SpProfSet(SP_COUNT_HASH_DROPPED, s_unitHash.dropped);
+
+    // Pathfinding runs BEFORE the state machine so a route that finishes this
+    // frame is walked this frame rather than next - at a low budget that is the
+    // difference between a visible hitch on every order and none.
+    SpProfBegin(SP_PROF_ASTAR);
+    StrategyMoveBeginFrame();
+    SpServiceUpdate();
+    StrategyMoveCollect();
+    SpProfEnd(SP_PROF_ASTAR);
+
+    // Form-up BEFORE the state machine, for the same reason as pathing: every
+    // unit in a group must scale its speed against the SAME snapshot of how
+    // scattered the group is. Computed inside UnitUpdate it would depend on
+    // update order, and units early in the roster would pace themselves against
+    // a group that had already half-moved.
+    StrategyMoveFormUpdate(dt);
+    StrategyMovePreviewUpdate(dt);
+
+    SpProfBegin(SP_PROF_UNIT_UPDATE);
+    // Snapshot the count, and re-check `active` inside the loop. UnitUpdate can
+    // kill - a unit dies mid-tick from an attack resolved in its own update -
+    // and RosterRemove swaps the last entry down into the dead slot. Walking a
+    // live s_activeCount would then skip whichever unit got swapped in.
+    // Snapshotting means the swapped-in unit is visited at its old index
+    // instead: it may be re-visited or missed for exactly one frame, which is
+    // invisible, whereas iterating a shrinking list drops units silently.
+    // Spawns are safe either way - they append past the snapshot and simply
+    // start next frame, which is what the old scan did too.
+    int liveUnits = s_activeCount;
+    for (int k = 0; k < liveUnits && k < s_activeCount; k++)
     {
+        int i = s_active[k];
         if (world.units[i].active) UnitUpdate(i, dt);
     }
-    UnitSeparation();
+    SpProfEnd(SP_PROF_UNIT_UPDATE);
+    SpProfSet(SP_COUNT_UNITS_ACTIVE, s_activeCount);
+
+    // LEGACY had no separation at all - units walked through each other freely.
+    // Skipping it rather than tuning it to zero is the point: this is the single
+    // largest cost difference between the arms, and SP_PROF_SEPARATE reading a
+    // flat zero is how the lab confirms the gate actually took effect.
+    if (s_scheme != STRAT_CTRL_LEGACY)
+    {
+        SpProfBegin(SP_PROF_SEPARATE);
+        UnitSeparation(dt);
+        SpProfEnd(SP_PROF_SEPARATE);
+    }
+
+    StrategyMoveStats();
+
+    // Flow refcounts, recomputed at 1 Hz. Cheap (O(live)) and immune to a
+    // missed decrement, which is the whole reason it is a sweep.
+    s_flowSweepTimer += dt;
+    if (s_flowSweepTimer >= 1.0f)
+    {
+        s_flowSweepTimer = 0.0f;
+        StrategyMoveFlowSweep((float)GetTime());
+    }
+
+    // Arrival census, for the clustering acceptance test. The fix is judged by
+    // eye - a pile either stops or it does not - but the eye cannot tell a
+    // still crowd from one drifting a millimetre a frame, so the overlay counts
+    // too.
+    //
+    // `moving` is the number to watch: a settled unit leaves UNIT_MOVE the same
+    // frame it parks, so an order that resolves drives this to zero and it
+    // STAYS at zero. The old spiral pinned it at the group size forever.
+    // `settling` catches the in-between case - units parked but still being
+    // shoved back out - which is the state a half-working fix produces.
+    {
+        int moving = 0, settling = 0;
+        for (int k = 0; k < s_activeCount; k++)
+        {
+            const Unit *u = &world.units[s_active[k]];
+            if (u->state != UNIT_MOVE && u->state != UNIT_FLEE) continue;
+            moving++;
+            if (u->arrival != ARRIVE_SEEKING) settling++;
+        }
+        SpProfSet(SP_COUNT_UNITS_MOVING, moving);
+        SpProfSet(SP_COUNT_UNITS_SETTLED, settling);
+    }
+
+    // After the sim, so the animation reflects the move that just happened
+    // rather than last frame's.
+    SpProfBegin(SP_PROF_ANIM);
+    for (int k = 0; k < s_activeCount; k++)
+    {
+        Unit *u = &world.units[s_active[k]];
+
+        StrategyEntityAnimUpdate(u, dt);
+        StrategyEntityAnimRetire(u, StrategyCatalogForRole(SGB_ROLE_UNIT, u->kind));
+    }
+    SpProfEnd(SP_PROF_ANIM);
+
+    CorpsesUpdate(dt);
     BuildingsUpdate(dt);
 
-    // Enemy + animal brains live in strategy_ai.c (orders-only).
-    world.aiTimer -= dt;
-    if (world.aiTimer <= 0.0f)
-    {
-        world.aiTimer += world.aiPeriod;
-        StrategyAiTick();
-    }
+    // Faction brains + animals (strategy_ai.c, orders-only). Every frame now:
+    // the world's single aiTimer used to gate one brain, but each faction owns
+    // a staggered clock of its own so that eight of them never think on the
+    // same frame. The cheap early-out lives in AiBrainTick.
+    SpProfBegin(SP_PROF_AI);
+    StrategyAiTick(dt);
+    SpProfEnd(SP_PROF_AI);
 
     EffectsUpdate(dt);
 }
@@ -1999,6 +4136,16 @@ void StrategyWorldUpdate(float dt)
 // ----------------------------------------------------------------------------
 static void DrawNode(const ResourceNode *n)
 {
+    const SgaAsset *asset = StrategyCatalogForRole(SGB_ROLE_NODE, n->kind);
+    if (asset != NULL)
+    {
+        SgaStateSet set;
+        StrategyAssetStateSetInit(&set);
+        StrategyAssetStateSetAdd(&set, SGA_STATE_IDLE, (float)GetTime());
+        StrategyAssetDrawStates(asset, FACTION_NEUTRAL, n->pos, 0.0f, 1.0f, &set);
+        return;
+    }
+
     switch (n->kind)
     {
         case NODE_TREE:
@@ -2033,11 +4180,29 @@ static void DrawNode(const ResourceNode *n)
             Vector3 body = (Vector3){ n->pos.x, 0.12f, n->pos.z };
             DrawCube(body, 0.7f, 0.24f, 0.5f, (Color){ 140, 60, 50, 255 });
         } break;
+
+        default: break;     // NODE_KIND_COUNT is a sentinel, never a node
     }
 }
 
 static void DrawBuilding(BuildingKind kind, int faction, Vector3 pos, Color tint)
 {
+    // Same fork as DrawUnit. Buildings have no state machine, so they get one
+    // IDLE slot - which is still enough for an authored building to breathe,
+    // turn a wheel or flicker a fire.
+    const SgaAsset *asset = StrategyCatalogForRole(SGB_ROLE_BUILDING, kind);
+    if (asset != NULL)
+    {
+        // Alpha rides in tint.a here (the placement ghost and the scaffold both
+        // fade that way), so it is passed through as the asset's alpha rather
+        // than being lost.
+        SgaStateSet set;
+        StrategyAssetStateSetInit(&set);
+        StrategyAssetStateSetAdd(&set, SGA_STATE_IDLE, (float)GetTime());
+        StrategyAssetDrawStates(asset, faction, pos, 0.0f, tint.a/255.0f, &set);
+        return;
+    }
+
     switch (kind)
     {
         case BLD_HOUSE:
@@ -2133,9 +4298,138 @@ static void DrawBuilding(BuildingKind kind, int faction, Vector3 pos, Color tint
     DrawCube(postTop, 0.25f, 0.18f, 0.05f, Fade(strategyFactionColor[faction], tint.a/255.0f));
 }
 
+// ----------------------------------------------------------------------------
+//  Render LOD. The authored path costs a per-part loop of immediate-mode
+//  primitives with a matrix push/pop each, so it saturates the batcher long
+//  before the simulation is in trouble. The stress lab needs to push the
+//  renderer out of the way to measure the MOVER, so every unit draw runs
+//  through this fork. The game never changes it and always pays AUTHORED.
+// ----------------------------------------------------------------------------
+static StrategyRenderLod s_renderLod = STRAT_LOD_AUTHORED;
+
+void StrategyRenderLodSet(StrategyRenderLod lod) { s_renderLod = lod; }
+StrategyRenderLod StrategyRenderLodGet(void)     { return s_renderLod; }
+
+const char *StrategyRenderLodName(StrategyRenderLod lod)
+{
+    switch (lod)
+    {
+        case STRAT_LOD_AUTHORED:  return "AUTHORED";
+        case STRAT_LOD_PRIMITIVE: return "PRIMITIVE";
+        case STRAT_LOD_DOTS:      return "DOTS";
+        case STRAT_LOD_NONE:      return "NONE";
+        default:                  return "?";
+    }
+}
+
+// ----------------------------------------------------------------------------
+//  Control scheme
+// ----------------------------------------------------------------------------
+//  The A/B switch. Storage is up at the top of the file with the other
+//  frame-wide state, because it is read from three places that all sit well
+//  above here; only the accessors live down with the LOD ones they mirror.
+// ----------------------------------------------------------------------------
+void                  StrategyControlSet(StrategyControlScheme s) { s_scheme = s; }
+StrategyControlScheme StrategyControlGet(void)                    { return s_scheme; }
+
+const char *StrategyControlName(StrategyControlScheme s)
+{
+    switch (s)
+    {
+        case STRAT_CTRL_LEGACY:  return "LEGACY";
+        case STRAT_CTRL_SIMPLE:  return "SIMPLE";
+        case STRAT_CTRL_CURRENT: return "CURRENT";
+        default:                 return "?";
+    }
+}
+
+// ----------------------------------------------------------------------------
+//  Distance culling
+//
+//  THE CHEAPEST WIN IN THE RENDER OVERHAUL, and it is cheap only because this
+//  camera is constrained: fixed pitch, no rotation, zoom clamped to 0.35..1.45.
+//  A general frustum cull would need six plane tests per unit; here the visible
+//  ground is always a fixed shape around camFocus, so one squared-distance
+//  compare rejects everything outside it.
+//
+//  The radius is DERIVED, not guessed, and it is derived PER UNIT OF ZOOM. The
+//  camera offset is (0,14,10)*zoom with a 45-degree fovy, so the distance from
+//  the focus to the farthest visible ground corner is exactly linear in zoom:
+//
+//      zoom 0.35 -> 9.0      zoom 1.00 -> 25.8
+//      zoom 0.70 -> 18.0     zoom 1.45 -> 37.4      (= 25.8 * zoom throughout)
+//
+//  Hence the coefficient below, plus slack for a 16:10 window and a unit's own
+//  height. Getting this wrong in the safe direction is nearly free to write and
+//  nearly worthless: a flat 40 - the max-zoom figure, applied at every zoom -
+//  culls 0% at full zoom-out, which is the case that needs it most.
+//
+//  Measured against the maps that exist: at maximum zoom the visible ground is
+//  roughly 37x37 units, so on the 96x96 "long march" about 15% of the map is on
+//  screen. The other 85% of units currently run the full authored part loop
+//  every frame to produce nothing.
+#define CULL_RADIUS_PER_ZOOM  28.0f
+
+// Distance LOD tiers, as fractions of the SQUARED cull radius - so 0.35 is 59%
+// of the way out, and 0.65 is 81%. Expressed against the cull radius rather
+// than in world units so the tiers scale with zoom exactly as the cull does:
+// the question a tier answers is "how big is this on screen", and at this
+// camera that is entirely a function of the fraction of the view it sits at.
+#define LOD_MID_FRAC  0.35f
+#define LOD_FAR_FRAC  0.65f
+
+// Squared, recomputed once per frame by CullBegin. Seeded wide rather than to
+// zero: the HP-bar pass reads it from a DIFFERENT function than the one that
+// sets it, and a zero here would silently hide every bar in the game if the 3D
+// pass were ever skipped. Culling nothing is the safe failure.
+static float s_cullR2 = 1.0e9f;
+
+static void CullBegin(void)
+{
+    // The floor is not tuning slack - it is the guard for a camZoom that some
+    // future caller sets to zero or negative. A unit popping in at the screen
+    // edge is far worse than drawing a few extra.
+    float r = CULL_RADIUS_PER_ZOOM*world.camZoom;
+    if (r < 10.0f) r = 10.0f;
+    s_cullR2 = r*r;
+}
+
+static bool CullTest(Vector3 pos)
+{
+    float dx = pos.x - world.camFocus.x;
+    float dz = pos.z - world.camFocus.y;
+    return (dx*dx + dz*dz) <= s_cullR2;
+}
+
 static void DrawUnit(const Unit *u)
 {
+    // BEFORE the LOD fork, the colour lookup and everything else: a culled unit
+    // must cost one subtract, one multiply-add and one compare, or the cull is
+    // not paying for itself.
+    if (!CullTest(u->pos)) return;
+
     Color color = UnitColor(u);
+
+    // Cheap tiers first: they skip the selection ring, the asset lookup and the
+    // whole part loop, which is the entire point of having them.
+    if (s_renderLod != STRAT_LOD_AUTHORED)
+    {
+        SpProfAdd(SP_COUNT_DRAWN_UNITS, 1);
+        if (s_renderLod == STRAT_LOD_NONE) return;
+        if (s_renderLod == STRAT_LOD_DOTS)
+        {
+            DrawCube((Vector3){ u->pos.x, 0.1f, u->pos.z }, 0.18f, 0.18f, 0.18f, color);
+            return;
+        }
+        // PRIMITIVE: one box, one draw, no matrix push, no asset lookup.
+        DrawCube((Vector3){ u->pos.x, 0.4f, u->pos.z }, 0.5f, 0.8f, 0.5f, color);
+        if (u->selected)
+        {
+            DrawCubeWires((Vector3){ u->pos.x, 0.4f, u->pos.z }, 0.55f, 0.85f, 0.55f, GREEN);
+        }
+        return;
+    }
+    SpProfAdd(SP_COUNT_DRAWN_UNITS, 1);
 
     if (u->selected)
     {
@@ -2143,28 +4437,72 @@ static void DrawUnit(const Unit *u)
         DrawCircle3D(ring, 0.55f, (Vector3){ 1.0f, 0.0f, 0.0f }, 90.0f, GREEN);
     }
 
-    switch (u->kind)
+    // THE FORK. A role with a binding draws its authored asset; everything else
+    // falls through to the hand-built primitives below, unchanged. That is what
+    // makes this safe to land before a single asset exists: with no bindings,
+    // every branch below is the one that runs.
+    const SgaAsset *asset = StrategyCatalogForRole(SGB_ROLE_UNIT, u->kind);
+    if (asset != NULL)
     {
+        SgaStateSet set;
+        StrategyEntityAnimSet(u, asset, &set);
+
+        // Distance LOD. The tiers are in SQUARED distance from the focus, so
+        // the whole decision costs no square root - the same reason the cull
+        // above is squared.
+        //
+        // The thresholds are fractions of the cull radius rather than absolute
+        // distances, so they follow the zoom the same way the cull does: at
+        // full zoom-out a unit two thirds of the way to the screen edge is
+        // genuinely tiny, and at full zoom-in the same fraction is a unit still
+        // large enough to want its detail.
+        float dx = u->pos.x - world.camFocus.x;
+        float dz = u->pos.z - world.camFocus.y;
+        float d2 = dx*dx + dz*dz;
+
+        float minSize = 0.0f;
+        bool  lowPoly = false;
+        if (d2 > s_cullR2*LOD_FAR_FRAC)
+        {
+            minSize = 0.18f;    // drop buttons, eyes, buckles
+            lowPoly = true;
+        }
+        else if (d2 > s_cullR2*LOD_MID_FRAC)
+        {
+            minSize = 0.08f;    // only the genuinely sub-pixel parts
+        }
+
+        StrategyAssetDrawStatesLod(asset, u->faction, u->pos, u->anim.yaw, 1.0f,
+                                   &set, minSize, lowPoly);
+    }
+    // THE BUILT-IN PRIMITIVES ARE WHERE THE TRIANGLES ACTUALLY ARE, and that is
+    // the opposite of what the plan assumed. Measured on the three assets that
+    // exist: worker, soldier and ranged are each ONE visible 8-sided cylinder -
+    // 32 triangles, two draw calls. The fallback below is 2-3 draws with a
+    // DrawSphere head at raylib's default 16x16 rings, which is 512 triangles
+    // on its own, and it serves four of the seven kinds (both templars, both
+    // animals) because those have no binding.
+    //
+    // So the LOD tiers below apply to THIS path, not the authored one: a head
+    // is under a pixel at distance and costs sixteen times the body.
+    else
+    {
+        float ddx = u->pos.x - world.camFocus.x;
+        float ddz = u->pos.z - world.camFocus.y;
+        float dd2 = ddx*ddx + ddz*ddz;
+        bool  lowPoly = (dd2 > s_cullR2*LOD_MID_FRAC);
+        bool  noDetail = (dd2 > s_cullR2*LOD_FAR_FRAC);
+
+        switch (u->kind)
+        {
         case KIND_WORKER:
         {
             DrawCylinder(u->pos, 0.28f, STRAT_UNIT_RADIUS, 0.8f, 8, color);
-            Vector3 head = (Vector3){ u->pos.x, 0.95f, u->pos.z };
-            DrawSphere(head, 0.18f, ColorBrightness(color, 0.3f));
-
-            // Tending workers wear a "hat" shaped like the resource they plant:
-            // a green cone (forestry -> wood) or a golden cone (farm -> wheat).
-            // Only worn once equipped (after the trip back to the building).
-            if (u->state == UNIT_FARM && u->tendEquipped && u->targetBuilding >= 0)
+            if (!noDetail)
             {
-                const BuildingDef *tb =
-                    StrategyBuildingDef(world.buildings[u->targetBuilding].kind);
-                if (tb->tendNode >= 0)
-                {
-                    Color hat = (tb->tendNode == NODE_TREE)
-                        ? (Color){ 60, 140, 60, 255 } : (Color){ 220, 190, 90, 255 };
-                    Vector3 cap = (Vector3){ u->pos.x, 1.12f, u->pos.z };
-                    DrawCylinder(cap, 0.0f, 0.16f, 0.28f, 6, hat);
-                }
+                Vector3 head = (Vector3){ u->pos.x, 0.95f, u->pos.z };
+                if (lowPoly) DrawSphereEx(head, 0.18f, 6, 6, ColorBrightness(color, 0.3f));
+                else         DrawSphere(head, 0.18f, ColorBrightness(color, 0.3f));
             }
         } break;
 
@@ -2173,8 +4511,12 @@ static void DrawUnit(const Unit *u)
             // Taller, wider, darker - reads as "military" at a glance.
             Color dark = ColorBrightness(color, -0.25f);
             DrawCylinder(u->pos, 0.34f, 0.45f, 1.1f, 8, dark);
-            Vector3 head = (Vector3){ u->pos.x, 1.28f, u->pos.z };
-            DrawSphere(head, 0.2f, color);
+            if (!noDetail)
+            {
+                Vector3 head = (Vector3){ u->pos.x, 1.28f, u->pos.z };
+                if (lowPoly) DrawSphereEx(head, 0.2f, 6, 6, color);
+                else         DrawSphere(head, 0.2f, color);
+            }
         } break;
 
         case KIND_RANGED:
@@ -2182,10 +4524,14 @@ static void DrawUnit(const Unit *u)
             // Slighter than the soldier, with a "bow" post at the side.
             Color light = ColorBrightness(color, 0.15f);
             DrawCylinder(u->pos, 0.30f, 0.40f, 1.0f, 8, light);
-            Vector3 head = (Vector3){ u->pos.x, 1.18f, u->pos.z };
-            DrawSphere(head, 0.18f, color);
-            DrawLine3D((Vector3){ u->pos.x + 0.35f, 0.25f, u->pos.z },
-                       (Vector3){ u->pos.x + 0.35f, 1.05f, u->pos.z }, DARKBROWN);
+            if (!noDetail)
+            {
+                Vector3 head = (Vector3){ u->pos.x, 1.18f, u->pos.z };
+                if (lowPoly) DrawSphereEx(head, 0.18f, 6, 6, color);
+                else         DrawSphere(head, 0.18f, color);
+                DrawLine3D((Vector3){ u->pos.x + 0.35f, 0.25f, u->pos.z },
+                           (Vector3){ u->pos.x + 0.35f, 1.05f, u->pos.z }, DARKBROWN);
+            }
         } break;
 
         case KIND_TEMPLAR:
@@ -2194,10 +4540,22 @@ static void DrawUnit(const Unit *u)
             // White robe, gold (templar) or lime (healer) head, faction band.
             Color halo = (u->kind == KIND_TEMPLAR) ? GOLD : LIME;
             DrawCylinder(u->pos, 0.26f, 0.42f, 1.0f, 8, RAYWHITE);
-            Vector3 band = (Vector3){ u->pos.x, 0.55f, u->pos.z };
-            DrawCube(band, 0.5f, 0.12f, 0.5f, color);
-            Vector3 head = (Vector3){ u->pos.x, 1.16f, u->pos.z };
-            DrawSphere(head, 0.17f, halo);
+            if (!noDetail)
+            {
+                Vector3 band = (Vector3){ u->pos.x, 0.55f, u->pos.z };
+                DrawCube(band, 0.5f, 0.12f, 0.5f, color);
+                Vector3 head = (Vector3){ u->pos.x, 1.16f, u->pos.z };
+                if (lowPoly) DrawSphereEx(head, 0.17f, 6, 6, halo);
+                else         DrawSphere(head, 0.17f, halo);
+            }
+            else
+            {
+                // The band is what makes a templar readable as YOURS at range,
+                // so it survives when the head does not - it is 12 triangles
+                // against the head's 512.
+                DrawCube((Vector3){ u->pos.x, 0.55f, u->pos.z },
+                         0.5f, 0.12f, 0.5f, color);
+            }
         } break;
 
         case KIND_ANIMAL_WEAK:
@@ -2212,10 +4570,34 @@ static void DrawUnit(const Unit *u)
             // Bigger, darker beast - reads as "don't poke it".
             Vector3 body = (Vector3){ u->pos.x, 0.34f, u->pos.z };
             DrawCube(body, 0.9f, 0.65f, 0.55f, ColorBrightness(color, -0.35f));
-            DrawCubeWires(body, 0.9f, 0.65f, 0.55f, DARKBROWN);
+            // The wireframe is pure silhouette detail and doubles this kind's
+            // draw calls; at distance it is a smudge on top of a smudge.
+            if (!noDetail) DrawCubeWires(body, 0.9f, 0.65f, 0.55f, DARKBROWN);
         } break;
 
         default: break;
+        }
+    }
+
+    // Decorations sit OUTSIDE the fork: they describe what a unit is doing, not
+    // what it looks like, so they belong to every unit whether its model is
+    // authored or built in.
+    //
+    // Tending workers wear a "hat" shaped like the resource they plant: a green
+    // cone (forestry -> wood) or a golden cone (farm -> wheat). Only worn once
+    // equipped (after the trip back to the building).
+    if (u->kind == KIND_WORKER && u->state == UNIT_FARM &&
+        u->tendEquipped && u->targetBuilding >= 0)
+    {
+        const BuildingDef *tb =
+            StrategyBuildingDef(world.buildings[u->targetBuilding].kind);
+        if (tb->tendNode >= 0)
+        {
+            Color hat = (tb->tendNode == NODE_TREE)
+                ? (Color){ 60, 140, 60, 255 } : (Color){ 220, 190, 90, 255 };
+            Vector3 cap = (Vector3){ u->pos.x, 1.12f, u->pos.z };
+            DrawCylinder(cap, 0.0f, 0.16f, 0.28f, 6, hat);
+        }
     }
 
     // Carried resources float above the head, tinted by kind.
@@ -2231,13 +4613,30 @@ static void DrawUnit(const Unit *u)
 
 void StrategyWorldDraw3D(void)
 {
+    SpProfBegin(SP_PROF_DRAW_WORLD);
     BeginMode3D(world.camera);
 
-    // Plane slightly below the grid lines to avoid z-fighting.
+    // Plane slightly below the grid lines to avoid z-fighting. Sized from the
+    // world's extent, so an authored map's ground reaches its own edges rather
+    // than the built-in 50x50.
     DrawPlane((Vector3){ 0.0f, -0.01f, 0.0f },
-              (Vector2){ 2.0f*STRAT_GROUND_HALF, 2.0f*STRAT_GROUND_HALF },
+              (Vector2){ 2.0f*world.groundHalfX, 2.0f*world.groundHalfZ },
               (Color){ 90, 110, 80, 255 });
-    DrawGrid((int)(2.0f*STRAT_GROUND_HALF), 1.0f);
+    MapDrawTerrain();
+    DrawGroundGrid();
+    // After the terrain, so the cost tint reads ON TOP of the water and cliff
+    // colours it is supposed to be checked against.
+    if (s_navShow) NavDraw();
+
+    // Paths above the nav tint but before the props, so a route reads against
+    // the terrain it crosses rather than through a tree.
+    if (s_pathShow) PathDraw();
+
+    // Flow arrows go UNDER the paths: when both are on, the question is whether
+    // an individual route agrees with the field, and the route has to be the
+    // one on top for that comparison to be readable.
+    if (s_flowShow) FlowDraw();
+    if (s_slotShow) SlotDraw();
 
     for (int i = 0; i < STRAT_MAX_NODES; i++)
     {
@@ -2275,9 +4674,31 @@ void StrategyWorldDraw3D(void)
             }
         }
     }
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    SpProfEnd(SP_PROF_DRAW_WORLD);
+
+    SpProfBegin(SP_PROF_DRAW_UNITS);
+    CullBegin();        // once per frame: the radius only moves with the zoom
+    for (int k = 0; k < s_activeCount; k++) DrawUnit(&world.units[s_active[k]]);
+    SpProfEnd(SP_PROF_DRAW_UNITS);
+
+    SpProfBegin(SP_PROF_DRAW_WORLD);
+
+    // Corpses finish their DIE animation after the slot is gone. Drawn with the
+    // units so they sort the same way; a corpse whose role lost its binding
+    // simply stops drawing, since there is no built-in death pose to fall back
+    // on.
+    for (int i = 0; i < STRAT_MAX_CORPSES; i++)
     {
-        if (world.units[i].active) DrawUnit(&world.units[i]);
+        const UnitCorpse *c = &world.corpses[i];
+        if (!c->active) continue;
+
+        const SgaAsset *ca = StrategyCatalogForRole(SGB_ROLE_UNIT, c->kind);
+        if (ca == NULL) continue;
+
+        SgaStateSet set;
+        StrategyAssetStateSetInit(&set);
+        StrategyAssetStateSetAdd(&set, SGA_STATE_DIE, c->t);
+        StrategyAssetDrawStates(ca, c->faction, c->pos, c->yaw, 1.0f, &set);
     }
 
     // Placement ghost: green when the spot is valid, red when not.
@@ -2292,8 +4713,10 @@ void StrategyWorldDraw3D(void)
         }
     }
 
+    PreviewDraw();
     EffectsDraw3D();
     EndMode3D();
+    SpProfEnd(SP_PROF_DRAW_WORLD);
 }
 
 // ----------------------------------------------------------------------------
@@ -2316,10 +4739,15 @@ void StrategyWorldDraw2DOverlay(void)
     }
 
     // HP bars over damaged units.
-    for (int i = 0; i < STRAT_MAX_UNITS; i++)
+    for (int k = 0; k < s_activeCount; k++)
     {
-        Unit *u = &world.units[i];
-        if (!u->active || u->hp >= u->maxHp) continue;
+        Unit *u = &world.units[s_active[k]];
+        if (u->hp >= u->maxHp) continue;
+        // Same cull as the unit itself. WorldToGame is a full matrix projection
+        // per unit, so at ten thousand units this loop costs as much as the
+        // draw it annotates - and every one of those bars is for a unit that
+        // was not drawn.
+        if (!CullTest(u->pos)) continue;
 
         Vector2 sp = WorldToGame((Vector3){ u->pos.x, 1.5f, u->pos.z });
         float frac = u->hp/u->maxHp;
@@ -2346,12 +4774,27 @@ void StrategyWorldDraw2DOverlay(void)
                         world.stockpile[0][RES_FOOD], world.stockpile[0][RES_PROVIDENCE],
                         StrategyPopUsed(0), StrategyPopCap(0)),
              (int)(gameSize.x*0.02f), (int)(gameSize.y*0.02f), size, RAYWHITE);
-    DrawText(TextFormat("enemy: wood %d stone %d food %d prov %d pop %d/%d",
-                        world.stockpile[1][RES_WOOD], world.stockpile[1][RES_STONE],
-                        world.stockpile[1][RES_FOOD], world.stockpile[1][RES_PROVIDENCE],
-                        StrategyPopUsed(1), StrategyPopCap(1)),
-             (int)(gameSize.x*0.02f), (int)(gameSize.y*0.02f) + size + 4, size/2,
-             Fade(strategyFactionColor[1], 0.8f));
+    // One tinted line per AI faction, named by its archetype. This was a single
+    // hardcoded "enemy:" row reading stockpile[1] - which on a six-faction map
+    // showed one opponent of five and implied the others did not exist. The
+    // colour is the faction's own, so a line matches the units on the field.
+    {
+        int   sub = size/2;
+        float y   = gameSize.y*0.02f + (float)size + 4.0f;
+        for (int f = 1; f < world.factionCount; f++)
+        {
+            const char *txt = world.defeated[f]
+                ? TextFormat("%s: defeated", StrategyAiArchetype(f))
+                : TextFormat("%s: wood %d stone %d food %d prov %d pop %d/%d",
+                             StrategyAiArchetype(f),
+                             world.stockpile[f][RES_WOOD], world.stockpile[f][RES_STONE],
+                             world.stockpile[f][RES_FOOD], world.stockpile[f][RES_PROVIDENCE],
+                             StrategyPopUsed(f), StrategyPopCap(f));
+            DrawText(txt, (int)(gameSize.x*0.02f), (int)y, sub,
+                     Fade(StrategyFactionTint(f), world.defeated[f] ? 0.35f : 0.8f));
+            y += (float)sub + 2.0f;
+        }
+    }
 
     if (world.placing >= 0)
     {
@@ -2360,17 +4803,44 @@ void StrategyWorldDraw2DOverlay(void)
                  (int)(gameSize.y*0.9f), size/2, RAYWHITE);
     }
 
-    // Victory/defeat banner: the sim keeps running underneath, R restarts.
-    if (world.gameOver >= 0)
+    // Formation readout. Shown only while units are selected - it is a property
+    // of the order you are about to give, so it is noise at every other moment.
     {
-        const char *msg = (world.gameOver == 0) ? "VICTORY" : "DEFEAT";
-        Color tint = (world.gameOver == 0) ? GOLD : RED;
+        int selCount = 0;
+        SelectedUnits(&selCount);
+        if (selCount > 0)
+        {
+            const char *txt = TextFormat("[F] %s   [V] %s",
+                                         StrategyFormationShapeName(StrategyFormationShape()),
+                                         StrategyFormationBehaviorName(StrategyFormationBehavior()));
+            int fs = size/2;
+            DrawText(txt, (int)(gameSize.x*0.5f - (float)MeasureText(txt, fs)*0.5f),
+                     (int)(gameSize.y*0.945f), fs, (Color){ 190, 195, 205, 255 });
+        }
+    }
+
+    // Victory/defeat banner: the sim keeps running underneath, R restarts.
+    // Note the != -1 rather than >= 0: a player knockout is a NEGATIVE sentinel,
+    // because gameOver otherwise holds the winning faction index.
+    if (world.gameOver != -1)
+    {
+        bool won = (world.gameOver == 0);
+        const char *msg = won ? "VICTORY" : "DEFEAT";
+        Color tint = won ? GOLD : RED;
         int bigSize = (int)(gameSize.y*0.14f);
         DrawText(msg, (int)(gameSize.x*0.5f - (float)MeasureText(msg, bigSize)*0.5f),
                  (int)(gameSize.y*0.36f), bigSize, tint);
-        const char *why = (world.gameOver == 0)
-            ? "the enemy lost every critical building and worker"
-            : "you lost every critical building and worker";
+        // With more than two factions "the enemy" is not a thing, so name the
+        // winner instead of implying there was only ever one opponent.
+        const char *why;
+        if (won)
+            why = (world.factionCount > 2)
+                ? "every rival faction lost its critical buildings and workers"
+                : "the enemy lost every critical building and worker";
+        else if (world.gameOver == STRAT_GAMEOVER_PLAYER_LOST)
+            why = "you lost every critical building and worker";
+        else
+            why = TextFormat("faction %d outlasted every rival", world.gameOver + 1);
         DrawText(why, (int)(gameSize.x*0.5f - (float)MeasureText(why, size/2)*0.5f),
                  (int)(gameSize.y*0.36f) + bigSize + 8, size/2, LIGHTGRAY);
         const char *sub = "press R to restart";

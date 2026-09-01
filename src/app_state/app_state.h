@@ -16,6 +16,15 @@ typedef struct{
 } AppState;
 
 void AppStateTransition(AppState* value);
+
+// Is this state still the one running? AppStateTransition switches states
+// SYNCHRONOUSLY, so a state that transitions from inside its own Gui() keeps
+// executing the rest of that function - drawing its header, footer and tooltips
+// on top of the frame the NEW state already painted, for one visible frame.
+// Returning right after the transition is not enough when the call is nested a
+// few draw functions deep. A state whose Gui() continues after a possible
+// transition guards the remainder with AppStateIsCurrent(&app_state_mine).
+bool AppStateIsCurrent(const AppState* value);
 void AppStateEnter();
 void AppStateExit();
 void AppStateUpdate();
@@ -32,8 +41,12 @@ bool AppStateShouldQuit();
 extern AppState app_state_main_menu;    // learning demo: main menu
 extern AppState app_state_platformer;   // original: launch platformer
 extern AppState app_state_strategy;     // RTS test: units, resources, factions
+extern AppState app_state_strategy_showcase;    // RTS asset gallery (menu -> here -> game)
 extern AppState app_state_anim_editor_zen;  // animation editor (menu bar, zoomed viewport)
 extern AppState app_state_shape_editor;     // pixel-shape editor (the global shape pool)
+extern AppState app_state_strategy_forge;   // RTS asset forge (showcase -> here -> back)
+extern AppState app_state_map_forge;        // RTS map forge (menu -> here -> back)
+extern AppState app_state_strategy_path_lab; // RTS movement stress harness
 
 
 #endif // APP_STATE_H
