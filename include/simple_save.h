@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 // Remove name mangling for C++
 #ifdef __cplusplus
