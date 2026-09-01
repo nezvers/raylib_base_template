@@ -1976,6 +1976,130 @@ static void TestNearestOpenEscapesLargeObstacle(void)
 }
 
 
+// ----------------------------------------------------------------------------
+//  STRAT_CTRL_SIMPLE's two premises
+// ----------------------------------------------------------------------------
+//  The lab's SIMPLE arm is built entirely on this module: a rotated LOS probe
+//  for obstacle avoidance and index-order slots validated by SpNearestOpen. The
+//  arm itself needs a Unit and so cannot be tested here, but the two properties
+//  it RESTS on can be, and if either fails the arm is measuring nothing.
+// ----------------------------------------------------------------------------
+
+// The dodge premise, and the LIMIT that comes with it.
+//
+// A 45-degree turn moves the probe endpoint sideways by look*sin(45) - about
+// three tiles at look 4. So the dodge clears an obstacle it can get AROUND
+// within that reach, and CANNOT clear a wall wider than it that it is facing
+// square-on: both shoulders land on the same wall. That is not a defect to fix
+// by widening the angle - at 90 degrees the unit stops making progress at all -
+// it is the boundary of what a local steer can do, and it is exactly why the
+// CURRENT arm has a search. Both halves are asserted so the boundary is a
+// recorded property rather than a surprise in the lab.
+static void TestSimpleDodgeFindsShoulder(void)
+{
+    const int   look  = 4;                  // STRAT_SIMPLE_DODGE_LOOK
+    const float angle = 0.7853982f;         // STRAT_SIMPLE_DODGE_ANGLE
+    float c = cosf(angle), s = sinf(angle);
+
+    // Probe helper: is the endpoint of `dir` rotated by `side` reachable?
+    #define SHOULDER_CLEAR(sx, sz, dirX, dirZ, side, okOut)                   \
+        do {                                                                  \
+            float rx = (dirX)*c - (dirZ)*(s*(float)(side));                   \
+            float rz = (dirX)*(s*(float)(side)) + (dirZ)*c;                   \
+            int px = (sx) + (int)(rx*look), pz = (sz) + (int)(rz*look);       \
+            (okOut) = SpGridInBounds(&s_grid, px, pz) &&                      \
+                      SpLosClear(&s_grid, (sx), (sz), px, pz);                \
+        } while (0)
+
+    // -- Case 1: a compact obstacle. The dodge must get round this. ----------
+    {
+        SpGridInit(&s_grid, 64, 64);
+
+        // A 3x3 block - narrower than the dodge's sideways reach.
+        for (int z = 31; z <= 33; z++)
+            for (int x = 31; x <= 33; x++)
+                SpGridSet(&s_grid, x, z, SP_COST_BLOCKED);
+
+        int sx = 32, sz = 27;               // approaching from below, head-on
+        float dirX = 0.0f, dirZ = 1.0f;
+
+        // Straight ahead must actually be blocked, or the case proves nothing.
+        CHECK(!SpLosClear(&s_grid, sx, sz, sx, sz + look));
+
+        bool left = false, right = false;
+        SHOULDER_CLEAR(sx, sz, dirX, dirZ, -1, left);
+        SHOULDER_CLEAR(sx, sz, dirX, dirZ, +1, right);
+        CHECK(left || right);               // a way round exists and is found
+    }
+
+    // -- Case 2: a long flat wall. The dodge must NOT be able to clear it. ---
+    {
+        SpGridInit(&s_grid, 64, 64);
+        for (int x = 10; x < 50; x++) SpGridSet(&s_grid, x, 32, SP_COST_BLOCKED);
+
+        int sx = 30, sz = 30;
+        float dirX = 0.0f, dirZ = 1.0f;
+
+        CHECK(!SpLosClear(&s_grid, sx, sz, sx, sz + look));
+
+        bool left = false, right = false;
+        SHOULDER_CLEAR(sx, sz, dirX, dirZ, -1, left);
+        SHOULDER_CLEAR(sx, sz, dirX, dirZ, +1, right);
+
+        // Both blocked: SimpleDodge falls through to "steer straight anyway",
+        // the unit presses against the wall, and the stall test resolves it.
+        // A search would have gone round; this is the cost of not having one.
+        CHECK(!left && !right);
+    }
+
+    #undef SHOULDER_CLEAR
+}
+
+// The slot premise: index-order assignment over SpFormSlotLocal still produces
+// DISTINCT positions, and every one of them resolves onto passable ground once
+// pushed through SpNearestOpen. SIMPLE skips the stable assignment, so if the
+// raw slots collided the arm would stack units invisibly and its zero-overlap
+// claim would be false for reasons that have nothing to do with pathing.
+static void TestSimpleSlotsSurviveObstacles(void)
+{
+    SpGridInit(&s_grid, 64, 64);
+
+    // A lake sitting right where a formation centred at (32,32) would lay out.
+    for (int z = 28; z < 38; z++)
+        for (int x = 28; x < 38; x++)
+            SpGridSet(&s_grid, x, z, SP_COST_BLOCKED);
+
+    const SpFormCaps caps = { 24.0f, 2, 24.0f, 2, 3.0f };
+    const float spacing = 1.5f;             // FORMATION_SPACING at r=0.35
+    const int   count   = 64;
+
+    for (int shape = 0; shape < SP_FORM_SHAPE_COUNT; shape++)
+    {
+        float bias = SpFormForwardBias(shape, count, spacing, &caps);
+
+        int notPassable = 0, unresolved = 0;
+        for (int k = 0; k < count; k++)
+        {
+            float offR, offF;
+            SpFormSlotLocal(shape, k, count, spacing, &caps, &offR, &offF);
+            offF -= bias;
+
+            // Facing +Z, so right is +X - the same basis the order path uses.
+            float wx = 32.0f + offR;
+            float wz = 32.0f + offF;
+
+            int tx, tz, ox, oz;
+            SpWorldToTile(&s_grid, wx, wz, &tx, &tz);
+            if (!SpNearestOpen(&s_grid, tx, tz, 16, &ox, &oz)) { unresolved++; continue; }
+            if (!SpGridPassable(&s_grid, ox, oz)) notPassable++;
+        }
+
+        // Not one slot may be left sitting in the lake.
+        CHECK(unresolved == 0);
+        CHECK(notPassable == 0);
+    }
+}
+
 // Every shape must land CENTRED on the point it is built around, not trailing
 // behind it. GRID always did; LINE, COLUMN and WEDGE grew backward from the
 // click, so a 100-unit column's mass sat eighteen world units behind where the
@@ -2250,6 +2374,8 @@ int main(void)
     TestFormAssignDeterministic();
     TestFormAssignRotatedReorder();
     TestNearestOpenEscapesLargeObstacle();
+    TestSimpleDodgeFindsShoulder();
+    TestSimpleSlotsSurviveObstacles();
     TestFormForwardBiasCentres();
     TestFormForwardBiasIsSubstantial();
     TestFormShortMoveDoesNotWalkBackwards();

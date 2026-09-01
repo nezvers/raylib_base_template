@@ -19,6 +19,7 @@
 #include "strategy_entity_anim.h"
 #include "strategy_models.h"
 #include "../../strategy_asset/strategy_catalog.h"
+#include "../../strategy_ai/strategy_ai.h"
 #include "../../strategy_map/strategy_map.h"
 #include "../../strategy_map/strategy_map_catalog.h"
 #include "../../screen_state/screen_state.h"
@@ -27,9 +28,21 @@
 #include <math.h>
 #include <stddef.h>
 
+// THE faction palette, and the only copy of it. It used to hold two colours
+// while the same nine lived duplicated in map_forge.c and strategy_showcase.c,
+// each commented "until the runtime grows to match" - this is the runtime
+// growing to match, so both duplicates now read this array instead. The order
+// is the authored order a map's colorIndex refers to; do not permute it.
 const Color strategyFactionColor[STRAT_FACTIONS] = {
-    {  80, 140, 255, 255 },     // faction 0: player, blue
-    { 230,  70,  70, 255 },     // faction 1: enemy, red
+    {  80, 140, 255, 255 },     // 0 blue   - the human player
+    { 230,  70,  70, 255 },     // 1 red
+    {  90, 200, 110, 255 },     // 2 green
+    { 235, 190,  70, 255 },     // 3 gold
+    { 190, 110, 230, 255 },     // 4 violet
+    { 240, 150,  60, 255 },     // 5 orange
+    {  80, 210, 210, 255 },     // 6 teal
+    { 240, 120, 180, 255 },     // 7 pink
+    { 190, 195, 205, 255 },     // 8 silver
 };
 
 static StrategyWorld world;
@@ -94,6 +107,13 @@ static bool s_selectionDirty = true;        // rebuild s_selected before next us
 // Frame counter, used only to stagger per-unit work across frames. Wrapping is
 // harmless: every consumer takes it modulo a small stride.
 static int s_frame;
+
+// Which movement system is driving. Declared here rather than beside its
+// accessors at the bottom of the file because the UNIT_MOVE state, the
+// separation pass and the group-order path all read it, and the earliest of
+// those is ~1700 lines above the accessors. Defaults to CURRENT: the game never
+// touches this, so the default IS the shipped behaviour.
+static StrategyControlScheme s_scheme = STRAT_CTRL_CURRENT;
 
 static SpHash s_unitHash;       // separation: fine cells, tiny radius
 static SpHash s_sightHash;      // aggro / targeting: coarse cells, wide radius
@@ -764,6 +784,7 @@ static void SpawnBuiltinLayout(void)
     world.groundHalfX = STRAT_GROUND_HALF;
     world.groundHalfZ = STRAT_GROUND_HALF;
     world.camFocus    = (Vector2){ -14.0f, -12.0f };
+    world.factionCount = 2;     // the shipped layout is player vs one enemy
 
     // Two rival bases in opposite corners: town hall FIRST (critical, trains
     // workers, and the AI's EnemyHome anchors to the first building), two
@@ -831,14 +852,22 @@ static void SpawnBuiltinLayout(void)
 //     Walking by family would NOT: it would spawn every faction's buildings
 //     interleaved and could seat a house ahead of a town hall.
 //
-// The runtime still plays two factions (STRAT_FACTIONS). Authored factions
-// 2..8 are stored and validated but their placements are SKIPPED here - the
-// agreed scope. Neutral placements (resource nodes, wild animals) always spawn.
+// Every authored faction the map declares now spawns (up to STRAT_FACTIONS).
+// Placements owned by a faction beyond the map's own factionCount are skipped,
+// which only happens if a map lists an owner it never declared. Neutral
+// placements (resource nodes, wild animals) always spawn.
 static void SpawnFromMap(const SgmMap *m)
 {
     world.map         = m;
     world.groundHalfX = 0.5f*(float)m->gridW;
     world.groundHalfZ = 0.5f*(float)m->gridH;
+
+    // How many factions this match runs. Clamped to the array ceiling rather
+    // than trusted outright: the on-disk value is validated 1..9 on load, but
+    // this is the one place a bad map would index past every faction array.
+    world.factionCount = m->factionCount;
+    if (world.factionCount < 1)              world.factionCount = 1;
+    if (world.factionCount > STRAT_FACTIONS) world.factionCount = STRAT_FACTIONS;
 
     // Focus on faction 0's start, so the player opens looking at their own base
     // wherever the author put it.
@@ -856,7 +885,10 @@ static void SpawnFromMap(const SgmMap *m)
         // A neutral placement belongs to nobody; an owned one belongs to a
         // faction the runtime may not be playing yet.
         bool neutral = (pl->faction == SGM_FACTION_NEUTRAL);
-        if (!neutral && pl->faction >= STRAT_FACTIONS) continue;
+        // Owned by a faction this match does not run. Was `>= STRAT_FACTIONS`,
+        // which silently threw away every authored faction past the second -
+        // "four lakes" lost half its bases and "the crucible" two thirds.
+        if (!neutral && pl->faction >= world.factionCount) continue;
         int faction = neutral ? FACTION_NEUTRAL : (int)pl->faction;
 
         switch (pl->family)
@@ -924,24 +956,51 @@ void StrategyWorldInit(void)
     StrategyCatalogLoad();
 
     // Difficulty mods BEFORE any spawn (UnitSpawn reads them). The player and
-    // neutral rows stay identity; only the AI faction is scaled. Hard is the
-    // baseline; Normal/Easy weaken the AI and give the player a sell bonus.
+    // neutral rows stay identity; EVERY AI faction gets the difficulty row.
+    // Hard is the baseline; Normal/Easy weaken the AI and give the player a
+    // sell bonus.
+    //
+    // Applied to all STRAT_FACTIONS AI slots rather than just the live ones
+    // because factionCount is not known yet - the battlefield below is what
+    // sets it, and UnitSpawn runs inside that. Rows for factions that never
+    // spawn are simply never read.
+    //
+    // Difficulty says how STRONG an AI is; the archetype (strategy_ai) says how
+    // it PLAYS, and multiplies its own mods on top of this row.
     FactionMods identity = { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f };
-    world.mods[0] = world.mods[1] = world.mods[FACTION_NEUTRAL] = identity;
+    FactionMods aiRow    = identity;
     switch (SettingsGet()->difficulty)
     {
         case 0:     // Easy
-            world.mods[1] = (FactionMods){ 0.8f, 0.8f, 1.10f, 0.9f, 1.6f, 0.0f };
-            world.mods[0].refundBonus = 0.2f;
+            aiRow = (FactionMods){ 0.8f, 0.8f, 1.10f, 0.9f, 1.6f, 0.0f };
             break;
         case 1:     // Normal
-            world.mods[1] = (FactionMods){ 0.9f, 1.0f, 1.05f, 1.0f, 1.25f, 0.0f };
-            world.mods[0].refundBonus = 0.1f;
+            aiRow = (FactionMods){ 0.9f, 1.0f, 1.05f, 1.0f, 1.25f, 0.0f };
             break;
         default:    // Hard: identity
             break;
     }
-    world.aiPeriod = STRAT_AI_PERIOD*world.mods[1].aiPeriodMul;
+    world.mods[0]               = identity;
+    world.mods[FACTION_NEUTRAL] = identity;
+    // Difficulty row x archetype row. Two orthogonal axes: difficulty decides
+    // how strong an AI faction is, the archetype decides how it plays, and an
+    // Easy AGGRESSOR still rushes - it is just weaker while doing it. The
+    // archetype's own mods are deliberately mild (ai_tests asserts 0.85..1.15),
+    // so this multiply can never turn a behaviour row into a stat advantage.
+    for (int f = 1; f < STRAT_FACTIONS; f++)
+    {
+        const AiProfile *p = AiProfileFor(f);
+        world.mods[f] = aiRow;
+        world.mods[f].hpMul     *= p->hpMul;
+        world.mods[f].dmgMul    *= p->dmgMul;
+        world.mods[f].gatherMul *= p->gatherMul;
+        world.mods[f].sightMul  *= p->sightMul;
+    }
+
+    world.mods[0].refundBonus = (SettingsGet()->difficulty == 0) ? 0.2f
+                              : (SettingsGet()->difficulty == 1) ? 0.1f : 0.0f;
+
+    world.aiPeriod = STRAT_AI_PERIOD*aiRow.aiPeriodMul;
     world.aiTimer  = world.aiPeriod;
 
     // Camera: perspective, fixed pitch. The FOCUS is not set here - it belongs
@@ -964,6 +1023,11 @@ void StrategyWorldInit(void)
     else             SpawnBuiltinLayout();
     CameraRefresh();    // the layout set camFocus; rebuild the camera from it
 
+    // Faction brains, AFTER the battlefield: the layout is what sets
+    // factionCount, and a brain built before it would be sized against a world
+    // that does not exist yet.
+    StrategyAiReset();
+
     // The battlefield is populated: derive the nav grid from it once, then let
     // later placements and demolitions patch incrementally.
     NavRebuild();
@@ -983,7 +1047,7 @@ void StrategyWorldInit(void)
     // Normal x2, Hard x1. The enemy always starts on the base amounts.
     int playerMul = (SettingsGet()->difficulty == 0) ? 3
                   : (SettingsGet()->difficulty == 1) ? 2 : 1;
-    for (int f = 0; f < STRAT_FACTIONS; f++)
+    for (int f = 0; f < world.factionCount; f++)
     {
         int mul = (f == 0) ? playerMul : 1;
         world.stockpile[f][RES_WOOD]  = 10*mul;
@@ -1447,12 +1511,31 @@ bool StrategyTrainStart(int bldIndex, UnitKind kind)
 // A faction is defeated when it has NO critical building AND no workers left
 // (houses alone can't rebuild an economy). Called after every building
 // destroy/sell and every unit kill.
+//
+// THE WIN RULE IS "LAST ONE STANDING", not "the other one". This used to end
+// with `world.gameOver = 1 - f`, which reads as "whoever isn't the loser wins"
+// and is only arithmetic that works for exactly two factions - with nine it
+// would hand victory to faction -6. Now defeat is latched per faction and the
+// match ends when one survivor remains.
+//
+// The player is special-cased on purpose: losing your own base ends YOUR game
+// immediately, even with four AIs still fighting each other. Watching a match
+// you are no longer in play itself out is not a defeat screen.
 static void CheckGameOver(void)
 {
-    if (world.gameOver >= 0) return;
+    if (world.gameOver != -1) return;   // != -1, not >= 0: see the banner note
 
-    for (int f = 0; f < STRAT_FACTIONS; f++)
+    // Nothing has spawned yet. This runs from BuildingDestroy and UnitKill,
+    // both of which are reachable DURING init (a placement that fails, a
+    // starting layout being rebuilt), and with factionCount still 0 the
+    // survivor count below is 0 - which would declare the match over on frame
+    // one, before a single unit exists.
+    if (world.factionCount <= 0) return;
+
+    for (int f = 0; f < world.factionCount; f++)
     {
+        if (world.defeated[f]) continue;     // latched: cannot come back
+
         bool critical = false;
         bool workers  = false;
         for (int i = 0; i < STRAT_MAX_BUILDINGS; i++)
@@ -1474,12 +1557,22 @@ static void CheckGameOver(void)
                 break;
             }
         }
-        if (!critical && !workers)
-        {
-            world.gameOver = 1 - f;     // the OTHER faction wins
-            return;
-        }
+        if (!critical && !workers) world.defeated[f] = true;
     }
+
+    // The player is out: over now, whoever else is still standing.
+    if (world.defeated[0])
+    {
+        world.gameOver = STRAT_GAMEOVER_PLAYER_LOST;
+        return;
+    }
+
+    int alive = 0, last = -1;
+    for (int f = 0; f < world.factionCount; f++)
+    {
+        if (!world.defeated[f]) { alive++; last = f; }
+    }
+    if (alive <= 1) world.gameOver = last;   // last one standing takes it
 }
 
 static void BuildingDestroy(int index)
@@ -1746,9 +1839,11 @@ bool StrategyTryBuild(int faction, BuildingKind kind, Vector3 pos)
     {
         world.stockpile[faction][r] -= StrategyBuildingDef(kind)->cost[r];
     }
-    // Player buildings go up as scaffolds a worker must finish; the AI has no
-    // build behavior, so its buildings spawn complete.
-    BuildingSpawn(kind, faction, pos, faction == 0);
+    // Everyone builds scaffolds. The AI used to skip straight to a finished
+    // building because it had no build behaviour - a free head start that was
+    // tolerable against one enemy and is not against eight. The AI adapter
+    // issues StrategyOrderBuild for its own scaffolds instead.
+    BuildingSpawn(kind, faction, pos, true);
     EffectSpawn(FX_RING, pos, RAYWHITE);
     for (int i = 0; i < 3; i++) EffectSpawn(FX_PUFF, (Vector3){ pos.x, 0.8f, pos.z }, LIGHTGRAY);
     return true;
@@ -2289,6 +2384,152 @@ static void MoveToward(Unit *u, Vector3 dest, float dt)
 }
 
 // ----------------------------------------------------------------------------
+//  Legacy / simple movement  (STRAT_CTRL_LEGACY, STRAT_CTRL_SIMPLE)
+// ----------------------------------------------------------------------------
+//  The other side of the A/B. Deliberately NOT built on MoveArrive or
+//  StrategyMoveTo: the point of these arms is to measure what the world costs
+//  and looks like WITHOUT the arrival progression and without the path service,
+//  so borrowing either would defeat the experiment.
+// ----------------------------------------------------------------------------
+
+// SIMPLE's obstacle avoidance, and the whole of it. Given the direction the unit
+// wants to travel, return the direction it should actually travel.
+//
+// WHY LINE OF SIGHT AND NOT A SEARCH. A* answers "what route reaches the goal";
+// this answers only "is there a wall immediately in front of me", which is a
+// single supercover walk of four tiles and no allocation. That is the entire
+// bet of this arm - that most of the value of pathing on an open map comes from
+// not walking into the one obstacle you can already see.
+//
+// SUPERCOVER MATTERS HERE. SpLosClear visits both cells a diagonal line grazes;
+// a standard Bresenham would report a zero-width gap between two corner-touching
+// obstacles as clear, and the unit would wedge itself on the corner and sit
+// there. path_tests names that case.
+//
+// WHAT THIS CANNOT DO: escape a concave obstacle. A unit in a U-shaped bay
+// probes clear along the bay's axis, walks in, and then oscillates at the back
+// of it. There is no local rule that fixes that - it is what a search is for -
+// and finding out how much it costs in practice is a result this lab exists to
+// produce.
+static bool SimpleDodge(Unit *u, float dirX, float dirZ, float *outX, float *outZ)
+{
+    const SpGrid *g = StrategyNavGrid();
+
+    int sx, sz;
+    SpWorldToTile(g, u->pos.x, u->pos.z, &sx, &sz);
+
+    // Probe along a candidate direction: is the tile LOOK ahead reachable in a
+    // straight line? Out-of-bounds counts as blocked, so units turn back from
+    // the map edge instead of grinding along it.
+    #define PROBE_CLEAR(dx, dz, okOut)                                        \
+        do {                                                                  \
+            int px, pz;                                                       \
+            SpWorldToTile(g, u->pos.x + (dx)*(float)STRAT_SIMPLE_DODGE_LOOK,  \
+                             u->pos.z + (dz)*(float)STRAT_SIMPLE_DODGE_LOOK,  \
+                          &px, &pz);                                          \
+            (okOut) = SpGridInBounds(g, px, pz) &&                            \
+                      SpLosClear(g, sx, sz, px, pz);                          \
+        } while (0)
+
+    bool clear = false;
+    PROBE_CLEAR(dirX, dirZ, clear);
+    if (clear)
+    {
+        // Straight ahead is fine. Forget the remembered side: holding it across
+        // an open stretch would bias the NEXT obstacle toward whichever way this
+        // unit happened to turn minutes ago.
+        u->dodgeSide = 0;
+        *outX = dirX;
+        *outZ = dirZ;
+        return true;
+    }
+
+    // Blocked. Try both shoulders, preferring the side already committed to.
+    // COMMITTING MATTERS: a unit square-on to a wall probes identically to left
+    // and right, so a fresh decision every frame flips sides at frame rate and
+    // the unit vibrates in place. Once it has turned, it keeps turning that way
+    // until it gets a clear run.
+    float c = cosf(STRAT_SIMPLE_DODGE_ANGLE);
+    float s = sinf(STRAT_SIMPLE_DODGE_ANGLE);
+
+    int first = (u->dodgeSide != 0) ? u->dodgeSide : 1;
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        int side = (attempt == 0) ? first : -first;
+
+        // Rotate by +/- the dodge angle in XZ.
+        float rx = dirX*c - dirZ*(s*(float)side);
+        float rz = dirX*(s*(float)side) + dirZ*c;
+
+        PROBE_CLEAR(rx, rz, clear);
+        if (clear)
+        {
+            u->dodgeSide = (signed char)side;
+            *outX = rx;
+            *outZ = rz;
+            return true;
+        }
+    }
+
+    #undef PROBE_CLEAR
+
+    // Boxed in on all three probes. Steer straight and let separation and the
+    // stall test sort it out - refusing to move would strand the unit silently,
+    // and a unit pressed against a wall is at least visibly stuck.
+    *outX = dirX;
+    *outZ = dirZ;
+    return false;
+}
+
+// Walk toward a fixed destination the way the pre-overhaul game did, and decide
+// arrival the way it did: a bare distance test.
+//
+// THE 0.15 IS NOT A TYPO AND MUST NOT BE "FIXED". It is smaller than
+// STRAT_UNIT_RADIUS, so in any crowd it is physically unsatisfiable and the
+// state never resolves - units orbit their destination forever. That defect is
+// the entire reason MoveArrive exists, and reproducing it faithfully is what
+// makes the LEGACY arm worth measuring. The lab's `moving` counter is what
+// shows it: it stays pinned near the group size instead of falling to zero.
+//
+// Returns true once the unit should leave UNIT_MOVE.
+static bool MoveLegacy(Unit *u, int index, float dt)
+{
+    (void)index;    // no path, no slot, no per-unit service state to look up
+
+    Vector3 dest = u->target;
+
+    if (s_scheme == STRAT_CTRL_SIMPLE)
+    {
+        // Steer at a dodged heading rather than at the destination, but keep
+        // measuring arrival against the DESTINATION. Steering and arrival have
+        // to stay separate here for the same reason they do in MoveArrive: a
+        // unit that tested arrival against its dodge target would stop the
+        // moment it cleared the obstacle.
+        Vector3 delta = Vector3Subtract(dest, u->pos);
+        delta.y = 0.0f;
+        float dist = Vector3Length(delta);
+        if (dist > 0.001f)
+        {
+            float ox, oz;
+            SimpleDodge(u, delta.x/dist, delta.z/dist, &ox, &oz);
+
+            // Aim one look-ahead along the chosen heading, never past the
+            // destination - overshooting it would make the unit circle.
+            float reach = (float)STRAT_SIMPLE_DODGE_LOOK;
+            if (reach > dist) reach = dist;
+            Vector3 step = { u->pos.x + ox*reach, u->pos.y, u->pos.z + oz*reach };
+            StrategyMoveDirect(u, step, dt);
+        }
+    }
+    else
+    {
+        StrategyMoveDirect(u, dest, dt);
+    }
+
+    return DistXZ(u->pos, dest) < 0.15f;
+}
+
+// ----------------------------------------------------------------------------
 //  Arrival
 // ----------------------------------------------------------------------------
 //  Walk toward a final DESTINATION and decide when the walk is over. Returns
@@ -2454,6 +2695,12 @@ static void MoveArriveReset(Unit *u)
     u->formSlotIndex  = -1;
     u->formSlotShape  = -1;
     u->formSlotOf     = -1;
+
+    // The dodge commitment goes too. It records which way this unit turned
+    // around an obstacle on the way to its LAST destination; carried into a new
+    // order it would bias the first obstacle of the new route toward a side
+    // chosen for a wall somewhere else entirely.
+    u->dodgeSide      = 0;
 }
 
 // Nearest own building that ACCEPTS what the unit is carrying - wood only
@@ -2707,8 +2954,24 @@ static void UnitAggroScan(Unit *u, int index, int frame)
     if (u->kind == KIND_ANIMAL_WEAK || u->kind == KIND_ANIMAL_STRONG) return;
     if (u->kind == KIND_TEMPLAR || u->kind == KIND_TEMPLAR_HEALER) return;
 
+    // Idle units of any faction scan. An AI FIGHTER also breaks off mid-march,
+    // because nobody is watching it and a soldier that walks past an enemy
+    // reads as broken. The player's units do not: that would be the game taking
+    // manual control away.
+    //
+    // WORKERS ARE EXCLUDED, and that exclusion is load-bearing. This test was
+    // `u->faction == 1` back when faction 1 was the only AI; generalising it to
+    // `!= 0` without also excluding workers made every AI worker abandon its
+    // job to charge any enemy it could see. On a map where two bases are close
+    // - "four lakes" - the two economies walked into each other and killed each
+    // other off with 4-damage punches inside thirty seconds, leaving both
+    // factions with buildings, no workers and no way to ever rebuild. A worker
+    // that is already working stays working; an idle one still defends itself
+    // through the UNIT_IDLE arm above.
+    bool fighter = (u->kind == KIND_SOLDIER) || (u->kind == KIND_RANGED);
     bool scan = (u->state == UNIT_IDLE) ||
-                (u->faction == 1 && (u->state == UNIT_MOVE ||
+                (u->faction != 0 && fighter &&
+                                    (u->state == UNIT_MOVE ||
                                      u->state == UNIT_GATHER ||
                                      u->state == UNIT_RETURN ||
                                      u->state == UNIT_FARM));
@@ -2852,7 +3115,16 @@ static void UnitUpdate(int index, float dt)
             // the ground, so it is the one case that has to decide it is over.
             // The old test here was `< 0.15f` against a 0.35 unit radius - in
             // any crowd that is unreachable, so the state never resolved.
-            if (MoveArrive(u, index, u->target, dt)) u->state = UNIT_IDLE;
+            //
+            // THE ONE STATE THE CONTROL SCHEME FORKS. Every other case in this
+            // switch is chasing, gathering or fighting something, and those all
+            // steer directly under every scheme - see the note on the movers in
+            // strategy_world.h. A walk to a clicked point is the only thing the
+            // three systems actually disagree about.
+            bool done = (s_scheme == STRAT_CTRL_CURRENT)
+                      ? MoveArrive(u, index, u->target, dt)
+                      : MoveLegacy(u, index, dt);
+            if (done) u->state = UNIT_IDLE;
         } break;
 
         case UNIT_GATHER:
@@ -3788,9 +4060,16 @@ void StrategyWorldUpdate(float dt)
     SpProfEnd(SP_PROF_UNIT_UPDATE);
     SpProfSet(SP_COUNT_UNITS_ACTIVE, s_activeCount);
 
-    SpProfBegin(SP_PROF_SEPARATE);
-    UnitSeparation(dt);
-    SpProfEnd(SP_PROF_SEPARATE);
+    // LEGACY had no separation at all - units walked through each other freely.
+    // Skipping it rather than tuning it to zero is the point: this is the single
+    // largest cost difference between the arms, and SP_PROF_SEPARATE reading a
+    // flat zero is how the lab confirms the gate actually took effect.
+    if (s_scheme != STRAT_CTRL_LEGACY)
+    {
+        SpProfBegin(SP_PROF_SEPARATE);
+        UnitSeparation(dt);
+        SpProfEnd(SP_PROF_SEPARATE);
+    }
 
     StrategyMoveStats();
 
@@ -3841,14 +4120,12 @@ void StrategyWorldUpdate(float dt)
     CorpsesUpdate(dt);
     BuildingsUpdate(dt);
 
-    // Enemy + animal brains live in strategy_ai.c (orders-only).
+    // Faction brains + animals (strategy_ai.c, orders-only). Every frame now:
+    // the world's single aiTimer used to gate one brain, but each faction owns
+    // a staggered clock of its own so that eight of them never think on the
+    // same frame. The cheap early-out lives in AiBrainTick.
     SpProfBegin(SP_PROF_AI);
-    world.aiTimer -= dt;
-    if (world.aiTimer <= 0.0f)
-    {
-        world.aiTimer += world.aiPeriod;
-        StrategyAiTick();
-    }
+    StrategyAiTick(dt);
     SpProfEnd(SP_PROF_AI);
 
     EffectsUpdate(dt);
@@ -4042,6 +4319,27 @@ const char *StrategyRenderLodName(StrategyRenderLod lod)
         case STRAT_LOD_DOTS:      return "DOTS";
         case STRAT_LOD_NONE:      return "NONE";
         default:                  return "?";
+    }
+}
+
+// ----------------------------------------------------------------------------
+//  Control scheme
+// ----------------------------------------------------------------------------
+//  The A/B switch. Storage is up at the top of the file with the other
+//  frame-wide state, because it is read from three places that all sit well
+//  above here; only the accessors live down with the LOD ones they mirror.
+// ----------------------------------------------------------------------------
+void                  StrategyControlSet(StrategyControlScheme s) { s_scheme = s; }
+StrategyControlScheme StrategyControlGet(void)                    { return s_scheme; }
+
+const char *StrategyControlName(StrategyControlScheme s)
+{
+    switch (s)
+    {
+        case STRAT_CTRL_LEGACY:  return "LEGACY";
+        case STRAT_CTRL_SIMPLE:  return "SIMPLE";
+        case STRAT_CTRL_CURRENT: return "CURRENT";
+        default:                 return "?";
     }
 }
 
@@ -4476,12 +4774,27 @@ void StrategyWorldDraw2DOverlay(void)
                         world.stockpile[0][RES_FOOD], world.stockpile[0][RES_PROVIDENCE],
                         StrategyPopUsed(0), StrategyPopCap(0)),
              (int)(gameSize.x*0.02f), (int)(gameSize.y*0.02f), size, RAYWHITE);
-    DrawText(TextFormat("enemy: wood %d stone %d food %d prov %d pop %d/%d",
-                        world.stockpile[1][RES_WOOD], world.stockpile[1][RES_STONE],
-                        world.stockpile[1][RES_FOOD], world.stockpile[1][RES_PROVIDENCE],
-                        StrategyPopUsed(1), StrategyPopCap(1)),
-             (int)(gameSize.x*0.02f), (int)(gameSize.y*0.02f) + size + 4, size/2,
-             Fade(strategyFactionColor[1], 0.8f));
+    // One tinted line per AI faction, named by its archetype. This was a single
+    // hardcoded "enemy:" row reading stockpile[1] - which on a six-faction map
+    // showed one opponent of five and implied the others did not exist. The
+    // colour is the faction's own, so a line matches the units on the field.
+    {
+        int   sub = size/2;
+        float y   = gameSize.y*0.02f + (float)size + 4.0f;
+        for (int f = 1; f < world.factionCount; f++)
+        {
+            const char *txt = world.defeated[f]
+                ? TextFormat("%s: defeated", StrategyAiArchetype(f))
+                : TextFormat("%s: wood %d stone %d food %d prov %d pop %d/%d",
+                             StrategyAiArchetype(f),
+                             world.stockpile[f][RES_WOOD], world.stockpile[f][RES_STONE],
+                             world.stockpile[f][RES_FOOD], world.stockpile[f][RES_PROVIDENCE],
+                             StrategyPopUsed(f), StrategyPopCap(f));
+            DrawText(txt, (int)(gameSize.x*0.02f), (int)y, sub,
+                     Fade(StrategyFactionTint(f), world.defeated[f] ? 0.35f : 0.8f));
+            y += (float)sub + 2.0f;
+        }
+    }
 
     if (world.placing >= 0)
     {
@@ -4507,16 +4820,27 @@ void StrategyWorldDraw2DOverlay(void)
     }
 
     // Victory/defeat banner: the sim keeps running underneath, R restarts.
-    if (world.gameOver >= 0)
+    // Note the != -1 rather than >= 0: a player knockout is a NEGATIVE sentinel,
+    // because gameOver otherwise holds the winning faction index.
+    if (world.gameOver != -1)
     {
-        const char *msg = (world.gameOver == 0) ? "VICTORY" : "DEFEAT";
-        Color tint = (world.gameOver == 0) ? GOLD : RED;
+        bool won = (world.gameOver == 0);
+        const char *msg = won ? "VICTORY" : "DEFEAT";
+        Color tint = won ? GOLD : RED;
         int bigSize = (int)(gameSize.y*0.14f);
         DrawText(msg, (int)(gameSize.x*0.5f - (float)MeasureText(msg, bigSize)*0.5f),
                  (int)(gameSize.y*0.36f), bigSize, tint);
-        const char *why = (world.gameOver == 0)
-            ? "the enemy lost every critical building and worker"
-            : "you lost every critical building and worker";
+        // With more than two factions "the enemy" is not a thing, so name the
+        // winner instead of implying there was only ever one opponent.
+        const char *why;
+        if (won)
+            why = (world.factionCount > 2)
+                ? "every rival faction lost its critical buildings and workers"
+                : "the enemy lost every critical building and worker";
+        else if (world.gameOver == STRAT_GAMEOVER_PLAYER_LOST)
+            why = "you lost every critical building and worker";
+        else
+            why = TextFormat("faction %d outlasted every rival", world.gameOver + 1);
         DrawText(why, (int)(gameSize.x*0.5f - (float)MeasureText(why, size/2)*0.5f),
                  (int)(gameSize.y*0.36f) + bigSize + 8, size/2, LIGHTGRAY);
         const char *sub = "press R to restart";

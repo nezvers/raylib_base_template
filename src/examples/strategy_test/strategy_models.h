@@ -81,10 +81,12 @@ const StrategyModel *StrategyUnitModel(UnitKind kind);
 const StrategyModel *StrategyBuildingModel(BuildingKind kind);
 const StrategyModel *StrategyNodeModel(NodeKind kind);
 
-// Faction color, GUARDED. strategyFactionColor[] has only STRAT_FACTIONS (2)
-// entries while FACTION_NEUTRAL is 2, so indexing it with a neutral faction
-// reads out of bounds - which is exactly what DrawBuilding does today. Every
-// color in this module resolves through here instead.
+// Faction color, GUARDED, and THE way anything outside strategy_world.c reads
+// the palette. strategyFactionColor[] has STRAT_FACTIONS entries and
+// FACTION_NEUTRAL is one past the last of them, so indexing it with a neutral
+// faction reads out of bounds. Every color in this module resolves through
+// here, and so do the map forge and the showcase - which each used to carry
+// their own copy of the nine colours.
 Color StrategyFactionTint(int faction);
 
 // Draw one model. MUST be called between BeginMode3D/EndMode3D.

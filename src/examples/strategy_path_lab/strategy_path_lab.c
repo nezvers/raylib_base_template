@@ -15,14 +15,24 @@
 //  The L key exists to get the renderer out of the way; use it before believing
 //  any number on this screen.
 //
-//  Keys:  N spawn   M two armies   C clear   [ ] count   1-6 faction
-//         L render LOD   T profiler   SPACE pause   . step   ESC back
+//  WHAT IT ALSO COMPARES. Three movement systems share this world, and K cycles
+//  between them: LEGACY (the pre-overhaul lerp, no separation or formations),
+//  SIMPLE (legacy plus index-order slots and a line-of-sight dodge) and CURRENT
+//  (formations, A*, flow fields). Measuring them against each other is only
+//  meaningful because it is the SAME build, the same map and the same profiler -
+//  which is exactly what a key press between two runs gives you and two branches
+//  do not.
+//
+//  Keys:  N spawn   M two armies   C clear   [ ] count   1-9 faction
+//         K control scheme   L render LOD
+//         T profiler   SPACE pause   . step   ESC back
 // ============================================================================
 
 #include "../../app_state/app_state.h"
 #include "../../screen_state/screen_state.h"
 #include "../../strategy_path/strategy_path_prof.h"
 #include "../strategy_test/strategy_world.h"
+#include "../strategy_test/strategy_models.h"   // StrategyFactionTint
 #include <math.h>
 
 #include "raygui.h"
@@ -51,14 +61,12 @@ static int s_spawnStep = 3;     // 1000
 // multi-faction population, which the old fixed "player" / "player vs enemy"
 // pair could not express.
 //
-// CLAMPED TO STRAT_FACTIONS ON PURPOSE. The runtime plays two factions, and
-// strategyFactionColor[] has exactly two entries - it is indexed unguarded from
-// eight or so draw sites, so a faction 2 unit is an out-of-bounds read on the
-// first frame it is drawn, not a graceful nothing. The selector goes to 6
-// because that is what maps may author and what this lab will eventually need;
-// until the runtime grows to match, the extra slots are shown as unavailable
-// rather than silently ignored, so the limit is visible instead of mysterious.
-#define LAB_FACTION_SLOTS 6
+// UNCLAMPED. This used to stop at STRAT_FACTIONS and grey out the rest, because
+// the runtime played two factions and strategyFactionColor[] had two entries -
+// a faction 2 unit was an out-of-bounds read on the first frame it was drawn.
+// The runtime now plays up to nine and the palette has nine rows, so every slot
+// the selector offers is real. Keys 1..9 map to factions 0..8.
+#define LAB_FACTION_SLOTS STRAT_FACTIONS
 static int s_faction = 0;
 
 static bool  s_paused    = false;
@@ -75,6 +83,9 @@ static void Enter()
     // too - it just has no obstacles to path around.
     StrategyWorldInit();
     StrategyRenderLodSet(STRAT_LOD_AUTHORED);
+    // Start every visit on the shipped system, so a run begins from a known
+    // arm rather than from whatever the previous visit was left cycled to.
+    StrategyControlSet(STRAT_CTRL_CURRENT);
     spProfEnabled = true;
     s_paused   = false;
     s_stepOnce = false;
@@ -84,6 +95,10 @@ static void Exit()
 {
     // Leave nothing behind: the game shares this world and this renderer.
     StrategyRenderLodSet(STRAT_LOD_AUTHORED);
+    // ...and this MOVER. A scheme left on LEGACY would silently degrade normal
+    // play - units piling onto a click and never settling - and it would read
+    // as a regression in the movement code rather than a toggle nobody reset.
+    StrategyControlSet(STRAT_CTRL_CURRENT);
     spProfEnabled = false;
 }
 
@@ -134,6 +149,21 @@ static void Update()
     {
         StrategyRenderLod next = (StrategyRenderLod)((StrategyRenderLodGet() + 1) % STRAT_LOD_COUNT);
         StrategyRenderLodSet(next);
+    }
+    // THE A/B SWITCH. Cycles which movement system drives a walk-to-a-point,
+    // over the same world, the same input path and the same profiler - which is
+    // the only way the three sets of numbers are comparable at all.
+    //
+    // ORDERS ALREADY GIVEN ARE NOT RE-ISSUED. Units mid-march keep the
+    // destination they were given; the new scheme takes effect from the next
+    // order. So measure by cycling FIRST and ordering SECOND - flipping the key
+    // mid-march tells you nothing, because the interesting half of each system
+    // is what it does when the order is issued.
+    if (IsKeyPressed(KEY_K))
+    {
+        StrategyControlScheme next =
+            (StrategyControlScheme)((StrategyControlGet() + 1) % STRAT_CTRL_COUNT);
+        StrategyControlSet(next);
     }
     if (IsKeyPressed(KEY_T))     s_profView = (s_profView + 1) % 3;
     if (IsKeyPressed(KEY_G))     StrategyDebugNavShow(!StrategyDebugNavShown());
@@ -192,12 +222,10 @@ static void Update()
     // -- Population -----------------------------------------------------------
     if (IsKeyPressed(KEY_LEFT_BRACKET)  && s_spawnStep > 0) s_spawnStep--;
     if (IsKeyPressed(KEY_RIGHT_BRACKET) && s_spawnStep < SPAWN_STEP_COUNT - 1) s_spawnStep++;
-    // Faction select. Out-of-range keys are swallowed rather than clamped: a
-    // press that quietly lands on a different faction than the one asked for is
-    // worse than one that does nothing, because the spawn afterwards looks right.
+    // Faction select, keys 1..9.
     for (int f = 0; f < LAB_FACTION_SLOTS; f++)
     {
-        if (IsKeyPressed(KEY_ONE + f) && f < STRAT_FACTIONS) s_faction = f;
+        if (IsKeyPressed(KEY_ONE + f)) s_faction = f;
     }
 
     if (IsKeyPressed(KEY_N)) SpawnBurst();
@@ -255,10 +283,18 @@ static void DrawProfiler(Vector2 gameSize)
              (int)x, (int)y, fs, frameCol);
     y += line;
 
-    DrawText(TextFormat("render %s      drawn %d",
+    // Scheme sits on the render row because both answer the same question -
+    // how is this frame being produced - and because reading a measurement off
+    // this HUD without knowing which arm produced it is worse than useless.
+    // Highlighted whenever it is NOT the shipped system, so a number recorded
+    // under a debug arm cannot be mistaken for a number about the game.
+    StrategyControlScheme scheme = StrategyControlGet();
+    DrawText(TextFormat("render %s      drawn %d      control %s",
                         StrategyRenderLodName(StrategyRenderLodGet()),
-                        SpProfGet(SP_COUNT_DRAWN_UNITS)),
-             (int)x, (int)y, fs, dim);
+                        SpProfGet(SP_COUNT_DRAWN_UNITS),
+                        StrategyControlName(scheme)),
+             (int)x, (int)y, fs,
+             (scheme == STRAT_CTRL_CURRENT) ? dim : hot);
     y += line;
 
     // The clustering acceptance test. Order a pile onto one point: `moving`
@@ -298,6 +334,13 @@ static void DrawProfiler(Vector2 gameSize)
     // numbers answer a different question than the lines do: `pending` climbing
     // and staying up means the budget is binding, and `failed` spiking explains
     // a slowdown that a millisecond figure never would.
+    //
+    // NOT EXPECTED TO BE ZERO UNDER LEGACY / SIMPLE. The control scheme forks
+    // only UNIT_MOVE - a walk to a clicked point. Workers heading for a tree or
+    // a scaffold path under every scheme, deliberately: gathering is not what
+    // these arms disagree about. The maps seed a handful of workers per faction,
+    // so expect a small standing figure here even on LEGACY. It is the SPAWNED
+    // soldiers, which never enter those states, that the A/B actually measures.
     {
         int queued = 0, active = 0, pending = 0, nodes = 0;
         StrategyDebugPathStats(&queued, &active, &pending, &nodes);
@@ -352,7 +395,7 @@ static void Gui()
 
     const char *keys[] = {
         "N spawn    M two armies    C clear",
-        "[ ] count    1-6 faction    L render LOD",
+        "K control scheme    [ ] count    1-9 faction    L render LOD",
         "G nav grid    P paths    J flow    O slots",
         "- + astar budget    , / flow threshold",
         "F formation shape    V formation behaviour",
@@ -382,8 +425,7 @@ static void Gui()
     for (int f = LAB_FACTION_SLOTS - 1, slot = 0; f >= 0; f--, slot++)
     {
         float cx = rx - chip*(float)(slot + 1);
-        bool  playable = (f < STRAT_FACTIONS);
-        Color col = playable ? strategyFactionColor[f] : (Color){ 60, 62, 68, 255 };
+        Color col = StrategyFactionTint(f);
 
         if (f == s_faction) DrawRectangle((int)cx, (int)cy, (int)chip - 3, fs + 4, col);
         else                DrawRectangleLines((int)cx, (int)cy, (int)chip - 3, fs + 4, col);
@@ -391,7 +433,6 @@ static void Gui()
         const char *num = TextFormat("%d", f + 1);
         DrawText(num, (int)(cx + (chip - 3 - (float)MeasureText(num, fs))*0.5f),
                  (int)(cy + 2), fs,
-                 (f == s_faction) ? BLACK
-                                  : (playable ? col : (Color){ 90, 92, 98, 255 }));
+                 (f == s_faction) ? BLACK : col);
     }
 }

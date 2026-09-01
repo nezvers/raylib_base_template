@@ -1231,6 +1231,19 @@ static void OrderMoveGroupFaced(const int *units, int count, Vector3 dest,
 
     if (count > STRAT_MAX_UNITS) count = STRAT_MAX_UNITS;
 
+    // -- LEGACY: no group order at all ----------------------------------------
+    // Every unit gets the SAME point, which is what the pre-overhaul game did
+    // and is the behaviour the formation layer was written to replace. 500 units
+    // ordered onto one spot are being asked to stand where about six fit, so
+    // they queue and shove indefinitely. Reproduced exactly, because a baseline
+    // that quietly did something smarter would understate what formations buy.
+    if (StrategyControlGet() == STRAT_CTRL_LEGACY)
+    {
+        for (int k = 0; k < count; k++)
+            StrategyOrderMove(&world->units[units[k]], dest);
+        return;
+    }
+
     // -- Facing ---------------------------------------------------------------
     // The formation faces the way the group is travelling, so a block of units
     // arrives broadside-on rather than in a column. Centroid first.
@@ -1262,6 +1275,65 @@ static void OrderMoveGroupFaced(const int *units, int count, Vector3 dest,
         else               { fx /= flen; fz /= flen; }
     }
     float rx = -fz, rz = fx;                            // right-hand perpendicular
+
+    // -- SIMPLE: naive slots, index order -------------------------------------
+    // The cheap approximation of a formation, and the arm this whole experiment
+    // is really about. It keeps the SHAPE - SpFormSlotLocal is the same headless
+    // geometry the current system uses - and throws away everything expensive
+    // built on top of it:
+    //
+    //   no SpFormAssignStable  - assignment is unit k -> slot k, so a re-order
+    //                            reshuffles the block instead of translating it.
+    //                            Visible as churn when you re-click; that is the
+    //                            defect stable assignment was added to fix, and
+    //                            here it is, on purpose, to show the difference.
+    //   no chunking            - one block however large, so a 5000-unit order
+    //                            lays out one absurdly wide formation. Also on
+    //                            purpose: it shows what the echelon logic is for.
+    //   no flow field, no A*   - MoveLegacy steers with SimpleDodge instead.
+    //   no form-up pacing      - StrategyMoveFormUpdate early-returns below.
+    //
+    // What it KEEPS is SpNearestOpen on every slot, because a slot in a lake is
+    // not a formation defect but an unreachable order, and a unit sent to one
+    // walks at it forever. Every goal goes through that check under every arm.
+    if (StrategyControlGet() == STRAT_CTRL_SIMPLE)
+    {
+        float bias = SpFormForwardBias((int)s_formShape, count, FORMATION_SPACING,
+                                       &s_formCaps);
+
+        for (int k = 0; k < count; k++)
+        {
+            float offR, offF;
+            SpFormSlotLocal((int)s_formShape, k, count, FORMATION_SPACING,
+                            &s_formCaps, &offR, &offF);
+
+            // Same re-anchoring the current path uses: without it the block
+            // lands with its FRONT rank on the clicked point and every rear
+            // unit walks backward away from it on a short move.
+            offF -= bias;
+
+            Vector3 slot = {
+                dest.x + rx*offR + fx*offF,
+                dest.y,
+                dest.z + rz*offR + fz*offF,
+            };
+
+            // Pull the slot out of anything impassable. Ring cap 16, matching
+            // the current path - 6 could not escape a building footprint, which
+            // is what left units standing in walls.
+            int tx, tz, ox, oz;
+            SpWorldToTile(g, slot.x, slot.z, &tx, &tz);
+            if (SpNearestOpen(g, tx, tz, 16, &ox, &oz))
+            {
+                Vector3 open = SpTileToWorld(g, ox, oz);
+                slot.x = open.x;
+                slot.z = open.z;
+            }
+
+            StrategyOrderMove(&world->units[units[k]], slot);
+        }
+        return;
+    }
 
     // -- Flow field -----------------------------------------------------------
     // Resolved ONCE for the whole order, before any chunk is laid out, and
@@ -1428,6 +1500,11 @@ static uint16_t s_fieldMedian[SP_FLOW_FIELDS_MAX];
 
 void StrategyMoveFlowSweep(float now)
 {
+    // Neither non-CURRENT arm ever acquires a field, so there is nothing to
+    // recount and the O(live) sweep is pure cost. The lab's `flow fields` row
+    // reading 0/N under those arms is how a missed gate would show up.
+    if (StrategyControlGet() != STRAT_CTRL_CURRENT) return;
+
     int liveCount = 0;
     const int *live = StrategyActiveUnits(&liveCount);
     const SpGrid *g = StrategyNavGrid();
@@ -1528,6 +1605,12 @@ int StrategyMoveFlowLive(void) { return SpFlowLiveCount(); }
 // leaves a phantom member holding a group short of its latch forever.
 void StrategyMoveFormUpdate(float dt)
 {
+    // LEGACY and SIMPLE never stamp formGroup, so every group record would be
+    // empty and every pass over them a no-op with extra steps. Returning here
+    // also keeps form-up pacing and the slot hold-pull out of those arms, which
+    // is what makes them the cheap systems they are advertised as.
+    if (StrategyControlGet() != STRAT_CTRL_CURRENT) return;
+
     StrategyWorld *world = StrategyWorldGet();
     int liveCount = 0;
     const int *live = StrategyActiveUnits(&liveCount);

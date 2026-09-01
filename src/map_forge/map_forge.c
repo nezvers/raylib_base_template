@@ -115,19 +115,11 @@ static const Color TERRAIN_COL[SGM_TERRAIN_COUNT] = {
 // view, and tall steps turn a ridge into a wall that hides what is behind it.
 #define MF_HEIGHT_STEP  0.35f
 
-// The faction palette. The game ships two colours (blue/red); a map may author
-// nine, so the other seven live here until the runtime grows to match.
-static const Color FACTION_COL[SGM_FACTIONS_MAX] = {
-    {  80, 140, 255, 255 },     // 0 blue   - the game's player colour
-    { 230,  70,  70, 255 },     // 1 red    - the game's enemy colour
-    {  90, 200, 110, 255 },     // 2 green
-    { 235, 190,  70, 255 },     // 3 gold
-    { 190, 110, 230, 255 },     // 4 violet
-    { 240, 150,  60, 255 },     // 5 orange
-    {  80, 210, 210, 255 },     // 6 teal
-    { 240, 120, 180, 255 },     // 7 pink
-    { 190, 195, 205, 255 },     // 8 silver
-};
+// The faction palette lives in the GAME now (strategyFactionColor[], nine
+// entries) and is read through the guarded accessor. This file used to carry
+// its own copy because the runtime only shipped two colours; it ships nine, so
+// the copy is gone and the forge cannot drift from what the game draws.
+#define FACTION_COL(i)  StrategyFactionTint(i)
 
 // ---------------------------------------------------------------------------
 //  What PLACE can drop. The map stores family + numeric kind; these tables are
@@ -674,7 +666,7 @@ static void DrawStarts(void)
         const SgmTile *t = SgmTileAtConst(&s_doc, sx, sz);
         Vector3 c = SgmTileToWorld(&s_doc, sx, sz);
         float top = TileTop(t);
-        Color col = FACTION_COL[ClampInt(s_doc.starts[f].colorIndex, 0, SGM_FACTIONS_MAX - 1)];
+        Color col = FACTION_COL(ClampInt(s_doc.starts[f].colorIndex, 0, SGM_FACTIONS_MAX - 1));
 
         // A banner: visible from across the map, and unmistakably not a
         // building. The ring on the ground is what marks the actual tile.
@@ -1184,7 +1176,7 @@ static void InspectorGui(Rectangle pane, float s, int fs, int fsSmall)
             bool on = (f == s_faction);
             bool hot = !UiModalBlocks() && CheckCollisionPointRec(GetMousePosition(), r);
 
-            DrawRectangleRec(r, FACTION_COL[f]);
+            DrawRectangleRec(r, FACTION_COL(f));
             DrawRectangleLinesEx(r, on ? 2.0f : 1.0f,
                                  on ? UI_COL_TEXT : (hot ? UI_COL_LINE_HI : UI_COL_LINE));
             const char *num = TextFormat("%d", f + 1);

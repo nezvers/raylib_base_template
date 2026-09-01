@@ -110,8 +110,18 @@ bool StrategySellBuilding(int index);
 // Quarry: spend providence to spawn a fresh stone node beside it.
 bool StrategyQuarrySpawnStone(int bldIndex);
 
-// Enemy + animal think tick (strategy_ai.c), called on the world's aiTimer.
-void StrategyAiTick(void);
+// Faction brains + animals (strategy_ai.c). Called EVERY FRAME, not on a gate:
+// each AI faction owns its own staggered think clock now, so the world no
+// longer has one timer to fire them all on the same frame.
+void StrategyAiTick(float dt);
+
+// Rebuild every faction's brain. Called from StrategyWorldInit, after the AI
+// period is known and before the first tick.
+void StrategyAiReset(void);
+
+// The archetype a faction plays ("AGGRESSOR", "TURTLE", ...), for the HUD and
+// the path lab. Fixed by faction index, so a match is reproducible.
+const char *StrategyAiArchetype(int faction);
 
 // -- Movement (strategy_move.c) -----------------------------------------------
 //  Path following. The split of responsibility is the point:
@@ -139,6 +149,14 @@ void StrategyAiTick(void);
 //
 //  Neither decides that the unit has ARRIVED; callers keep their own proximity
 //  tests exactly as they did when every one of these was a lerp.
+//
+//  WHICH ONE A WALK-TO-A-POINT GETS IS NOW A RUNTIME CHOICE. Under
+//  STRAT_CTRL_CURRENT the UNIT_MOVE state runs MoveArrive, which drives
+//  StrategyMoveTo; under LEGACY and SIMPLE it runs MoveLegacy, which drives
+//  StrategyMoveDirect and never asks the path service for anything. Every OTHER
+//  call site - chasing, kiting, shuffling - is unaffected by the scheme, because
+//  those already chose StrategyMoveDirect on the merits described above and the
+//  scheme has nothing to say about them.
 void StrategyMoveTo(Unit *u, int index, Vector3 dest, float dt);
 void StrategyMoveDirect(Unit *u, Vector3 dest, float dt);
 
@@ -278,6 +296,19 @@ typedef enum {
 void StrategyRenderLodSet(StrategyRenderLod lod);
 StrategyRenderLod StrategyRenderLodGet(void);
 const char *StrategyRenderLodName(StrategyRenderLod lod);
+
+// -- Control scheme -----------------------------------------------------------
+// Which of the three movement systems drives UNIT_MOVE. See the enum in
+// strategy_types.h for what each one is and why all three exist.
+//
+// SAME SHAPE AS THE LOD TRIO ABOVE, and for the same reason: a lab-only switch
+// over a world the game shares. The lab restores CURRENT on exit, exactly as it
+// restores AUTHORED - a scheme left on LEGACY would silently degrade normal
+// play, and the symptom (units piling up on a click) looks like a regression in
+// the movement code rather than a stale toggle.
+void                  StrategyControlSet(StrategyControlScheme s);
+StrategyControlScheme StrategyControlGet(void);
+const char           *StrategyControlName(StrategyControlScheme s);
 
 // Spawn `count` units of one kind for a faction, scattered in a disc around
 // `center`. Stress-test entry point: it goes through the same UnitSpawn as

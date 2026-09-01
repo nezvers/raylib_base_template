@@ -928,14 +928,10 @@ static const Color mapTerrainCol[SGM_TERRAIN_COUNT] = {
     {  14,  15,  20, 255 },     // void
 };
 
-// The nine authorable faction colours. The game ships two (StrategyFactionTint
-// covers 0/1/neutral); a map may declare nine, so the browser needs the rest to
-// show a 6-faction map as six distinguishable sides.
-static const Color mapFactionCol[SGM_FACTIONS_MAX] = {
-    {  80, 140, 255, 255 }, { 230,  70,  70, 255 }, {  90, 200, 110, 255 },
-    { 235, 190,  70, 255 }, { 190, 110, 230, 255 }, { 240, 150,  60, 255 },
-    {  80, 210, 210, 255 }, { 240, 120, 180, 255 }, { 190, 195, 205, 255 },
-};
+// The nine authorable faction colours come from the GAME's palette now, via the
+// guarded accessor. This file used to hold its own copy because the runtime
+// shipped only two; it ships all nine, so the copy is gone.
+#define mapFactionCol(i)  StrategyFactionTint(i)
 
 #define MAP_HEIGHT_STEP 0.35f   // matches the forge's MF_HEIGHT_STEP
 
@@ -1031,7 +1027,7 @@ static void PreviewDrawSgm(Rectangle region, const SgmMap *m,
             float top = (t != NULL) ? (float)t->height*MAP_HEIGHT_STEP : 0.0f;
             int ci = m->starts[f].colorIndex;
             if ((ci < 0) || (ci >= SGM_FACTIONS_MAX)) ci = f % SGM_FACTIONS_MAX;
-            Color col = mapFactionCol[ci];
+            Color col = mapFactionCol(ci);
 
             DrawLine3D((Vector3){ c.x, top, c.z }, (Vector3){ c.x, top + 2.4f, c.z }, col);
             DrawCube((Vector3){ c.x + 0.35f, top + 2.15f, c.z }, 0.7f, 0.45f, 0.05f, col);
@@ -2188,7 +2184,10 @@ static void DrawMapFull(const Layout *L)
     // An authored map may declare up to nine sides, so the legend is built from
     // the map rather than from the game's two-entry palette.
     {
-        int fc = sel ? sel->factionCount : STRAT_FACTIONS;
+        // No map selected: show the two the built-in layout actually plays,
+        // not the nine the arrays are sized for - a legend of nine chips for a
+        // two-faction battlefield describes something that is not on screen.
+        int fc = sel ? sel->factionCount : 2;
         float sw = 10.0f*L->s;
         float ly = stage.y + stage.height - 26.0f*L->s;
         float lx = stage.x + stage.width - 20.0f*L->s;
@@ -2201,7 +2200,7 @@ static void DrawMapFull(const Layout *L)
             {
                 int ci = sel->starts[f].colorIndex;
                 if ((ci < 0) || (ci >= SGM_FACTIONS_MAX)) ci = f % SGM_FACTIONS_MAX;
-                col = mapFactionCol[ci];
+                col = mapFactionCol(ci);
                 label = TextFormat("F%d", f + 1);
             }
             else

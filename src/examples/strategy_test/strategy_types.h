@@ -38,13 +38,40 @@
 #ifndef STRAT_MAX_UNITS
 #define STRAT_MAX_UNITS      256    // Web tier; desktop raised via CMake
 #endif
-#define STRAT_MAX_BUILDINGS  24
-#define STRAT_MAX_NODES      48
+// TWO-TIER for the same reason STRAT_MAX_UNITS is: nine factions each with a
+// real base do not fit in the 24 buildings two factions needed. These are also
+// what SgmBudget is built from (map_forge.c), so the forge's budget check
+// follows them without being told twice.
+#ifndef STRAT_MAX_BUILDINGS
+#define STRAT_MAX_BUILDINGS  64     // Web tier; desktop raised via CMake
+#endif
+#ifndef STRAT_MAX_NODES
+#define STRAT_MAX_NODES      96     // Web tier; desktop raised via CMake
+#endif
 #define STRAT_MAX_CORPSES    16     // visual-only death animations in flight
 #define UNIT_MAX_JOB_QUEUE   8      // build/repair/gather jobs one worker Shift-queues
-#define STRAT_FACTIONS       2      // 0 = player (blue), 1 = enemy (red)
-#define FACTION_NEUTRAL      2      // animals: no stockpile, no color entry -
+
+// -- Factions -----------------------------------------------------------------
+// 0 is always the human player; 1..8 are AI. STRAT_FACTIONS is the CEILING the
+// arrays are sized to, NOT how many play: a match runs world.factionCount of
+// them, which the authored map decides (SGM_FACTIONS_MAX is the same 9) and the
+// built-in layout sets to 2.
+//
+// FACTION_NEUTRAL MUST STAY ONE PAST THE LAST FACTION. It was 2 back when
+// STRAT_FACTIONS was 2, and the two constants were separately typed - so raising
+// the faction count would have silently aliased the animals onto faction 2 and
+// given every deer a stockpile row. The assert below is what makes that
+// impossible to reintroduce; mods[] is sized STRAT_FACTIONS + 1 to hold it.
+#define STRAT_FACTIONS       9      // 0 = player, 1..8 = AI (arrays sized to this)
+#define FACTION_NEUTRAL      9      // animals: no stockpile, no color entry -
                                     //   always guard before indexing by faction
+_Static_assert(FACTION_NEUTRAL == STRAT_FACTIONS,
+               "FACTION_NEUTRAL must be the row just past the last playable faction");
+
+// world.gameOver holds the WINNING faction, so "the player was knocked out"
+// needs a value that is not a faction and not the still-playing -1. The player
+// losing ends the match even when several AI factions are still fighting.
+#define STRAT_GAMEOVER_PLAYER_LOST  (-2)
 
 // -- Tuning (world-level; per-kind numbers live in strategy_defs.c) ----------
 #define STRAT_GROUND_HALF    25.0f  // ground spans [-HALF, +HALF] on x and z
@@ -91,6 +118,49 @@
 #define STRAT_SETTLE_CROWD   3       // settled neighbours that justify stopping
                                      //   short - without this a chokepoint
                                      //   grinds forever
+
+// -- Control scheme -----------------------------------------------------------
+//  WHICH MOVEMENT SYSTEM IS DRIVING. Three of them coexist so the path lab can
+//  A/B them against the same world, the same input path and the same profiler -
+//  numbers from two different builds are not comparable, numbers from one build
+//  with a key press between them are.
+//
+//  This is a MEASUREMENT switch, not a gameplay setting. The game always runs
+//  CURRENT; the lab restores it on exit. Nothing outside the lab should ever
+//  set it, which is why there is no UI for it in strategy_test.
+//
+//    LEGACY   the behaviour that predates all of the movement work: a straight
+//             lerp at the destination and a bare distance test for arrival. No
+//             separation, no formations, no pathing. Kept EXACTLY as it was so
+//             it is a real baseline and not a reconstruction - the claims made
+//             about what the current system fixed are only checkable against
+//             the thing it replaced.
+//    SIMPLE   legacy plus the two cheap upgrades: index-order formation slots
+//             and a local line-of-sight dodge. This is the interesting arm - it
+//             asks what the heavy machinery actually buys over an approximation
+//             that costs almost nothing. It TRAPS IN CONCAVE OBSTACLES by
+//             construction; that is a finding, not a defect.
+//    CURRENT  formations, A*, flow fields and the arrival progression.
+typedef enum {
+    STRAT_CTRL_LEGACY = 0,
+    STRAT_CTRL_SIMPLE,
+    STRAT_CTRL_CURRENT,
+    STRAT_CTRL_COUNT,
+} StrategyControlScheme;
+
+// SIMPLE's tunables. It deliberately has NO spacing constant of its own: it
+// lays out on FORMATION_SPACING, the same pitch the current system uses (see
+// below - it is defined with the rest of the formation geometry). Both arms at
+// the same density is what makes the comparison mean anything; a slot pitch of
+// its own would let a spacing difference masquerade as a pathing result.
+//
+// How far ahead the dodge probe looks, in TILES (one tile is one world unit).
+// Short on purpose: this is a local steer, and a long probe makes it veer for
+// obstacles it would never have reached.
+#define STRAT_SIMPLE_DODGE_LOOK 4
+// How hard it turns when the probe is blocked. 45 degrees, in radians. Shallower
+// and it scrapes along the obstacle; steeper and it visibly lurches sideways.
+#define STRAT_SIMPLE_DODGE_ANGLE 0.7853982f
 
 // Neutral animal reactions to being hit.
 #define STRAT_FLEE_PACK_RADIUS 5.0f // weak animals this close flee together
@@ -398,6 +468,14 @@ typedef struct {
                                     //   straggler re-triggers it and the whole army
                                     //   crawls for the rest of the march.
     bool         formBrokeOff;      // peeled off to fight; rejoins on its next order
+
+    // STRAT_CTRL_SIMPLE's dodge memory: which way this unit turned the last time
+    // its path probe was blocked (-1 left, +1 right, 0 never). Held so a unit in
+    // a corridor keeps committing to the side it already chose. Without it the
+    // dodge re-decides from scratch every frame, and a unit facing a wall
+    // head-on - where both sides probe equally - flips sides at frame rate and
+    // vibrates in place instead of going around.
+    signed char  dodgeSide;
     float        hp, maxHp;
 
     // Stats resolved at spawn (def x difficulty x building buffs); see header.
@@ -517,6 +595,24 @@ typedef struct {
     FactionMods  mods[STRAT_FACTIONS + 1];  // [FACTION_NEUTRAL] = identity
     float        aiPeriod;                  // STRAT_AI_PERIOD * enemy aiPeriodMul
 
+    // -- How many factions are actually PLAYING -------------------------------
+    // STRAT_FACTIONS is what the arrays are sized to; this is how many of them
+    // exist in THIS match. The authored map decides it (SgmMap.factionCount);
+    // the built-in layout sets 2. Faction 0 is always the human player, so this
+    // is never below 1 and the AI loop runs 1..factionCount-1.
+    //
+    // EVERY LOOP OVER LIVE FACTION STATE MUST USE THIS, not STRAT_FACTIONS -
+    // starting stockpiles, the defeat sweep, the resource HUD. Walking to the
+    // ceiling instead would hand resources to six factions that never spawned
+    // and then declare them all defeated on frame one.
+    int          factionCount;
+
+    // Knocked out: no critical building and no workers left. Latched, because
+    // defeat is permanent - a faction cannot come back, and re-testing a dead
+    // one every kill is work that can only produce the same answer. The AI
+    // skips defeated factions; CheckGameOver counts the survivors.
+    bool         defeated[STRAT_FACTIONS];
+
     // -- Battlefield extent, in world units from the origin ------------------
     // The ground used to be a fixed STRAT_GROUND_HALF square, and that constant
     // was read directly at the camera clamp, the placement margin, the ground
@@ -551,7 +647,8 @@ typedef struct {
     int       selectedBuilding;     // buildings[] index (player), -1 = none;
                                     //   mutually exclusive with unit selection
     bool      buildMenuOpen;        // command panel currently shows the build list
-    int       gameOver;             // -1 = playing, else the WINNING faction index
+    int       gameOver;             // -1 = playing, STRAT_GAMEOVER_PLAYER_LOST,
+                                    //   else the WINNING faction index
     float     aiTimer;              // countdown to the next enemy think tick
     Rectangle guiBlock;             // REAL-screen px area where the GUI owns the
                                     //   mouse (command panel); world clicks ignore it

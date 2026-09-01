@@ -177,6 +177,17 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
         src/strategy_path/strategy_path_form.c
         src/strategy_map/strategy_map.c)
     target_link_libraries(path_tests raylib)
+
+    # ai_tests - faction behaviour. src/strategy_ai/ is the strictest of the
+    # headless modules: it does not include strategy_types.h AND does not
+    # include raylib, because a decision function needs neither a Vector3 nor a
+    # window. So this target links nothing but the module itself - which is the
+    # point, since "does a rusher attack before a turtle" used to be a question
+    # you could only answer by playing the game for five minutes.
+    add_executable(ai_tests
+        tests/ai_tests.c
+        src/strategy_ai/strategy_ai_profile.c
+        src/strategy_ai/strategy_ai_brain.c)
 endif()
 
 # Checks if OSX and links appropriate frameworks (Only required on MacOS)
@@ -350,6 +361,15 @@ if (NOT "${PLATFORM}" STREQUAL "Web")
     if (NOT DEFINED STRAT_MAX_UNITS)  # strategy_types.h Web default: 256
         set(STRAT_MAX_UNITS 10000)
     endif()
+    # Nine factions with a real base each do not fit the two-faction budget.
+    # These also size SgmBudget in the map forge, so an authored map's building
+    # and node allowance follows the tier it was authored on.
+    if (NOT DEFINED STRAT_MAX_BUILDINGS)  # strategy_types.h Web default: 64
+        set(STRAT_MAX_BUILDINGS 256)
+    endif()
+    if (NOT DEFINED STRAT_MAX_NODES)      # strategy_types.h Web default: 96
+        set(STRAT_MAX_NODES 384)
+    endif()
 endif()
 
 # Navigation / steering capacities (src/strategy_path/). Same two-tier scheme:
@@ -394,7 +414,7 @@ function(sp_apply_caps target)
 endfunction()
 
 function(strat_apply_caps target)
-    foreach(cap STRAT_MAX_UNITS)
+    foreach(cap STRAT_MAX_UNITS STRAT_MAX_BUILDINGS STRAT_MAX_NODES)
         if (DEFINED ${cap})
             target_compile_definitions(${target} PUBLIC ${cap}=${${cap}})
         endif()
@@ -448,7 +468,7 @@ endif()
 if ("${PLATFORM}" STREQUAL "Web")
     message(STATUS " - - - strategy runtime capacities: WEB tier (header defaults)")
 else()
-    message(STATUS " - - - strategy runtime capacities: units=${STRAT_MAX_UNITS}")
+    message(STATUS " - - - strategy runtime capacities: units=${STRAT_MAX_UNITS} buildings=${STRAT_MAX_BUILDINGS} nodes=${STRAT_MAX_NODES}")
 endif()
 
 strat_apply_caps(${PROJECT_NAME})
